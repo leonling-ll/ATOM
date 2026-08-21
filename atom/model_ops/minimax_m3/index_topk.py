@@ -120,20 +120,25 @@ def _index_block_score_kernel(
     if BLOCK_SIZE_Q * pid_q >= q_len:
         return
 
-    q_ptrs = tl.make_block_ptr(
-        base=q_ptr + seq_start * stride_q_n + pid_h * stride_q_h,
-        shape=(q_len, head_dim),
-        strides=(stride_q_n, stride_q_d),
-        offsets=(pid_q * BLOCK_SIZE_Q, 0),
-        block_shape=(BLOCK_SIZE_Q, head_dim),
-        order=(1, 0),
-    )
-    q = tl.load(q_ptrs, boundary_check=(0,), padding_option="zero")
-    q_start = prefix_len + pid_q * BLOCK_SIZE_Q
-
-    off_q = tl.arange(0, BLOCK_SIZE_Q) + pid_q * BLOCK_SIZE_Q + prefix_len
+    # Query-row offsets within this request, and the tail mask for the last
+    # partial tile. head_dim is the full extent of the second axis, so only
+    # axis 0 needs masking.
+    off_q_local = pid_q * BLOCK_SIZE_Q + tl.arange(0, BLOCK_SIZE_Q)
     off_k = tl.arange(0, BLOCK_SIZE_K)
     off_d = tl.arange(0, head_dim)
+    q_mask = off_q_local < q_len
+    q = tl.load(
+        q_ptr
+        + seq_start * stride_q_n
+        + pid_h * stride_q_h
+        + off_q_local[:, None] * stride_q_n
+        + off_d[None, :] * stride_q_d,
+        mask=q_mask[:, None],
+        other=0.0,
+    )
+    q_start = prefix_len + pid_q * BLOCK_SIZE_Q
+
+    off_q = off_q_local + prefix_len
     # Block table row for this request.
     bt_row = block_table_ptr + pid_b * stride_bt_b
     # Causal window: only blocks up to the last query token's position.
@@ -164,12 +169,10 @@ def _index_block_score_kernel(
         s_ptrs = (
             score_ptr
             + pid_h * stride_s_h
-            + (seq_start + pid_q * BLOCK_SIZE_Q + tl.arange(0, BLOCK_SIZE_Q))
-            * stride_s_n
+            + (seq_start + off_q_local) * stride_s_n
             + blk * stride_s_k
         )
-        q_store_mask = (pid_q * BLOCK_SIZE_Q + tl.arange(0, BLOCK_SIZE_Q)) < q_len
-        tl.store(s_ptrs, score, mask=q_store_mask)
+        tl.store(s_ptrs, score, mask=q_mask)
 
 
 # ---------------------------------------------------------------------------
