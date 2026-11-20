@@ -6,7 +6,7 @@ the native ATOM OpenAI-compatible server. The attention has two implementations:
 reference (`atom/model_ops/minimax_m3/pro_attn.py`; about 0.14 s per decoded token at TP8, eager
 only) and a kernel path (`atom/model_ops/minimax_m3/pro_kernels.py`: Triton prep, block scores and
 block selection, aiter's paged attention, an FP8 KV cache, decode CUDA graphs; about 11-12 ms per
-decoded token at TP8). Both reach the same GSM8K; the kernel path is selected through
+decoded token at TP8). The kernel path is selected through
 `ATOM_M3PRO_VARIANTS` (see Kernels below). Images go through the checkpoint's vision tower, prefix
 caching is on, and the checkpoint's embedded DSpark draft runs speculative decoding (sections below).
 
@@ -28,12 +28,19 @@ loader, is the Flash path with Pro's sizes):
 docker pull rocm/atom-dev:latest
 ```
 
-Checked on ATOM `main` (`9b2e67b7f`) plus the commits of this branch, in the `rocm/atom-dev:latest`
-image with its aiter (`95d211284`, aiter main of 2026-11-15; aiter main has since moved 75 commits and
-was not retried). The branch carries `feat(minimax-m3.1): load the MiniMax-M3.1-Flash release checkpoint
-(NVFP4 routed experts)`, which is not in `main` yet: Pro's routed experts are NVFP4
-(`nvfp4-pack-quantized`) in the same format, and `--online_quant_config` converts them to MXFP4 at load
-time (the dense/attention MXFP8 weights are used as shipped).
+On `m3.1` the image's aiter has to be from 2026-11-19 or later: `m3.1`'s MiniMax-M3 mono decode
+imports aiter's NVFP4 index-score helpers (`minimax_m3_index_score.LUT_ENTRIES` and others) when the
+model module loads, so with an older aiter no MiniMax-M3 model starts, Pro included. The
+`rocm/atom-dev:latest` built on 2026-11-19 (`sha256:23ee7cf4c16f`, aiter `956fd46d8`) has all of them.
+Mono decode itself never runs for Pro: it is built for M3's TP4 shapes, and Pro's TP8 / block-16
+deployment is refused at startup (`MiniMax-M3 mono decode off: ...` in the log).
+
+The numbers in this guide were measured on ATOM `main` `9b2e67b7f` with these Pro commits on top,
+before they were rebased onto `m3.1`, in the `rocm/atom-dev:latest` of 2026-11-15 (aiter `95d211284`).
+The branch carries `feat(minimax-m3.1): load the MiniMax-M3.1-Flash release checkpoint (NVFP4 routed
+experts)`, which `m3.1` does not have yet: Pro's routed experts are NVFP4 (`nvfp4-pack-quantized`) in
+the same format, and `--online_quant_config` converts them to MXFP4 at load time (the dense/attention
+MXFP8 weights are used as shipped).
 
 ## Launching Server (TP8)
 
@@ -76,9 +83,8 @@ draft. For the torch reference, leave `ATOM_M3PRO_VARIANTS` unset, add `--enforc
 
 Pro is a plain-completion model whose chat template is just the BOS token `]~!b[` in front of
 the text. `/v1/chat/completions` adds it; on `/v1/completions` it is up to the prompt (the tokenizer
-does not add it). On an earlier ATOM base, leaving it out cost GSM8K (0.86 against 1.00 on the first
-100 questions); on the current base it makes no measurable difference (100/100 on those questions
-either way, 0.92-0.93 on the full set with or without it).
+does not add it). On an earlier ATOM base leaving it out cost GSM8K accuracy; on the current base it
+makes no measurable difference, and the GSM8K run below sends none.
 
 ```bash
 curl -s http://127.0.0.1:8300/v1/completions -H 'Content-Type: application/json' -d '{
@@ -88,36 +94,101 @@ curl -s http://127.0.0.1:8300/v1/completions -H 'Content-Type: application/json'
 # " Paris. The city is located in the north of the country, on the banks of the Seine River. Paris is the"
 ```
 
-## Accuracy (GSM8K, 5-shot)
+## Accuracy (GSM8K, 64-shot)
 
-lm-eval sends raw text; to send what the chat template would, add the BOS through a task that
-includes the stock one:
+With 64 shots a prompt is about 10k tokens (9.0k-11.9k, median 10.4k), so the indexer picks 128 of
+about 650 blocks; up to 2048 tokens it selects every block and the score cannot see it. The server
+is the kernel path with an FP8 KV cache, a bf16 index cache and prefix caching off:
 
-```yaml
-# tasks/gsm8k_bos.yaml
-include: <lm_eval>/tasks/gsm8k/gsm8k.yaml
-task: gsm8k_bos
-tag: []
-description: "]~!b["
+```bash
+export AITER_CUSTOM_AR_DISABLE_LAMPORT=1
+export ATOM_M3PRO_VARIANTS='{"kernels": true, "attn": "aiter", "topk": "fused"}'
+
+python -m atom.entrypoints.openai_server \
+  --model /data/models/yuhua/m3-pro \
+  --trust-remote-code \
+  --tensor-parallel-size 8 \
+  --server-port 8300 \
+  --max-model-len 16384 \
+  --max-num-seqs 16 \
+  --max-num-batched-tokens 16384 \
+  --gpu-memory-utilization 0.85 \
+  --block-size 16 \
+  --kv_cache_dtype fp8 \
+  --index-cache-dtype bf16 \
+  --level 0 \
+  --no-enable_prefix_caching \
+  --online_quant_config '{"layer_quant_config": {"*.experts": "mxfp4"}}'
 ```
+
+lm-eval's stock `gsm8k` task (raw text, no BOS), greedy, all 1319 questions:
 
 ```bash
 lm_eval --model local-completions \
   --model_args "model=/data/models/yuhua/m3-pro,tokenizer=/data/models/yuhua/m3-pro,base_url=http://127.0.0.1:8300/v1/completions,num_concurrent=16,max_retries=3,tokenized_requests=False,trust_remote_code=True" \
-  --include_path tasks --tasks gsm8k_bos --num_fewshot 5
+  --tasks gsm8k --num_fewshot 64
 ```
 
-| Run | flexible-extract | strict-match |
+| Indexer reading | flexible-extract | strict-match |
 |---|---|---|
-| ATOM `main` `9b2e67b7f` + this branch, run 1 | 0.9310 +- 0.0070 | 0.9287 +- 0.0071 |
-| same server, run 2 | 0.9340 +- 0.0068 | 0.9340 +- 0.0068 |
-| earlier base (`5f3ae2b5b`), run 1 | 0.9424 +- 0.0064 | 0.9409 +- 0.0065 |
+| pool4 / max (default) | 0.9409 +- 0.0065 | 0.9393 +- 0.0066 |
+| lse / lse (`{"block_score": "lse", "head_reduce": "lse"}`) | 0.9477 +- 0.0061 | 0.9469 +- 0.0062 |
 
-Greedy decoding is not bit-reproducible on this stack (MoE reductions and the batch composition
-change between runs): two runs of the same server disagree on 78 of the 1319 questions, about the same
-as runs on different bases (75-77). Even one request at a time, two runs of the first 40 questions give
-34-36 identical responses. Read the accuracy as 0.92-0.94: some fifteen full runs of the kernel
-configurations below spread from 0.923 to 0.939.
+The two readings are about one standard error apart. Greedy decoding is not bit-reproducible on
+this stack (MoE reductions and the batch composition change between runs), so two runs of one
+server differ by about as much.
+
+## Accuracy (AIME 2026)
+
+AIME 2026 I and II (30 problems), 0-shot with thinking, 16 samples per problem, on the kernel path
+with an FP8 KV cache, a bf16 index cache and a 131k context (prefix caching and DSpark off):
+
+```bash
+export AITER_CUSTOM_AR_DISABLE_LAMPORT=1
+export ATOM_M3PRO_VARIANTS='{"kernels": true, "attn": "aiter", "topk": "fused"}'
+
+python -m atom.entrypoints.openai_server \
+  --model /data/models/yuhua/m3-pro \
+  --trust-remote-code \
+  --tensor-parallel-size 8 \
+  --server-port 8300 \
+  --max-model-len 131072 \
+  --max-num-seqs 32 \
+  --max-num-batched-tokens 16384 \
+  --gpu-memory-utilization 0.85 \
+  --block-size 16 \
+  --kv_cache_dtype fp8 \
+  --index-cache-dtype bf16 \
+  --level 0 \
+  --no-enable_prefix_caching \
+  --online_quant_config '{"layer_quant_config": {"*.experts": "mxfp4"}}'
+```
+
+The checkpoint's own `chat_template.jinja` is the BOS followed by the user text (no roles, no
+thinking switch), so the client renders each prompt with MiniMax-M3's chat template instead
+(`chat_template.jinja` of `amd/MiniMax-M3-MXFP4`, `thinking_mode="enabled"`, generation prompt
+added): the system turn with the thinking instructions, the default developer turn, the user turn
+and an assistant turn opened with `<mm:think>`. The user turn asks for the final answer in
+`\boxed{}` (the number or expression only) and ends with `Problem: {problem}\nAnswer:`.
+
+| | |
+|---|---|
+| Endpoint | `/v1/completions`, streamed; the client stops each reply at the first `]~b]`, `[e~[` or `]~!b[` |
+| Sampling | temperature 1.0, top-p 0.95, up to 98,304 new tokens, 16 samples per problem, 16 concurrent |
+| Scoring | the content of the last `\boxed{}` in the reply, compared as a string with the reference (no numeric normalization); avg@16 over the 480 samples |
+
+| Indexer reading | avg@16 | pass@16 | maj@16 | Replies at the 98k cap | Median reply (tokens) |
+|---|---:|---:|---:|---:|---:|
+| pool4 / max (default) | **0.9563** (459/480) | 1.000 | 0.967 | 2 | 4930 |
+| lse / lse (`{"block_score": "lse", "head_reduce": "lse"}`) | **0.9625** (462/480) | 1.000 | 0.967 | 1 | 4932 |
+
+The two readings are within sampling noise. Problem 15 is the only one missed more than twice
+(1 of 16 right in both runs); every other miss is one or two samples, on different problems in the
+two runs. Scoring only the text after `</mm:think>` gives the same averages.
+
+The prompt format matters more than either reading: the lse / lse server scored 0.8229 when the
+prompt was the bare M3.1 chat layout (user and assistant turns only, no system or developer turn)
+with a 32k cap; 82 of the 480 replies hit the cap and only 177 closed their thinking.
 
 ## Images
 
@@ -164,18 +235,18 @@ later chunk of a chunked prefill. Checked on the kernel path with fp8 caches, wi
 * A cached and an uncached run of the same prompt give the same answer tokens with the same logprobs
   (to three decimals). They part ways after the answer, at tokens whose top two are within 0.5 of each
   other: the last block goes through other GEMM shapes, and decoding is not bit-reproducible anyway.
-* GSM8K with one fixed 5-shot prefix for every question (an lm-eval task that includes `gsm8k` with
-  `fewshot_config: {sampler: first_n}`; 89% of the prompt tokens cached, 16 concurrent, DSpark on):
-  0.9219 against 0.9136 on the same prompts without prefix caching (40 questions turn wrong, 51 turn
-  right). Stock GSM8K, whose few-shot examples differ per question, hits almost nothing.
+* GSM8K with one fixed few-shot prefix for every question (an lm-eval task that includes `gsm8k` with
+  `fewshot_config: {sampler: first_n}`; 89% of the prompt tokens cached, 16 concurrent, DSpark on)
+  scores within run-to-run noise of the same prompts without prefix caching (40 questions turn
+  wrong, 51 turn right). Stock GSM8K, whose few-shot examples differ per question, hits almost nothing.
 
 ## Speculative decoding (DSpark)
 
 `--method dspark --num-speculative-tokens 7` drafts with the checkpoint's own 5-layer DSpark model
 (`language_model.model.dspark.*`, block size 7, fed by target layers 4/19/35/51/67). It changes no
-answer beyond the run-to-run noise: GSM8K (strict-match) is 0.9386 against 0.9356 and 0.9340 in two
-runs without it, and a run with the draft agrees with one without it on as many questions as two runs
-without it (41% identical responses, 68 questions flipping either way, against 40% and 76). It
+answer beyond the run-to-run noise: on GSM8K a run with the draft agrees with one without it on as
+many questions as two runs without it (41% identical responses, 68 questions flipping either way,
+against 40% and 76). It
 accepts 43% of the drafted tokens on GSM8K (4.0 tokens per target forward), the same with prefix
 caching on, where the draft's context for cached blocks comes from the cache too: copying lines out of
 an 8k-token list, it accepts 40% cold and 42-43% with the list cached.
@@ -190,9 +261,10 @@ Settled by running them (`ATOM_M3PRO_VARIANTS`, a JSON string or file re-read be
 * V is the *normed* K without its rope dims: the raw `k_proj` output instead generates only newlines.
 * Softmax scale `head_dim ** -0.5`: GSM8K is flat from 0.85x to 1.6x of it, so nothing argues for another.
 
-Not verifiable with GSM8K: the indexer. Up to 2048 tokens (128 blocks of 16) every block is selected,
-so selection is the identity. A 14k-token key-value retrieval (12 lookups, chunked prefill, 4 concurrent
-sequences) is 12/12 with the indexer and with dense attention, and 0/12 with a selector that
+Short prompts cannot test the indexer: up to 2048 tokens (128 blocks of 16) every block is selected,
+so selection is the identity (hence the 64 shots of the GSM8K run). A 14k-token key-value retrieval
+(12 lookups, chunked prefill, 4 concurrent sequences) is 12/12 with the indexer and with dense
+attention, and 0/12 with a selector that
 ignores the scores; every alternative reading of the unspecified parts (head reduction
 sum/max/mean/lse, `softmax_pool` 4-centroid block scores with `index_compress_query`, lookahead
 source `ffn_in`/`resid`, no lookahead, no indexer rope, 0 init / 1 local blocks) also scores 12/12,
@@ -265,8 +337,8 @@ indexer was trained with. The rest of the reference agrees with the readings set
 (YaRN magnitude, V from the normed K, rope on the index q/k, the lookahead source, the forced
 blocks). The measured readings stay available through the variants (`{"block_score": "lse",
 "head_reduce": "lse"}`, or the first bring-up's `{"block_score": "max", "head_reduce": "sum",
-"lookahead_src": "ffn_in"}`). GSM8K (5-shot, all 1319) is within noise between the two: 0.927 for
-the reference's reading, 0.936 for lse / lse.
+"lookahead_src": "ffn_in"}`). Both benchmarks are within noise between the two: GSM8K (64-shot, all
+1319) 0.941 for the reference's reading and 0.948 for lse / lse, AIME 2026 0.9563 and 0.9625.
 
 ## Kernels
 
@@ -321,19 +393,18 @@ MI355X (fp8 caches, aiter's own kernels, a decode graph replayed on another batc
 End to end on 8x MI355X (TP8, `--max-num-batched-tokens 16384`, 256 tokens out, greedy; TPOT in
 steady decode, ms per token):
 
-| attention | KV / index | GSM8K flex / strict | 14k retrieval | TPOT 1k bs1 | 1k bs16 | 8k bs1 | 8k bs4 | TTFT 8k bs1 |
-|---|---|---|---|---|---|---|---|---|
-| torch reference, eager | bf16 | 0.9310 / 0.9287 | 12/12 | ~140 | | | | |
-| kernels, Triton attention, eager | bf16 | 0.9310 | | ~95 | | | | |
-| kernels, Triton attention, aiter top-k, graphs | bf16 | 0.9310 / 0.9295 | 12/12 | 14.92 | 18.14 | 15.22 | 16.23 | 759 ms |
-| kernels, aiter attention, aiter top-k, graphs | bf16 | 0.9234 / 0.9227 | 12/12 | 14.80 | 18.11 | 14.92 | 16.06 | 789 ms |
-| kernels, aiter attention, fused selection, graphs | bf16 | 0.9318 / 0.9310 | 12/12 | 11.85 | 14.75 | 11.76 | 12.62 | 574 ms |
-| same | fp8 | 0.9280 / 0.9265 | 12/12 | 11.33 | 14.08 | 11.26 | 12.13 | 504 ms |
-| same, tuned launch shapes | fp8 | 0.9348 / 0.9340 | 12/12 | 11.10 | 13.86 | 11.02 | 11.88 | 502 ms |
+| attention | KV / index | 14k retrieval | TPOT 1k bs1 | 1k bs16 | 8k bs1 | 8k bs4 | TTFT 8k bs1 |
+|---|---|---|---|---|---|---|---|
+| torch reference, eager | bf16 | 12/12 | ~140 | | | | |
+| kernels, Triton attention, eager | bf16 | | ~95 | | | | |
+| kernels, Triton attention, aiter top-k, graphs | bf16 | 12/12 | 14.92 | 18.14 | 15.22 | 16.23 | 759 ms |
+| kernels, aiter attention, aiter top-k, graphs | bf16 | 12/12 | 14.80 | 18.11 | 14.92 | 16.06 | 789 ms |
+| kernels, aiter attention, fused selection, graphs | bf16 | 12/12 | 11.85 | 14.75 | 11.76 | 12.62 | 574 ms |
+| same | fp8 | 12/12 | 11.33 | 14.08 | 11.26 | 12.13 | 504 ms |
+| same, tuned launch shapes | fp8 | 12/12 | 11.10 | 13.86 | 11.02 | 11.88 | 502 ms |
 
-GSM8K is the `gsm8k_bos` task in the torch-reference row (the run of the Accuracy section) and
-lm-eval's stock `gsm8k` (no BOS) in the kernel rows. The spread (0.923-0.935) is about one standard
-error. Of the 2.9 ms between the aiter top-k
+The GSM8K and AIME 2026 runs of the Accuracy sections use the fused-selection configuration with an
+fp8 KV cache and a bf16 index cache. Of the 2.9 ms between the aiter top-k
 and the fused-selection rows at 1k bs1, 0.6 ms is the fused selection and the tiled scores, and 2.4 ms
 is outside the attention kernels (the lookahead norm, the shared quantization, the removed copies).
 
