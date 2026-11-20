@@ -1,0 +1,425 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+"""MiniMax-M3-Pro (text): 68 layers, 384 experts, one shared-KV head of 256 dims.
+
+Against M3.1-Flash, only the attention differs (the MoE / dense MLP / norms / loader
+are the Flash modules, with Pro's sizes read from the config):
+
+* q_proj (128 heads x 256, TP-sharded), k_proj (1 head x 256, replicated): no v_proj
+  -- V is K with the 64 rope dims dropped, so ``o_proj`` takes 128 x 192;
+* a 16-head x 128 indexer (``index_q_proj`` / ``index_k_proj``, replicated) whose
+  inputs, from layer 2 on, are the state of the layer two back
+  (``sparse_indexer_lookahead_*``, source ``pre_ffn_norm``: its residual before the FFN
+  norm, here put through the reading layer's input norm), and which scores 16-token
+  blocks;
+* ``index_compress_query`` per layer (softmax-pool compression of the index keys).
+
+The attention math is ``model_ops.minimax_m3.pro_attn`` (torch, correctness first).
+"""
+
+from functools import partial
+from typing import ClassVar
+
+import torch
+from aiter.dist.parallel_state import get_tensor_model_parallel_world_size
+from aiter.rotary_embedding import get_rope
+from torch import nn
+from transformers import PretrainedConfig
+
+from atom.config import Config, QuantizationConfig
+from atom.model_ops.base_attention import Attention
+from atom.model_ops.layernorm import GemmaRMSNorm, fused_allreduce_gemma_rms_norm
+from atom.model_ops.linear import (
+    ColumnParallelLinear,
+    ReplicatedLinear,
+    RowParallelLinear,
+)
+from atom.model_ops.minimax_m3.pro_attn import ProSparseAttentionImpl, variants
+from atom.model_ops.utils import atom_parameter
+from atom.models.minimax_m3.model import (
+    MiniMaxM3DecoderLayer,
+    MiniMaxM3SparseForCausalLM,
+    MiniMaxM3SparseForConditionalGenerationTextOnly,
+    _rope_theta,
+)
+from atom.models.minimax_m3.vl import MiniMaxM3SparseForConditionalGenerationVL
+
+
+def _quantized_once(x: torch.Tensor, x_scale: torch.Tensor | None, linears) -> tuple:
+    """``x`` (and its scale) for ``linears`` that share it: quantised here, once, when
+    every one runs the native group32 FP8 GEMM, which would quantise it the same way
+    itself (``quantize_fp8``); as it is otherwise."""
+    if x_scale is None and all(
+        getattr(m, "native_a8_group_rows", None) is not None for m in linears
+    ):
+        from atom.model_ops.blockscale import quantize_fp8
+
+        return quantize_fp8(x)
+    return x, x_scale
+
+
+class ProLookaheadState:
+    """The states the lookahead indexers of later layers read.
+
+    Layer ``L >= start`` feeds its indexer from layer ``L - ahead``'s state (see
+    ``ProVariants.lookahead_src`` for which one); one forward's layers run in order, so a
+    dict of the last ``ahead`` layers is the whole state (no cross-forward lifetime: a
+    layer's entry is written before it is read).
+    """
+
+    def __init__(self, config: PretrainedConfig):
+        sparse_cfg = config.sparse_attention_config
+        self.ahead = int(sparse_cfg.get("sparse_indexer_lookahead_num_layers") or 0)
+        self.start = int(sparse_cfg.get("sparse_indexer_lookahead_start_layer") or 0)
+        self.source = sparse_cfg.get("sparse_indexer_lookahead_source")
+        self.ffn_in: dict[int, torch.Tensor] = {}
+        self.resid: dict[int, torch.Tensor] = {}
+        # every layer's input_layernorm (the decoder layers register them): with them the
+        # ``resid_in`` source is normed when it is put, keyed by the layer that reads it
+        self.norms: dict[int, GemmaRMSNorm] = {}
+        self.resid_in: dict[int, torch.Tensor] = {}
+
+    @staticmethod
+    def _normed(norm: GemmaRMSNorm, x: torch.Tensor) -> torch.Tensor:
+        """``x`` through ``norm`` as a plain (torch) Gemma RMSNorm: the module's own call may be
+        the fused all-reduce / quantising variant, which this is not."""
+        return GemmaRMSNorm.forward_static(
+            norm.weight.data, norm.variance_epsilon, x, None
+        )
+
+    def source_for(
+        self, layer: int, norm: GemmaRMSNorm | None = None
+    ) -> torch.Tensor | None:
+        """The indexer input of ``layer`` (``None``: its own attention input). ``norm`` is the
+        layer's input_layernorm, which the ``resid_in`` source goes through."""
+        v = variants()
+        if not (self.ahead and v.lookahead and layer >= self.start):
+            return None
+        if v.lookahead_src == "ffn_in":
+            return self.ffn_in.get(layer - self.ahead)
+        if v.lookahead_src == "resid_in" and layer in self.resid_in:
+            return self.resid_in.pop(layer)
+        src = self.resid.get(layer - self.ahead)
+        if src is not None and v.lookahead_src == "resid_in":
+            src = self._normed(norm, src)
+        return src
+
+    def diag_sources(
+        self, layer: int, norm: GemmaRMSNorm | None = None
+    ) -> dict[str, torch.Tensor | None]:
+        """Every candidate lookahead input of ``layer`` (the ``pro_diag`` developer tool)."""
+        if not (self.ahead and layer >= self.start):
+            return {}
+        resid = self.resid.get(layer - self.ahead)
+        return {
+            "ffn": self.ffn_in.get(layer - self.ahead),
+            "res": resid,
+            "resn": (
+                None if resid is None or norm is None else self._normed(norm, resid)
+            ),
+        }
+
+    def put(self, layer: int, ffn_in: torch.Tensor, resid: torch.Tensor) -> None:
+        if not self.ahead:
+            return
+        # Copies: the next layer's fused add updates ``resid`` in place, and the FFN
+        # may reuse ``ffn_in``; the lookahead reads them two layers later.
+        v = variants()
+        reader = layer + self.ahead
+        if v.diag:
+            self.resid[layer] = resid.clone()
+            self.ffn_in[layer] = ffn_in.clone()
+        elif v.lookahead_src == "resid_in" and self.norms:
+            # the reader's input norm now, one kernel writing a new tensor: no copy
+            if v.lookahead and reader >= self.start and reader in self.norms:
+                self.resid_in[reader] = self.norms[reader].forward_cuda(resid)
+        elif v.lookahead_src in ("resid", "resid_in"):
+            self.resid[layer] = resid.clone()
+        else:
+            self.ffn_in[layer] = ffn_in.clone()
+        stale = layer - self.ahead
+        self.ffn_in.pop(stale, None)
+        self.resid.pop(stale, None)
+
+
+class MiniMaxM3ProAttention(nn.Module):
+    """Pro's MQA attention with a 16-head lightning indexer."""
+
+    def __init__(
+        self,
+        config: PretrainedConfig,
+        layer_id: int,
+        quant_config: QuantizationConfig | None = None,
+        prefix: str = "",
+        cache_config: str = "bf16",
+        index_cache_config: str = "auto",
+    ) -> None:
+        super().__init__()
+        if index_cache_config not in ("auto", "bf16", "fp8"):
+            raise NotImplementedError(
+                "MiniMax-M3-Pro keeps a bf16 or fp8 index cache, got "
+                f"--index-cache-dtype {index_cache_config}"
+            )
+        sparse_cfg = config.sparse_attention_config
+        self.layer_num = layer_id
+        self.hidden_size = config.hidden_size
+        tp = get_tensor_model_parallel_world_size()
+        self.total_num_heads = config.num_attention_heads
+        if self.total_num_heads % tp:
+            raise ValueError("num_attention_heads must be divisible by the TP size")
+        self.num_heads = self.total_num_heads // tp
+        if config.num_key_value_heads != 1:
+            raise ValueError("MiniMax-M3-Pro is MQA: num_key_value_heads must be 1")
+        self.head_dim = config.head_dim
+        rotary_dim = int(self.head_dim * getattr(config, "partial_rotary_factor", 1.0))
+        self.value_dim = self.head_dim - rotary_dim
+        declared = sparse_cfg.get("value_head_dim") or self.value_dim
+        if declared != self.value_dim:
+            raise ValueError(
+                f"value_head_dim {declared} is not head_dim {self.head_dim} minus the "
+                f"rope dims {rotary_dim}"
+            )
+        self.num_idx_heads = sparse_cfg["sparse_num_index_heads"]
+        self.idx_head_dim = sparse_cfg["sparse_index_dim"]
+        self.scaling = self.head_dim**-0.5
+
+        self.q_proj = ColumnParallelLinear(
+            self.hidden_size,
+            self.total_num_heads * self.head_dim,
+            bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.q_proj",
+        )
+        self.k_proj = ReplicatedLinear(
+            self.hidden_size,
+            self.head_dim,
+            bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.k_proj",
+        )
+        self.index_q_proj = ReplicatedLinear(
+            self.hidden_size,
+            self.num_idx_heads * self.idx_head_dim,
+            bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.index_q_proj",
+        )
+        self.index_k_proj = ReplicatedLinear(
+            self.hidden_size,
+            self.idx_head_dim,
+            bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.index_k_proj",
+        )
+        self.o_proj = RowParallelLinear(
+            self.total_num_heads * self.value_dim,
+            self.hidden_size,
+            bias=False,
+            reduce_results=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.o_proj",
+        )
+        self.q_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        self.k_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        self.index_q_norm = GemmaRMSNorm(self.idx_head_dim, eps=config.rms_norm_eps)
+        self.index_k_norm = GemmaRMSNorm(self.idx_head_dim, eps=config.rms_norm_eps)
+        # The learned query of the index keys' softmax-pool compression.
+        self.index_compress_query = atom_parameter(
+            torch.empty(self.idx_head_dim, dtype=torch.bfloat16)
+        )
+        self.rotary_emb = get_rope(
+            self.head_dim,
+            rotary_dim=rotary_dim,
+            max_position=config.max_position_embeddings,
+            base=_rope_theta(config),
+            rope_scaling=getattr(config, "rope_scaling", None),
+        )
+        self.attn = Attention(
+            self.num_heads,
+            self.head_dim,
+            self.scaling,
+            1,
+            kv_cache_dtype=cache_config,
+            layer_num=layer_id,
+            use_mla=False,
+            rotary_emb=self.rotary_emb,
+            q_norm=self.q_norm,
+            k_norm=self.k_norm,
+            prefix=f"{prefix}.attn",
+            impl_cls=ProSparseAttentionImpl,
+            index_q_norm=self.index_q_norm,
+            index_k_norm=self.index_k_norm,
+            index_compress_query=self.index_compress_query,
+            num_index_heads=self.num_idx_heads,
+            index_head_dim=self.idx_head_dim,
+            value_head_dim=self.value_dim,
+            rotary_dim=rotary_dim,
+            topk=sparse_cfg["sparse_topk_blocks"],
+            init_blocks=sparse_cfg.get("sparse_init_block", 0),
+            local_blocks=sparse_cfg.get("sparse_local_block", 0),
+            block_size=sparse_cfg["sparse_block_size"],
+        )
+
+    def forward(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        hidden_states_scale: torch.Tensor | None = None,
+        index_src: torch.Tensor | None = None,
+        diag_srcs: dict[str, torch.Tensor | None] | None = None,
+    ) -> torch.Tensor:
+        own = [self.q_proj, self.k_proj]
+        if index_src is None:
+            own += [self.index_q_proj, self.index_k_proj]
+        x, xs = _quantized_once(hidden_states, hidden_states_scale, own)
+        q = self.q_proj(x, x_scale=xs)
+        k = self.k_proj(x, x_scale=xs)
+        if index_src is None:
+            iq = self.index_q_proj(x, x_scale=xs)
+            ik = self.index_k_proj(x, x_scale=xs)
+        else:
+            ix, ixs = _quantized_once(
+                index_src, None, [self.index_q_proj, self.index_k_proj]
+            )
+            iq = self.index_q_proj(ix, x_scale=ixs)
+            ik = self.index_k_proj(ix, x_scale=ixs)
+        if diag_srcs is not None:
+            # raw indexer projections of every candidate input, for `pro_diag`
+            own = (
+                (iq, ik)
+                if index_src is None
+                else (
+                    self.index_q_proj(hidden_states, x_scale=hidden_states_scale),
+                    self.index_k_proj(hidden_states, x_scale=hidden_states_scale),
+                )
+            )
+            raw = {"own": own}
+            for name, src in diag_srcs.items():
+                if src is not None:
+                    raw[name] = (self.index_q_proj(src), self.index_k_proj(src))
+            self.attn.impl._diag_raw = raw
+        # the impl reads the four projections where they are: index k rides in ``qkv``
+        out = self.attn(q, k, iq, positions, qkv=ik)
+        return self.o_proj(out)
+
+
+class MiniMaxM3ProDecoderLayer(MiniMaxM3DecoderLayer):
+    """A Flash decoder layer with Pro's attention and the lookahead hand-over."""
+
+    def __init__(self, *args, state: ProLookaheadState, **kwargs) -> None:
+        # a plain attribute, set before `nn.Module.__init__` runs inside super()
+        self._pro_state = state
+        super().__init__(*args, **kwargs)
+        state.norms[self.layer_num] = self.input_layernorm
+
+    def _make_attention(
+        self,
+        config,
+        layer_num,
+        prefix,
+        cache_config,
+        index_cache_config,
+        quant_config,
+    ):
+        return MiniMaxM3ProAttention(
+            config=config,
+            layer_id=layer_num,
+            quant_config=quant_config,
+            prefix=f"{prefix}.self_attn",
+            cache_config=cache_config,
+            index_cache_config=index_cache_config,
+        )
+
+    def forward(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor | None,
+        capture_aux: bool = False,
+    ):
+        # Plain (unfused-quant) norms: the lookahead needs the bf16 FFN input of
+        # every layer, which a fused norm + per-token-FP8 quant does not produce.
+        if residual is None:
+            residual = hidden_states
+            hidden_states = self.input_layernorm(hidden_states)
+        else:
+            hidden_states, residual = fused_allreduce_gemma_rms_norm(
+                hidden_states, residual, self.input_layernorm
+            )
+        aux_hidden_state = residual.clone() if capture_aux else None
+
+        state = self._pro_state
+        hidden_states = self.self_attn(
+            positions=positions,
+            hidden_states=hidden_states,
+            index_src=state.source_for(self.layer_num, self.input_layernorm),
+            diag_srcs=(
+                state.diag_sources(self.layer_num, self.input_layernorm)
+                if variants().diag
+                else None
+            ),
+        )
+        ffn = self.block_sparse_moe if self.is_moe_layer else self.mlp
+        hidden_states, residual = fused_allreduce_gemma_rms_norm(
+            hidden_states, residual, self.post_attention_layernorm
+        )
+        state.put(self.layer_num, hidden_states, residual)
+        hidden_states = ffn(hidden_states)
+        if aux_hidden_state is not None:
+            return hidden_states, residual, aux_hidden_state
+        return hidden_states, residual
+
+
+class MiniMaxM3ProForCausalLM(MiniMaxM3SparseForCausalLM):
+    """The text model: Flash's ``MiniMaxM3Model`` over Pro's decoder layers."""
+
+    # No q/k/v pack: the projections are separate modules named as the checkpoint's.
+    packed_modules_mapping: ClassVar[dict[str, tuple[str, str | int]]] = {
+        ".gate_proj": (".gate_up_proj", 0),
+        ".up_proj": (".gate_up_proj", 1),
+    }
+
+    def __init__(self, atom_config: Config, prefix: str = "") -> None:
+        text = getattr(atom_config.hf_config, "text_config", atom_config.hf_config)
+        super().__init__(
+            atom_config,
+            prefix=prefix,
+            layer_type=partial(MiniMaxM3ProDecoderLayer, state=ProLookaheadState(text)),
+        )
+
+
+class MiniMaxM3ProForConditionalGenerationTextOnly(
+    MiniMaxM3SparseForConditionalGenerationTextOnly
+):
+    """Text-only view of the Pro checkpoint (vision tower and DSpark head skipped)."""
+
+    packed_modules_mapping = MiniMaxM3ProForCausalLM.packed_modules_mapping
+    skip_weight_prefixes: ClassVar[list[str]] = [
+        *MiniMaxM3SparseForConditionalGenerationTextOnly.skip_weight_prefixes,
+        # the embedded DSpark draft (5 layers + Markov / confidence heads)
+        "language_model.model.dspark.",
+    ]
+
+    def __init__(self, atom_config: Config, prefix: str = "") -> None:
+        nn.Module.__init__(self)
+        self.config = atom_config.hf_config
+        self.language_model = MiniMaxM3ProForCausalLM(
+            atom_config=atom_config, prefix=prefix
+        )
+        self.make_empty_intermediate_tensors = (
+            self.language_model.make_empty_intermediate_tensors
+        )
+
+
+class MiniMaxM3ProForConditionalGenerationVL(
+    MiniMaxM3SparseForConditionalGenerationVL,
+    MiniMaxM3ProForConditionalGenerationTextOnly,
+):
+    """Pro with its vision tower: Flash's tower, projector and patch merger (``vl``),
+    sized by Pro's vision config, over Pro's text model. Without image input
+    (``image_input_refusal``) it is the text-only model."""
+
+    packed_modules_mapping = MiniMaxM3ProForCausalLM.packed_modules_mapping
+    skip_weight_prefixes: ClassVar[list[str]] = ["language_model.model.dspark."]
+    # The packed mapping has no q/k/v renames: Pro's text attention keeps those names.
+    fused_vision_qkv: ClassVar[bool] = False

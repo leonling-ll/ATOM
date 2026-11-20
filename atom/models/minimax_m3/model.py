@@ -17,7 +17,7 @@ from aiter.rotary_embedding import get_rope
 from torch import nn
 from transformers import PretrainedConfig
 
-from atom.config import Config, QuantizationConfig
+from atom.config import Config, QuantizationConfig, is_minimax_m3_pro_config
 from atom.distributed.indexer_cp import indexer_cp_enabled
 from atom.distributed.ulysses_sp import local_num_kv_heads
 from atom.model_ops import module_dispatch_ops as _module_dispatch_ops  # noqa: F401
@@ -81,6 +81,64 @@ def _sparse_attention_layer_ordinals(config: PretrainedConfig) -> dict[int, int]
         layer_id: ordinal
         for ordinal, layer_id in enumerate(sorted(_sparse_attention_layer_ids(config)))
     }
+
+
+def _unsupported_sparse_attention_variant(config: PretrainedConfig) -> list[str]:
+    """The MSA options of this checkpoint the native sparse attention lacks.
+
+    M3 and M3.1 use 128-token blocks, one index head per KV head, separate K and
+    V heads of `head_dim`, and an indexer on every sparse layer that scores its
+    own keys. MiniMax-M3-Pro changes each of these; none has a kernel or a
+    reference here, so they are refused together rather than one per run.
+    """
+    sparse_cfg = getattr(config, "sparse_attention_config", None) or {}
+    if not sparse_cfg.get("use_sparse_attention") or not _sparse_attention_layer_ids(
+        config
+    ):
+        return []
+    if is_minimax_m3_pro_config(config):
+        # `models.minimax_m3.pro` builds its own attention for every one of these
+        # options; this module's native layers are never constructed for it.
+        return []
+    problems = []
+    if sparse_cfg.get("sparse_block_size") != SPARSE_BLOCK_SIZE:
+        problems.append(
+            f"sparse_block_size={sparse_cfg.get('sparse_block_size')} "
+            f"(supported: {SPARSE_BLOCK_SIZE})"
+        )
+    num_idx_heads = sparse_cfg.get("sparse_num_index_heads")
+    if num_idx_heads != config.num_key_value_heads:
+        problems.append(
+            f"sparse_num_index_heads={num_idx_heads} with "
+            f"num_key_value_heads={config.num_key_value_heads} "
+            "(supported: one index head per KV head)"
+        )
+    if sparse_cfg.get("sparse_enable_kv_share"):
+        problems.append(
+            "sparse_enable_kv_share (V read from K, no v_proj; value_head_dim="
+            f"{sparse_cfg.get('value_head_dim')}, "
+            "sparse_kvshare_value_drop_rope_dim="
+            f"{sparse_cfg.get('sparse_kvshare_value_drop_rope_dim')})"
+        )
+    if sparse_cfg.get("sparse_enable_vo_rope"):
+        problems.append("sparse_enable_vo_rope")
+    if sparse_cfg.get("sparse_index_q4k4"):
+        problems.append("sparse_index_q4k4 (4-bit index Q and K scoring)")
+    if sparse_cfg.get("sparse_index_compress_type"):
+        problems.append(
+            "sparse_index_compress_type="
+            f"{sparse_cfg['sparse_index_compress_type']!r} with "
+            f"{sparse_cfg.get('sparse_index_compress_centroids')} centroids "
+            "(index_compress_query)"
+        )
+    if sparse_cfg.get("sparse_indexer_lookahead_num_layers"):
+        problems.append(
+            "sparse_indexer_lookahead_num_layers="
+            f"{sparse_cfg['sparse_indexer_lookahead_num_layers']} from layer "
+            f"{sparse_cfg.get('sparse_indexer_lookahead_start_layer')} "
+            f"(source {sparse_cfg.get('sparse_indexer_lookahead_source')!r})"
+        )
+    return problems
 
 
 def _validate_sparse_flydsl_config(
@@ -633,18 +691,14 @@ class MiniMaxM3DecoderLayer(nn.Module):
         layer_num: int = 0,
     ) -> None:
         super().__init__()
-        attn_cls = (
-            MiniMaxM3SparseAttention
-            if layer_num in _sparse_attention_layer_ids(config)
-            else MiniMaxM3Attention
-        )
-        self.self_attn = attn_cls(
-            config=config,
-            layer_id=layer_num,
-            quant_config=quant_config,
-            prefix=f"{prefix}.self_attn",
-            cache_config=cache_config,
-            index_cache_config=index_cache_config,
+        self.layer_num = layer_num
+        self.self_attn = self._make_attention(
+            config,
+            layer_num,
+            prefix,
+            cache_config,
+            index_cache_config,
+            quant_config,
         )
 
         self.is_moe_layer = _is_moe_layer(config, layer_num)
@@ -668,6 +722,30 @@ class MiniMaxM3DecoderLayer(nn.Module):
         self.input_layernorm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = GemmaRMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
+        )
+
+    def _make_attention(
+        self,
+        config: PretrainedConfig,
+        layer_num: int,
+        prefix: str,
+        cache_config: str,
+        index_cache_config: str,
+        quant_config: QuantizationConfig | None,
+    ) -> nn.Module:
+        """This layer's attention module; a variant of the model overrides it."""
+        attn_cls = (
+            MiniMaxM3SparseAttention
+            if layer_num in _sparse_attention_layer_ids(config)
+            else MiniMaxM3Attention
+        )
+        return attn_cls(
+            config=config,
+            layer_id=layer_num,
+            quant_config=quant_config,
+            prefix=f"{prefix}.self_attn",
+            cache_config=cache_config,
+            index_cache_config=index_cache_config,
         )
 
     def forward(
@@ -757,6 +835,12 @@ class MiniMaxM3Model(nn.Module):
     ) -> None:
         super().__init__()
         config = _get_text_config(atom_config.hf_config)
+        unsupported = _unsupported_sparse_attention_variant(config)
+        if unsupported:
+            raise NotImplementedError(
+                "MiniMax-M3 sparse attention options this checkpoint uses are not "
+                f"implemented: {'; '.join(unsupported)}"
+            )
         _validate_sparse_flydsl_config(atom_config, config)
         self.config = config
         cache_config = atom_config.kv_cache_dtype

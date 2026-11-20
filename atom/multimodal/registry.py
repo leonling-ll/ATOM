@@ -37,6 +37,9 @@ _MULTIMODAL_ARCH_TO_INPUT_BUILDER: dict[str, str] = {
     "MiniMaxM3SparseForConditionalGeneration": (
         "atom.models.minimax_m3.image_processing.build_minimax_m3_inputs"
     ),
+    "MiniMaxM3ProForConditionalGeneration": (
+        "atom.models.minimax_m3.image_processing.build_minimax_m3_inputs"
+    ),
 }
 
 # Architectures whose checkpoint ships its own processor rather than one
@@ -45,6 +48,9 @@ _MULTIMODAL_ARCH_TO_INPUT_BUILDER: dict[str, str] = {
 _MULTIMODAL_ARCH_TO_PROCESSOR: dict[str, str] = {
     "DeepseekV41ForCausalLM": (
         "atom.models.deepseek_v41.image_processing.DeepseekV41ImageProcessor"
+    ),
+    "MiniMaxM3ProForConditionalGeneration": (
+        "atom.models.minimax_m3.image_processing.minimax_m3_pro_processor"
     ),
 }
 

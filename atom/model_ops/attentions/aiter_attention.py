@@ -10,7 +10,11 @@ import torch
 import triton
 import triton.language as tl
 
-from atom.config import _is_minimax_m3_config, kv_cache_torch_dtype
+from atom.config import (
+    _is_minimax_m3_config,
+    is_minimax_m3_pro_config,
+    kv_cache_torch_dtype,
+)
 from atom.distributed.ulysses_sp import local_num_kv_heads
 from atom.model_engine.scheduler import ScheduledBatch
 from atom.model_ops.attention_mha import PagedAttentionImpl, use_pa_decode_bf16_asm
@@ -210,9 +214,12 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         hf_config = model_runner.config.hf_config
         text_config = getattr(hf_config, "text_config", hf_config)
         sparse_cfg = getattr(text_config, "sparse_attention_config", None)
-        self._has_sparse_attention = bool(sparse_cfg) and _is_minimax_m3_config(
-            hf_config
-        )
+        is_m3 = bool(sparse_cfg) and _is_minimax_m3_config(hf_config)
+        # MiniMax-M3-Pro keeps the indexer keys in the same kind of cache, but its
+        # attention (`ProSparseAttentionImpl`) selects and reads the pages itself:
+        # none of M3's page-128 sparse metadata, scorers or block tables applies.
+        self._has_pro_sparse_attention = is_m3 and is_minimax_m3_pro_config(hf_config)
+        self._has_sparse_attention = is_m3 and not self._has_pro_sparse_attention
         # The backend's own, from the one rule `make_kv_pool` also reads, so a
         # draft resolving here gets it from its own config the same way.
         # `CommonAttentionBuilder` holds it to dividing the scheduler's.
@@ -479,7 +486,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         declares two pools and sums them, so a second predicate would have to
         be kept from double-charging; this one is false for it by construction.
         """
-        if not self._has_sparse_attention:
+        if not (self._has_sparse_attention or self._has_pro_sparse_attention):
             return None
 
         config = self.model_runner.config
@@ -952,8 +959,10 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
     def _prefill_block_table_rows(self, batch, running_bs, has_cached):
         # Sparse attention and `prefill_attention_triton` read the paged KV
         # cache, so they need the block tables even with no cached tokens.
-        if self._has_sparse_attention or (
-            envs.ATOM_USE_UNIFIED_ATTN and batch.block_tables
+        if (
+            self._has_sparse_attention
+            or self._has_pro_sparse_attention
+            or (envs.ATOM_USE_UNIFIED_ATTN and batch.block_tables)
         ):
             return running_bs
         return super()._prefill_block_table_rows(batch, running_bs, has_cached)

@@ -9,7 +9,9 @@ names mirror the checkpoint (``vision_tower.vision_model.*``,
 ``multi_modal_projector.*``, ``patch_merge_mlp.*``) with one exception: the
 attention's q/k/v projections are fused into ``qkv_proj``. The model's packed
 mapping already renames every ``.q_proj``/``.k_proj``/``.v_proj`` checkpoint
-tensor to ``.qkv_proj``, so the fused parameter carries a shard loader.
+tensor to ``.qkv_proj``, so the fused parameter carries a shard loader. A model
+whose packed mapping leaves those names alone (MiniMax-M3-Pro, whose text
+attention keeps them) builds the tower with ``fused_qkv=False``.
 
 The stack is replicated on every TP rank rather than sharded: at ~0.6B params
 it is small next to the language model, and replication keeps the image
@@ -108,14 +110,20 @@ class MiniMaxM3VisionEmbeddings(nn.Module):
 
 
 class MiniMaxM3VisionAttention(nn.Module):
-    def __init__(self, config) -> None:
+    def __init__(self, config, fused_qkv: bool = True) -> None:
         super().__init__()
         self.embed_dim = config.hidden_size
         self.num_heads = config.num_attention_heads
         self.head_dim = self.embed_dim // self.num_heads
-        self.qkv_proj = nn.Linear(self.embed_dim, 3 * self.embed_dim, bias=True)
-        self.qkv_proj.weight.weight_loader = _load_qkv_shard
-        self.qkv_proj.bias.weight_loader = _load_qkv_shard
+        self.fused_qkv = fused_qkv
+        if fused_qkv:
+            self.qkv_proj = nn.Linear(self.embed_dim, 3 * self.embed_dim, bias=True)
+            self.qkv_proj.weight.weight_loader = _load_qkv_shard
+            self.qkv_proj.bias.weight_loader = _load_qkv_shard
+        else:
+            self.q_proj = nn.Linear(self.embed_dim, self.embed_dim, bias=True)
+            self.k_proj = nn.Linear(self.embed_dim, self.embed_dim, bias=True)
+            self.v_proj = nn.Linear(self.embed_dim, self.embed_dim, bias=True)
         self.out_proj = nn.Linear(self.embed_dim, self.embed_dim, bias=True)
 
     def forward(
@@ -126,8 +134,13 @@ class MiniMaxM3VisionAttention(nn.Module):
         cu_seqlens: torch.Tensor,
         max_seqlen: int,
     ) -> torch.Tensor:
-        qkv = self.qkv_proj(x).view(x.shape[0], 3, self.num_heads, self.head_dim)
-        q, k, v = qkv.unbind(dim=1)
+        shape = (x.shape[0], self.num_heads, self.head_dim)
+        if self.fused_qkv:
+            q, k, v = self.qkv_proj(x).view(shape[0], 3, *shape[1:]).unbind(dim=1)
+        else:
+            q, k, v = (
+                p(x).view(shape) for p in (self.q_proj, self.k_proj, self.v_proj)
+            )
         q, k = _apply_rope(q, cos, sin), _apply_rope(k, cos, sin)
         out = _varlen_attention(
             q.contiguous(), k.contiguous(), v.contiguous(), cu_seqlens, max_seqlen
@@ -146,9 +159,9 @@ class MiniMaxM3VisionMLP(nn.Module):
 
 
 class MiniMaxM3VisionEncoderLayer(nn.Module):
-    def __init__(self, config) -> None:
+    def __init__(self, config, fused_qkv: bool = True) -> None:
         super().__init__()
-        self.self_attn = MiniMaxM3VisionAttention(config)
+        self.self_attn = MiniMaxM3VisionAttention(config, fused_qkv)
         self.layer_norm1 = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
         self.mlp = MiniMaxM3VisionMLP(config)
         self.layer_norm2 = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
@@ -159,22 +172,23 @@ class MiniMaxM3VisionEncoderLayer(nn.Module):
 
 
 class MiniMaxM3VisionEncoder(nn.Module):
-    def __init__(self, config) -> None:
+    def __init__(self, config, fused_qkv: bool = True) -> None:
         super().__init__()
         self.layers = nn.ModuleList(
-            MiniMaxM3VisionEncoderLayer(config) for _ in range(config.num_hidden_layers)
+            MiniMaxM3VisionEncoderLayer(config, fused_qkv)
+            for _ in range(config.num_hidden_layers)
         )
 
 
 class MiniMaxM3VisionTransformer(nn.Module):
     """CLIP tower with 3D RoPE; returns the last layer (no post-layernorm)."""
 
-    def __init__(self, config) -> None:
+    def __init__(self, config, fused_qkv: bool = True) -> None:
         super().__init__()
         self.embeddings = MiniMaxM3VisionEmbeddings(config)
         # "layrnorm" is the checkpoint's spelling.
         self.pre_layrnorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
-        self.encoder = MiniMaxM3VisionEncoder(config)
+        self.encoder = MiniMaxM3VisionEncoder(config, fused_qkv)
 
         self.spatial_merge_size = _compression(config).get("spatial_merge_size", 2)
         self.max_frames = getattr(config, "vision_segment_max_frames", None)
@@ -239,9 +253,9 @@ class MiniMaxM3VisionTransformer(nn.Module):
 
 
 class MiniMaxM3VisionTower(nn.Module):
-    def __init__(self, vision_config) -> None:
+    def __init__(self, vision_config, fused_qkv: bool = True) -> None:
         super().__init__()
-        self.vision_model = MiniMaxM3VisionTransformer(vision_config)
+        self.vision_model = MiniMaxM3VisionTransformer(vision_config, fused_qkv)
 
     def forward(
         self, pixel_values: torch.Tensor, grid_thw: list[list[int]]
@@ -270,7 +284,9 @@ class MiniMaxM3PatchMerger(MiniMaxM3MultiModalProjector):
         return super().forward(x.reshape(x.shape[0] // self.merge_size**2, -1))
 
 
-def build_vision_modules(hf_config) -> tuple[nn.Module, nn.Module, nn.Module]:
+def build_vision_modules(
+    hf_config, fused_qkv: bool = True
+) -> tuple[nn.Module, nn.Module, nn.Module]:
     """The tower, projector and patch merger named as in the checkpoint."""
     vision_config = hf_config.vision_config
     text_config = getattr(hf_config, "text_config", None) or hf_config
@@ -283,7 +299,7 @@ def build_vision_modules(hf_config) -> tuple[nn.Module, nn.Module, nn.Module]:
         act = getattr(vision_config, name, None) or getattr(hf_config, name, "gelu")
         if act != "gelu":
             raise ValueError(f"MiniMax-M3 vision expects gelu {name}, got {act!r}")
-    tower = MiniMaxM3VisionTower(vision_config)
+    tower = MiniMaxM3VisionTower(vision_config, fused_qkv)
     projector = MiniMaxM3MultiModalProjector(
         vision_config.hidden_size,
         mid_size,
@@ -314,6 +330,8 @@ class MiniMaxM3SparseForConditionalGenerationVL(
     vision_weight_prefixes: ClassVar[tuple[str, ...]] = tuple(
         MiniMaxM3SparseForConditionalGenerationTextOnly.skip_weight_prefixes
     )
+    # Whether the packed mapping renames the tower's q/k/v into one qkv_proj.
+    fused_vision_qkv: ClassVar[bool] = True
 
     def __init__(self, atom_config: Config, prefix: str = "") -> None:
         super().__init__(atom_config, prefix=prefix)
@@ -327,14 +345,17 @@ class MiniMaxM3SparseForConditionalGenerationVL(
             self.vision_tower = PPMissingLayer()
             self.multi_modal_projector = PPMissingLayer()
             self.patch_merge_mlp = PPMissingLayer()
-            self.skip_weight_prefixes = list(self.vision_weight_prefixes)
+            self.skip_weight_prefixes = [
+                *self.skip_weight_prefixes,
+                *self.vision_weight_prefixes,
+            ]
             return
 
         (
             self.vision_tower,
             self.multi_modal_projector,
             self.patch_merge_mlp,
-        ) = build_vision_modules(hf_config)
+        ) = build_vision_modules(hf_config, fused_qkv=self.fused_vision_qkv)
         self.language_model.embed_before_model = True
 
     def get_vision_embeddings(

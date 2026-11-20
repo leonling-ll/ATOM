@@ -39,6 +39,10 @@ support_model_arch_dict = {
     "MiniMaxM3SparseForConditionalGeneration": (
         "atom.models.minimax_m3.vl.MiniMaxM3SparseForConditionalGenerationVL"
     ),
+    # MiniMax-M3-Pro (`config.get_hf_config` rewrites the architecture).
+    "MiniMaxM3ProForConditionalGeneration": (
+        "atom.models.minimax_m3.pro.MiniMaxM3ProForConditionalGenerationVL"
+    ),
     "Glm5NextForConditionalGeneration": (
         "atom.models.glm5_next.Glm5NextForConditionalGeneration"
     ),

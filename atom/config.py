@@ -820,6 +820,22 @@ def flatten_dsa_config(hf_config) -> None:
     hf_config.dsa_layer_indices = tuple(sorted(i - 1 for i in dsa["dsa_layers"]))
 
 
+MINIMAX_M3_PRO_ARCH = "MiniMaxM3ProForConditionalGeneration"
+
+
+def is_minimax_m3_pro_config(hf_config: PretrainedConfig) -> bool:
+    """True for a MiniMax-M3-Pro export: its attention shares one K/V projection
+    (``sparse_enable_kv_share``), which M3 / M3.1 never do. Reads the text block of a
+    VL root or a bare text config alike."""
+    text_config = getattr(hf_config, "text_config", None) or hf_config
+    sparse_cfg = getattr(text_config, "sparse_attention_config", None) or {}
+    return bool(
+        isinstance(sparse_cfg, dict)
+        and sparse_cfg.get("use_sparse_attention")
+        and sparse_cfg.get("sparse_enable_kv_share")
+    )
+
+
 def get_hf_config(model: str, trust_remote_code: bool = False) -> PretrainedConfig:
     """``model``'s config, its architecture the one ATOM's tables key
     (``ARCH_ALIASES``)."""
@@ -827,6 +843,14 @@ def get_hf_config(model: str, trust_remote_code: bool = False) -> PretrainedConf
     architectures = getattr(hf_config, "architectures", None)
     if architectures and architectures[0] in ARCH_ALIASES:
         hf_config.architectures = [ARCH_ALIASES[architectures[0]]]
+    if (
+        architectures
+        and str(architectures[0]).startswith("MiniMaxM3")
+        and is_minimax_m3_pro_config(hf_config)
+    ):
+        # Pro's attention is a different module from M3 / M3.1's, so it is its own
+        # architecture key: the model class (`models.registry`), not a flag.
+        hf_config.architectures = [MINIMAX_M3_PRO_ARCH]
     return hf_config
 
 
@@ -945,6 +969,18 @@ def _load_hf_config(model: str, trust_remote_code: bool) -> PretrainedConfig:
             hf_config = maybe_patch_hf_config_from_gguf(model, hf_config)
         else:
             raise
+    if model_type == "minimax_m3_vl" and not config_dict.get("auto_map"):
+        # Without an auto_map (MiniMax-M3-Pro) transformers' own
+        # MiniMaxM3VLTextConfig parses the text block, dropping
+        # sparse_attention_config, moe_layer_freq and rope_theta and resetting
+        # hidden_act to silu. Keep the export's fields verbatim instead, as the
+        # bundled remote config of the other M3 exports does. Set one by one:
+        # `from_dict` standardizes the yarn rope_scaling before
+        # max_position_embeddings exists.
+        text_config = PretrainedConfig()
+        for field, value in config_dict["text_config"].items():
+            setattr(text_config, field, value)
+        hf_config.text_config = text_config
     return hf_config
 
 
@@ -1255,9 +1291,15 @@ def _resolve_sequential_drafter_max_spec(
 # Standalone DSpark draft architectures: their own checkpoint, normalized by
 # `_normalize_draft_dspark_config`. Inline drafts (V4-Pro-DSpark) are not
 # listed; they ship inside the target checkpoint and are told by
-# `dspark_block_size`.
+# `dspark_block_size`. MiniMax-M3-Pro's draft is inline too, but runs as a
+# standalone one (its own paged pool), so it is renamed onto an entry here.
 _STANDALONE_DSPARK_ARCHS: frozenset[str] = frozenset(
-    {"K3DSparkModel", "DSparkMiniMaxDraftModel", "K3DSparkGQAModel"}
+    {
+        "K3DSparkModel",
+        "DSparkMiniMaxDraftModel",
+        "K3DSparkGQAModel",
+        "DSparkMiniMaxProDraftModel",
+    }
 )
 # Where the standalone drafts name each field ATOM reads, in lookup order:
 # Kimi-K3's top-level names, then MiniMax-M3.1's `dspark_*` names and its DFlash
@@ -1345,6 +1387,37 @@ def _normalize_draft_dspark_config(hf_config: PretrainedConfig) -> None:
         f"target_layers={hf_config.dspark_target_layer_ids}, "
         f"mask_token_id={hf_config.dspark_noise_token_id})"
     )
+
+
+def _normalize_minimax_m3_pro_dspark_config(hf_config: PretrainedConfig) -> None:
+    """MiniMax-M3-Pro's DSpark draft, from the target's own text config.
+
+    The draft's tensors sit in the target checkpoint
+    (``language_model.model.dspark.*``) and its fields in the target's text
+    config: ``dflash_config.num_hidden_layers`` is its depth, the ``dspark_*``
+    fields the rest, the attention shapes are the target's. It attends densely
+    over a pool of its own, so the copy drops the target's sparse attention.
+    """
+    dflash = getattr(hf_config, "dflash_config", None) or {}
+    layers = dflash.get("num_hidden_layers")
+    if not layers:
+        raise ValueError(
+            "MiniMax-M3-Pro DSpark: the text config's dflash_config names no "
+            "num_hidden_layers, the draft's depth."
+        )
+    hf_config.architectures = ["DSparkMiniMaxProDraftModel"]
+    hf_config.num_hidden_layers = int(layers)
+    hf_config.sparse_attention_config = None
+    # The draft has no routed experts. The target's NVFP4 MoE fields would make its
+    # own quantization parse demand the online conversion it is never given.
+    quant = getattr(hf_config, "quantization_config", None)
+    if isinstance(quant, dict) and quant.get("moe_quant_algo"):
+        hf_config.quantization_config = {
+            k: v
+            for k, v in quant.items()
+            if k not in ("moe_quant_algo", "moe_quant_format")
+        }
+    _normalize_draft_dspark_config(hf_config)
 
 
 def _normalize_moe_config_fields(
@@ -1591,6 +1664,12 @@ class SpeculativeConfig:
             hf_config.architectures = ["Eagle3LlamaModel"]
         elif arch == "Eagle3DeepseekV2ForCausalLM":
             hf_config.architectures = ["Eagle3DeepseekMLAModel"]
+
+        if getattr(hf_config, "dspark_block_size", None) and is_minimax_m3_pro_config(
+            hf_config
+        ):
+            _normalize_minimax_m3_pro_dspark_config(hf_config)
+            return
 
         # DSpark detection (before MTP rewrite): the V4 DSpark checkpoint has
         # model_type=deepseek_v4 just like serial MTP, but carries DSpark-only

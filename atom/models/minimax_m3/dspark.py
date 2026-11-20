@@ -65,7 +65,6 @@ from atom.model_ops.layernorm import GemmaRMSNorm
 from atom.model_ops.linear import QKVParallelLinear, ReplicatedLinear, RowParallelLinear
 from atom.model_ops.minimax_m3.sparse_attn import (
     ASM_PAGE_SIZE,
-    PAGES_PER_SPARSE_BLOCK,
     sparse_pa_per_row,
     to_page16_shuffle,
 )
@@ -99,20 +98,22 @@ def _draft_rope_theta(config) -> float:
 
 
 def _page16_table(
-    block_tables: torch.Tensor,  # [rb, W] page-128 ids
-    out: torch.Tensor,  # [rb, 8 * W]
-    sub_pages: torch.Tensor,  # [8] = arange(8)
+    block_tables: torch.Tensor,  # [rb, W] ids of pages of n page-16s each
+    out: torch.Tensor,  # [rb, n * W]
+    sub_pages: torch.Tensor,  # [n] = arange(n)
 ) -> torch.Tensor:
-    """Page-16 ids of a page-128 table: page p covers ``p * 8 + 0..7``.
+    """Page-16 ids of a table of ``n``-page-16 pages: page p covers
+    ``p * n + 0..n-1`` (n = 8 for M3.1's page-128 pool, 1 for M3-Pro's page-16).
 
     Through ``copy_`` of an expanded view: an ``out=`` of the ``[rb, W, 1]``
     product would be resized to that shape rather than broadcast over the
-    eight sub-pages, leaving ``[8p0, 8p1+1, 8p2+2, ...]``.
+    sub-pages, leaving ``[8p0, 8p1+1, 8p2+2, ...]``.
     """
     rb, W = block_tables.shape
-    out3 = out.view(rb, W, PAGES_PER_SPARSE_BLOCK)
-    out3.copy_(block_tables.unsqueeze(-1).expand(rb, W, PAGES_PER_SPARSE_BLOCK))
-    out3.mul_(PAGES_PER_SPARSE_BLOCK).add_(sub_pages)
+    n = sub_pages.shape[0]
+    out3 = out.view(rb, W, n)
+    out3.copy_(block_tables.unsqueeze(-1).expand(rb, W, n))
+    out3.mul_(n).add_(sub_pages)
     return out
 
 
@@ -219,9 +220,14 @@ class M3DSparkAttention(nn.Module):
             rotary_dim=rotary_dim,
             max_position=config.max_position_embeddings,
             base=_draft_rope_theta(config),
-            rope_scaling=None,
+            rope_scaling=self._rope_scaling(config),
         )
         self.kv = KVCacheBinding(layer_num, page_tokens=ASM_PAGE_SIZE)
+
+    def _rope_scaling(self, config) -> dict | None:
+        """The ``rope_scaling`` handed to ``get_rope``: the M3.1 draft's RoPE is
+        unscaled."""
+        return None
 
     def _bound_cache(self):
         """This layer's KV cache in the layout every access of it uses.
@@ -344,6 +350,8 @@ class M3DSparkAttention(nn.Module):
 class M3DSparkDecoderLayer(DSparkGQADecoderLayer):
     """One draft layer: pre-norm attention + pre-norm dense SwiGLU-OAI MLP."""
 
+    attention_cls: ClassVar[type[M3DSparkAttention]] = M3DSparkAttention
+
     def __init__(
         self,
         atom_config: "Config",
@@ -353,7 +361,7 @@ class M3DSparkDecoderLayer(DSparkGQADecoderLayer):
         prefix: str = "",
     ) -> None:
         super().__init__()
-        self.self_attn = M3DSparkAttention(
+        self.self_attn = self.attention_cls(
             atom_config, config, quant_config, layer_num, prefix=f"{prefix}.self_attn"
         )
         self.mlp = MiniMaxM3MLP(
@@ -384,6 +392,8 @@ class MiniMaxM3DSpark(DSparkDraftModel):
 
     # Per-row MHA decode; its tables are built in `prepare_paged_block`.
     block_attention_is_mla = False
+
+    layer_cls: ClassVar[type[M3DSparkDecoderLayer]] = M3DSparkDecoderLayer
 
     weights_mapping: ClassVar[dict[str, str]] = {
         "language_model.model.dspark.": "",
@@ -429,7 +439,7 @@ class MiniMaxM3DSpark(DSparkDraftModel):
         self.hidden_norm = GemmaRMSNorm(self.hidden_size, eps=config.rms_norm_eps)
         self.layers = nn.ModuleList(
             [
-                M3DSparkDecoderLayer(
+                self.layer_cls(
                     atom_config,
                     config,
                     quant_config,
@@ -460,7 +470,7 @@ class MiniMaxM3DSpark(DSparkDraftModel):
 
     # ---- drafting entry points (called by the proposer) --------------------
 
-    def _alloc_block_rows(self, P: int, T: int, device) -> None:
+    def _alloc_block_rows(self, P: int, T: int, pages: int, device) -> None:
         """The first call is the warmup, ahead of any capture: these addresses
         are the ones every recording bakes in."""
         max_bs = self.max_num_seqs
@@ -476,16 +486,14 @@ class MiniMaxM3DSpark(DSparkDraftModel):
         self._row_req = torch.arange(
             max_bs, dtype=torch.int64, device=device
         ).repeat_interleave(T)
-        self._sub_pages = torch.arange(
-            PAGES_PER_SPARSE_BLOCK, dtype=torch.int32, device=device
-        )
+        self._sub_pages = torch.arange(pages, dtype=torch.int32, device=device)
         self._start16 = torch.zeros(max_bs * T, dtype=torch.int64, device=device)
         self._ctx_eff = torch.zeros(max_bs, dtype=torch.int32, device=device)
 
     def prepare_paged_block(
         self,
         attn_metadata,
-        block_tables: torch.Tensor,  # [running_bs, W] page ids (page-128)
+        block_tables: torch.Tensor,  # [running_bs, W] ids of entry_tokens pages
         block_positions: torch.Tensor,  # [running_bs, T]
         slots: torch.Tensor,  # [running_bs, T] -- the block's KV write slots
         ctx_lens: torch.Tensor,  # [running_bs] anchor + 1 + T
@@ -511,9 +519,10 @@ class MiniMaxM3DSpark(DSparkDraftModel):
         is allocated): their draft rows simply miss a few of their own keys.
         """
         running_bs, T = block_positions.shape
-        P = PAGES_PER_SPARSE_BLOCK * block_tables.shape[1]
+        pages = entry_tokens // ASM_PAGE_SIZE  # page-16s per table entry
+        P = pages * block_tables.shape[1]
         if self._bt16 is None or self._bt16.shape[1] != P:
-            self._alloc_block_rows(P, T, block_tables.device)
+            self._alloc_block_rows(P, T, pages, block_tables.device)
 
         alloc = self._alloc_cap.apply(
             allocated_pages, scheduled_bs, block_positions, slots, entry_tokens
@@ -525,7 +534,7 @@ class MiniMaxM3DSpark(DSparkDraftModel):
         bt16 = _page16_table(block_tables, self._bt16[:running_bs], self._sub_pages)
         if running_bs > scheduled_bs:
             # A pad row reads one page: page 0.
-            bt16[scheduled_bs:, :PAGES_PER_SPARSE_BLOCK].copy_(self._sub_pages)
+            bt16[scheduled_bs:, :pages].copy_(self._sub_pages)
 
         rows = running_bs * T
         _window_rows(

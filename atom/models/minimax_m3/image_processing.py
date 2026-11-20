@@ -42,6 +42,32 @@ def image_input_refusal(atom_config: "Config") -> str | None:
     return None
 
 
+def minimax_m3_pro_processor(atom_config: "Config", tokenizer, encoder):
+    """The checkpoint's processor, with MiniMax-M3-Pro's image size read as a pixel range.
+
+    Pro's ``preprocessor_config.json`` gives ``size`` as a box (``height`` / ``width``)
+    beside ``max_pixels``. ``MiniMaxM3VLImageProcessor`` adds ``max_pixels`` to the box as
+    a ``longest_edge`` and rejects the mix, while its resize takes a pixel range:
+    [``min_pixels`` or 56 * 56, ``max_pixels`` or the box's area].
+    """
+    from transformers import AutoProcessor
+    from transformers.image_processing_base import ImageProcessingMixin
+
+    path = atom_config.model
+    config, _ = ImageProcessingMixin.get_image_processor_dict(path)
+    kwargs = {}
+    size = config.get("size")
+    if isinstance(size, dict) and {"height", "width"} <= size.keys():
+        kwargs["size"] = {
+            "shortest_edge": config.get("min_pixels") or 56 * 56,
+            "longest_edge": config.get("max_pixels") or size["height"] * size["width"],
+        }
+    processor = AutoProcessor.from_pretrained(path, trust_remote_code=True, **kwargs)
+    if processor.chat_template is None:
+        processor.chat_template = tokenizer.chat_template
+    return processor
+
+
 def _image_token_spans(input_ids: list[int], token_id: int) -> list[tuple]:
     spans, start = [], None
     for index, token in enumerate(input_ids + [None]):
