@@ -1083,6 +1083,88 @@ def fused_allreduce_gemma_rms_norm_quant(
     return out_fp8, scale_out, residual_out
 
 
+def gemma_rms_norm_mxfp8(
+    x: torch.Tensor,
+    residual: torch.Tensor | None,
+    norm: GemmaRMSNorm,
+    write_bf16: bool = True,
+) -> tuple[torch.Tensor | None, torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    """``norm.forward_cuda(x, residual)`` with its output also as MXFP8, from the one
+    kernel: ``(out, q, q_scale, residual_out)``, ``out`` / ``residual_out`` forward_cuda's
+    (``out`` None unless ``write_bf16``; ``residual_out`` None without ``residual``) and
+    ``(q, q_scale)`` ``quantize_fp8(out)``'s bytes (E4M3 ``[m, n]``, E8M0 ``[m, n // 32]``).
+    """
+    from aiter.ops.fused_qk_rmsnorm_group_quant import fused_qk_rmsnorm_group_quant
+    from aiter.utility.dtypes import fp8
+
+    n = x.shape[-1]
+    x_2d = x.view(-1, n)
+    m = x_2d.shape[0]
+    q = torch.empty((m, n), dtype=fp8, device=x.device)
+    q_scale = torch.empty((m, n // 32), dtype=torch.float8_e8m0fnu, device=x.device)
+    out = torch.empty_like(x_2d) if write_bf16 else None
+    residual_2d = None if residual is None else residual.view(-1, n)
+    res_out = None if residual is None else torch.empty_like(x_2d)
+    fused_qk_rmsnorm_group_quant(
+        q,
+        q_scale.view(torch.uint8),
+        x_2d,
+        norm.weight.data,
+        norm.variance_epsilon,
+        q_out_unquantized=out,
+        q_res_out=res_out,
+        q_residual=residual_2d,
+        group_size=32,
+        transpose_scale=False,
+        gemma_norm=True,
+    )
+    return out, q, q_scale, res_out
+
+
+def fused_allreduce_gemma_rms_norm_mxfp8(
+    hidden_states: torch.Tensor,
+    residual: torch.Tensor,
+    norm: GemmaRMSNorm,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """``fused_allreduce_gemma_rms_norm`` with its output also as MXFP8 (the bytes of
+    ``quantize_fp8`` of it): ``(out, q, q_scale, residual_out)``. The quant rides on the
+    norm's kernel where there is a form of it that does (aiter's custom all-reduce
+    epilogue and add_rmsnorm at TP > 1, ``gemma_rms_norm_mxfp8`` at TP 1); every other
+    route runs the unfused pair."""
+    from atom.model_ops.blockscale import quantize_fp8
+
+    if get_tensor_model_parallel_world_size() > 1:
+        from aiter.dist import communication_op
+
+        fused = getattr(
+            communication_op,
+            "tensor_model_parallel_fused_allreduce_rmsnorm_mxfp8_quant",
+            None,
+        )
+        x = hidden_states.contiguous()
+        outs = (
+            None
+            if fused is None
+            else fused(x, residual, norm.weight, norm.variance_epsilon, gemma_norm=True)
+        )
+        if outs is not None:
+            out, residual_out, q, q_scale = outs
+            return out, q, q_scale, residual_out
+        out, residual_out = tensor_model_parallel_fused_allreduce_rmsnorm(
+            x, residual, norm.weight, norm.variance_epsilon, gemma_norm=True
+        )
+        q, q_scale = quantize_fp8(out)
+        return out, q, q_scale, residual_out
+    if norm.use_fused_quant or norm.fused_allreduce:
+        # this norm's own forward is not forward_cuda, which the MX kernel mirrors
+        out, residual_out = fused_allreduce_gemma_rms_norm(
+            hidden_states, residual, norm
+        )
+        q, q_scale = quantize_fp8(out)
+        return out, q, q_scale, residual_out
+    return gemma_rms_norm_mxfp8(hidden_states, residual, norm)
+
+
 # ---------------------------------------------------------------------------
 # Fused Q/K RMSNorm Triton kernel
 # ---------------------------------------------------------------------------

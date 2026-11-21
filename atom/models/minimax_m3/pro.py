@@ -17,7 +17,8 @@ are the Flash modules, with Pro's sizes read from the config):
 The attention math is ``model_ops.minimax_m3.pro_attn`` (torch, correctness first).
 """
 
-from functools import partial
+import logging
+from functools import cache, partial
 from typing import ClassVar
 
 import torch
@@ -28,7 +29,12 @@ from transformers import PretrainedConfig
 
 from atom.config import Config, QuantizationConfig
 from atom.model_ops.base_attention import Attention
-from atom.model_ops.layernorm import GemmaRMSNorm, fused_allreduce_gemma_rms_norm
+from atom.model_ops.layernorm import (
+    GemmaRMSNorm,
+    fused_allreduce_gemma_rms_norm,
+    fused_allreduce_gemma_rms_norm_mxfp8,
+    gemma_rms_norm_mxfp8,
+)
 from atom.model_ops.linear import (
     ColumnParallelLinear,
     ReplicatedLinear,
@@ -44,6 +50,8 @@ from atom.models.minimax_m3.model import (
 )
 from atom.models.minimax_m3.vl import MiniMaxM3SparseForConditionalGenerationVL
 
+logger = logging.getLogger("atom")
+
 
 def _quantized_once(x: torch.Tensor, x_scale: torch.Tensor | None, linears) -> tuple:
     """``x`` (and its scale) for ``linears`` that share it: quantised here, once, when
@@ -56,6 +64,32 @@ def _quantized_once(x: torch.Tensor, x_scale: torch.Tensor | None, linears) -> t
 
         return quantize_fp8(x)
     return x, x_scale
+
+
+def _native_a8(*linears) -> bool:
+    """Whether every one of ``linears`` runs the native group32 FP8 GEMM, i.e. takes an
+    MXFP8 ``(x, x_scale)`` (and would ``quantize_fp8`` a bf16 ``x`` itself)."""
+    return all(getattr(m, "native_a8_group_rows", None) is not None for m in linears)
+
+
+@cache
+def _aiter_mx_norm() -> bool:
+    """Whether this aiter's norm kernels can write MXFP8 (``add_rmsnorm_mxfp8`` and the
+    E8M0 mode of ``fused_qk_rmsnorm_group_quant`` come in together); without them the
+    fuse_mxfp8_quant norms keep the unfused path."""
+    import aiter
+    from aiter.dist import communication_op
+
+    ok = hasattr(aiter, "add_rmsnorm_mxfp8")
+    logger.info(
+        "M3-Pro fuse_mxfp8_quant: aiter MXFP8 norms %s, all-reduce MXFP8 epilogue %s",
+        ok,
+        hasattr(
+            communication_op,
+            "tensor_model_parallel_fused_allreduce_rmsnorm_mxfp8_quant",
+        ),
+    )
+    return ok
 
 
 class ProLookaheadState:
@@ -77,7 +111,10 @@ class ProLookaheadState:
         # every layer's input_layernorm (the decoder layers register them): with them the
         # ``resid_in`` source is normed when it is put, keyed by the layer that reads it
         self.norms: dict[int, GemmaRMSNorm] = {}
-        self.resid_in: dict[int, torch.Tensor] = {}
+        # and their attentions' indexer projections: a ``resid_in`` entry for a reader whose
+        # two are native group32 FP8 is put as MXFP8 ``(x, x_scale)`` under fuse_mxfp8_quant
+        self.index_linears: dict[int, tuple[nn.Module, nn.Module]] = {}
+        self.resid_in: dict[int, torch.Tensor | tuple[torch.Tensor, torch.Tensor]] = {}
 
     @staticmethod
     def _normed(norm: GemmaRMSNorm, x: torch.Tensor) -> torch.Tensor:
@@ -89,9 +126,10 @@ class ProLookaheadState:
 
     def source_for(
         self, layer: int, norm: GemmaRMSNorm | None = None
-    ) -> torch.Tensor | None:
-        """The indexer input of ``layer`` (``None``: its own attention input). ``norm`` is the
-        layer's input_layernorm, which the ``resid_in`` source goes through."""
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor] | None:
+        """The indexer input of ``layer`` (``None``: its own attention input), bf16 or
+        MXFP8 ``(x, x_scale)``. ``norm`` is the layer's input_layernorm, which the
+        ``resid_in`` source goes through."""
         v = variants()
         if not (self.ahead and v.lookahead and layer >= self.start):
             return None
@@ -132,7 +170,20 @@ class ProLookaheadState:
         elif v.lookahead_src == "resid_in" and self.norms:
             # the reader's input norm now, one kernel writing a new tensor: no copy
             if v.lookahead and reader >= self.start and reader in self.norms:
-                self.resid_in[reader] = self.norms[reader].forward_cuda(resid)
+                norm = self.norms[reader]
+                linears = self.index_linears.get(reader)
+                if (
+                    v.fuse_mxfp8_quant
+                    and linears is not None
+                    and _native_a8(*linears)
+                    and _aiter_mx_norm()
+                ):
+                    _, q, q_scale, _ = gemma_rms_norm_mxfp8(
+                        resid, None, norm, write_bf16=False
+                    )
+                    self.resid_in[reader] = (q, q_scale)
+                else:
+                    self.resid_in[reader] = norm.forward_cuda(resid)
         elif v.lookahead_src in ("resid", "resid_in"):
             self.resid[layer] = resid.clone()
         else:
@@ -265,7 +316,7 @@ class MiniMaxM3ProAttention(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         hidden_states_scale: torch.Tensor | None = None,
-        index_src: torch.Tensor | None = None,
+        index_src: torch.Tensor | tuple[torch.Tensor, torch.Tensor] | None = None,
         diag_srcs: dict[str, torch.Tensor | None] | None = None,
     ) -> torch.Tensor:
         own = [self.q_proj, self.k_proj]
@@ -278,8 +329,12 @@ class MiniMaxM3ProAttention(nn.Module):
             iq = self.index_q_proj(x, x_scale=xs)
             ik = self.index_k_proj(x, x_scale=xs)
         else:
-            ix, ixs = _quantized_once(
-                index_src, None, [self.index_q_proj, self.index_k_proj]
+            ix, ixs = (
+                index_src
+                if isinstance(index_src, tuple)
+                else _quantized_once(
+                    index_src, None, [self.index_q_proj, self.index_k_proj]
+                )
             )
             iq = self.index_q_proj(ix, x_scale=ixs)
             ik = self.index_k_proj(ix, x_scale=ixs)
@@ -311,6 +366,10 @@ class MiniMaxM3ProDecoderLayer(MiniMaxM3DecoderLayer):
         self._pro_state = state
         super().__init__(*args, **kwargs)
         state.norms[self.layer_num] = self.input_layernorm
+        state.index_linears[self.layer_num] = (
+            self.self_attn.index_q_proj,
+            self.self_attn.index_k_proj,
+        )
 
     def _make_attention(
         self,
@@ -339,9 +398,31 @@ class MiniMaxM3ProDecoderLayer(MiniMaxM3DecoderLayer):
     ):
         # Plain (unfused-quant) norms: the lookahead needs the bf16 FFN input of
         # every layer, which a fused norm + per-token-FP8 quant does not produce.
+        # fuse_mxfp8_quant: the norms whose output a native group32 FP8 GEMM reads
+        # also write it as MXFP8 (the same bytes its quantize_fp8 would), the bf16
+        # output kept where anything else reads it.
+        v = variants()
+        fuse = v.fuse_mxfp8_quant and not v.diag
+        mx_norm = fuse and _aiter_mx_norm()
+        attn = self.self_attn
+        fuse_attn_in = mx_norm and _native_a8(
+            attn.q_proj, attn.k_proj, attn.index_q_proj, attn.index_k_proj
+        )
+        hidden_states_scale = None
         if residual is None:
             residual = hidden_states
-            hidden_states = self.input_layernorm(hidden_states)
+            if fuse_attn_in:
+                _, hidden_states, hidden_states_scale, _ = gemma_rms_norm_mxfp8(
+                    hidden_states, None, self.input_layernorm, write_bf16=False
+                )
+            else:
+                hidden_states = self.input_layernorm(hidden_states)
+        elif fuse_attn_in:
+            _, hidden_states, hidden_states_scale, residual = (
+                fused_allreduce_gemma_rms_norm_mxfp8(
+                    hidden_states, residual, self.input_layernorm
+                )
+            )
         else:
             hidden_states, residual = fused_allreduce_gemma_rms_norm(
                 hidden_states, residual, self.input_layernorm
@@ -349,22 +430,49 @@ class MiniMaxM3ProDecoderLayer(MiniMaxM3DecoderLayer):
         aux_hidden_state = residual.clone() if capture_aux else None
 
         state = self._pro_state
-        hidden_states = self.self_attn(
+        hidden_states = attn(
             positions=positions,
             hidden_states=hidden_states,
+            hidden_states_scale=hidden_states_scale,
             index_src=state.source_for(self.layer_num, self.input_layernorm),
             diag_srcs=(
                 state.diag_sources(self.layer_num, self.input_layernorm)
-                if variants().diag
+                if v.diag
                 else None
             ),
         )
         ffn = self.block_sparse_moe if self.is_moe_layer else self.mlp
-        hidden_states, residual = fused_allreduce_gemma_rms_norm(
-            hidden_states, residual, self.post_attention_layernorm
+        # the MoE's router and routed experts read the bf16 output; its shared expert
+        # (or the dense MLP) can read the MXFP8 one
+        ffn_gate_up = (
+            None
+            if self.is_moe_layer and ffn.shared_experts is None
+            else (ffn.shared_experts if self.is_moe_layer else ffn).gate_up_proj
         )
+        fuse_ffn_in = mx_norm and ffn_gate_up is not None and _native_a8(ffn_gate_up)
+        if fuse_ffn_in:
+            hidden_states, ffn_x, ffn_x_scale, residual = (
+                fused_allreduce_gemma_rms_norm_mxfp8(
+                    hidden_states, residual, self.post_attention_layernorm
+                )
+            )
+        else:
+            hidden_states, residual = fused_allreduce_gemma_rms_norm(
+                hidden_states, residual, self.post_attention_layernorm
+            )
         state.put(self.layer_num, hidden_states, residual)
-        hidden_states = ffn(hidden_states)
+        if not fuse:
+            hidden_states = ffn(hidden_states)
+        elif self.is_moe_layer:
+            hidden_states = ffn(
+                hidden_states,
+                shared_input=(ffn_x, ffn_x_scale) if fuse_ffn_in else None,
+                quant_down=True,
+            )
+        elif fuse_ffn_in:
+            hidden_states = ffn(ffn_x, ffn_x_scale, quant_down=True)
+        else:
+            hidden_states = ffn(hidden_states, quant_down=True)
         if aux_hidden_state is not None:
             return hidden_states, residual, aux_hidden_state
         return hidden_states, residual

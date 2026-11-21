@@ -154,6 +154,12 @@ class ProVariants:
     # and blocks per step.
     attn_splits: int = 0
     attn_nblk: int = 2
+    # MXFP8 activation quant (E4M3, group-32 E8M0 scales, ``quantize_fp8``'s bytes) written
+    # by the ops that produce the activations -- the norms after the all-reduces, the
+    # lookahead norm, the SwiGLU -- instead of a ``quantize_fp8`` launch before each native
+    # group32 FP8 GEMM (``pro.py``). Off under ``diag``; the norms keep the unfused path on
+    # an aiter without the MXFP8 norm outputs.
+    fuse_mxfp8_quant: bool = True
 
 
 _variants = ProVariants()

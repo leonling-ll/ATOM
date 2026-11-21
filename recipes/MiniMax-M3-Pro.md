@@ -445,4 +445,39 @@ the profiler): Pro's attention kernels 22% (aiter attention 10%, prep, scores an
 the MXFP8 / router GEMMs 24%, the MoE with its routing and elementwise ops 26%, the all-reduces 11%,
 the activation quantization 11%, norms and the shared expert's activation 4%.
 
+## Fused MXFP8 activation quantization
+
+`fuse_mxfp8_quant` (a `ProVariants` field, on by default; `{"fuse_mxfp8_quant": false}` in
+`ATOM_M3PRO_VARIANTS` turns it off, and `diag` does too) has the ops that produce the inputs of the
+native MXFP8 (group-32) linears write them as MXFP8 themselves -- E4M3 values and E8M0 scales, the
+bytes `quantize_fp8` would give -- instead of a separate `quantize_fp8` launch before the GEMM:
+
+- the all-reduce + input norm writes the q / k / indexer projections' input (layer 0: the norm);
+- the all-reduce + post-attention norm writes the dense MLP's or the shared expert's gate_up input,
+  and still writes the bf16 rows the router and the routed experts read;
+- the lookahead norm in `ProLookaheadState.put` writes the reading layer's indexer input;
+- the SwiGLU writes down_proj's input (one Triton kernel).
+
+o_proj's input, written by the paged attention, is still quantized on its own: `quantize_fp8` per
+layer goes from 5 launches to 1.
+
+The norms need aiter's MXFP8 norm outputs ([zhuyuhua-v/aiter-M3#2](https://github.com/zhuyuhua-v/aiter-M3/pull/2): the custom all-reduce
+MXFP8 epilogue, `add_rmsnorm_mxfp8` for the RCCL route and an E8M0 mode of
+`fused_qk_rmsnorm_group_quant`). On an aiter without them the norms keep the unfused path (a log
+line at startup says which aiter features were found) and the SwiGLU is still fused. Where the
+all-reduce takes a route the MXFP8 epilogue does not cover (the reduce-scatter 2-stage kernel above
+80 rows, gluon, Lamport, quick-reduce), that norm runs unfused too. Every fused output is checked
+byte for byte against the unfused pair (`tests/test_m3pro_mxfp8_fusion.py`, TP1 and TP8, eager and
+in CUDA graphs).
+
+End to end with the server command above (TP8, fp8 KV cache), off -> on:
+
+| | c=1 | c=8 | c=32 |
+|---|---|---|---|
+| TPOT, ms | 12.73 -> 12.29 | 14.82 -> 14.35 | 20.66 -> 20.09 |
+
+Decode step under the torch profiler: bs1 14.29 -> 13.24 ms, bs32 20.03 -> 18.92 ms. GSM8K (20-shot,
+all 1319): 0.9303 and 0.9363 off (two runs), 0.9318 on. Greedy outputs differ between the two no
+more than two runs of the same setting do.
+
 Not done: TP other than 8. Untested: video input, prefix caching on the torch reference path.
