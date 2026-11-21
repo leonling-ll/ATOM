@@ -390,6 +390,28 @@ the layer back to torch. `tests/test_minimax_m3_pro_kernels.py` checks them agai
 reference on a CPU (Triton interpreter, fp32 and bf16, aiter through torch stand-ins) and on one
 MI355X (fp8 caches, aiter's own kernels, a decode graph replayed on another batch).
 
+`"prep": "aiter"` (with `"kernels": true`; default `"triton"`) runs prep as aiter's
+`fused_qk_norm_rope_cache_mqa` (one HIP launch, a 32-lane group per head row) instead of the Triton
+prep, falling back to Triton where the installed aiter lacks the op. Same math and rounding points:
+K, V, index K and the fp8 codes and scales match Triton's; q / index q differ on ~1e-5 of the
+values by one bf16 step (Triton's own fma contraction; both within that of the torch reference).
+It takes any number of local heads, which removes the Triton prep's 32-heads-per-rank limit on the
+kernel path (TP 2 / 1: 64 / 128 local heads); the rest of TP < 8 is still unverified. GPU time per
+call in a CUDA graph (MI355X, Triton -> aiter, us):
+
+| local heads, KV / index | 1 token | 128 tokens | 1024 tokens | 8192 tokens |
+|---|---|---|---|---|
+| 16, bf16 | 6.2 -> 3.9 | 6.8 -> 4.9 | 15.5 -> 10.7 | 79.7 -> 48.4 |
+| 16, fp8 | 6.9 -> 4.9 | 7.4 -> 6.0 | 15.7 -> 13.2 | 85.2 -> 51.1 |
+| 128, bf16 | 10.2 -> 3.9 | 11.9 -> 7.3 | 48.1 -> 27.5 | 439 -> 214 |
+| 128, fp8 | 10.7 -> 4.9 | 12.2 -> 8.3 | 49.6 -> 28.5 | 440 -> 209 |
+
+End to end (TP8, the fused-selection configuration, fp8 KV / bf16 index cache, graphs, 1k in /
+512 out) it is ~1%: TPOT at concurrency 1 / 8 / 32 12.73 -> 12.56, 14.82 -> 14.68, 20.66 -> 20.64
+ms, a bs1 decode step 14.29 -> 14.13 ms; GSM8K (20-shot, all 1319) 0.9356 against 0.9303 / 0.9363
+for two baseline runs. `tests/test_minimax_m3_pro_prep_aiter.py` checks it against the Triton prep
+and the torch reference.
+
 End to end on 8x MI355X (TP8, `--max-num-batched-tokens 16384`, 256 tokens out, greedy; TPOT in
 steady decode, ms per token):
 

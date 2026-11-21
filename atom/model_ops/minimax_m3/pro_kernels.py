@@ -21,6 +21,10 @@ host sync:
                  rope dims, read from the same cache), optionally split over the blocks
                  for small batches, followed by ``combine``.
 
+``prep_aiter`` is the alternative to ``prep``: aiter's ``fused_qk_norm_rope_cache_mqa``, the
+same math (and rounding points) in one HIP launch of a 32-lane group per head row, any
+number of local heads.
+
 ``attention_aiter`` is the alternative to ``attention``: ``sparse_rows`` turns every
 token's selected blocks into a page table of its own (its own block last, so the context
 length masks the part of it past the token), and aiter's paged-attention decode runs over
@@ -294,6 +298,19 @@ def _prep_kernel(
         tl.store(ib + 64 + a64[None, :], r0_i)
 
 
+def _split_rows(qkv, heads):
+    """``(q, k, index q, index k)`` from the packed rows or the tuple of the four."""
+    if isinstance(qkv, torch.Tensor):
+        o = heads * HEAD_DIM
+        qkv = (
+            qkv,
+            qkv[:, o:],
+            qkv[:, o + HEAD_DIM :],
+            qkv[:, o + HEAD_DIM + IDX_HEADS * IDX_DIM :],
+        )
+    return qkv
+
+
 def prep(
     qkv,
     positions,
@@ -323,14 +340,7 @@ def prep(
     takes the per-token dequant scales ``k_scale`` / ``v_scale`` ``[N, 1, page]``; an fp8
     ``ic`` holds the keys cast (clamped to the fp8 range), unscaled.
     """
-    if isinstance(qkv, torch.Tensor):
-        o = heads * HEAD_DIM
-        qkv = (
-            qkv,
-            qkv[:, o:],
-            qkv[:, o + HEAD_DIM :],
-            qkv[:, o + HEAD_DIM + IDX_HEADS * IDX_DIM :],
-        )
+    qkv = _split_rows(qkv, heads)
     q, k, iq, ik = qkv
     t = q.shape[0]
     q_out = torch.empty(t, heads, HEAD_DIM, dtype=q.dtype, device=q.device)
@@ -402,6 +412,117 @@ def prep(
         IC_FP8=ic_fp8,
     )
     return q_out, iq_out
+
+
+_fused_prep = (
+    None  # aiter's fused_qk_norm_rope_cache_mqa (tests swap it); False: missing
+)
+
+
+def _aiter_prep():
+    global _fused_prep
+    if _fused_prep is None:
+        try:
+            from aiter.ops.fused_qk_norm_rope_cache_mqa import (
+                fused_qk_norm_rope_cache_mqa,
+            )
+        except ImportError:
+            _fused_prep = False
+        else:
+            _fused_prep = fused_qk_norm_rope_cache_mqa
+    return _fused_prep
+
+
+def aiter_prep_available() -> bool:
+    """Whether this aiter has ``fused_qk_norm_rope_cache_mqa`` (``prep_aiter``)."""
+    return bool(_aiter_prep())
+
+
+def prep_aiter_fits(qkv, heads) -> bool:
+    """Whether ``prep_aiter`` takes these rows: 2-D, rows 16-byte (q, k) / 8-byte (index)
+    aligned (its vector loads)."""
+
+    def ok(x, vec):
+        return (
+            x.dim() == 2
+            and x.stride(-1) == 1
+            and x.stride(0) % vec == 0
+            and x.data_ptr() % (vec * x.element_size()) == 0
+        )
+
+    q, k, iq, ik = _split_rows(qkv, heads)
+    return ok(q, 8) and ok(k, 8) and ok(iq, 4) and ok(ik, 4)
+
+
+def prep_aiter(
+    qkv,
+    positions,
+    slots,
+    cos,
+    sin,
+    ratio,
+    wq,
+    wk,
+    wiq,
+    wik,
+    eps,
+    kc4,
+    ic,
+    heads,
+    vc4=None,
+    k_scale=None,
+    v_scale=None,
+):
+    """``prep`` in one launch of aiter's ``fused_qk_norm_rope_cache_mqa``: the same arguments
+    and results (rows as ``prep_aiter_fits`` takes them), any number of heads. The op takes
+    the norm weights and cos / sin in the activation dtype; others go to ``prep``."""
+    q, k, iq, ik = _split_rows(qkv, heads)
+    if any(t.dtype != q.dtype for t in (wq, wk, wiq, wik, cos, sin)):
+        return prep(
+            qkv,
+            positions,
+            slots,
+            cos,
+            sin,
+            ratio,
+            wq,
+            wk,
+            wiq,
+            wik,
+            eps,
+            kc4,
+            ic,
+            heads,
+            vc4=vc4,
+            k_scale=k_scale,
+            v_scale=v_scale,
+        )
+    fp8 = kc4.element_size() == 1
+    return _aiter_prep()(
+        q,
+        k,
+        iq,
+        ik,
+        positions,
+        slots,
+        cos,
+        sin,
+        wq,
+        wk,
+        wiq,
+        wik,
+        kc4,
+        ic,
+        heads,
+        eps,
+        rope_scale=ratio,
+        v_cache=vc4,
+        k_scale=k_scale if fp8 else None,
+        v_scale=v_scale if fp8 and vc4 is not None else None,
+        num_index_heads=IDX_HEADS,
+        kv_fp8_max=torch.finfo(kc4.dtype).max if fp8 else None,
+        index_fp8_max=torch.finfo(ic.dtype).max if ic.element_size() == 1 else None,
+    )
 
 
 # ------------------------------------------------------------------------- scores --

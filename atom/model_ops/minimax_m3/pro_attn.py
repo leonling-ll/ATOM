@@ -134,6 +134,12 @@ class ProVariants:
     # handful of launches per layer instead of ~100, no host sync past the lengths.
     # Every other switch above either is honoured by them or sends the layer back to torch.
     kernels: bool = False
+    # The prep of the kernel path (norm + rope of q / k / index q / index k, the K / V /
+    # index-K cache writes): "triton" (``pro_kernels.prep``) or "aiter"
+    # (``pro_kernels.prep_aiter``: aiter's fused_qk_norm_rope_cache_mqa, the same math in
+    # one HIP launch, any number of local heads, Triton's at most 32). "aiter" runs
+    # Triton's where this aiter lacks it.
+    prep: str = "triton"
     # The attention of the kernel path: "triton" (``pro_kernels.attention``) or "aiter":
     # aiter's paged-attention decode (gluon, as ATOM's M3 runs it) with every token a
     # sequence of its own over a page table of its selected blocks, V from the V cache.
@@ -557,6 +563,10 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
         return tok, o.reshape(r, h * self.value_head_dim).to(q.dtype)
 
     # ------------------------------------------------------------ kernel path --
+    @staticmethod
+    def _aiter_prep(v: ProVariants) -> bool:
+        return v.prep == "aiter" and pro_kernels.aiter_prep_available()
+
     def _use_kernels(self, v: ProVariants) -> bool:
         """Whether the Triton kernels cover this layer and these variants."""
         return (
@@ -569,8 +579,10 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
             and v.index_rope
             and v.block_score in ("max", "pool4", "lse")
             and v.head_reduce in ("sum", "mean", "max", "lse")
+            and v.prep in ("triton", "aiter")
             and self.num_heads % 16 == 0
-            and self.num_heads <= 32  # prep holds all of a token's heads in one program
+            # Triton's prep holds all of a token's heads in one program
+            and (self.num_heads <= 32 or self._aiter_prep(v))
             and (self.head_dim, self.rotary_dim, self.value_head_dim) == (256, 64, 192)
             and (self.num_idx_heads, self.index_head_dim, self.page) == (16, 128, 16)
             and v.attn_nblk in (1, 2, 4, 8)
@@ -640,7 +652,17 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
         else:
             ratio = (1.0 if v.mscale == "hf" else float(v.mscale)) / aiter_m
         eps = self.q_norm.variance_epsilon
-        q, iq = pro_kernels.prep(
+        prep = pro_kernels.prep
+        if self._aiter_prep(v):
+            if pro_kernels.prep_aiter_fits(qkv, self.num_heads):
+                prep = pro_kernels.prep_aiter
+            elif not getattr(self, "_warned_prep", False):
+                self._warned_prep = True
+                logger.warning(
+                    "M3-Pro layer %d: unaligned projection rows, Triton prep",
+                    self.layer_num,
+                )
+        q, iq = prep(
             qkv,
             positions,
             slots,
@@ -784,10 +806,13 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
         md = fwd.attn_metadata
         if self._use_kernels(v):
             layer = fwd.kv_cache_data[f"layer_{self.layer_num}"]
-            if self.layer_num == 0 and getattr(self, "_logged_kernels", None) != v.attn:
-                self._logged_kernels = v.attn
+            prep_impl = "aiter" if self._aiter_prep(v) else "triton"
+            logged = (v.attn, prep_impl)
+            if self.layer_num == 0 and getattr(self, "_logged_kernels", None) != logged:
+                self._logged_kernels = logged
                 logger.info(
-                    "M3-Pro attention: kernels, %s attention, %s KV cache (%s)",
+                    "M3-Pro attention: kernels, %s prep, %s attention, %s KV cache (%s)",
+                    prep_impl,
                     v.attn,
                     layer.k_cache.dtype,
                     v,
