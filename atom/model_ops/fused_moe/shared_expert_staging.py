@@ -67,16 +67,28 @@ class SharedExpertStaging:
         elif will_online_requant(
             quant_config, layer.prefix, source.quant_type, source.quant_dtype
         ):
-            # The shared slot is written as MXFP4, so the routed buffers must
-            # stay the checkpoint's MXFP4. This also rules out streaming online
-            # quant, whose buffers are still on meta here.
-            raise NotImplementedError(
-                f"{layer.prefix}: {name} needs the routed experts to stay MXFP4, "
-                "but --online_quant_config re-quantizes this layer."
+            # The shared slot is written as MXFP4 after the online quant (`fuse`
+            # runs after it), so the routed experts must end up MXFP4: MiniMax-M3.1-Pro's
+            # NVFP4 -> MXFP4 does, any other target does not.
+            target = quant_config.get_layer_quant_config(
+                layer.prefix, use_online_quant=True
             )
+            if (target.quant_type, target.quant_dtype) != (
+                QuantType.per_1x32,
+                dtypes.fp4x2,
+            ):
+                raise NotImplementedError(
+                    f"{layer.prefix}: {name} needs the routed experts to end up "
+                    "MXFP4, but --online_quant_config re-quantizes this layer to "
+                    f"{target.quant_type} / {target.quant_dtype}."
+                )
         self.shared_lo = layer.expert_layout.routed_physical_per_rank
         self.num_shared = layer.num_fused_shared_experts
         n, device = self.num_shared, layer.w13_weight.device
+        if (
+            device.type == "meta"
+        ):  # streaming online quant: the routed buffers come later
+            device = torch.device("cuda", torch.cuda.current_device())
         f8 = torch.float8_e4m3fn
         # One F32 scale per row, or E8M0 per 1x32 block.
         s13, s2 = (1, 1) if ptpc else (hidden_size // 32, inter // 32)

@@ -100,6 +100,7 @@ from atom.quant_spec import (
     LayerQuantConfig,
     fuses_mxfp8_shared_into_mxfp4,
     fuses_ptpc_shared_into_online_ptpc,
+    loaded_routed_spec,
     should_skip_online_quant,
     should_stream_online_quant,
     validate_nvfp4_global_scales,
@@ -3757,7 +3758,10 @@ class FusedMoE(torch.nn.Module):
         )
         stage_shared = stage_shared_ptpc or bool(
             shared_spec is not None
-            and fuses_mxfp8_shared_into_mxfp4(shared_spec, layer_quant_config)
+            and fuses_mxfp8_shared_into_mxfp4(
+                shared_spec,
+                loaded_routed_spec(quant_config, prefix, layer_quant_config),
+            )
         )
 
         eplb_enabled = self.use_ep and getattr(atom_config, "eplb_enable", False)

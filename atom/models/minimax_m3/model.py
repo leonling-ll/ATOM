@@ -427,6 +427,7 @@ class MiniMaxM3MoE(nn.Module):
         # logits. Let the weight loader cast once instead of casting every forward.
 
         self.routed_scaling_factor = getattr(config, "routed_scaling_factor", 1.0)
+        tp_megamoe = _ffn_output_reduced(config, layer_id)
         self.experts = FusedMoE(
             num_experts=config.num_local_experts,
             top_k=config.num_experts_per_tok,
@@ -444,8 +445,11 @@ class MiniMaxM3MoE(nn.Module):
             shared_expert_prefix=f"{prefix}.shared_experts",
             # Pro's 640-wide TP8 rank slice stays unpadded (256 would pad it to 768,
             # +1/5 routed-expert memory, all of it taken from the KV pool); aiter
-            # serves 640 with the FlyDSL a16w4 kernels. Flash keeps the default.
-            pad_align=128 if is_minimax_m3_pro_config(config) else None,
+            # serves 640 with the FlyDSL a16w4 kernels. Flash keeps the default,
+            # except under TP MegaMoE, whose MegaMoeTP reads unpadded tables.
+            pad_align=(
+                128 if is_minimax_m3_pro_config(config) or tp_megamoe else None
+            ),
         )
         if hasattr(self.experts.quant_method, "intermediate_pad"):
             # MiniMax-M3 pads expert weights at load time; computing the full
@@ -470,7 +474,7 @@ class MiniMaxM3MoE(nn.Module):
         # TP MegaMoE: the output is all-reduced on every step (in-kernel, or by
         # FusedMoE's own on the steps it skips). The kernel runs the shared expert
         # as one more routed expert, hence the fused one.
-        if _ffn_output_reduced(config, layer_id):
+        if tp_megamoe:
             if not self.fuse_shared_experts:
                 raise ValueError(
                     "--moe-backend mega needs the shared expert fused into the "

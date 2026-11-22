@@ -276,6 +276,17 @@ def fuses_mxfp8_shared_into_mxfp4(
     )
 
 
+def loaded_routed_spec(quant_config, prefix: str | None, routed: LayerQuantConfig):
+    """The routed experts' format once loaded: the online target when online
+    quantization re-quantizes them (MiniMax-M3.1-Pro's NVFP4 -> MXFP4), else the
+    checkpoint's."""
+    if prefix is not None and will_online_requant(
+        quant_config, prefix, routed.quant_type, routed.quant_dtype
+    ):
+        return quant_config.get_layer_quant_config(prefix, use_online_quant=True)
+    return routed
+
+
 def fuses_ptpc_shared_into_online_ptpc(
     quant_config, routed_prefix: str, shared: LayerQuantConfig, routed: LayerQuantConfig
 ) -> bool:
