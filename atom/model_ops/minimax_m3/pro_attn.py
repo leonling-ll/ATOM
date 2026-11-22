@@ -804,6 +804,7 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
 
         def attend(sel, rows=None):
             if day0:
+                assert rows is None, "day0 takes block ids (select_logical), not page tables"
                 return pro_kernels.attention_day0(
                     q, kc4, block_tables, seq_id, positions, sel, out, scale
                 )
@@ -879,7 +880,7 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
         )
         k = min(self.topk, nb)
         if v.topk == "fused" and k & (k - 1) == 0:
-            if not aiter_attn:
+            if day0 or not aiter_attn:  # day0 and Triton take block ids, aiter pages
                 valid_first = True
                 return attend(pro_kernels.select_logical(score, positions, k))
             return attend(

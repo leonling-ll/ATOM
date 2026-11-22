@@ -1134,6 +1134,41 @@ class TestImplGlue:
         assert len(pa.calls) == (kw.get("attn") == "aiter")
         return v, seen, out
 
+    def test_day0_takes_block_ids_beside_aiter_k_rows(self, monkeypatch):
+        # K-only fp8 cache, aiter reading the K rows: a day0 prefill still gets
+        # select_logical's block ids, never aiter's page tables (dispatch only: the
+        # interpreter's fp8 rounding does not matter here)
+        c = Case([150, 97], topk=8, seed=3, kv_dtype=FP8, k_only=True)
+        c.impl.k_only = True
+        self._impl_with_rope(c, ProVariants())
+        monkeypatch.setattr(K, "TOPK", 8)
+        monkeypatch.setattr(K, "aiter_value_rows_available", lambda: True)
+        monkeypatch.setattr(K, "day0_prefill_available", lambda: True)
+        got = {}
+
+        def fake_day0(q, kc4, bt, seq, pos, sel, out, scale):
+            got["sel"] = sel
+            return out
+
+        def no_aiter(*a, **k):
+            pytest.fail("aiter page tables in a day0 prefill")
+
+        monkeypatch.setattr(K, "attention_day0", fake_day0)
+        monkeypatch.setattr(K, "attention_aiter", no_aiter)
+        kw = {"topk": "fused", "attn": "aiter", "k_only": True}
+        kw.update(k_plain_fp8=True, prefill_attn="day0")
+        out = torch.zeros(c.T, H * VD, dtype=DT, device=DEV)
+        c.impl._kernel_attention(
+            c.qkv, c.pos, c.seq, c.slot, c.bt, c.layer, c.ic, c.bt.shape[1],
+            ProVariants(**kw), out,
+        )
+        sel = got["sel"]
+        assert sel is not None and tuple(sel.shape) == (c.T, 8)
+        qb = (c.pos // PG).unsqueeze(1).expand_as(sel)
+        valid = sel >= 0
+        assert (sel[valid] <= qb[valid]).all()
+        assert torch.equal(valid.sum(1), torch.clamp(c.pos // PG + 1, max=8))
+
     def _reference(self, c, v, seen, v_cache=False):
         k_all, ik_all = c.cached()
         v_all = c.cached_v() if v_cache else None
