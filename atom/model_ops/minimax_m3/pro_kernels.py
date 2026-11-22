@@ -1382,7 +1382,9 @@ def _default_partitions(t: int) -> int:
     return min(get_recommended_splits(t, 1), max(1, units // t))
 
 
-_gluon_value_rows = None  # aiter's pa_decode_gluon if it takes value_rows; False: it does not
+_gluon_value_rows = (
+    None  # aiter's pa_decode_gluon if it takes value_rows; False: it does not
+)
 
 
 def aiter_value_rows_available() -> bool:
@@ -1434,7 +1436,9 @@ def attention_aiter(
         partitions = _default_partitions(t)
     partitions = max(1, min(partitions, triton.cdiv(rows.shape[1] * PAGE, 256)))
     if k_rows:
-        assert aiter_value_rows_available(), "this aiter's pa_decode_gluon has no value_rows"
+        assert (
+            aiter_value_rows_available()
+        ), "this aiter's pa_decode_gluon has no value_rows"
         n, sb, o = k_cache.shape[0], k_cache.stride(0), k_cache.storage_offset()
         xk = 16 // k_cache.element_size()
         k_view = k_cache.as_strided(

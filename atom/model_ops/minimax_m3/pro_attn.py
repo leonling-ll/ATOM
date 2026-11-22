@@ -781,7 +781,11 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
         splits = v.attn_splits or (
             32
             if n <= 16
-            else 16 if n <= 32 else 8 if n <= 64 else 4 if n <= 128 else 2 if n <= 256 else 1
+            else (
+                16
+                if n <= 32
+                else 8 if n <= 64 else 4 if n <= 128 else 2 if n <= 256 else 1
+            )
         )
 
         day0 = (

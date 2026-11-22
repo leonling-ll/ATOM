@@ -1389,9 +1389,21 @@ class TestValidFirst:
         sel = K.select_logical(sc, c.pos, k)
         out = torch.zeros(c.T, H * VD, dtype=DT, device=DEV)
         K.attention(
-            c.q, c.kc4, c.bt, c.seq, c.pos, sel, out, D**-0.5, splits, nblk=2,
-            k_scale=c.ks, valid_first=True,
+            c.q,
+            c.kc4,
+            c.bt,
+            c.seq,
+            c.pos,
+            sel,
+            out,
+            D**-0.5,
+            splits,
+            nblk=2,
+            k_scale=c.ks,
+            valid_first=True,
         )
         ref = torch.zeros_like(out)
-        K.attention(c.q, c.kc4, c.bt, c.seq, c.pos, sel, ref, D**-0.5, 1, nblk=2, k_scale=c.ks)
+        K.attention(
+            c.q, c.kc4, c.bt, c.seq, c.pos, sel, ref, D**-0.5, 1, nblk=2, k_scale=c.ks
+        )
         assert _close(out, ref)
