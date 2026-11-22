@@ -1208,7 +1208,9 @@ class TestKOnly:
         c = Case([150, 97], kv_dtype=kv, k_only=True)
         c.q, c.iq = c.run_prep()
         att = TestAttention()
-        got = att._run(c, None, 2, dense=dense, n_blocks=c.bt.shape[1] if dense else None)
+        got = att._run(
+            c, None, 2, dense=dense, n_blocks=c.bt.shape[1] if dense else None
+        )
         assert _close(got, att._ref(c, dense=dense))
 
     @pytest.mark.parametrize("width,k", [(40, 8), (1024, 128), (100, 128)])
@@ -1227,7 +1229,7 @@ class TestKOnly:
         score = torch.where((j[None, :] >= qb[:, None] - 2), 1e29, score)
         score = torch.where(j[None, :] <= qb[:, None], score, float("-inf"))
         sel = K.select_logical(score, pos, k)
-        rows, ctx = K.select_rows(score, bt, seq, pos, k)
+        rows, _ctx = K.select_rows(score, bt, seq, pos, k)
         assert sel.shape == (t, k) and sel.dtype == torch.int32
         for r in range(t):
             n = min(k, int(qb[r]) + 1)
@@ -1239,7 +1241,13 @@ class TestKOnly:
     def test_pool_holds_k_and_one_scale_plane(self):
         from atom.model_ops.attentions.mha_kv_pool import MhaKvPool
 
-        kw = dict(layers=2, block_size=PG, num_kv_heads=1, head_dim=D, kv_dtype=FP8)
+        kw = {
+            "layers": 2,
+            "block_size": PG,
+            "num_kv_heads": 1,
+            "head_dim": D,
+            "kv_dtype": FP8,
+        }
         shuffle = MhaKvPool(**kw)
         konly = MhaKvPool(**kw, layout=ProKOnlyLayout(FP8))
         assert [f.name for f in konly.cache_fields + konly.scale_fields] == [
@@ -1250,7 +1258,10 @@ class TestKOnly:
         konly.allocate(5, "cpu")
         k, v = konly.kv_views(1)
         assert tuple(k.shape) == (5, 1, 1, PG, D) and v is k
-        assert k[:, 0, 0].stride()[1:] == (D, 1)  # rows of 256 bytes, as day0 / moo read
+        assert k[:, 0, 0].stride()[1:] == (
+            D,
+            1,
+        )  # rows of 256 bytes, as day0 / moo read
         ks, vs = konly.scale_views(1)
         assert tuple(ks.shape) == (5, 1, PG) and vs is ks
 
@@ -1262,11 +1273,16 @@ class TestKOnly:
         rk = c.ref_prep()[1][:, 0]
         blk, off = c.slot // PG, c.slot % PG
         assert torch.equal(c.ks[blk, 0, off], torch.ones_like(c.ks[blk, 0, off]))
-        want = K.quant_fp8_rows(c.cached()[0], FP8, plain=True)[0]  # a fixed point of it
+        want = K.quant_fp8_rows(c.cached()[0], FP8, plain=True)[
+            0
+        ]  # a fixed point of it
         assert torch.equal(c.kc4[blk, 0, off], want)
         rtol = 1e-2 if BF16 else 1e-4
         got = c.cached()[0]
-        assert ((got - rk.float()).abs() <= rk.float().abs() * (1 / 16 + rtol) + 2**-9 + ATOL).all()
+        assert (
+            (got - rk.float()).abs()
+            <= rk.float().abs() * (1 / 16 + rtol) + 2**-9 + ATOL
+        ).all()
 
     @pytest.mark.skipif(
         not (GPU and K.day0_prefill_available()), reason="amd-kernels-day0 on a GPU"
@@ -1279,14 +1295,25 @@ class TestKOnly:
         nb = c.bt.shape[1]
         sel = None
         if not dense:
-            sc = K.scores(c.iq, c.ic, c.bt, c.seq, c.pos, nb, None, c.init, c.local, 1.0)
+            sc = K.scores(
+                c.iq, c.ic, c.bt, c.seq, c.pos, nb, None, c.init, c.local, 1.0
+            )
             sel = K.select_logical(sc, c.pos, K.TOPK)
         q16 = c.q[:, :16].contiguous()
         ref = torch.zeros(c.T, 16 * VD, dtype=DT, device=DEV)
         # the reference sees what day0 does: q cast to fp8
         K.attention(
-            q16.to(FP8).to(DT), c.kc4, c.bt, c.seq, c.pos, sel, ref, D**-0.5, 2,
-            n_blocks=nb if dense else None, k_scale=c.ks,
+            q16.to(FP8).to(DT),
+            c.kc4,
+            c.bt,
+            c.seq,
+            c.pos,
+            sel,
+            ref,
+            D**-0.5,
+            2,
+            n_blocks=nb if dense else None,
+            k_scale=c.ks,
         )
         got = torch.zeros_like(ref)
         K.attention_day0(q16, c.kc4, c.bt, c.seq, c.pos, sel, got, D**-0.5)
@@ -1310,7 +1337,9 @@ class TestNvfp4Index:
         d = K.nvfp4_dequant_rows(K.nvfp4_rows(x)).reshape(64, 8, 16)
         xg = x.float().reshape(64, 8, 16)
         step = xg.abs().amax(-1, keepdim=True) / 6  # the e2m1 grid's unit, up to e4m3
-        assert ((d - xg).abs() <= step * 1.13 + 1e-6).all()  # half of the widest gap (2)
+        assert (
+            (d - xg).abs() <= step * 1.13 + 1e-6
+        ).all()  # half of the widest gap (2)
 
     @needs_fp8
     def test_prep_writes_the_reference_rows(self):
@@ -1341,7 +1370,7 @@ class TestNvfp4Index:
         sc = DI**-0.5 if var else 1.0
         cq = c.impl.index_compress_query.data
         args = (c.bt, c.seq, c.pos, nb, cq, c.init, c.local, sc)
-        kw = dict(block_mode=mode, head_mode=head, pool_temp=DI**-0.5)
+        kw = {"block_mode": mode, "head_mode": head, "pool_temp": DI**-0.5}
         want = K.scores(c.iq, deq, *args, **kw)
         got = K.scores(c.iq, _nv_pages(rows), *args, **kw)
         assert torch.allclose(got, want, rtol=1e-4, atol=1e-4)
