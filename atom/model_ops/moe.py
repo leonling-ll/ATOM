@@ -3969,6 +3969,9 @@ class FusedMoE(torch.nn.Module):
         # Override weight padding alignment before create_weights consumes it.
         # Must happen here (pre-create_weights) — setting it on quant_method
         # after FusedMoE construction is a no-op since weights are already sized.
+        # Kept for the online-quant method swap, whose fresh method would
+        # otherwise size its weights with its own default.
+        self.pad_align_override = pad_align
         if pad_align is not None:
             self.quant_method.pad_align = pad_align
 
@@ -4428,6 +4431,8 @@ class FusedMoE(torch.nn.Module):
         self.moe_quant_params["params_dtype"] = online_quant_dtype
         # Target buffers must use real storage.
         self._stream_online_quant = False
+        if getattr(self, "pad_align_override", None) is not None:
+            self.quant_method.pad_align = self.pad_align_override
         with torch.device(device):
             self.quant_method.create_weights(layer=self, **self.moe_quant_params)
         if pinned_intermediate_pad is not None and hasattr(
