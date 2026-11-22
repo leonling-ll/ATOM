@@ -62,12 +62,15 @@ FP8_AMAX_FLOOR = 1e-6
 F8_FLOOR = tl.constexpr(FP8_AMAX_FLOOR)
 
 
-def quant_fp8_rows(x: torch.Tensor, dtype: torch.dtype):
+def quant_fp8_rows(x: torch.Tensor, dtype: torch.dtype, plain: bool = False):
     """Per-row fp8 quantization as ``prep`` does it: ``(q, scale)`` with
-    ``x ~= q * scale[:, None]``, ``scale = max(amax, floor) / fp8_max`` (fp32)."""
+    ``x ~= q * scale[:, None]``, ``scale = max(amax, floor) / fp8_max`` (fp32); ``plain``
+    the clamped cast, every scale 1.0 (``prep``'s ``k_unit``)."""
     fmax = torch.finfo(dtype).max
     xf = x.float()
     scale = xf.abs().amax(dim=-1).clamp(min=FP8_AMAX_FLOOR) / fmax
+    if plain:
+        scale = torch.ones_like(scale)
     q = (xf / scale.unsqueeze(-1)).clamp(-fmax, fmax).to(dtype)
     return q, scale
 
@@ -155,6 +158,7 @@ def _prep_kernel(
     WRITE_V: tl.constexpr,
     KV_FP8: tl.constexpr,
     IC_FP8: tl.constexpr,
+    K_UNIT: tl.constexpr,
 ):
     t = tl.program_id(0)
     OUT_DT = q_out_ptr.dtype.element_ty
@@ -215,6 +219,8 @@ def _prep_kernel(
                 tl.maximum(tl.max(tl.abs(lo_f)), tl.max(tl.abs(hi_f))), vmax
             )
             ksc = tl.maximum(kmax, F8_FLOOR) / fp8_max
+            if K_UNIT:  # a plain cast: what moo's / day0's kernels read
+                ksc = ksc * 0.0 + 1.0
             lo_k = _to_fp8(lo_f, ksc, fp8_max, KV_DT)
             hi_k = _to_fp8(hi_f, ksc, fp8_max, KV_DT)
             r0_k = _to_fp8(r0_f, ksc, fp8_max, KV_DT)
@@ -222,6 +228,8 @@ def _prep_kernel(
             tl.store(ks_ptr + blk * s_sb + off, ksc)
             if WRITE_V:
                 vsc = tl.maximum(vmax, F8_FLOOR) / fp8_max
+                if K_UNIT:
+                    vsc = vsc * 0.0 + 1.0
                 r0_v = _to_fp8(r0_f, vsc, fp8_max, KV_DT)
                 r1_v = _to_fp8(r1_f, vsc, fp8_max, KV_DT)
                 tl.store(vs_ptr + blk * s_sb + off, vsc)
@@ -329,6 +337,7 @@ def prep(
     vc4=None,
     k_scale=None,
     v_scale=None,
+    k_unit=False,
 ):
     """Norm + rope the raw projections and write K / V / index-K to the caches.
 
@@ -338,7 +347,8 @@ def prep(
     ``kc4`` is the K cache ``[N, D/x, page, x]``, ``vc4`` (optional) the V cache
     ``[N, page/x, 256, x]``, ``ic`` the index cache ``[N, page, 128]``. An fp8 ``kc4``
     takes the per-token dequant scales ``k_scale`` / ``v_scale`` ``[N, 1, page]``; an fp8
-    ``ic`` holds the keys cast (clamped to the fp8 range), unscaled.
+    ``ic`` holds the keys cast (clamped to the fp8 range), unscaled. ``k_unit``: an fp8 K /
+    V cache a plain cast too, its scales written 1.0.
     """
     qkv = _split_rows(qkv, heads)
     q, k, iq, ik = qkv
@@ -410,6 +420,7 @@ def prep(
         WRITE_V=write_v,
         KV_FP8=fp8,
         IC_FP8=ic_fp8,
+        K_UNIT=k_unit,
     )
     return q_out, iq_out
 
@@ -1278,5 +1289,46 @@ def attention_aiter(
         k_scale.unsqueeze(-1) if fp8 else None,
         v_scale.unsqueeze(-1) if fp8 else None,
         ps=True,
+    )
+    return out
+
+
+_day0_prefill = None  # amd-kernels-day0's fp8_sparse_prefill; False: not installed
+
+
+def day0_prefill_available() -> bool:
+    """Whether amd-kernels-day0's FlyDSL sparse prefill (``attention_day0``) imports."""
+    global _day0_prefill
+    if _day0_prefill is None:
+        try:
+            from amd_kernels.attention.fp8_sparse_prefill_gqa16_d256_v192_b16_top128.host import (
+                fp8_sparse_prefill,
+            )
+        except ImportError:
+            _day0_prefill = False
+        else:
+            _day0_prefill = fp8_sparse_prefill
+    return bool(_day0_prefill)
+
+
+def attention_day0(q, kc4, block_tables, seq_id, positions, sel, out, scale):
+    """``attention`` on amd-kernels-day0's FlyDSL fp8 sparse prefill, over the K-only cache
+    as a plain fp8 cast (``kc4`` ``[N, 1, page, 256]``): ``q`` ``[T, 16, 256]`` is cast to
+    fp8 as well. ``sel`` ``[T, 128]`` block ids, valid first and -1 after (``select_logical``),
+    or None: every causal block (at most 128)."""
+    t = q.shape[0]
+    if sel is None:
+        j = torch.arange(TOPK, device=q.device, dtype=torch.int32)
+        sel = torch.where(j[None, :] <= (positions // PAGE)[:, None], j[None, :], -1)
+        sel = sel.to(torch.int32)
+    _day0_prefill(
+        q.to(torch.float8_e4m3fn),
+        kc4[:, 0],
+        sel,
+        block_tables,
+        seq_id.to(torch.int32),
+        positions.to(torch.int32),
+        scale,
+        out.view(t, IDX_HEADS, VALUE_DIM),
     )
     return out

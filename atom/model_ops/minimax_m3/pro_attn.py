@@ -25,6 +25,7 @@ At most 2048 tokens (128 blocks of 16) selection is the identity, so short promp
 for the parts of the formulas the checkpoint does not pin down.
 """
 
+import functools
 import json
 import logging
 import os
@@ -165,6 +166,14 @@ class ProVariants:
     # The attention is then the Triton one. Read once, when the layers are built: the
     # pool's layout cannot change while it serves.
     k_only: bool = False
+    # An fp8 K cache as a plain (clamped) cast, its scale plane all 1.0: what moo's and
+    # amd-kernels-day0's kernels read. The normed K is O(1), within e4m3's range. Triton
+    # prep only (aiter's scales every row).
+    k_plain_fp8: bool = False
+    # The prefill attention of the K-only cache: "triton", or "day0" (amd-kernels-day0's
+    # FlyDSL fp8_sparse_prefill; needs k_plain_fp8, 16 local heads and the package, else
+    # "triton").
+    prefill_attn: str = "triton"
 
 
 _variants = ProVariants()
@@ -526,10 +535,10 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
         if kc4.element_size() == 1:
             from atom.model_ops.minimax_m3.pro_kernels import quant_fp8_rows
 
-            kr, ksc = quant_fp8_rows(kr, kc4.dtype)
+            kr, ksc = quant_fp8_rows(kr, kc4.dtype, plain=v.k_plain_fp8)
             layer.k_scale[blk, 0, off] = ksc
             if write_v:
-                vr, vsc = quant_fp8_rows(vr, kc4.dtype)
+                vr, vsc = quant_fp8_rows(vr, kc4.dtype, plain=v.k_plain_fp8)
                 layer.v_scale[blk, 0, off] = vsc
         kc4[blk, :, off, :] = kr.reshape(n, d // x, x)
         if write_v:
@@ -624,7 +633,11 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
     # ------------------------------------------------------------ kernel path --
     @staticmethod
     def _aiter_prep(v: ProVariants) -> bool:
-        return v.prep == "aiter" and pro_kernels.aiter_prep_available()
+        return (
+            v.prep == "aiter"
+            and not v.k_plain_fp8
+            and pro_kernels.aiter_prep_available()
+        )
 
     def _aiter_attn(self, v: ProVariants) -> bool:
         """aiter's paged attention, which reads a V cache: not on the K-only one."""
@@ -718,7 +731,7 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
         else:
             ratio = (1.0 if v.mscale == "hf" else float(v.mscale)) / aiter_m
         eps = self.q_norm.variance_epsilon
-        prep = pro_kernels.prep
+        prep = functools.partial(pro_kernels.prep, k_unit=fp8 and v.k_plain_fp8)
         if self._aiter_prep(v):
             if pro_kernels.prep_aiter_fits(qkv, self.num_heads):
                 prep = pro_kernels.prep_aiter
@@ -753,7 +766,23 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
             8 if n <= 16 else 4 if n <= 64 else 2 if n <= 256 else 1
         )
 
+        day0 = (
+            not static
+            and v.prefill_attn == "day0"
+            and self.k_only
+            and fp8
+            and v.k_plain_fp8
+            and v.topk == "fused"  # its picks: valid first, -1 after (select_logical)
+            and self.num_heads == 16
+            and self.topk == pro_kernels.TOPK
+            and pro_kernels.day0_prefill_available()
+        )
+
         def attend(sel, rows=None):
+            if day0:
+                return pro_kernels.attention_day0(
+                    q, kc4, block_tables, seq_id, positions, sel, out, scale
+                )
             if aiter_attn:
                 if rows is None:
                     rows = pro_kernels.sparse_rows(

@@ -160,6 +160,7 @@ class Case:
             vc4=self.vc4,
             k_scale=self.ks,
             v_scale=self.vs,
+            k_unit=getattr(self, "k_unit", False),
         )
 
     def seq_slice(self, s):
@@ -1252,3 +1253,41 @@ class TestKOnly:
         assert k[:, 0, 0].stride()[1:] == (D, 1)  # rows of 256 bytes, as day0 / moo read
         ks, vs = konly.scale_views(1)
         assert tuple(ks.shape) == (5, 1, PG) and vs is ks
+
+    @needs_fp8
+    def test_plain_fp8_k_is_the_clamped_cast(self):
+        c = Case([150, 97], seed=4, kv_dtype=FP8, k_only=True)
+        c.k_unit = True
+        c.q, c.iq = c.run_prep()
+        rk = c.ref_prep()[1][:, 0]
+        blk, off = c.slot // PG, c.slot % PG
+        assert torch.equal(c.ks[blk, 0, off], torch.ones_like(c.ks[blk, 0, off]))
+        want = K.quant_fp8_rows(c.cached()[0], FP8, plain=True)[0]  # a fixed point of it
+        assert torch.equal(c.kc4[blk, 0, off], want)
+        rtol = 1e-2 if BF16 else 1e-4
+        got = c.cached()[0]
+        assert ((got - rk.float()).abs() <= rk.float().abs() * (1 / 16 + rtol) + 2**-9 + ATOL).all()
+
+    @pytest.mark.skipif(
+        not (GPU and K.day0_prefill_available()), reason="amd-kernels-day0 on a GPU"
+    )
+    @pytest.mark.parametrize("dense", [False, True])
+    def test_day0_prefill_matches_the_triton_attention(self, dense):
+        c = Case([300, 197], topk=K.TOPK, seed=6, kv_dtype=FP8, k_only=True)
+        c.k_unit = True
+        c.q, c.iq = c.run_prep()
+        nb = c.bt.shape[1]
+        sel = None
+        if not dense:
+            sc = K.scores(c.iq, c.ic, c.bt, c.seq, c.pos, nb, None, c.init, c.local, 1.0)
+            sel = K.select_logical(sc, c.pos, K.TOPK)
+        q16 = c.q[:, :16].contiguous()
+        ref = torch.zeros(c.T, 16 * VD, dtype=DT, device=DEV)
+        # the reference sees what day0 does: q cast to fp8
+        K.attention(
+            q16.to(FP8).to(DT), c.kc4, c.bt, c.seq, c.pos, sel, ref, D**-0.5, 2,
+            n_blocks=nb if dense else None, k_scale=c.ks,
+        )
+        got = torch.zeros_like(ref)
+        K.attention_day0(q16, c.kc4, c.bt, c.seq, c.pos, sel, got, D**-0.5)
+        assert _close(got, ref)
