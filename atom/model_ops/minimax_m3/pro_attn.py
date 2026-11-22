@@ -148,7 +148,9 @@ class ProVariants:
     attn_fp8_compute: bool = True
     # The kernels' block selection: "torch" (torch.topk over the block table's width),
     # "aiter" (aiter's per-row top-k over each token's causal blocks only) or, for the
-    # "aiter" attention, "fused": selection and page tables in one kernel (select_rows).
+    # "aiter" attention, "fused": selection and page tables in one kernel (select_rows),
+    # "split": the same tables with each row split over several programs
+    # (select_rows_split; its cost follows the context, not the block table's width).
     topk: str = "torch"
     # Kernel launch shape: programs per token over the selected blocks (0: by batch size)
     # and blocks per step.
@@ -596,7 +598,7 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
             and (
                 v.topk in ("torch", "aiter")
                 or (
-                    v.topk == "fused"
+                    v.topk in ("fused", "split")
                     and v.attn == "aiter"
                     and self.topk & (self.topk - 1) == 0
                 )
@@ -763,10 +765,13 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
             pool_temp=v.pool_scale,
         )
         k = min(self.topk, nb)
-        if v.topk == "fused" and k & (k - 1) == 0:
-            return attend(
-                None, pro_kernels.select_rows(score, block_tables, seq_id, positions, k)
+        if v.topk in ("fused", "split") and k & (k - 1) == 0:
+            select = (
+                pro_kernels.select_rows_split
+                if v.topk == "split"
+                else pro_kernels.select_rows
             )
+            return attend(None, select(score, block_tables, seq_id, positions, k))
         if v.topk == "aiter":
             sel = pro_kernels.select_blocks(score, positions, k)
         else:

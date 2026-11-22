@@ -1096,7 +1096,50 @@ def select_blocks(score, positions, k):
     return sel
 
 
-_NEG_INF_KEY = tl.constexpr(-2139095041)  # _select_rows_kernel's key of a -inf score
+_NEG_INF_KEY = tl.constexpr(-2139095041)  # the sort key of a -inf score
+
+
+@triton.jit
+def _block_keys(score_row, start, hi, W: tl.constexpr, K: tl.constexpr):
+    """The ``K`` best sort keys, descending, of blocks ``[start, start + W)`` below ``hi``
+    (the others score -inf): the fp32 bits as an int ordered like the floats, the block
+    index (reversed: the lower wins a tie) below them, so all keys are distinct."""
+    j = start + tl.arange(0, W)
+    s = tl.load(score_row + j, mask=j < hi, other=float("-inf"))
+    b = s.to(tl.int32, bitcast=True)
+    key = (b ^ ((b >> 31) & 0x7FFFFFFF)).to(tl.int64)
+    return tl.topk((key << 32) | (0x7FFFFFFF - j).to(tl.int64), K)
+
+
+@triton.jit
+def _store_rows(
+    top,
+    t,
+    seq,
+    qpos,
+    bt_ptr,
+    stride_bt,
+    rows_ptr,
+    stride_rows,
+    ctx_ptr,
+    K: tl.constexpr,
+    PG: tl.constexpr,
+):
+    """A token's page table from its ``K`` best keys, as ``_rows_kernel``: the full
+    blocks in key order, the token's own block last, cut by the context length."""
+    qb = qpos // PG
+    jj = (0x7FFFFFFF - (top & 0x7FFFFFFF)).to(tl.int32)
+    valid = (top >> 32) > _NEG_INF_KEY  # fewer than K causal blocks leave -inf ones in
+    full = (valid & (jj < qb)).to(tl.int32)
+    n_full = tl.sum(full, axis=0)
+    has_tail = tl.sum((valid & (jj == qb)).to(tl.int32), axis=0)
+    slot = tl.where(full > 0, tl.cumsum(full, axis=0) - full, n_full)
+    phys = tl.load(bt_ptr + seq * stride_bt + jj, mask=valid, other=0)
+    e = tl.arange(0, K)
+    rbase = rows_ptr + t.to(tl.int64) * stride_rows
+    tl.store(rbase + slot, phys, mask=valid)
+    tl.store(rbase + e, tl.zeros_like(e), mask=e >= n_full + has_tail)
+    tl.store(ctx_ptr + t, n_full * PG + has_tail * (qpos - qb * PG + 1))
 
 
 @triton.jit
@@ -1118,33 +1161,11 @@ def _select_rows_kernel(
     t = tl.program_id(0)
     seq = tl.load(seq_ptr + t)
     qpos = tl.load(pos_ptr + t)
-    qb = qpos // PG
-    j = tl.arange(0, BW)
-    s = tl.load(
-        score_ptr + t.to(tl.int64) * stride_s + j,
-        mask=(j < NB) & (j <= qb),
-        other=float("-inf"),
+    hi = tl.minimum(qpos // PG + 1, NB)
+    top = _block_keys(score_ptr + t.to(tl.int64) * stride_s, 0, hi, BW, K)
+    _store_rows(
+        top, t, seq, qpos, bt_ptr, stride_bt, rows_ptr, stride_rows, ctx_ptr, K, PG
     )
-    # fp32 bits as an int ordered like the floats, the block index (reversed: the lower
-    # wins a tie) below them: K distinct keys
-    b = s.to(tl.int32, bitcast=True)
-    key = (b ^ ((b >> 31) & 0x7FFFFFFF)).to(tl.int64)
-    top = tl.topk((key << 32) | (BW - 1 - j).to(tl.int64), K)
-    jj = BW - 1 - top.to(tl.int32)
-    valid = (
-        top >> 32
-    ) > _NEG_INF_KEY  # a causal block: fewer than K leave -inf ones in
-    full = (valid & (jj < qb)).to(tl.int32)
-    n_full = tl.sum(full, axis=0)
-    has_tail = tl.sum((valid & (jj == qb)).to(tl.int32), axis=0)
-    # as _rows_kernel: the token's own block last, cut by the context length
-    slot = tl.where(full > 0, tl.cumsum(full, axis=0) - full, n_full)
-    phys = tl.load(bt_ptr + seq * stride_bt + jj, mask=valid, other=0)
-    e = tl.arange(0, K)
-    rbase = rows_ptr + t.to(tl.int64) * stride_rows
-    tl.store(rbase + slot, phys, mask=valid)
-    tl.store(rbase + e, tl.zeros_like(e), mask=e >= n_full + has_tail)
-    tl.store(ctx_ptr + t, n_full * PG + has_tail * (qpos - qb * PG + 1))
 
 
 def select_rows(score, block_tables, seq_id, positions, k, num_warps=8):
@@ -1171,6 +1192,227 @@ def select_rows(score, block_tables, seq_id, positions, k, num_warps=8):
         PG=PAGE,
         num_warps=num_warps,
     )
+    return rows, ctx
+
+
+@triton.jit
+def _span_keys(score_row, lo, hi, K: tl.constexpr, CHUNK: tl.constexpr):
+    """The ``K`` best keys of blocks ``[lo, hi)`` (``hi > lo``), a ``CHUNK`` at a time;
+    a range of at most ``4K`` blocks is sorted at the narrowest width that holds it."""
+    n = hi - lo
+    if n <= K:
+        best = _block_keys(score_row, lo, hi, K, K)
+    elif n <= 2 * K:
+        best = _block_keys(score_row, lo, hi, 2 * K, K)
+    elif n <= 4 * K:
+        best = _block_keys(score_row, lo, hi, 4 * K, K)
+    else:
+        best = _block_keys(score_row, lo, hi, CHUNK, K)
+        for start in range(lo + CHUNK, hi, CHUNK):
+            tile = _block_keys(score_row, start, hi, CHUNK, K)
+            best = tl.topk(tl.reshape(tl.join(best, tile), (2 * K,)), K)
+    return best
+
+
+@triton.jit
+def _merge_keys(base, count, K: tl.constexpr, VOLATILE: tl.constexpr):
+    """The ``K`` best of the ``count`` (a multiple of ``K``) partial keys at ``base``."""
+    e = tl.arange(0, K)
+    best = tl.load(base + e, volatile=VOLATILE)
+    for start in range(K, count, K):
+        tile = tl.load(base + start + e, volatile=VOLATILE)
+        best = tl.topk(tl.reshape(tl.join(best, tile), (2 * K,)), K)
+    return best
+
+
+@triton.jit(do_not_specialize=["stride_s", "stride_bt", "stride_rows", "NB"])
+def _select_split_kernel(
+    score_ptr,
+    stride_s,
+    bt_ptr,
+    stride_bt,
+    seq_ptr,
+    pos_ptr,
+    rows_ptr,
+    stride_rows,
+    ctx_ptr,
+    part_ptr,  # [T, P, K] int64 scratch
+    count_ptr,  # [T] int32 arrivals, zero between calls (FUSED only)
+    NB,
+    SPAN: tl.constexpr,
+    K: tl.constexpr,
+    CHUNK: tl.constexpr,
+    PG: tl.constexpr,
+    FUSED: tl.constexpr,
+    IS_HIP: tl.constexpr,
+):
+    t = tl.program_id(0)
+    part = tl.program_id(1)
+    qpos = tl.load(pos_ptr + t)
+    hi = tl.minimum(qpos // PG + 1, NB)
+    lo = part * SPAN
+    if lo >= hi:  # past the token's causal blocks: the cost follows the context
+        return
+    score_row = score_ptr + t.to(tl.int64) * stride_s
+    seq = tl.load(seq_ptr + t)
+    if hi <= SPAN:  # one span holds them all: no merge
+        best = _span_keys(score_row, 0, hi, K, CHUNK)
+        _store_rows(
+            best, t, seq, qpos, bt_ptr, stride_bt, rows_ptr, stride_rows, ctx_ptr, K, PG
+        )
+        return
+    best = _span_keys(score_row, lo, tl.minimum(lo + SPAN, hi), K, CHUNK)
+    base = part_ptr + t.to(tl.int64) * tl.num_programs(1) * K
+    tl.store(base + part * K + tl.arange(0, K), best)
+    if FUSED:
+        # the release publishes this span's keys; the last arrival acquires every
+        # span's, merges them and rearms the counter. On AMD the barrier waits on LDS
+        # only, so each wave drains its own stores first.
+        if IS_HIP:
+            tl.inline_asm_elementwise(
+                "s_waitcnt vmcnt(0)", "=r,r", [t], dtype=tl.int32, is_pure=False, pack=1
+            )
+        tl.debug_barrier()
+        spans = tl.cdiv(hi, SPAN)
+        arrival = tl.atomic_add(count_ptr + t, 1, sem="acq_rel", scope="gpu")
+        if arrival == spans - 1:
+            best = _merge_keys(base, spans * K, K, True)
+            _store_rows(
+                best,
+                t,
+                seq,
+                qpos,
+                bt_ptr,
+                stride_bt,
+                rows_ptr,
+                stride_rows,
+                ctx_ptr,
+                K,
+                PG,
+            )
+            tl.atomic_xchg(count_ptr + t, 0, sem="relaxed", scope="gpu")
+
+
+@triton.jit(do_not_specialize=["stride_bt", "stride_rows", "NB", "P"])
+def _select_merge_kernel(
+    bt_ptr,
+    stride_bt,
+    seq_ptr,
+    pos_ptr,
+    rows_ptr,
+    stride_rows,
+    ctx_ptr,
+    part_ptr,
+    NB,
+    P,
+    SPAN: tl.constexpr,
+    K: tl.constexpr,
+    PG: tl.constexpr,
+):
+    t = tl.program_id(0)
+    qpos = tl.load(pos_ptr + t)
+    hi = tl.minimum(qpos // PG + 1, NB)
+    if hi <= SPAN:  # written by the span kernel
+        return
+    best = _merge_keys(
+        part_ptr + t.to(tl.int64) * P * K, tl.cdiv(hi, SPAN) * K, K, False
+    )
+    seq = tl.load(seq_ptr + t)
+    _store_rows(
+        best, t, seq, qpos, bt_ptr, stride_bt, rows_ptr, stride_rows, ctx_ptr, K, PG
+    )
+
+
+# Grow-only scratch per (device, stream, kind): a captured graph keeps the addresses it
+# ran with, and the arrival counters must not be shared by concurrent streams.
+_split_buffers: dict[tuple, list[torch.Tensor]] = {}
+
+
+def _split_buffer(kind, numel, dtype, device):
+    stream = (
+        torch.cuda.current_stream(device).cuda_stream if device.type == "cuda" else 0
+    )
+    bufs = _split_buffers.setdefault((device, stream, kind), [])
+    if not bufs or bufs[-1].numel() < numel:
+        bufs.append(
+            torch.zeros(triton.next_power_of_2(numel), dtype=dtype, device=device)
+        )
+    return bufs[-1]
+
+
+def select_rows_split(
+    score,
+    block_tables,
+    seq_id,
+    positions,
+    k,
+    parts=None,
+    chunk=1024,
+    fused=None,
+    num_warps=4,
+):
+    """``select_rows``' tables (bit for bit), each row's causal blocks split into ``parts``
+    spans that separate programs reduce to their ``k`` best, merged per row by the last
+    span program to finish (``fused``, default up to 16 rows) or a second launch. Spans
+    past a row's blocks exit at once, so the cost follows the context, not ``score``'s
+    width; the grid depends only on the shapes, so a graph can hold it. Any width (block
+    ids below 2**31)."""
+    assert k & (k - 1) == 0 and chunk >= 4 * k and chunk & (chunk - 1) == 0, (k, chunk)
+    t, nb = score.shape
+    dev = score.device
+    rows = torch.empty(t, k, dtype=torch.int32, device=dev)
+    ctx = torch.empty(t, dtype=torch.int32, device=dev)
+    if t == 0:
+        return rows, ctx
+    chunks = triton.cdiv(nb, chunk)
+    if parts is None:  # about two programs per CU over the batch; whole chunks each
+        parts = max(1, min(chunks, triton.cdiv(512, t)))
+    span = triton.cdiv(chunks, parts) * chunk
+    parts = triton.cdiv(nb, span)
+    if fused is None:
+        # fusing saves the merge launch, but every span program's device-scope release
+        # costs more than that beyond a few rows
+        fused = t <= 16
+    part = _split_buffer("part", t * parts * k, torch.int64, dev)
+    count = _split_buffer("count", t, torch.int32, dev)
+    _select_split_kernel[(t, parts)](
+        score,
+        score.stride(0),
+        block_tables,
+        block_tables.stride(0),
+        seq_id,
+        positions,
+        rows,
+        rows.stride(0),
+        ctx,
+        part,
+        count,
+        nb,
+        SPAN=span,
+        K=k,
+        CHUNK=chunk,
+        PG=PAGE,
+        FUSED=fused,
+        IS_HIP=dev.type == "cuda" and torch.version.hip is not None,
+        num_warps=num_warps,
+    )
+    if not fused and parts > 1:
+        _select_merge_kernel[(t,)](
+            block_tables,
+            block_tables.stride(0),
+            seq_id,
+            positions,
+            rows,
+            rows.stride(0),
+            ctx,
+            part,
+            nb,
+            parts,
+            SPAN=span,
+            K=k,
+            PG=PAGE,
+            num_warps=num_warps,
+        )
     return rows, ctx
 
 

@@ -641,8 +641,9 @@ class TestSelectRows:
     of each row (any order of the full ones, the token's own block last), scores as
     ``scores`` writes them: pins finite, future blocks -inf."""
 
+    @pytest.mark.parametrize("select", ["select_rows", "select_rows_split"])
     @pytest.mark.parametrize("width,k", [(40, 8), (1024, 128), (100, 128)])
-    def test_against_topk_and_the_rows_rule(self, width, k):
+    def test_against_topk_and_the_rows_rule(self, width, k, select):
         g = torch.Generator(device=DEV).manual_seed(1)
         t, s = 37, 5
         bt = (
@@ -662,7 +663,7 @@ class TestSelectRows:
         score[:, 0] = 1e30
         score = torch.where((j[None, :] >= qb[:, None] - 2), 1e29, score)
         score = torch.where(j[None, :] <= qb[:, None], score, float("-inf"))
-        rows, ctx = K.select_rows(score, bt, seq, pos, k)
+        rows, ctx = getattr(K, select)(score, bt, seq, pos, k)
         assert rows.shape == (t, k) and rows.dtype == ctx.dtype == torch.int32
         for r in range(t):
             n, q = int(qb[r]) + 1, int(qb[r])
@@ -676,16 +677,120 @@ class TestSelectRows:
             assert not any(got[len(full) + 1 :]), r
             assert int(ctx[r]) == len(full) * PG + int(pos[r]) % PG + 1, r
 
-    def test_ties_go_to_the_lower_block(self):
+    @pytest.mark.parametrize("select", ["select_rows", "select_rows_split"])
+    def test_ties_go_to_the_lower_block(self, select):
         score = torch.zeros(1, 16, device=DEV)
         score[0, 15] = 1.0
         bt = torch.arange(16, dtype=torch.int32, device=DEV)[None] + 100
         pos = torch.tensor([15 * PG], device=DEV)
-        rows, ctx = K.select_rows(
+        rows, ctx = getattr(K, select)(
             score, bt, torch.zeros(1, dtype=torch.long, device=DEV), pos, 4
         )
         assert sorted(rows[0, :3].tolist()) == [100, 101, 102] and rows[0, 3] == 115
         assert ctx.tolist() == [3 * PG + 1]
+
+
+class TestSelectRowsSplit:
+    """``select_rows_split`` writes ``select_rows``' tables bit for bit, however a row is
+    split, merged or wide, and reads none of a row's scores past its own block."""
+
+    @staticmethod
+    def _case(t, width, seed, ties=False):
+        g = torch.Generator(device=DEV).manual_seed(seed)
+        bt = torch.randint(1, 1 << 20, (3, width), generator=g, device=DEV).to(
+            torch.int32
+        )
+        seq = torch.randint(0, 3, (t,), generator=g, device=DEV)
+        pos = torch.randint(0, width * PG, (t,), generator=g, device=DEV)
+        pos[0], pos[-1] = width * PG - 1, 3  # the widest row and a one-block one
+        j = torch.arange(width, device=DEV)
+        qb = pos // PG
+        if ties:  # a few distinct values: most picks are decided by the block index
+            score = torch.randint(-2, 3, (t, width), generator=g, device=DEV).float()
+            score[:, 1::7] = float("-inf")  # causal -inf blocks are never picked
+        else:
+            score = torch.randn(t, width, generator=g, device=DEV)
+        score[:, :1] = 1e30
+        score = torch.where(j[None, :] >= qb[:, None] - 2, 1e29, score)
+        # what scores writes past the token is never read: garbage must not change a pick
+        score = torch.where(j[None, :] <= qb[:, None], score, float("nan"))
+        return score, bt, seq, pos
+
+    @pytest.mark.parametrize("ties", [False, True])
+    @pytest.mark.parametrize(
+        "t,width,k,chunk,parts,fused",
+        [
+            (5, 40, 8, 32, 1, None),  # one span, looped chunks
+            (5, 40, 8, 32, 2, True),
+            (5, 40, 8, 32, 2, False),
+            (3, 300, 8, 32, None, True),  # a span program per chunk
+            (19, 300, 8, 32, 4, False),
+            (19, 300, 8, 64, 3, None),
+            (4, 1000, 32, 128, None, None),
+            (2, 100, 128, 512, None, None),  # fewer blocks than k
+        ],
+    )
+    def test_equals_select_rows(self, t, width, k, chunk, parts, fused, ties):
+        score, bt, seq, pos = self._case(t, width, seed=t + width + k, ties=ties)
+        want = K.select_rows(
+            score.masked_fill(score.isnan(), float("-inf")), bt, seq, pos, k
+        )
+        got = K.select_rows_split(
+            score, bt, seq, pos, k, parts=parts, chunk=chunk, fused=fused
+        )
+        assert torch.equal(got[0], want[0]) and torch.equal(got[1], want[1])
+
+    def test_rearms_its_counters(self):
+        # the fused merge zeroes its arrival counters: a second call (a graph replay)
+        # selects alike
+        score, bt, seq, pos = self._case(3, 300, seed=9)
+        args = {"parts": None, "chunk": 32, "fused": True}
+        a = K.select_rows_split(score, bt, seq, pos, 8, **args)
+        b = K.select_rows_split(score, bt, seq, pos, 8, **args)
+        assert torch.equal(a[0], b[0]) and torch.equal(a[1], b[1])
+
+    @pytest.mark.skipif(not GPU, reason="wide rows take long in the interpreter")
+    @pytest.mark.parametrize("t", [1, 16, 64, 200])
+    @pytest.mark.parametrize("width", [1024, 8192, 65536])
+    def test_wide_rows_equal_select_rows(self, t, width):
+        score, bt, seq, pos = self._case(t, width, seed=t * width)
+        want = K.select_rows(
+            score.masked_fill(score.isnan(), float("-inf")), bt, seq, pos, 128
+        )
+        for fused in (True, False):
+            got = K.select_rows_split(score, bt, seq, pos, 128, fused=fused)
+            assert torch.equal(got[0], want[0]) and torch.equal(got[1], want[1])
+
+    @pytest.mark.skipif(not GPU, reason="CUDA graphs need a GPU")
+    @pytest.mark.parametrize("t", [4, 32])
+    def test_graph_replays_other_rows(self, t):
+        # captured once over a wide table, replayed for other scores and positions: the
+        # spans past each row exit, the fused merge's counters are rearmed every replay
+        score, bt, seq, pos = self._case(t, 8192, seed=t)
+        s_buf, p_buf = score.clone(), pos.clone()
+        side = torch.cuda.Stream()
+        side.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(side):
+            K.select_rows_split(s_buf, bt, seq, p_buf, 128)
+        torch.cuda.current_stream().wait_stream(side)
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g):
+            out = K.select_rows_split(s_buf, bt, seq, p_buf, 128)
+        for seed in (1, 2):
+            sc, _, _, po = self._case(t, 8192, seed=100 + seed)
+            po[1] = 8192 * PG - 1 - seed  # keep a long row in the batch
+            sc = torch.where(
+                torch.arange(8192, device=DEV)[None, :] <= (po // PG)[:, None],
+                sc.masked_fill(sc.isnan(), 0.5),
+                float("nan"),
+            )
+            s_buf.copy_(sc), p_buf.copy_(po)
+            g.replay()
+            want = K.select_rows(
+                sc.masked_fill(sc.isnan(), float("-inf")), bt, seq, po, 128
+            )
+            torch.cuda.synchronize()
+            assert torch.equal(out[0], want[0]) and torch.equal(out[1], want[1])
 
 
 class TestAttentionAiter:
@@ -959,10 +1064,11 @@ class TestImplGlue:
     def test_fused_selection_matches_the_torch_reference(self, variant, monkeypatch):
         # select_rows takes a power-of-two k: 8 > the 5 blocks init 2 + local 3 force
         c = Case([150, 97], topk=8, seed=3)
-        v, seen, out = self._run(
-            c, variant, {"topk": "fused", "attn": "aiter"}, monkeypatch
-        )
-        assert _close(out, self._reference(c, v, seen))
+        for topk in ("fused", "split"):
+            v, seen, out = self._run(
+                c, variant, {"topk": topk, "attn": "aiter"}, monkeypatch
+            )
+            assert _close(out, self._reference(c, v, seen))
 
     @needs_fp8
     @pytest.mark.parametrize("attn", ["triton", "aiter"])
@@ -978,12 +1084,13 @@ class TestImplGlue:
             ("aiter", "torch"),
             ("aiter", "aiter"),
             ("aiter", "fused"),
+            ("aiter", "split"),
         ],
     )
     def test_static_decode_equals_the_dynamic_path(self, attn, topk, monkeypatch):
         # decode as a graph runs it: the last token of each sequence plus a padding row
         # (slot -1), over a block table wider than any sequence, selection throughout
-        c = Case([150, 97], topk=8 if topk == "fused" else 6, seed=3)
+        c = Case([150, 97], topk=8 if topk in ("fused", "split") else 6, seed=3)
         kw = {"attn": attn, "topk": topk}
         _, _, out = self._run(c, {}, kw, monkeypatch)
         caches = [t.clone() for t in (c.kc4, c.vc4, c.ic)]
@@ -1017,13 +1124,16 @@ class TestImplGlue:
             ("aiter", "torch"),
             ("aiter", "aiter"),
             ("aiter", "fused"),
+            ("aiter", "split"),
         ],
     )
     def test_decode_graph_replays_another_batch(self, attn, topk):
         # the static path captured over fixed buffers (a graph's decode), replayed for
         # other sequences at other positions plus a padding row; the token -> sequence
         # map comes from the metadata as in ATOM, whose capture reuses its warmup's
-        c = Case([1500, 970, 610, 200], topk=64 if topk == "fused" else 40, seed=5)
+        c = Case(
+            [1500, 970, 610, 200], topk=64 if topk in ("fused", "split") else 40, seed=5
+        )
         kw = {"attn": attn, "topk": topk}
         v = ProVariants(**kw)
         m = self._impl_with_rope(c, v)
