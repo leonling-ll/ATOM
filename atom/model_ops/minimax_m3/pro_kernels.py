@@ -62,12 +62,15 @@ FP8_AMAX_FLOOR = 1e-6
 F8_FLOOR = tl.constexpr(FP8_AMAX_FLOOR)
 
 
-def quant_fp8_rows(x: torch.Tensor, dtype: torch.dtype):
+def quant_fp8_rows(x: torch.Tensor, dtype: torch.dtype, plain: bool = False):
     """Per-row fp8 quantization as ``prep`` does it: ``(q, scale)`` with
-    ``x ~= q * scale[:, None]``, ``scale = max(amax, floor) / fp8_max`` (fp32)."""
+    ``x ~= q * scale[:, None]``, ``scale = max(amax, floor) / fp8_max`` (fp32); ``plain``
+    the clamped cast, every scale 1.0 (``prep``'s ``k_unit``)."""
     fmax = torch.finfo(dtype).max
     xf = x.float()
     scale = xf.abs().amax(dim=-1).clamp(min=FP8_AMAX_FLOOR) / fmax
+    if plain:
+        scale = torch.ones_like(scale)
     q = (xf / scale.unsqueeze(-1)).clamp(-fmax, fmax).to(dtype)
     return q, scale
 
@@ -75,6 +78,92 @@ def quant_fp8_rows(x: torch.Tensor, dtype: torch.dtype):
 @triton.jit
 def _to_fp8(x, scale, fp8_max, DT: tl.constexpr):
     return tl.minimum(tl.maximum(x / scale, -fp8_max), fp8_max).to(DT)
+
+
+# An NVFP4 index row (``--index-cache-dtype nvfp4``): 128 e2m1 (64 B, the low nibble the
+# even dim) and 8 e4m3 scales, one per 16 dims, no global scale; a page of PAGE tokens is
+# [PAGE x 64 B data | PAGE x 8 B scales]. Quantized as vLLM's ``_quant4``: the scale
+# e4m3(min(amax * RN(1/6), 448)), the elements x / that scale (decoded), RNE to e2m1.
+NV_DATA_BYTES = IDX_DIM // 2
+NV_SCALE_BYTES = IDX_DIM // 16
+NV_ROW_BYTES = NV_DATA_BYTES + NV_SCALE_BYTES
+NV_RCP6 = tl.constexpr(0.1666666716337204)  # RN(1/6) in fp32 (0x3E2AAAAB)
+
+
+@triton.jit
+def _nvfp4_store(x, G: tl.constexpr, data_ptr, scale_ptr):
+    """``x`` ``[1, 16 G]`` (fp32 of bf16 values): its G groups' 8 G packed e2m1 bytes at
+    ``data_ptr``, their G e4m3 scale bytes at ``scale_ptr``."""
+    xg = tl.reshape(x, (G, 16))
+    sf = tl.minimum(tl.max(tl.abs(xg), axis=1) * NV_RCP6, 448.0)
+    s8 = sf.to(tl.float8e4nv)
+    sv = s8.to(tl.float32)
+    y = xg * tl.where(sv != 0.0, 1.0 / sv, 0.0)[:, None]
+    a = tl.abs(y)
+    # RNE onto 0, .5, 1, 1.5, 2, 3, 4, 6: a tie goes to the even code
+    c = (
+        (a > 0.25).to(tl.int32)
+        + (a >= 0.75).to(tl.int32)
+        + (a > 1.25).to(tl.int32)
+        + (a >= 1.75).to(tl.int32)
+        + (a > 2.5).to(tl.int32)
+        + (a >= 3.5).to(tl.int32)
+        + (a > 5.0).to(tl.int32)
+    )
+    c = tl.where(y < 0, c + 8, c)
+    ev, od = tl.split(tl.reshape(c, (G * 8, 2)))
+    tl.store(data_ptr + tl.arange(0, G * 8), (ev | (od << 4)).to(tl.uint8))
+    tl.store(scale_ptr + tl.arange(0, G), s8.to(tl.uint8, bitcast=True))
+
+
+@triton.jit
+def _nvfp4_rows(dat, sc, R: tl.constexpr):
+    """``[R, 128]`` fp32 index keys from their ``[R, 64]`` e2m1 bytes and ``[R, 8]`` e4m3
+    scale bytes."""
+    c = tl.reshape(tl.join((dat & 15).to(tl.int32), (dat >> 4).to(tl.int32)), (R, 128))
+    e = (c >> 1) & 3
+    m = (c & 1).to(tl.float32)
+    mag = tl.where(e == 0, 0.5 * m, (1.0 + 0.5 * m) * tl.exp2((e - 1).to(tl.float32)))
+    v = tl.where((c & 8) != 0, -mag, mag)
+    s = sc.to(tl.float8e4nv, bitcast=True).to(tl.float32)
+    return tl.reshape(tl.reshape(v, (R, 8, 16)) * s[:, :, None], (R, 128))
+
+
+def nvfp4_rows(x: torch.Tensor) -> torch.Tensor:
+    """The torch reference of an NVFP4 index row: ``[..., 128]`` -> the ``[..., 72]`` uint8
+    row ``prep`` writes (64 data bytes, 8 scale bytes)."""
+    xg = x.float().reshape(*x.shape[:-1], 8, 16)
+    sf = (xg.abs().amax(-1) * 0.1666666716337204).clamp(max=448.0)
+    s8 = sf.to(torch.float8_e4m3fn)
+    sv = s8.float()
+    y = xg * torch.where(sv != 0, 1.0 / sv, torch.zeros_like(sv)).unsqueeze(-1)
+    a = y.abs()
+    c = sum(
+        (op(a, t)).int()
+        for op, t in (
+            (torch.gt, 0.25),
+            (torch.ge, 0.75),
+            (torch.gt, 1.25),
+            (torch.ge, 1.75),
+            (torch.gt, 2.5),
+            (torch.ge, 3.5),
+            (torch.gt, 5.0),
+        )
+    )
+    c = torch.where(y < 0, c + 8, c).reshape(*x.shape[:-1], 64, 2)
+    data = (c[..., 0] | (c[..., 1] << 4)).to(torch.uint8)
+    return torch.cat([data, s8.view(torch.uint8)], dim=-1)
+
+
+def nvfp4_dequant_rows(rows: torch.Tensor) -> torch.Tensor:
+    """``[..., 72]`` uint8 NVFP4 rows -> ``[..., 128]`` fp32."""
+    dat, sc = rows[..., :64].int(), rows[..., 64:]
+    c = torch.stack([dat & 15, dat >> 4], dim=-1).reshape(*rows.shape[:-1], 128)
+    e, m = (c >> 1) & 3, (c & 1).float()
+    mag = torch.where(e == 0, 0.5 * m, (1 + 0.5 * m) * torch.exp2((e - 1).float()))
+    v = torch.where((c & 8) != 0, -mag, mag).reshape(*rows.shape[:-1], 8, 16)
+    s = sc.view(torch.float8_e4m3fn).float().unsqueeze(-1)
+    return (v * s).reshape(*rows.shape[:-1], 128)
 
 
 # --------------------------------------------------------------------------- prep --
@@ -155,6 +244,8 @@ def _prep_kernel(
     WRITE_V: tl.constexpr,
     KV_FP8: tl.constexpr,
     IC_FP8: tl.constexpr,
+    K_UNIT: tl.constexpr,
+    IC_NV: tl.constexpr,
 ):
     t = tl.program_id(0)
     OUT_DT = q_out_ptr.dtype.element_ty
@@ -215,6 +306,8 @@ def _prep_kernel(
                 tl.maximum(tl.max(tl.abs(lo_f)), tl.max(tl.abs(hi_f))), vmax
             )
             ksc = tl.maximum(kmax, F8_FLOOR) / fp8_max
+            if K_UNIT:  # a plain cast: what moo's / day0's kernels read
+                ksc = ksc * 0.0 + 1.0
             lo_k = _to_fp8(lo_f, ksc, fp8_max, KV_DT)
             hi_k = _to_fp8(hi_f, ksc, fp8_max, KV_DT)
             r0_k = _to_fp8(r0_f, ksc, fp8_max, KV_DT)
@@ -222,6 +315,8 @@ def _prep_kernel(
             tl.store(ks_ptr + blk * s_sb + off, ksc)
             if WRITE_V:
                 vsc = tl.maximum(vmax, F8_FLOOR) / fp8_max
+                if K_UNIT:
+                    vsc = vsc * 0.0 + 1.0
                 r0_v = _to_fp8(r0_f, vsc, fp8_max, KV_DT)
                 r1_v = _to_fp8(r1_f, vsc, fp8_max, KV_DT)
                 tl.store(vs_ptr + blk * s_sb + off, vsc)
@@ -285,7 +380,14 @@ def _prep_kernel(
     lo, hi, r0, z1 = _norm_rope_rows(
         lo, hi, r0, z1, wl, wh, w0, tl.zeros([32], tl.float32), c, s, eps, D_IDX, OUT_DT
     )
-    if slot >= 0:
+    if IC_NV:  # [page x 64 B e2m1 | page x 8 B e4m3 scales] a block
+        if slot >= 0:
+            nd = ic_ptr + blk * ic_sb + off * 64
+            ns = ic_ptr + blk * ic_sb + PG * 64 + off * 8
+            _nvfp4_store(lo.to(tl.float32), 2, nd, ns)
+            _nvfp4_store(hi.to(tl.float32), 2, nd + 16, ns + 2)
+            _nvfp4_store(r0.to(tl.float32), 4, nd + 32, ns + 4)
+    elif slot >= 0:
         lo_i, hi_i, r0_i = lo, hi, r0
         if IC_FP8:  # a plain cast, as M3's fp8 index cache: the keys are normed
             IC_DT = ic_ptr.dtype.element_ty
@@ -329,6 +431,7 @@ def prep(
     vc4=None,
     k_scale=None,
     v_scale=None,
+    k_unit=False,
 ):
     """Norm + rope the raw projections and write K / V / index-K to the caches.
 
@@ -338,7 +441,8 @@ def prep(
     ``kc4`` is the K cache ``[N, D/x, page, x]``, ``vc4`` (optional) the V cache
     ``[N, page/x, 256, x]``, ``ic`` the index cache ``[N, page, 128]``. An fp8 ``kc4``
     takes the per-token dequant scales ``k_scale`` / ``v_scale`` ``[N, 1, page]``; an fp8
-    ``ic`` holds the keys cast (clamped to the fp8 range), unscaled.
+    ``ic`` holds the keys cast (clamped to the fp8 range), unscaled. ``k_unit``: an fp8 K /
+    V cache a plain cast too, its scales written 1.0.
     """
     qkv = _split_rows(qkv, heads)
     q, k, iq, ik = qkv
@@ -353,7 +457,8 @@ def prep(
     assert q.shape[-1] >= heads * HEAD_DIM and k.shape[-1] >= HEAD_DIM
     assert iq.shape[-1] >= IDX_HEADS * IDX_DIM and ik.shape[-1] >= IDX_DIM
     fp8 = kc4.element_size() == 1
-    ic_fp8 = ic.element_size() == 1
+    ic_nv = ic.dtype == torch.uint8  # NVFP4 rows, [N, page * 72]
+    ic_fp8 = ic.element_size() == 1 and not ic_nv
     write_v = vc4 is not None
     if write_v:
         assert vc4.dtype == kc4.dtype and vc4.stride(-1) == 1
@@ -410,6 +515,8 @@ def prep(
         WRITE_V=write_v,
         KV_FP8=fp8,
         IC_FP8=ic_fp8,
+        K_UNIT=k_unit,
+        IC_NV=ic_nv,
     )
     return q_out, iq_out
 
@@ -639,12 +746,14 @@ def _score_tile_kernel(
     HEAD_MODE: tl.constexpr,
     CAUSAL: tl.constexpr,
     STRIDE: tl.constexpr,
+    IC_NV: tl.constexpr,
 ):
     """_score_kernel's scores: BB blocks' keys in one [BB*PG, DI] tile. ``CAUSAL``: the
     blocks past a token are left unwritten (a program on them exits at once); with
     ``STRIDE`` a token's fewer programs stride over its causal tiles, else (and without
     ``CAUSAL``) one tile a program, future blocks -inf. A dynamic trip count slows the
     tile's code on long rows: ``STRIDE`` trades that for fewer programs on short ones.
+    ``IC_NV``: keys from NVFP4 pages.
     """
     t = tl.program_id(0)
     qpos = tl.load(pos_ptr + t)
@@ -674,14 +783,28 @@ def _score_tile_kernel(
             )
             ar_d = tl.arange(0, DI)
             ar_i = tl.arange(0, NI)
-            ik = tl.load(
-                ic_ptr
-                + phys[:, None] * ic_sb
-                + (r % PG)[:, None] * ic_so
-                + ar_d[None, :],
-                mask=live[:, None],
-                other=0.0,
-            )
+            if IC_NV:
+                pg = ic_ptr + phys[:, None] * ic_sb
+                dat = tl.load(
+                    pg + (r % PG)[:, None] * 64 + tl.arange(0, 64)[None, :],
+                    mask=live[:, None],
+                    other=0,
+                )
+                scb = tl.load(
+                    pg + PG * 64 + (r % PG)[:, None] * 8 + tl.arange(0, 8)[None, :],
+                    mask=live[:, None],
+                    other=0,
+                )
+                ik = _nvfp4_rows(dat, scb, BB * PG)
+            else:
+                ik = tl.load(
+                    ic_ptr
+                    + phys[:, None] * ic_sb
+                    + (r % PG)[:, None] * ic_so
+                    + ar_d[None, :],
+                    mask=live[:, None],
+                    other=0.0,
+                )
             iq = tl.load(
                 iq_ptr + t.to(tl.int64) * (NI * DI) + ar_i[:, None] * DI + ar_d[None, :]
             )
@@ -986,6 +1109,9 @@ def scores(
     t = iq.shape[0]
     out = torch.empty(t, nb, dtype=torch.float32, device=iq.device)
     assert ic.stride(-1) == 1 and (tiled or not causal)
+    nv = ic.dtype == torch.uint8
+    assert tiled or not nv, "NVFP4 index pages: the tiled scorer only"
+    assert not (tq and nv), "NVFP4 index pages: score_tq unsupported"
     if bb is None:
         bb = 4 if tiled and t <= 16 else 8
     if tq:
@@ -1024,7 +1150,11 @@ def scores(
         # 100k+ tokens at 16+ rows, a batch no KV pool here holds (MI355X)
         programs = min(tiles, programs or triton.cdiv(4096, t))
     grid = (t, programs if causal else tiles)
-    kw = {"CAUSAL": causal, "STRIDE": causal and programs < tiles} if tiled else {}
+    kw = (
+        {"CAUSAL": causal, "STRIDE": causal and programs < tiles, "IC_NV": nv}
+        if tiled
+        else {}
+    )
     (_score_tile_kernel if tiled else _score_kernel)[grid](
         iq,
         ic,
@@ -1086,6 +1216,8 @@ def _attn_kernel(
     NBLK: tl.constexpr,
     XK: tl.constexpr,
     KV_FP8: tl.constexpr,
+    VALID_FIRST: tl.constexpr = False,
+    EP2: tl.constexpr = 1,
 ):
     t = tl.program_id(0)
     sp = tl.program_id(1)
@@ -1112,8 +1244,20 @@ def _attn_kernel(
     acc2 = tl.zeros([16, 64], tl.float32)
     acc3 = tl.zeros([16, 64], tl.float32)
 
-    lo_i = sp * CHUNK
-    hi_i = tl.minimum(lo_i + CHUNK, n_entries)
+    if VALID_FIRST:
+        # the selection's valid blocks lead (select_logical): the splits share those,
+        # not the fixed width (a short context leaves most of it -1)
+        ep = tl.arange(0, EP2)
+        ids = tl.load(
+            sel_ptr + t.to(tl.int64) * stride_sel + ep, mask=ep < n_entries, other=-1
+        )
+        n_valid = tl.sum((ids >= 0).to(tl.int32), axis=0)
+        chunk = tl.cdiv(tl.cdiv(n_valid, SPLITS), NBLK) * NBLK
+        lo_i = sp * chunk
+        hi_i = tl.minimum(lo_i + chunk, n_valid)
+    else:
+        lo_i = sp * CHUNK
+        hi_i = tl.minimum(lo_i + CHUNK, n_entries)
     d = ar_c[:, None]
     for i in range(lo_i, hi_i, NBLK):
         e = i + ar_b
@@ -1134,13 +1278,17 @@ def _attn_kernel(
             kb + (d // XK) * k_sg + (d % XK), mask=vis[None, :], other=0.0
         )  # [64, TN]
         k1 = tl.load(
-            kb + ((64 + d) // XK) * k_sg + (d % XK), mask=vis[None, :], other=0.0
+            kb + ((64 + d) // XK) * k_sg + ((64 + d) % XK), mask=vis[None, :], other=0.0
         )
         k2 = tl.load(
-            kb + ((128 + d) // XK) * k_sg + (d % XK), mask=vis[None, :], other=0.0
+            kb + ((128 + d) // XK) * k_sg + ((128 + d) % XK),
+            mask=vis[None, :],
+            other=0.0,
         )
         k3 = tl.load(
-            kb + ((192 + d) // XK) * k_sg + (d % XK), mask=vis[None, :], other=0.0
+            kb + ((192 + d) // XK) * k_sg + ((192 + d) % XK),
+            mask=vis[None, :],
+            other=0.0,
         )
         if KV_FP8:  # per-token dequant; V is K's tail, so it shares K's scale here
             ksc = tl.load(ks_ptr + phys * s_sb + ar_o, mask=vis, other=0.0)[None, :]
@@ -1235,6 +1383,7 @@ def attention(
     nblk=4,
     n_blocks=None,
     k_scale=None,
+    valid_first=False,
 ):
     """Attention of every token's local heads over its selected blocks.
 
@@ -1242,7 +1391,8 @@ def attention(
     (``None``: dense, every block up to the token's own, ``n_blocks`` of them at most),
     ``out`` ``[T, H * 192]``. ``splits`` cuts the blocks over that many programs per token
     (for few tokens), ``nblk`` blocks are processed per step. An fp8 ``kc4`` takes its
-    per-token scales ``k_scale`` ``[N, 1, page]``.
+    per-token scales ``k_scale`` ``[N, 1, page]``. ``valid_first``: ``sel``'s valid blocks
+    lead each row (``select_logical``), and the splits divide those.
     """
     t, h, _ = q.shape
     assert h % 16 == 0 and kc4.stride(-1) == 1 and q.stride(-1) == 1
@@ -1291,6 +1441,8 @@ def attention(
         NBLK=nblk,
         XK=kc4.shape[-1],
         KV_FP8=fp8,
+        VALID_FIRST=valid_first and not dense,
+        EP2=triton.next_power_of_2(n_entries),
     )
     if splits > 1:
         _combine_kernel[(t, h)](
@@ -1425,14 +1577,23 @@ def _store_rows(
     ctx_ptr,
     K: tl.constexpr,
     PG: tl.constexpr,
+    LOGICAL: tl.constexpr = False,
 ):
     """A token's page table from its ``K`` best keys, as ``_rows_kernel``: the full
-    blocks in key order, the token's own block last, cut by the context length."""
+    blocks in key order, the token's own block last, cut by the context length.
+    ``LOGICAL``: the block ids themselves, best first, the valid ones leading and -1
+    after (no page table, no ``ctx``)."""
     qb = qpos // PG
     jj = (0x7FFFFFFF - (top & 0x7FFFFFFF)).to(tl.int32)
     valid = (top >> 32) > _NEG_INF_KEY  # fewer than K causal blocks leave -inf ones in
     # a key read back from the scratch must be one this launch wrote: a causal block
     tl.device_assert(~valid | ((jj >= 0) & (jj <= qb)), "selected block out of range")
+    if LOGICAL:
+        tl.store(
+            rows_ptr + t.to(tl.int64) * stride_rows + tl.arange(0, K),
+            tl.where(valid, jj, -1),
+        )
+        return
     full = (valid & (jj < qb)).to(tl.int32)
     n_full = tl.sum(full, axis=0)
     has_tail = tl.sum((valid & (jj == qb)).to(tl.int32), axis=0)
@@ -1460,6 +1621,7 @@ def _select_rows_kernel(
     K: tl.constexpr,
     BW: tl.constexpr,
     PG: tl.constexpr,
+    LOGICAL: tl.constexpr,
 ):
     t = tl.program_id(0)
     seq = tl.load(seq_ptr + t)
@@ -1467,7 +1629,18 @@ def _select_rows_kernel(
     hi = tl.minimum(qpos // PG + 1, NB)
     top = _block_keys(score_ptr + t.to(tl.int64) * stride_s, 0, hi, BW, K)
     _store_rows(
-        top, t, seq, qpos, bt_ptr, stride_bt, rows_ptr, stride_rows, ctx_ptr, K, PG
+        top,
+        t,
+        seq,
+        qpos,
+        bt_ptr,
+        stride_bt,
+        rows_ptr,
+        stride_rows,
+        ctx_ptr,
+        K,
+        PG,
+        LOGICAL,
     )
 
 
@@ -1493,6 +1666,7 @@ def select_rows(score, block_tables, seq_id, positions, k, num_warps=8):
         K=k,
         BW=max(triton.next_power_of_2(nb), k),
         PG=PAGE,
+        LOGICAL=False,
         num_warps=num_warps,
     )
     return rows, ctx
@@ -1548,6 +1722,7 @@ def _select_split_kernel(
     PG: tl.constexpr,
     FUSED: tl.constexpr,
     IS_HIP: tl.constexpr,
+    LOGICAL: tl.constexpr = False,
 ):
     t = tl.program_id(0)
     part = tl.program_id(1)
@@ -1561,7 +1736,18 @@ def _select_split_kernel(
     if hi <= SPAN:  # one span holds them all: no merge
         best = _span_keys(score_row, 0, hi, K, CHUNK)
         _store_rows(
-            best, t, seq, qpos, bt_ptr, stride_bt, rows_ptr, stride_rows, ctx_ptr, K, PG
+            best,
+            t,
+            seq,
+            qpos,
+            bt_ptr,
+            stride_bt,
+            rows_ptr,
+            stride_rows,
+            ctx_ptr,
+            K,
+            PG,
+            LOGICAL,
         )
         return
     best = _span_keys(score_row, lo, tl.minimum(lo + SPAN, hi), K, CHUNK)
@@ -1593,6 +1779,7 @@ def _select_split_kernel(
                 ctx_ptr,
                 K,
                 PG,
+                LOGICAL,
             )
             tl.atomic_xchg(count_ptr + t, 0, sem="relaxed", scope="gpu")
 
@@ -1612,6 +1799,7 @@ def _select_merge_kernel(
     SPAN: tl.constexpr,
     K: tl.constexpr,
     PG: tl.constexpr,
+    LOGICAL: tl.constexpr = False,
 ):
     t = tl.program_id(0)
     qpos = tl.load(pos_ptr + t)
@@ -1624,7 +1812,18 @@ def _select_merge_kernel(
     )
     seq = tl.load(seq_ptr + t)
     _store_rows(
-        best, t, seq, qpos, bt_ptr, stride_bt, rows_ptr, stride_rows, ctx_ptr, K, PG
+        best,
+        t,
+        seq,
+        qpos,
+        bt_ptr,
+        stride_bt,
+        rows_ptr,
+        stride_rows,
+        ctx_ptr,
+        K,
+        PG,
+        LOGICAL,
     )
 
 
@@ -1659,6 +1858,7 @@ def select_rows_split(
     chunk=1024,
     fused=None,
     num_warps=4,
+    logical=False,
 ):
     """``select_rows``' tables (bit for bit), each row's causal blocks split into ``parts``
     spans that separate programs reduce to their ``k`` best, merged per row by the last
@@ -1704,6 +1904,7 @@ def select_rows_split(
         PG=PAGE,
         FUSED=fused,
         IS_HIP=dev.type == "cuda" and torch.version.hip is not None,
+        LOGICAL=logical,
         num_warps=num_warps,
     )
     if not fused and parts > 1:
@@ -1721,9 +1922,40 @@ def select_rows_split(
             SPAN=span,
             K=k,
             PG=PAGE,
+            LOGICAL=logical,
             num_warps=num_warps,
         )
     return rows, ctx
+
+
+def select_logical(score, positions, k, num_warps=8, split=False):
+    """``select_rows``' selection as block ids, for the Triton attention: ``[T, k]`` int32,
+    best first, the token's valid (causal) blocks leading and -1 after. ``split``: by
+    ``select_rows_split`` (same ids; its cost follows the context, not the width)."""
+    assert k & (k - 1) == 0, k
+    if split:
+        # no page table in this mode: the positions stand in for the unread seq ids
+        return select_rows_split(score, score, positions, positions, k, logical=True)[0]
+    t, nb = score.shape
+    sel = torch.empty(t, k, dtype=torch.int32, device=score.device)
+    _select_rows_kernel[(t,)](
+        score,
+        score.stride(0),
+        sel,
+        0,
+        positions,
+        positions,
+        sel,
+        sel.stride(0),
+        sel,
+        nb,
+        K=k,
+        BW=max(triton.next_power_of_2(nb), k),
+        PG=PAGE,
+        LOGICAL=True,
+        num_warps=num_warps,
+    )
+    return sel
 
 
 _pa_decode = None  # aiter's paged-attention decode as ATOM wraps it (tests swap it)
@@ -1748,6 +1980,28 @@ def _default_partitions(t: int) -> int:
     return min(get_recommended_splits(t, 1), max(1, units // t))
 
 
+_gluon_value_rows = (
+    None  # aiter's pa_decode_gluon if it takes value_rows; False: it does not
+)
+
+
+def aiter_value_rows_available() -> bool:
+    """Whether this aiter's gluon paged attention reads V from the K cache's rows
+    (``pa_decode_gluon(value_rows=True)``): ``attention_aiter(k_rows=True)``."""
+    global _gluon_value_rows
+    if _gluon_value_rows is None:
+        import inspect
+
+        try:
+            from aiter.ops.triton.gluon.pa_decode_gluon import pa_decode_gluon
+        except ImportError:
+            _gluon_value_rows = False
+        else:
+            ok = "value_rows" in inspect.signature(pa_decode_gluon).parameters
+            _gluon_value_rows = pa_decode_gluon if ok else False
+    return bool(_gluon_value_rows)
+
+
 def attention_aiter(
     q,
     k_cache,
@@ -1761,6 +2015,7 @@ def attention_aiter(
     fp8_compute=True,
     partitions=None,
     value_dim=VALUE_DIM,
+    k_rows=False,
 ):
     """``attention`` on aiter's paged-attention decode (gluon, persistent dispatch), every
     token a sequence of its own over its ``sparse_rows`` table.
@@ -1768,14 +2023,48 @@ def attention_aiter(
     ``k_cache`` ``[N, 1, 256/x, page, x]`` and ``v_cache`` ``[N, 1, page/x, 256, x]`` are the
     5-D caches (V in the first ``value_dim`` rows), ``out`` ``[T, H * value_dim]``. An fp8
     cache takes its per-token scales ``[N, 1, page]``; ``fp8_compute`` runs the dots in fp8
-    as well.
+    as well. ``k_rows``: ``k_cache`` is the K-only row cache ``[N, 1, 1, page, 256]`` (no V
+    cache, ``v_cache`` / ``v_scale`` unused): aiter reads K through its SHUFFLE view and V
+    as the rows' last ``value_dim`` dims (``aiter_value_rows_available``).
     """
     t, h, _ = q.shape
     fp8 = k_cache.element_size() == 1
-    assert (k_scale is not None and v_scale is not None) or not fp8
+    assert (k_scale is not None and (v_scale is not None or k_rows)) or not fp8
     if partitions is None:
         partitions = _default_partitions(t)
     partitions = max(1, min(partitions, triton.cdiv(rows.shape[1] * PAGE, 256)))
+    if k_rows:
+        assert (
+            aiter_value_rows_available()
+        ), "this aiter's pa_decode_gluon has no value_rows"
+        n, sb, o = k_cache.shape[0], k_cache.stride(0), k_cache.storage_offset()
+        xk = 16 // k_cache.element_size()
+        k_view = k_cache.as_strided(
+            (n, 1, HEAD_DIM // xk, PAGE, xk), (sb, sb, xk, HEAD_DIM, 1), o
+        )
+        v_view = k_cache.as_strided(
+            (n, 1, PAGE, value_dim), (sb, sb, HEAD_DIM, 1), o + HEAD_DIM - value_dim
+        )
+        ks = k_scale.unsqueeze(-1) if fp8 else None
+        _gluon_value_rows(
+            out.view(t, h, value_dim),
+            q,
+            k_view,
+            v_view,
+            ctx,
+            rows,
+            scale,
+            1,
+            partitions,
+            256,
+            k_cache.dtype if (fp8 and fp8_compute) else q.dtype,
+            None,
+            ks,
+            ks,
+            ps=True,
+            value_rows=True,
+        )
+        return out
     _pa()(
         out.view(t, h, value_dim),
         q,
@@ -1794,3 +2083,45 @@ def attention_aiter(
         ps=True,
     )
     return out
+
+
+_day0_prefill = None  # amd-kernels-day0's fp8_sparse_prefill; False: not installed
+
+
+def day0_prefill_available() -> bool:
+    """Whether amd-kernels-day0's FlyDSL sparse prefill (``attention_day0``) imports."""
+    global _day0_prefill
+    if _day0_prefill is None:
+        try:
+            from amd_kernels.attention.fp8_sparse_prefill_gqa16_d256_v192_b16_top128.host import (
+                fp8_sparse_prefill,
+            )
+        except ImportError:
+            _day0_prefill = False
+        else:
+            _day0_prefill = fp8_sparse_prefill
+    return bool(_day0_prefill)
+
+
+def attention_day0(q, kc4, block_tables, seq_id, positions, sel, out, scale):
+    """``attention`` on amd-kernels-day0's FlyDSL fp8 sparse prefill, over the K-only cache
+    as a plain fp8 cast (``kc4`` ``[N, 1, page, 256]``): ``q`` ``[T, 16, 256]`` is cast to
+    fp8 as well. ``sel`` ``[T, 128]`` block ids, valid first and -1 after (``select_logical``),
+    or None: every causal block (at most 128)."""
+    t = q.shape[0]
+    if sel is None:
+        j = torch.arange(TOPK, device=q.device, dtype=torch.int32)
+        sel = torch.where(j[None, :] <= (positions // PAGE)[:, None], j[None, :], -1)
+        sel = sel.to(torch.int32)
+    _day0_prefill(
+        q.to(torch.float8_e4m3fn),
+        kc4[:, 0],
+        sel,
+        block_tables,
+        seq_id.to(torch.int32),
+        positions.to(torch.int32),
+        scale,
+        out.view(t, IDX_HEADS, VALUE_DIM),
+    )
+    return out
+                      

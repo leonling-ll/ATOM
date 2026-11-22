@@ -210,9 +210,9 @@ class MiniMaxM3ProAttention(nn.Module):
         index_cache_config: str = "auto",
     ) -> None:
         super().__init__()
-        if index_cache_config not in ("auto", "bf16", "fp8"):
+        if index_cache_config not in ("auto", "bf16", "fp8", "nvfp4"):
             raise NotImplementedError(
-                "MiniMax-M3-Pro keeps a bf16 or fp8 index cache, got "
+                "MiniMax-M3-Pro keeps a bf16, fp8 or nvfp4 index cache, got "
                 f"--index-cache-dtype {index_cache_config}"
             )
         sparse_cfg = config.sparse_attention_config

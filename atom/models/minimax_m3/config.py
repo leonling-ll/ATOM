@@ -127,6 +127,16 @@ def validate_runtime_config(config):
     kv, index = config.kv_cache_dtype, config.index_cache_dtype
     if kv not in FP4_CACHE_DTYPES and index not in FP4_CACHE_DTYPES:
         return
+    from atom.config import is_minimax_m3_pro_config
+
+    if (
+        index == "nvfp4"
+        and kv not in FP4_CACHE_DTYPES
+        and is_minimax_m3_pro_config(config.hf_config)
+    ):
+        # Pro's own NVFP4 index pages (16 tokens, ``pro_kernels``' Triton writer and
+        # scorer) beside its fp8 / bf16 KV: none of the FP4 attention's rules apply
+        return
     if is_plugin_mode():
         raise ValueError(
             "FP4 (MXFP4 / NVFP4) KV / index caches do not run under the "
