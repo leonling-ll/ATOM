@@ -1162,6 +1162,8 @@ def _store_rows(
     qb = qpos // PG
     jj = (0x7FFFFFFF - (top & 0x7FFFFFFF)).to(tl.int32)
     valid = (top >> 32) > _NEG_INF_KEY  # fewer than K causal blocks leave -inf ones in
+    # a key read back from the scratch must be one this launch wrote: a causal block
+    tl.device_assert(~valid | ((jj >= 0) & (jj <= qb)), "selected block out of range")
     full = (valid & (jj < qb)).to(tl.int32)
     n_full = tl.sum(full, axis=0)
     has_tail = tl.sum((valid & (jj == qb)).to(tl.int32), axis=0)
@@ -1295,6 +1297,7 @@ def _select_split_kernel(
         return
     best = _span_keys(score_row, lo, tl.minimum(lo + SPAN, hi), K, CHUNK)
     base = part_ptr + t.to(tl.int64) * tl.num_programs(1) * K
+    tl.device_assert(part < tl.num_programs(1), "span past the scratch")
     tl.store(base + part * K + tl.arange(0, K), best)
     if FUSED:
         # the release publishes this span's keys; the last arrival acquires every
@@ -1346,6 +1349,7 @@ def _select_merge_kernel(
     hi = tl.minimum(qpos // PG + 1, NB)
     if hi <= SPAN:  # written by the span kernel
         return
+    tl.device_assert(tl.cdiv(hi, SPAN) <= P, "more spans than the scratch holds")
     best = _merge_keys(
         part_ptr + t.to(tl.int64) * P * K, tl.cdiv(hi, SPAN) * K, K, False
     )
@@ -1357,6 +1361,10 @@ def _select_merge_kernel(
 
 # Grow-only scratch per (device, stream, kind): a captured graph keeps the addresses it
 # ran with, and the arrival counters must not be shared by concurrent streams.
+# shortcut: the counters' zeros are written when allocated, which a capture only records;
+# ATOM warms each graph's shape up eagerly on its capture stream first, so they never are
+# allocated in a capture there. A caller that captures first must replay that graph before
+# any other use of the stream's counters.
 _split_buffers: dict[tuple, list[torch.Tensor]] = {}
 
 

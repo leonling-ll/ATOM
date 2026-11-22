@@ -713,7 +713,7 @@ class TestSelectRowsSplit:
     split, merged or wide, and reads none of a row's scores past its own block."""
 
     @staticmethod
-    def _case(t, width, seed, ties=False):
+    def _case(t, width, seed, ties=False, ctx=None):
         g = torch.Generator(device=DEV).manual_seed(seed)
         bt = torch.randint(1, 1 << 20, (3, width), generator=g, device=DEV).to(
             torch.int32
@@ -721,6 +721,8 @@ class TestSelectRowsSplit:
         seq = torch.randint(0, 3, (t,), generator=g, device=DEV)
         pos = torch.randint(0, width * PG, (t,), generator=g, device=DEV)
         pos[0], pos[-1] = width * PG - 1, 3  # the widest row and a one-block one
+        if ctx is not None:  # a uniform decode batch, as the bench runs it
+            pos.fill_(ctx - 1)
         j = torch.arange(width, device=DEV)
         qb = pos // PG
         if ties:  # a few distinct values: most picks are decided by the block index
@@ -766,6 +768,56 @@ class TestSelectRowsSplit:
         a = K.select_rows_split(score, bt, seq, pos, 8, **args)
         b = K.select_rows_split(score, bt, seq, pos, 8, **args)
         assert torch.equal(a[0], b[0]) and torch.equal(a[1], b[1])
+
+    @staticmethod
+    def _poison_scratch():
+        """Fill every partial scratch with keys above any real one (a block id read back
+        from them is garbage); the arrival counters must be back at zero."""
+        for (_, _, kind), bufs in K._split_buffers.items():
+            for b in bufs:
+                if kind == "part":
+                    b.random_(1 << 62)
+                else:
+                    assert not b.any(), "an arrival counter was left armed"
+
+    # (rows, width, ctx) in the 004 bench order that faulted (a few rows over the whole
+    # table, then many rows with several spans each) and wider ones; the interpreter
+    # runs them scaled down (k 8 over chunks of 32 blocks: the same spans and merges)
+    SEQUENCE_GPU = (
+        (16, 8192, 131072),
+        (64, 8192, 1024),
+        (64, 8192, 8192),
+        (64, 8192, 32768),
+        (200, 8192, 32768),
+        (64, 8192, 131072),
+        (200, 8192, 131072),
+        (64, 65536, 32768),
+        (200, 65536, 131072),
+        (16, 65536, 1048576),
+    )
+    SEQUENCE_CPU = ((16, 256, 4096), (64, 256, 128), (64, 256, 2048), (40, 512, 8192))
+
+    @pytest.mark.parametrize("fused", [None, True, False])
+    def test_shape_sequence_over_garbage_scratch(self, fused):
+        k, chunk = (128, 1024) if GPU else (8, 32)
+        for i, (t, width, ctx) in enumerate(
+            self.SEQUENCE_GPU if GPU else self.SEQUENCE_CPU
+        ):
+            score, bt, seq, pos = self._case(t, width, seed=i, ctx=ctx)
+            want = K.select_rows(
+                score.masked_fill(score.isnan(), float("-inf")), bt, seq, pos, k
+            )
+            for _ in range(2):
+                self._poison_scratch()
+                got = K.select_rows_split(
+                    score, bt, seq, pos, k, chunk=chunk, fused=fused
+                )
+                assert torch.equal(got[0], want[0]) and torch.equal(got[1], want[1]), (
+                    t,
+                    width,
+                    ctx,
+                )
+        self._poison_scratch()
 
     @pytest.mark.skipif(not GPU, reason="wide rows take long in the interpreter")
     @pytest.mark.parametrize("t", [1, 16, 64, 200])
