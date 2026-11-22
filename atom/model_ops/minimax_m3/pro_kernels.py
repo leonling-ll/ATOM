@@ -751,8 +751,9 @@ def scores(
     ``tiled``: score ``bb`` blocks per dot (_score_tile_kernel; by default 4 for up to 16
     tokens, else 8) instead of one (_score_kernel). ``causal`` (tiled only): only each
     token's causal blocks are written -- all a selection that reads no further needs --
-    by ``programs`` a token (default: one a tile; the ones past the token exit at once,
-    fewer stride over its tiles), so the cost follows the context, not ``nb``."""
+    by ``programs`` a token (default: about 4096 over the batch; one a tile, or fewer
+    striding over its tiles; the ones past the token exit at once), so the cost follows
+    the context, not ``nb``."""
     t = iq.shape[0]
     out = torch.empty(t, nb, dtype=torch.float32, device=iq.device)
     assert ic.stride(-1) == 1 and (tiled or not causal)
@@ -760,9 +761,10 @@ def scores(
         bb = 4 if tiled and t <= 16 else 8
     tiles = triton.cdiv(nb, bb)
     if causal:
-        # a program a tile by default: striding (fewer programs) wins on short rows but
-        # loses up to a third on long ones (MI355X, 8192-block table)
-        programs = min(tiles, programs or tiles)
+        # about 4096 programs by default (a program a tile when that is fewer): striding
+        # saves the idle programs' cost on short rows and loses up to a third on rows of
+        # 100k+ tokens at 16+ rows, a batch no KV pool here holds (MI355X)
+        programs = min(tiles, programs or triton.cdiv(4096, t))
     grid = (t, programs if causal else tiles)
     kw = {"CAUSAL": causal, "STRIDE": causal and programs < tiles} if tiled else {}
     (_score_tile_kernel if tiled else _score_kernel)[grid](
@@ -1402,7 +1404,7 @@ def select_rows_split(
 ):
     """``select_rows``' tables (bit for bit), each row's causal blocks split into ``parts``
     spans that separate programs reduce to their ``k`` best, merged per row by the last
-    span program to finish (``fused``, default up to 16 rows) or a second launch. Spans
+    span program to finish (``fused``, the default) or a second launch. Spans
     past a row's blocks exit at once, so the cost follows the context, not ``score``'s
     width; the grid depends only on the shapes, so a graph can hold it. Any width (block
     ids below 2**31)."""
@@ -1419,9 +1421,10 @@ def select_rows_split(
     span = triton.cdiv(chunks, parts) * chunk
     parts = triton.cdiv(nb, span)
     if fused is None:
-        # fusing saves the merge launch, but every span program's device-scope release
-        # costs more than that beyond a few rows
-        fused = t <= 16
+        # fused saves the merge launch. Its device-scope releases outcost that only when
+        # many rows each span several programs, and a KV pool that fits 16+ rows of 16k+
+        # tokens is not one we have (a span is a 16k-token chunk past 32 rows)
+        fused = True
     part = _split_buffer("part", t * parts * k, torch.int64, dev)
     count = _split_buffer("count", t, torch.int32, dev)
     _select_split_kernel[(t, parts)](
