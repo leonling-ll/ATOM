@@ -162,14 +162,40 @@ def _servable_layer(moe):
     for name, shape in (
         ("w13_weight", (experts, 2 * inter, hidden // 2)),
         ("w2_weight", (experts, hidden, inter // 2)),
-        ("w13_weight_scale", (experts * 2 * inter, hidden // 32)),
-        ("w2_weight_scale", (experts * hidden, inter // 32)),
+        ("w13_weight_scale", _shuffled(experts * 2 * inter, hidden // 32)),
+        ("w2_weight_scale", _shuffled(experts * hidden, inter // 32)),
     ):
         value = torch.empty(shape, dtype=torch.uint8)
         value.is_shuffled = True
         setattr(layer, name, value)
     layer.sp_mega_moe = None
     return layer
+
+
+def _shuffled(rows, cols):
+    """aiter shuffle_scale's E8M0 layout: rows to 256, columns to 8."""
+    return (-(-rows // 256) * 256, -(-cols // 8) * 8)
+
+
+def test_scale_layout_is_aiters_shuffled_one(sp_modules):
+    """MiniMax-M3.1-Pro: inter 640 has 20 scale columns; shuffle_scale pads to 24."""
+    layer = _servable_layer(sp_modules.moe)
+    experts, hidden, inter = 5, 256, 640
+    vars(layer).update(intermediate_size_per_partition=inter)
+    for name, shape in (
+        ("w13_weight", (experts, 2 * inter, hidden // 2)),
+        ("w2_weight", (experts, hidden, inter // 2)),
+        ("w13_weight_scale", _shuffled(experts * 2 * inter, hidden // 32)),
+        ("w2_weight_scale", (experts * hidden, inter // 32)),
+    ):
+        value = torch.empty(shape, dtype=torch.uint8)
+        value.is_shuffled = True
+        setattr(layer, name, value)
+    assert "w2_weight_scale" in fusion._unsupported_layer(layer)
+    shape = _shuffled(experts * hidden, 20)
+    layer.w2_weight_scale = torch.empty(shape, dtype=torch.uint8)
+    assert layer.w2_weight_scale.shape[1] == 24
+    assert fusion._unsupported_layer(layer) is None
 
 
 def _pcp_group(monkeypatch, group):

@@ -95,11 +95,16 @@ def _unsupported_layer(layer, reduced=False):
     hidden = layer.hidden_size
     inter = layer.intermediate_size_per_partition
     experts = layer.local_num_experts
+    def shuffled(rows, cols):
+        # aiter's shuffle_scale pads E8M0 scales to 256 rows x 8 columns
+        # (MiniMax-M3.1-Pro: 640 / 32 = 20 -> 24)
+        return (-(-rows // 256) * 256, -(-cols // 8) * 8)
+
     for name, shape in (
         ("w13_weight", (experts, 2 * inter, hidden // 2)),
         ("w2_weight", (experts, hidden, inter // 2)),
-        ("w13_weight_scale", (experts * 2 * inter, hidden // 32)),
-        ("w2_weight_scale", (experts * hidden, inter // 32)),
+        ("w13_weight_scale", shuffled(experts * 2 * inter, hidden // 32)),
+        ("w2_weight_scale", shuffled(experts * hidden, inter // 32)),
     ):
         value = getattr(layer, name)
         if (
