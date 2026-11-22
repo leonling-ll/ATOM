@@ -946,9 +946,9 @@ def _attn_kernel(
     if VALID_FIRST:
         # the selection's valid blocks lead (select_logical): the splits share those,
         # not the fixed width (a short context leaves most of it -1)
-        e = tl.arange(0, EP2)
+        ep = tl.arange(0, EP2)
         ids = tl.load(
-            sel_ptr + t.to(tl.int64) * stride_sel + e, mask=e < n_entries, other=-1
+            sel_ptr + t.to(tl.int64) * stride_sel + ep, mask=ep < n_entries, other=-1
         )
         n_valid = tl.sum((ids >= 0).to(tl.int32), axis=0)
         chunk = tl.cdiv(tl.cdiv(n_valid, SPLITS), NBLK) * NBLK
