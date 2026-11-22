@@ -1382,6 +1382,26 @@ def _default_partitions(t: int) -> int:
     return min(get_recommended_splits(t, 1), max(1, units // t))
 
 
+_gluon_value_rows = None  # aiter's pa_decode_gluon if it takes value_rows; False: it does not
+
+
+def aiter_value_rows_available() -> bool:
+    """Whether this aiter's gluon paged attention reads V from the K cache's rows
+    (``pa_decode_gluon(value_rows=True)``): ``attention_aiter(k_rows=True)``."""
+    global _gluon_value_rows
+    if _gluon_value_rows is None:
+        import inspect
+
+        try:
+            from aiter.ops.triton.gluon.pa_decode_gluon import pa_decode_gluon
+        except ImportError:
+            _gluon_value_rows = False
+        else:
+            ok = "value_rows" in inspect.signature(pa_decode_gluon).parameters
+            _gluon_value_rows = pa_decode_gluon if ok else False
+    return bool(_gluon_value_rows)
+
+
 def attention_aiter(
     q,
     k_cache,
@@ -1395,6 +1415,7 @@ def attention_aiter(
     fp8_compute=True,
     partitions=None,
     value_dim=VALUE_DIM,
+    k_rows=False,
 ):
     """``attention`` on aiter's paged-attention decode (gluon, persistent dispatch), every
     token a sequence of its own over its ``sparse_rows`` table.
@@ -1402,14 +1423,46 @@ def attention_aiter(
     ``k_cache`` ``[N, 1, 256/x, page, x]`` and ``v_cache`` ``[N, 1, page/x, 256, x]`` are the
     5-D caches (V in the first ``value_dim`` rows), ``out`` ``[T, H * value_dim]``. An fp8
     cache takes its per-token scales ``[N, 1, page]``; ``fp8_compute`` runs the dots in fp8
-    as well.
+    as well. ``k_rows``: ``k_cache`` is the K-only row cache ``[N, 1, 1, page, 256]`` (no V
+    cache, ``v_cache`` / ``v_scale`` unused): aiter reads K through its SHUFFLE view and V
+    as the rows' last ``value_dim`` dims (``aiter_value_rows_available``).
     """
     t, h, _ = q.shape
     fp8 = k_cache.element_size() == 1
-    assert (k_scale is not None and v_scale is not None) or not fp8
+    assert (k_scale is not None and (v_scale is not None or k_rows)) or not fp8
     if partitions is None:
         partitions = _default_partitions(t)
     partitions = max(1, min(partitions, triton.cdiv(rows.shape[1] * PAGE, 256)))
+    if k_rows:
+        assert aiter_value_rows_available(), "this aiter's pa_decode_gluon has no value_rows"
+        n, sb, o = k_cache.shape[0], k_cache.stride(0), k_cache.storage_offset()
+        xk = 16 // k_cache.element_size()
+        k_view = k_cache.as_strided(
+            (n, 1, HEAD_DIM // xk, PAGE, xk), (sb, sb, xk, HEAD_DIM, 1), o
+        )
+        v_view = k_cache.as_strided(
+            (n, 1, PAGE, value_dim), (sb, sb, HEAD_DIM, 1), o + HEAD_DIM - value_dim
+        )
+        ks = k_scale.unsqueeze(-1) if fp8 else None
+        _gluon_value_rows(
+            out.view(t, h, value_dim),
+            q,
+            k_view,
+            v_view,
+            ctx,
+            rows,
+            scale,
+            1,
+            partitions,
+            256,
+            k_cache.dtype if (fp8 and fp8_compute) else q.dtype,
+            None,
+            ks,
+            ks,
+            ps=True,
+            value_rows=True,
+        )
+        return out
     _pa()(
         out.view(t, h, value_dim),
         q,

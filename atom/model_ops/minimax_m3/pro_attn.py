@@ -46,6 +46,10 @@ except ImportError:  # pragma: no cover
 logger = logging.getLogger("atom")
 
 _NEG_INF = float("-inf")
+# On the K-only cache aiter's gluon decode reads V from the K rows about 3 us a layer slower
+# than from a V cache, and the Triton attention wins up to 16 rows (opt/kv/test_vrows.py, MI355X:
+# bs1 16.0 vs 13.9 us, b16 16.1 vs 15.5, b32 at 8k 16.7 vs 20.7, b64 22.4 vs 30.3)
+_K_ROWS_AITER_MIN = 17
 # Forced blocks are pinned above every real score, init above local (as the M3
 # selector's 1e30 / 1e29): a block that is both ends up local.
 _PIN_INIT = 1e30
@@ -645,9 +649,13 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
         ic = self.index_cache
         return ic is not None and ic.dtype == torch.uint8
 
-    def _aiter_attn(self, v: ProVariants) -> bool:
-        """aiter's paged attention, which reads a V cache: not on the K-only one."""
-        return v.attn == "aiter" and not self.k_only
+    def _aiter_attn(self, v: ProVariants, n: int = _K_ROWS_AITER_MIN) -> bool:
+        """aiter's paged attention for ``n`` rows: on the K-only cache only where it reads V
+        from the K rows (``value_rows``), and from ``_K_ROWS_AITER_MIN`` rows up."""
+        return v.attn == "aiter" and (
+            not self.k_only
+            or (n >= _K_ROWS_AITER_MIN and pro_kernels.aiter_value_rows_available())
+        )
 
     def _use_kernels(self, v: ProVariants) -> bool:
         """Whether the Triton kernels cover this layer and these variants."""
@@ -726,7 +734,7 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
         fp8 = kc4.element_size() == 1
         ks = layer.k_scale if fp8 else None
         vs = layer.v_scale if fp8 and vc4 is not None else None
-        aiter_attn = self._aiter_attn(v)
+        aiter_attn = self._aiter_attn(v, n)
         n = positions.shape[0]
         rope = self.rotary_emb
         cos = rope.cos_cache.view(rope.cos_cache.shape[0], -1)
@@ -812,6 +820,7 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
                     k_scale=ks,
                     v_scale=vs,
                     fp8_compute=v.attn_fp8_compute,
+                    k_rows=self.k_only,
                 )
             return pro_kernels.attention(
                 q,
@@ -918,7 +927,11 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
         if self._use_kernels(v):
             layer = fwd.kv_cache_data[f"layer_{self.layer_num}"]
             prep_impl = "aiter" if self._aiter_prep(v) else "triton"
-            attn_impl = "aiter" if self._aiter_attn(v) else "triton"
+            attn_impl = (
+                ("aiter (K rows) past 16 rows, else triton" if self.k_only else "aiter")
+                if self._aiter_attn(v)
+                else "triton"
+            )
             logged = (attn_impl, prep_impl)
             if self.layer_num == 0 and getattr(self, "_logged_kernels", None) != logged:
                 self._logged_kernels = logged
