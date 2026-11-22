@@ -915,6 +915,8 @@ def _attn_kernel(
     NBLK: tl.constexpr,
     XK: tl.constexpr,
     KV_FP8: tl.constexpr,
+    VALID_FIRST: tl.constexpr = False,
+    EP2: tl.constexpr = 1,
 ):
     t = tl.program_id(0)
     sp = tl.program_id(1)
@@ -941,8 +943,20 @@ def _attn_kernel(
     acc2 = tl.zeros([16, 64], tl.float32)
     acc3 = tl.zeros([16, 64], tl.float32)
 
-    lo_i = sp * CHUNK
-    hi_i = tl.minimum(lo_i + CHUNK, n_entries)
+    if VALID_FIRST:
+        # the selection's valid blocks lead (select_logical): the splits share those,
+        # not the fixed width (a short context leaves most of it -1)
+        e = tl.arange(0, EP2)
+        ids = tl.load(
+            sel_ptr + t.to(tl.int64) * stride_sel + e, mask=e < n_entries, other=-1
+        )
+        n_valid = tl.sum((ids >= 0).to(tl.int32), axis=0)
+        chunk = tl.cdiv(tl.cdiv(n_valid, SPLITS), NBLK) * NBLK
+        lo_i = sp * chunk
+        hi_i = tl.minimum(lo_i + chunk, n_valid)
+    else:
+        lo_i = sp * CHUNK
+        hi_i = tl.minimum(lo_i + CHUNK, n_entries)
     d = ar_c[:, None]
     for i in range(lo_i, hi_i, NBLK):
         e = i + ar_b
@@ -1068,6 +1082,7 @@ def attention(
     nblk=4,
     n_blocks=None,
     k_scale=None,
+    valid_first=False,
 ):
     """Attention of every token's local heads over its selected blocks.
 
@@ -1075,7 +1090,8 @@ def attention(
     (``None``: dense, every block up to the token's own, ``n_blocks`` of them at most),
     ``out`` ``[T, H * 192]``. ``splits`` cuts the blocks over that many programs per token
     (for few tokens), ``nblk`` blocks are processed per step. An fp8 ``kc4`` takes its
-    per-token scales ``k_scale`` ``[N, 1, page]``.
+    per-token scales ``k_scale`` ``[N, 1, page]``. ``valid_first``: ``sel``'s valid blocks
+    lead each row (``select_logical``), and the splits divide those.
     """
     t, h, _ = q.shape
     assert h % 16 == 0 and kc4.stride(-1) == 1 and q.stride(-1) == 1
@@ -1124,6 +1140,8 @@ def attention(
         NBLK=nblk,
         XK=kc4.shape[-1],
         KV_FP8=fp8,
+        VALID_FIRST=valid_first and not dense,
+        EP2=triton.next_power_of_2(n_entries),
     )
     if splits > 1:
         _combine_kernel[(t, h)](

@@ -784,6 +784,8 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
             and pro_kernels.day0_prefill_available()
         )
 
+        valid_first = False  # set where the selection is select_logical's
+
         def attend(sel, rows=None):
             if day0:
                 return pro_kernels.attention_day0(
@@ -820,6 +822,7 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
                 nblk=nblk,
                 n_blocks=nb if sel is None else None,
                 k_scale=ks,
+                valid_first=valid_first,
             )
 
         if v.dense_only or (nb <= self.topk and not static):
@@ -860,6 +863,7 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
         k = min(self.topk, nb)
         if v.topk == "fused" and k & (k - 1) == 0:
             if not aiter_attn:
+                valid_first = True
                 return attend(pro_kernels.select_logical(score, positions, k))
             return attend(
                 None, pro_kernels.select_rows(score, block_tables, seq_id, positions, k)

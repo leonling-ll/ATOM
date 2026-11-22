@@ -1374,3 +1374,24 @@ class TestNvfp4Index:
         want = K.scores(c.iq, deq, *args, **kw)
         got = K.scores(c.iq, _nv_pages(rows), *args, **kw)
         assert torch.allclose(got, want, rtol=1e-4, atol=1e-4)
+
+
+class TestValidFirst:
+    """``attention(valid_first=True)`` over ``select_logical``'s rows (valid blocks first):
+    the splits share each row's valid blocks; the same output as the reference."""
+
+    @pytest.mark.parametrize("splits", [1, 3, 8])
+    def test_matches_the_reference(self, case, splits):
+        c = case
+        nb = c.bt.shape[1]
+        sc = K.scores(c.iq, c.ic, c.bt, c.seq, c.pos, nb, None, c.init, c.local, 1.0)
+        k = 1 << (min(c.topk, nb) - 1).bit_length() >> 1 or 1
+        sel = K.select_logical(sc, c.pos, k)
+        out = torch.zeros(c.T, H * VD, dtype=DT, device=DEV)
+        K.attention(
+            c.q, c.kc4, c.bt, c.seq, c.pos, sel, out, D**-0.5, splits, nblk=2,
+            k_scale=c.ks, valid_first=True,
+        )
+        ref = torch.zeros_like(out)
+        K.attention(c.q, c.kc4, c.bt, c.seq, c.pos, sel, ref, D**-0.5, 1, nblk=2, k_scale=c.ks)
+        assert _close(out, ref)
