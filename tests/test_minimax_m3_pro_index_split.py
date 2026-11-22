@@ -217,3 +217,51 @@ def test_plan_splits_long_selecting_prefills_once_a_forward(monkeypatch):
 def test_plan_declines(monkeypatch, n_tok, ctx, prefill, on):
     plan, _ = _plan(monkeypatch, n_tok, ctx, prefill, index_split=on)
     assert plan is None
+
+
+# ---- query-blocked scoring (ProVariants.score_tq) ------------------------------------
+QMODES = {**MODES, "max/sum": (K.BLOCK_TOKMAX, K.HEAD_SUM, 1.0)}
+
+
+def _scores(b, mode, tq):
+    block, head, sc = QMODES[mode]
+    return K.scores(
+        b.iq, b.ic, b.bt, b.seq, b.pos, b.nb, b.cq, 1, 2, sc,
+        block_mode=block, head_mode=head, pool_temp=DI**-0.5, tq=tq,
+    )  # fmt: skip
+
+
+@pytest.mark.parametrize("mode", list(QMODES))
+@pytest.mark.parametrize("tq", [2, 8])
+def test_query_blocked_scores_equal_the_row_kernel(mode, tq):
+    """Tiles inside one sequence share the keys; tiles across sequences (and the ragged
+    last one) score row by row: both as _score_tile_kernel does, and so is the selection.
+    """
+    b = _batch(CHUNKS, seed=5)
+    ref, got = _scores(b, mode, 0), _scores(b, mode, tq)
+    assert torch.equal(torch.isinf(ref), torch.isinf(got))
+    assert torch.equal(ref >= 1e29, got >= 1e29)  # the same pins
+    fin = torch.isfinite(ref)
+    assert torch.allclose(got[fin], ref[fin], rtol=1e-5, atol=1e-5)
+    k = 4
+    assert all(
+        torch.equal(x, y)
+        for x, y in zip(
+            K.select_rows(ref, b.bt, b.seq, b.pos, k),
+            K.select_rows(got, b.bt, b.seq, b.pos, k),
+        )
+    )
+
+
+def test_query_blocked_scores_ignore_unwritten_slots():
+    """Keys past a chunk's last token (unwritten slots) are NaN here: they only reach the
+    rows' own (pinned) or future blocks, as in _score_tile_kernel."""
+    b = _batch([(150, 150)], seed=6)
+    last = int(b.pos[-1])
+    blk, off = b.bt[0, last // PG], last % PG
+    b.ic[blk, off + 1 :] = float("nan")
+    for mode in QMODES:
+        ref, got = _scores(b, mode, 0), _scores(b, mode, 4)
+        assert not torch.isnan(got).any() and torch.equal(
+            torch.isinf(ref), torch.isinf(got)
+        )

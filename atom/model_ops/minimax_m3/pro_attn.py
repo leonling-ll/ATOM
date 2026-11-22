@@ -171,6 +171,9 @@ class ProVariants:
     # No effect: index q and k share one packed GEMM (index_qk_proj), so every row's
     # index q is computed; kept so variants files that set it still parse.
     index_split_proj: bool = True
+    # Prefill scores ``score_tq`` rows per program (a power of two; 0: one): the rows of a
+    # sequence read each tile of block keys once, one dot for all their query heads.
+    score_tq: int = 0
 
 
 # Below it the all-gather costs more than the scoring it saves (moo's threshold).
@@ -805,6 +808,7 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
             pool_temp=v.pool_scale,
             # torch.topk reads the whole width; the others only each token's causal blocks
             causal=v.topk != "torch",
+            tq=0 if static else v.score_tq,
         )
         # select_rows_split matches select_rows bit for bit; its cost follows the context
         select = (
