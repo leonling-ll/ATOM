@@ -280,14 +280,30 @@ def _ar_worker(tp, rank, init_method, bench):
     comm._ar_1stage_override = None
 
     # ProVariants.ar_lamport_rows: Lamport all-reduce + add_rmsnorm_mxfp8 (needs
-    # AITER_CUSTOM_AR_DISABLE_LAMPORT unset; else the helper keeps the fused route)
+    # AITER_CUSTOM_AR_DISABLE_LAMPORT unset; else the helper keeps the fused route).
+    # Not bit for bit: the Lamport kernel sums in rank order and the separate norm rounds
+    # on its own, so a bf16 output may move by one ulp (and its MXFP8 code with it).
     for m in AR_M:
         if m > 64:
             continue
         x = _rows(m, HIDDEN, seed=1000 * rank + m)
         res = _rows(m, HIDDEN, seed=m + 7)
         h = fused_allreduce_gemma_rms_norm_mxfp8(x, res, norm, lamport_rows=64)
-        check("atom-helper lamport", m, ref(x, res), (h[0], h[3], h[1], h[2]))
+        want, got = ref(x, res), (h[0], h[3], h[1], h[2])
+        ulp_ok = all(
+            torch.allclose(a.float(), b.float(), rtol=2**-7, atol=0)
+            for a, b in zip(want[:2], got[:2])
+        )
+        bytes_off = [_diff(a, b) for a, b in zip(want, got)]
+        rows.append(
+            {
+                "case": "atom-helper lamport (1 ulp)",
+                "m": m,
+                "route": "fused",
+                "bytes_off": bytes_off,
+                "diff": 0 if ulp_ok and bytes_off[2] <= m * HIDDEN // 1000 else 1,
+            }
+        )
 
     # CUDA graphs: the registered-buffer path of the custom all-reduce
     for m in (1, 4, 16, 32, 64):
