@@ -1026,7 +1026,9 @@ class _TargetCreationReached(Exception):
     ],
     ids=["replica-still-empty", "base-unloaded", "fused-shared-unloaded"],
 )
-@pytest.mark.parametrize("staged", [False, True], ids=["loaded-shared", "staged-shared"])
+@pytest.mark.parametrize(
+    "staged", [False, True], ids=["loaded-shared", "staged-shared"]
+)
 def test_nvfp4_moe_global_scale_check_skips_eplb_redundant_replicas(
     monkeypatch, w13_scale_2, w2_scale_2, error, match, staged
 ):
