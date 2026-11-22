@@ -1200,7 +1200,7 @@ class TestKOnly:
             assert torch.equal(ko.ks, sh.ks)
         used = torch.zeros(ko.kc4.shape[0], dtype=torch.bool, device=DEV)
         used[ko.slot // PG] = True
-        assert not ko.kc4[~used].any()
+        assert not ko.kc4[~used].view(torch.uint8).any()
 
     @pytest.mark.parametrize("kv", [None, pytest.param(FP8, marks=needs_fp8)])
     @pytest.mark.parametrize("dense", [False, True])
