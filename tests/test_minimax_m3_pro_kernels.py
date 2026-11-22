@@ -33,6 +33,7 @@ import triton.language as tl
 from atom.model_ops.layernorm import GemmaRMSNorm
 from atom.model_ops.minimax_m3 import pro_kernels as K
 from atom.model_ops.minimax_m3.pro_attn import (
+    ProKOnlyLayout,
     ProSparseAttentionImpl,
     ProVariants,
 )
@@ -64,7 +65,15 @@ def _impl(topk, init, local):
 
 class Case:
     def __init__(
-        self, seq_lens, topk=4, init=1, local=2, seed=0, kv_dtype=None, ic_dtype=None
+        self,
+        seq_lens,
+        topk=4,
+        init=1,
+        local=2,
+        seed=0,
+        kv_dtype=None,
+        ic_dtype=None,
+        k_only=False,
     ):
         g = torch.Generator().manual_seed(seed)
         self.lens, self.topk, self.init, self.local = seq_lens, topk, init, local
@@ -89,14 +98,20 @@ class Case:
         )
         kvdt = kv_dtype or DT
         self.fp8 = kvdt.itemsize == 1
-        self.x = 16 if self.fp8 else X  # ATOM's shuffle: 16 bytes
+        # ATOM's shuffle packs 16 bytes; the K-only page is row-major (x = 256), no V
+        self.x = D if k_only else 16 if self.fp8 else X
         self.kc4 = torch.zeros(total, D // self.x, PG, self.x, dtype=kvdt, device=DEV)
-        self.vc4 = torch.zeros(total, PG // self.x, D, self.x, dtype=kvdt, device=DEV)
+        self.vc4 = (
+            None
+            if k_only
+            else torch.zeros(total, PG // self.x, D, self.x, dtype=kvdt, device=DEV)
+        )
         scales = lambda: torch.zeros(total, 1, PG, device=DEV) if self.fp8 else None
-        self.ks, self.vs = scales(), scales()
+        self.ks = scales()
+        self.vs = None if k_only else scales()
         self.layer = SimpleNamespace(
             k_cache=self.kc4.unsqueeze(1),
-            v_cache=self.vc4.unsqueeze(1),
+            v_cache=self.kc4.unsqueeze(1) if k_only else self.vc4.unsqueeze(1),
             k_scale=self.ks,
             v_scale=self.vs,
         )
@@ -1164,3 +1179,76 @@ class TestImplGlue:
         assert m._use_kernels(ProVariants(kernels=True, attn="aiter", topk="fused"))
         m.topk = 6
         assert not m._use_kernels(ProVariants(kernels=True, attn="aiter", topk="fused"))
+
+
+class TestKOnly:
+    """The K-only cache (``k_only``): row-major K pages (x = 256), V read from K's tail,
+    no V cache; the Triton attention over it, the selection as block ids."""
+
+    @pytest.mark.parametrize("kv", [None, pytest.param(FP8, marks=needs_fp8)])
+    def test_prep_writes_the_same_k_as_the_shuffled_cache(self, kv):
+        sh = Case([150, 97], seed=3, kv_dtype=kv)
+        ko = Case([150, 97], seed=3, kv_dtype=kv, k_only=True)
+        q0, iq0 = sh.run_prep()
+        q1, iq1 = ko.run_prep()
+        assert torch.equal(q1, q0) and torch.equal(iq1, iq0)
+        assert torch.equal(ko.ic, sh.ic)
+        k0, k1 = sh.cached()[0], ko.cached()[0]
+        assert torch.equal(k1, k0)
+        if kv is not None:
+            assert torch.equal(ko.ks, sh.ks)
+        used = torch.zeros(ko.kc4.shape[0], dtype=torch.bool, device=DEV)
+        used[ko.slot // PG] = True
+        assert not ko.kc4[~used].any()
+
+    @pytest.mark.parametrize("kv", [None, pytest.param(FP8, marks=needs_fp8)])
+    @pytest.mark.parametrize("dense", [False, True])
+    def test_triton_attention_reads_v_from_the_row_cache(self, kv, dense):
+        c = Case([150, 97], kv_dtype=kv, k_only=True)
+        c.q, c.iq = c.run_prep()
+        att = TestAttention()
+        got = att._run(c, None, 2, dense=dense, n_blocks=c.bt.shape[1] if dense else None)
+        assert _close(got, att._ref(c, dense=dense))
+
+    @pytest.mark.parametrize("width,k", [(40, 8), (1024, 128), (100, 128)])
+    def test_select_logical_is_select_rows_as_block_ids(self, width, k):
+        g = torch.Generator(device=DEV).manual_seed(5)
+        t, s = 29, 3
+        bt = torch.randperm(s * width, generator=g, device=DEV).view(s, width)
+        bt = bt.to(torch.int32) + 1
+        seq = torch.randint(0, s, (t,), generator=g, device=DEV)
+        pos = torch.randint(0, width * PG, (t,), generator=g, device=DEV)
+        pos[:2] = torch.tensor([0, 3 * PG + 1], device=DEV)
+        qb = pos // PG
+        j = torch.arange(width, device=DEV)
+        score = torch.randn(t, width, generator=g, device=DEV)
+        score[:, 0] = 1e30
+        score = torch.where((j[None, :] >= qb[:, None] - 2), 1e29, score)
+        score = torch.where(j[None, :] <= qb[:, None], score, float("-inf"))
+        sel = K.select_logical(score, pos, k)
+        rows, ctx = K.select_rows(score, bt, seq, pos, k)
+        assert sel.shape == (t, k) and sel.dtype == torch.int32
+        for r in range(t):
+            n = min(k, int(qb[r]) + 1)
+            got = sel[r].tolist()
+            assert all(x >= 0 for x in got[:n]) and all(x == -1 for x in got[n:]), r
+            phys = {int(bt[seq[r], x]) for x in got[:n]}
+            assert phys == set(rows[r, :n].tolist()), r
+
+    def test_pool_holds_k_and_one_scale_plane(self):
+        from atom.model_ops.attentions.mha_kv_pool import MhaKvPool
+
+        kw = dict(layers=2, block_size=PG, num_kv_heads=1, head_dim=D, kv_dtype=FP8)
+        shuffle = MhaKvPool(**kw)
+        konly = MhaKvPool(**kw, layout=ProKOnlyLayout(FP8))
+        assert [f.name for f in konly.cache_fields + konly.scale_fields] == [
+            "k",
+            "k_scale",
+        ]
+        assert konly.entry_bytes < shuffle.entry_bytes * 0.52
+        konly.allocate(5, "cpu")
+        k, v = konly.kv_views(1)
+        assert tuple(k.shape) == (5, 1, 1, PG, D) and v is k
+        assert k[:, 0, 0].stride()[1:] == (D, 1)  # rows of 256 bytes, as day0 / moo read
+        ks, vs = konly.scale_views(1)
+        assert tuple(ks.shape) == (5, 1, PG) and vs is ks

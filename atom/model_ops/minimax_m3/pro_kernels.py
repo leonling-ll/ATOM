@@ -833,13 +833,17 @@ def _attn_kernel(
             kb + (d // XK) * k_sg + (d % XK), mask=vis[None, :], other=0.0
         )  # [64, TN]
         k1 = tl.load(
-            kb + ((64 + d) // XK) * k_sg + (d % XK), mask=vis[None, :], other=0.0
+            kb + ((64 + d) // XK) * k_sg + ((64 + d) % XK), mask=vis[None, :], other=0.0
         )
         k2 = tl.load(
-            kb + ((128 + d) // XK) * k_sg + (d % XK), mask=vis[None, :], other=0.0
+            kb + ((128 + d) // XK) * k_sg + ((128 + d) % XK),
+            mask=vis[None, :],
+            other=0.0,
         )
         k3 = tl.load(
-            kb + ((192 + d) // XK) * k_sg + (d % XK), mask=vis[None, :], other=0.0
+            kb + ((192 + d) // XK) * k_sg + ((192 + d) % XK),
+            mask=vis[None, :],
+            other=0.0,
         )
         if KV_FP8:  # per-token dequant; V is K's tail, so it shares K's scale here
             ksc = tl.load(ks_ptr + phys * s_sb + ar_o, mask=vis, other=0.0)[None, :]
@@ -1114,9 +1118,9 @@ def _select_rows_kernel(
     K: tl.constexpr,
     BW: tl.constexpr,
     PG: tl.constexpr,
+    LOGICAL: tl.constexpr,
 ):
     t = tl.program_id(0)
-    seq = tl.load(seq_ptr + t)
     qpos = tl.load(pos_ptr + t)
     qb = qpos // PG
     j = tl.arange(0, BW)
@@ -1134,6 +1138,13 @@ def _select_rows_kernel(
     valid = (
         top >> 32
     ) > _NEG_INF_KEY  # a causal block: fewer than K leave -inf ones in
+    rbase = rows_ptr + t.to(tl.int64) * stride_rows
+    e = tl.arange(0, K)
+    if LOGICAL:
+        # the block ids themselves, best first: the valid ones lead, -1 after
+        tl.store(rbase + e, tl.where(valid, jj, -1))
+        return
+    seq = tl.load(seq_ptr + t)
     full = (valid & (jj < qb)).to(tl.int32)
     n_full = tl.sum(full, axis=0)
     has_tail = tl.sum((valid & (jj == qb)).to(tl.int32), axis=0)
@@ -1169,9 +1180,36 @@ def select_rows(score, block_tables, seq_id, positions, k, num_warps=8):
         K=k,
         BW=max(triton.next_power_of_2(nb), k),
         PG=PAGE,
+        LOGICAL=False,
         num_warps=num_warps,
     )
     return rows, ctx
+
+
+def select_logical(score, positions, k, num_warps=8):
+    """``select_rows``' selection as block ids, for the Triton attention: ``[T, k]`` int32,
+    best first, the token's valid (causal) blocks leading and -1 after."""
+    assert k & (k - 1) == 0, k
+    t, nb = score.shape
+    sel = torch.empty(t, k, dtype=torch.int32, device=score.device)
+    _select_rows_kernel[(t,)](
+        score,
+        score.stride(0),
+        sel,
+        0,
+        positions,
+        positions,
+        sel,
+        sel.stride(0),
+        sel,
+        nb,
+        K=k,
+        BW=max(triton.next_power_of_2(nb), k),
+        PG=PAGE,
+        LOGICAL=True,
+        num_warps=num_warps,
+    )
+    return sel
 
 
 _pa_decode = None  # aiter's paged-attention decode as ATOM wraps it (tests swap it)
