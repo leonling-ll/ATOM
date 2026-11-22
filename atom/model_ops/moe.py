@@ -4086,6 +4086,12 @@ class FusedMoE(torch.nn.Module):
         )
 
     def process_weights_after_loading(self):
+        if getattr(self, "online_quant", False) and torch.cuda.is_available():
+            # Return the previous layer's freed source buffers and shuffle
+            # temporaries: each conversion allocates larger targets than those
+            # holes (MiniMax-M3.1-Pro with a fused shared expert ran out at load
+            # with ~70 GB reserved but unallocated).
+            torch.cuda.empty_cache()
         self._online_quant()
         if self.shared_expert_staging is not None:
             self.shared_expert_staging.fuse(self)
