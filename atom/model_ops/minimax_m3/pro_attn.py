@@ -162,6 +162,37 @@ class ProVariants:
     # group32 FP8 GEMM (``pro.py``). Off under ``diag``; the norms keep the unfused path on
     # an aiter without the MXFP8 norm outputs.
     fuse_mxfp8_quant: bool = True
+    # Prefill indexer split over the TP ranks: each rank scores and selects only its share
+    # of a long prefill's rows (``row_split_index``), then the page tables are all-gathered.
+    # Every row is computed as before, so the selection is the same bit for bit. Needs the
+    # kernel path with "topk": "fused" or "split"; only prefills of at least _SPLIT_MIN_TOKENS rows
+    # that select (more than ``topk`` blocks) split.
+    index_split: bool = False
+    # No effect: index q and k share one packed GEMM (index_qk_proj), so every row's
+    # index q is computed; kept so variants files that set it still parse.
+    index_split_proj: bool = True
+
+
+# Below it the all-gather costs more than the scoring it saves (moo's threshold).
+_SPLIT_MIN_TOKENS = 1024
+
+
+def row_split_index(n: int, tp: int, rank: int, device=None):
+    """``rank``'s rows of ``n``, cut into ``2 * tp`` segments of ``seg``: segment ``rank`` and
+    its mirror ``2 * tp - 1 - rank`` (causal cost grows along a prefill, so the pairs even
+    out). ``(idx [2 * seg] int64, seg)``; the last segments' rows past ``n`` repeat ``n - 1``.
+    """
+    seg = -(-n // (2 * tp))
+    s = torch.arange(seg, device=device)
+    idx = torch.cat([rank * seg + s, (2 * tp - 1 - rank) * seg + s])
+    return idx.clamp_(max=n - 1), seg
+
+
+def assemble_rows(gathered: torch.Tensor, seg: int, n: int, tp: int) -> torch.Tensor:
+    """The ranks' ``row_split_index`` rows, all-gathered ``[tp * 2 * seg, ...]``, back in row
+    order ``[n, ...]``."""
+    g = gathered.view(tp, 2, seg, *gathered.shape[1:])
+    return torch.cat([g[:, 0], g[:, 1].flip(0)]).flatten(0, 1)[:n]
 
 
 _variants = ProVariants()
@@ -638,6 +669,7 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
         v: ProVariants,
         out,
         static: bool = False,
+        split=None,
     ):
         """The whole layer in four launches (``prep`` / ``scores`` + top-k / ``attention``).
 
@@ -646,6 +678,8 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
         ``layer`` the layer's caches, ``nb`` the most blocks any sequence of the batch
         holds, ``out`` ``[n, H * 192]``. ``static``: ``nb`` is only a bound (the block
         table's width), so the selection runs even where every block would fit.
+        ``split``: this forward's ``index_split`` plan; the indexer scores this rank's
+        rows only (the other rows' index q may be unset).
         """
         kc4, vc4 = layer.k_cache[:, 0], layer.v_cache[:, 0]
         fp8 = kc4.element_size() == 1
@@ -749,12 +783,18 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
         sc = v.index_scale * (
             self.index_head_dim**-0.5 if v.block_score == "lse" else 1.0
         )
+        k = min(self.topk, nb)
+        rq, rseq, rpos = iq, seq_id, positions  # the rows the indexer scores
+        if split is not None:
+            # every row scores alone, so this rank's rows come out as they would in full
+            idx, seg, n_rows, tp = split
+            rq, rseq, rpos = iq[idx], seq_id[idx], positions[idx]
         score = pro_kernels.scores(
-            iq,
+            rq,
             ic,
             block_tables,
-            seq_id,
-            positions,
+            rseq,
+            rpos,
             nb,
             self.index_compress_query.data if pool else None,
             init,
@@ -766,13 +806,20 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
             # torch.topk reads the whole width; the others only each token's causal blocks
             causal=v.topk != "torch",
         )
-        k = min(self.topk, nb)
-        if v.topk in ("fused", "split") and k & (k - 1) == 0:
-            select = (
-                pro_kernels.select_rows_split
-                if v.topk == "split"
-                else pro_kernels.select_rows
+        # select_rows_split matches select_rows bit for bit; its cost follows the context
+        select = (
+            pro_kernels.select_rows_split if v.topk == "split" else pro_kernels.select_rows
+        )
+        if split is not None:
+            from aiter.dist.communication_op import tensor_model_parallel_all_gather
+
+            rows, ctx = select(score, block_tables, rseq, rpos, k)
+            mine = torch.cat([rows, ctx[:, None]], dim=1)
+            full = assemble_rows(
+                tensor_model_parallel_all_gather(mine, dim=0), seg, n_rows, tp
             )
+            return attend(None, (full[:, :k].contiguous(), full[:, k].contiguous()))
+        if v.topk in ("fused", "split") and k & (k - 1) == 0:
             return attend(None, select(score, block_tables, seq_id, positions, k))
         if v.topk == "aiter":
             sel = pro_kernels.select_blocks(score, positions, k)
@@ -781,6 +828,44 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
         return attend(sel)
 
     # ---------------------------------------------------------------- forward --
+    def index_split(self, n_tok: int):
+        """This forward's ``index_split`` plan, ``(idx, seg, n, tp)`` (``row_split_index``
+        of the forward's ``n`` rows for this rank), or ``None``: every rank scores every
+        row. Decided once a forward (the first layer's call, before its projections) from
+        the host lengths alone, so every rank and layer agrees."""
+        fwd = get_forward_context()
+        md = fwd.attn_metadata
+        plan = getattr(md, "_m3pro_split", False)
+        if plan is not False:
+            return plan
+        plan = None
+        v = refresh_variants()
+        if (
+            v.index_split
+            and fwd.context.is_prefill
+            and not fwd.context.is_dummy_run
+            and self._use_kernels(v)
+            and v.attn == "aiter"
+            and v.topk in ("fused", "split")
+            and not v.dense_only
+        ):
+            from aiter.dist.parallel_state import (
+                get_tensor_model_parallel_rank,
+                get_tensor_model_parallel_world_size,
+            )
+
+            tp = get_tensor_model_parallel_world_size()
+            cu, ctx = self._cpu_lengths(md)
+            n = min(n_tok, int(cu[-1]))
+            nb = (max(ctx, default=0) + self.page - 1) // self.page
+            if tp > 1 and n >= _SPLIT_MIN_TOKENS and nb > self.topk:
+                idx, seg = row_split_index(
+                    n, tp, get_tensor_model_parallel_rank(), md.slot_mapping.device
+                )
+                plan = (idx, seg, n, tp)
+        md._m3pro_split = plan
+        return plan
+
     def _cpu_lengths(self, md):
         """``(cu_seqlens_q, context_lens)`` as lists, synced once per forward."""
         cached = getattr(md, "_m3pro_cpu", None)
@@ -859,6 +944,7 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
                 v,
                 out[:n],
                 static=static,
+                split=None if static else self.index_split(n_tok),
             )
             return out
 
