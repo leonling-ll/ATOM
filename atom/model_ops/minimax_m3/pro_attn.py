@@ -734,8 +734,8 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
         fp8 = kc4.element_size() == 1
         ks = layer.k_scale if fp8 else None
         vs = layer.v_scale if fp8 and vc4 is not None else None
-        aiter_attn = self._aiter_attn(v, n)
         n = positions.shape[0]
+        aiter_attn = self._aiter_attn(v, n)
         rope = self.rotary_emb
         cos = rope.cos_cache.view(rope.cos_cache.shape[0], -1)
         sin = rope.sin_cache.view(rope.sin_cache.shape[0], -1)
