@@ -776,6 +776,26 @@ class TestSelectRowsSplit:
         )
         assert torch.equal(got[0], want[0]) and torch.equal(got[1], want[1])
 
+    @pytest.mark.parametrize(
+        "t,width,k,chunk,parts,fused",
+        [
+            (5, 40, 8, 32, 1, None),
+            (5, 40, 8, 32, 2, True),
+            (19, 300, 8, 32, 4, False),
+            (2, 100, 128, 512, None, None),  # fewer blocks than k: -1 after
+        ],
+    )
+    def test_logical_equals_select_logical(self, t, width, k, chunk, parts, fused):
+        # the K-only cache's block ids (day0, Triton attention) through the split path
+        score, bt, seq, pos = self._case(t, width, seed=t + width + k, ties=True)
+        want = K.select_logical(score.masked_fill(score.isnan(), float("-inf")), pos, k)
+        got = K.select_rows_split(
+            score, bt, pos, pos, k, parts=parts, chunk=chunk, fused=fused, logical=True
+        )[0]
+        assert torch.equal(got, want)
+        if parts is None:
+            assert torch.equal(K.select_logical(score, pos, k, split=True), want)
+
     def test_rearms_its_counters(self):
         # the fused merge zeroes its arrival counters: a second call (a graph replay)
         # selects alike

@@ -1211,4 +1211,5 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
             blocks = md.block_tables[b, :nblk].long()
             kk, ikk, vraw = self._gather_k(kc4, ks, ic, vc, blocks, length)
             qpos = torch.arange(length - (e - s), length, device=q.device)
-            out[s:e] = self._attend_prefill_
+            out[s:e] = self._attend_prefill_seq(q[s:e], iq[s:e], qpos, kk, ikk, v, vraw)
+        return out

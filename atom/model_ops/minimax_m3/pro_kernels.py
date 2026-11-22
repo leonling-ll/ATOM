@@ -2124,4 +2124,3 @@ def attention_day0(q, kc4, block_tables, seq_id, positions, sel, out, scale):
         out.view(t, IDX_HEADS, VALUE_DIM),
     )
     return out
-                      
