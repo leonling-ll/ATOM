@@ -4418,14 +4418,18 @@ class FusedMoE(torch.nn.Module):
             # EPLB redundant replicas are exempt: fill_redundant copies them
             # from their base experts only after this conversion has run, so
             # their slots still hold the zero placeholder here.
+            # The fused shared slots after the replicas are checked too, unless
+            # SharedExpertStaging writes them (from MXFP8) after this conversion.
             n_base = self.num_local_base_experts
-            replicas_end = self.expert_layout.routed_physical_per_rank
+            shared_lo = self.expert_layout.routed_physical_per_rank
+            staged = getattr(self, "shared_expert_staging", None) is not None
             for what, scale_2 in (
                 ("w13_weight_scale_2", old_w13_scale_2),
                 ("w2_weight_scale_2", old_w2_scale_2),
             ):
+                shared = scale_2[shared_lo:shared_lo] if staged else scale_2[shared_lo:]
                 validate_nvfp4_global_scales(
-                    torch.cat((scale_2[:n_base], scale_2[replicas_end:])),
+                    torch.cat((scale_2[:n_base], shared)),
                     self.layer_name,
                     what,
                 )

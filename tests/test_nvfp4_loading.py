@@ -1026,8 +1026,9 @@ class _TargetCreationReached(Exception):
     ],
     ids=["replica-still-empty", "base-unloaded", "fused-shared-unloaded"],
 )
+@pytest.mark.parametrize("staged", [False, True], ids=["loaded-shared", "staged-shared"])
 def test_nvfp4_moe_global_scale_check_skips_eplb_redundant_replicas(
-    monkeypatch, w13_scale_2, w2_scale_2, error, match
+    monkeypatch, w13_scale_2, w2_scale_2, error, match, staged
 ):
     """Local slots are [routed base, EPLB redundant replica, fused shared].
     fill_redundant copies the replica from its base expert only after online
@@ -1054,6 +1055,12 @@ def test_nvfp4_moe_global_scale_check_skips_eplb_redundant_replicas(
         num_local_base_experts=1,
         routed_physical_per_rank=2,
     )
+    if staged:
+        # MiniMax-M3.1-Pro: SharedExpertStaging fills the shared slot from MXFP8 later,
+        # so its NVFP4 scale_2 is never loaded and must not be checked.
+        layer.shared_expert_staging = object()
+        if match and "w13" in match:
+            error, match = _TargetCreationReached, None
 
     with pytest.raises(error, match=match):
         FusedMoE._online_quant(layer)
