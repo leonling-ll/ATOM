@@ -421,6 +421,24 @@ class TestScores:
     @pytest.mark.parametrize(
         "mode", [K.BLOCK_TOKMAX, K.BLOCK_TOKLSE, K.BLOCK_POOL4MAX, K.BLOCK_POOL4MEAN]
     )
+    def test_causal_scores_equal_the_full_width_ones(self, case, mode):
+        # however many tiles a program strides over, a causal block's score is the full
+        # launch's, bit for bit (same tile size); nothing past the token is read after
+        nb = case.bt.shape[1]
+        pool = mode in (K.BLOCK_POOL4MAX, K.BLOCK_POOL4MEAN)
+        cq = case.impl.index_compress_query.data if pool else None
+        args = (case.iq, case.ic, case.bt, case.seq, case.pos, nb, cq, 2, 3, 0.1)
+        kw = {"block_mode": mode, "head_mode": K.HEAD_LSE, "pool_temp": DI**-0.5}
+        causal = torch.arange(nb, device=DEV)[None, :] <= (case.pos // PG)[:, None]
+        for bb in (4, 8):
+            full = K.scores(*args, **kw, bb=bb)
+            for programs in (1, 2, None):
+                got = K.scores(*args, **kw, bb=bb, causal=True, programs=programs)
+                assert torch.equal(got[causal], full[causal]), (bb, programs)
+
+    @pytest.mark.parametrize(
+        "mode", [K.BLOCK_TOKMAX, K.BLOCK_TOKLSE, K.BLOCK_POOL4MAX, K.BLOCK_POOL4MEAN]
+    )
     def test_every_tile_size_scores_like_the_per_block_kernel(self, case, mode):
         nb = case.bt.shape[1]
         pool = mode in (K.BLOCK_POOL4MAX, K.BLOCK_POOL4MEAN)

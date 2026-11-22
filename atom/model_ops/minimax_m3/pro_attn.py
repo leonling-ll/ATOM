@@ -763,6 +763,8 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
             block_mode=block_mode,
             head_mode=head_mode,
             pool_temp=v.pool_scale,
+            # torch.topk reads the whole width; the others only each token's causal blocks
+            causal=v.topk != "torch",
         )
         k = min(self.topk, nb)
         if v.topk in ("fused", "split") and k & (k - 1) == 0:

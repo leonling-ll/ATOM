@@ -637,65 +637,87 @@ def _score_tile_kernel(
     PG: tl.constexpr,
     BLOCK_MODE: tl.constexpr,
     HEAD_MODE: tl.constexpr,
+    CAUSAL: tl.constexpr,
 ):
-    """_score_kernel's scores: BB blocks' keys in one [BB*PG, DI] tile."""
+    """_score_kernel's scores: BB blocks' keys in one [BB*PG, DI] tile. ``CAUSAL``: the
+    programs of a token stride over its causal tiles only (the blocks past it are left
+    unwritten, their cost spared), else one tile a program, future blocks -inf."""
     t = tl.program_id(0)
-    j0 = tl.program_id(1) * BB
     qpos = tl.load(pos_ptr + t)
     qb = qpos // PG
-    jb = j0 + tl.arange(0, BB)
     obase = out_ptr + t.to(tl.int64) * stride_out
-    if j0 > qb:
-        tl.store(obase + jb, tl.full([BB], float("-inf"), tl.float32), mask=jb < NB)
+    if CAUSAL:
+        stop = tl.cdiv(tl.minimum(qb + 1, NB), BB)
+        step = tl.num_programs(1)
     else:
-        seq = tl.load(seq_ptr + t)
-        r = tl.arange(0, BB * PG)
-        jr = j0 + r // PG
-        live = (jr <= qb) & (jr < NB)
-        phys = tl.load(bt_ptr + seq * stride_bt + jr, mask=live, other=0).to(tl.int64)
-        ar_d = tl.arange(0, DI)
-        ar_i = tl.arange(0, NI)
-        ik = tl.load(
-            ic_ptr + phys[:, None] * ic_sb + (r % PG)[:, None] * ic_so + ar_d[None, :],
-            mask=live[:, None],
-            other=0.0,
-        )
-        iq = tl.load(
-            iq_ptr + t.to(tl.int64) * (NI * DI) + ar_i[:, None] * DI + ar_d[None, :]
-        )
-        dots = tl.dot(iq, tl.trans(ik.to(iq.dtype))) * sc  # [NI, BB*PG]
-        if BLOCK_MODE == 0 or BLOCK_MODE == 3:
-            vis = (j0 * PG + r) <= qpos
-            # a block past the query scores 0 here (no NaN on the way) and -inf below
-            hide = tl.where(live, float("-inf"), 0.0)
-            dm = tl.reshape(tl.where(vis[None, :], dots, hide[None, :]), (NI, BB, PG))
-            bs = tl.max(dm, axis=2)  # [NI, BB]
-            if BLOCK_MODE == 3:
-                bs = tl.log(tl.sum(tl.exp(dm - bs[:, :, None]), axis=2)) + bs
+        stop = tl.program_id(1) + 1
+        step = 1
+    for jt in range(tl.program_id(1), stop, step):
+        j0 = jt * BB
+        jb = j0 + tl.arange(0, BB)
+        if j0 > qb:
+            tl.store(obase + jb, tl.full([BB], float("-inf"), tl.float32), mask=jb < NB)
         else:
-            # no token mask: only the query's own block holds keys past it, and it is pinned
-            cq = tl.load(cq_ptr + ar_d).to(tl.float32)
-            lg = tl.sum(ik.to(tl.float32) * cq[None, :], axis=1) * pool_temp  # [BB*PG]
-            lg = tl.reshape(lg, (BB * PG // 4, 4))
-            e = tl.exp(lg - tl.max(lg, axis=1)[:, None])
-            w = tl.reshape(e / tl.sum(e, axis=1)[:, None], (BB * PG,))
-            cent = tl.sum(tl.reshape(dots * w[None, :], (NI, BB * PG // 4, 4)), axis=2)
-            cent = tl.reshape(cent, (NI, BB, PG // 4))  # q . centroid
-            if BLOCK_MODE == 1:
-                bs = tl.max(cent, axis=2)
+            seq = tl.load(seq_ptr + t)
+            r = tl.arange(0, BB * PG)
+            jr = j0 + r // PG
+            live = (jr <= qb) & (jr < NB)
+            phys = tl.load(bt_ptr + seq * stride_bt + jr, mask=live, other=0).to(
+                tl.int64
+            )
+            ar_d = tl.arange(0, DI)
+            ar_i = tl.arange(0, NI)
+            ik = tl.load(
+                ic_ptr
+                + phys[:, None] * ic_sb
+                + (r % PG)[:, None] * ic_so
+                + ar_d[None, :],
+                mask=live[:, None],
+                other=0.0,
+            )
+            iq = tl.load(
+                iq_ptr + t.to(tl.int64) * (NI * DI) + ar_i[:, None] * DI + ar_d[None, :]
+            )
+            dots = tl.dot(iq, tl.trans(ik.to(iq.dtype))) * sc  # [NI, BB*PG]
+            if BLOCK_MODE == 0 or BLOCK_MODE == 3:
+                vis = (j0 * PG + r) <= qpos
+                # a block past the query scores 0 here (no NaN on the way) and -inf below
+                hide = tl.where(live, float("-inf"), 0.0)
+                dm = tl.reshape(
+                    tl.where(vis[None, :], dots, hide[None, :]), (NI, BB, PG)
+                )
+                bs = tl.max(dm, axis=2)  # [NI, BB]
+                if BLOCK_MODE == 3:
+                    bs = tl.log(tl.sum(tl.exp(dm - bs[:, :, None]), axis=2)) + bs
             else:
-                bs = tl.sum(cent, axis=2) / (PG // 4)
-        if HEAD_MODE == 0:
-            score = tl.sum(bs, axis=0)
-        elif HEAD_MODE == 1:
-            score = tl.max(bs, axis=0)
-        else:
-            mx = tl.max(bs, axis=0)
-            score = tl.log(tl.sum(tl.exp(bs - mx[None, :]), axis=0)) + mx
-        score = tl.where(jb < init_blocks, 1e30, score)
-        score = tl.where(jb >= qb + 1 - local_blocks, 1e29, score)
-        score = tl.where(jb <= qb, score, float("-inf"))
-        tl.store(obase + jb, score, mask=jb < NB)
+                # no token mask: only the query's own block holds keys past it, and it
+                # is pinned
+                cq = tl.load(cq_ptr + ar_d).to(tl.float32)
+                lg = (
+                    tl.sum(ik.to(tl.float32) * cq[None, :], axis=1) * pool_temp
+                )  # [BB*PG]
+                lg = tl.reshape(lg, (BB * PG // 4, 4))
+                e = tl.exp(lg - tl.max(lg, axis=1)[:, None])
+                w = tl.reshape(e / tl.sum(e, axis=1)[:, None], (BB * PG,))
+                cent = tl.sum(
+                    tl.reshape(dots * w[None, :], (NI, BB * PG // 4, 4)), axis=2
+                )
+                cent = tl.reshape(cent, (NI, BB, PG // 4))  # q . centroid
+                if BLOCK_MODE == 1:
+                    bs = tl.max(cent, axis=2)
+                else:
+                    bs = tl.sum(cent, axis=2) / (PG // 4)
+            if HEAD_MODE == 0:
+                score = tl.sum(bs, axis=0)
+            elif HEAD_MODE == 1:
+                score = tl.max(bs, axis=0)
+            else:
+                mx = tl.max(bs, axis=0)
+                score = tl.log(tl.sum(tl.exp(bs - mx[None, :]), axis=0)) + mx
+            score = tl.where(jb < init_blocks, 1e30, score)
+            score = tl.where(jb >= qb + 1 - local_blocks, 1e29, score)
+            score = tl.where(jb <= qb, score, float("-inf"))
+            tl.store(obase + jb, score, mask=jb < NB)
 
 
 def scores(
@@ -714,17 +736,26 @@ def scores(
     pool_temp=1.0,
     bb=None,
     tiled=True,
+    causal=False,
+    programs=None,
 ):
     """Indexer block scores ``[T, nb]`` (fp32): pins and ``-inf`` for future blocks applied.
 
     ``tiled``: score ``bb`` blocks per dot (_score_tile_kernel; by default 4 for up to 16
-    tokens, else 8) instead of one (_score_kernel)."""
+    tokens, else 8) instead of one (_score_kernel). ``causal`` (tiled only): only each
+    token's causal blocks are written -- all a selection that reads no further needs --
+    by ``programs`` a token (default: about 4096 over the batch, 16 a CU; the idle ones
+    exit at once), so the cost follows the context, not ``nb``."""
     t = iq.shape[0]
     out = torch.empty(t, nb, dtype=torch.float32, device=iq.device)
-    assert ic.stride(-1) == 1
+    assert ic.stride(-1) == 1 and (tiled or not causal)
     if bb is None:
         bb = 4 if tiled and t <= 16 else 8
-    grid = (t, triton.cdiv(nb, bb))
+    tiles = triton.cdiv(nb, bb)
+    if causal:
+        programs = min(tiles, programs or triton.cdiv(4096, t))
+    grid = (t, programs if causal else tiles)
+    kw = {"CAUSAL": causal} if tiled else {}
     (_score_tile_kernel if tiled else _score_kernel)[grid](
         iq,
         ic,
@@ -748,6 +779,7 @@ def scores(
         PG=PAGE,
         BLOCK_MODE=block_mode,
         HEAD_MODE=head_mode,
+        **kw,
     )
     return out
 
