@@ -422,6 +422,18 @@ class MiniMaxM3MoE(nn.Module):
         self.fuse_shared_experts = (
             getattr(self.experts, "num_fused_shared_experts", 0) > 0
         )
+        # The routed scale rides in the routing weights (aiter topk_gating), not a
+        # pass over the output: bit-exact for a power-of-two scale (M3's 2.0),
+        # otherwise only the rounding point moves (fp32 weight, not bf16 output).
+        # Only the plain sigmoid routing takes it, so the others keep the multiply.
+        self.experts.fold_routed_scaling_factor = (
+            not self.fuse_shared_experts
+            and self.experts.scoring_func == "sigmoid"
+            and not self.experts.use_grouped_topk
+            and self.experts.custom_routing_function is None
+            # FusedMoE keeps 1.0 under fp16, where the multiply must stay
+            and self.experts.routed_scaling_factor == self.routed_scaling_factor
+        )
 
         self.shared_experts: MiniMaxM3MLP | None = None
         if getattr(config, "n_shared_experts", 0) and not self.fuse_shared_experts:
@@ -449,7 +461,11 @@ class MiniMaxM3MoE(nn.Module):
             hidden_states=hidden_states,
             router_logits=router_logits,
         )
-        if not self.fuse_shared_experts and self.routed_scaling_factor != 1.0:
+        if (
+            not self.fuse_shared_experts
+            and not self.experts.fold_routed_scaling_factor
+            and self.routed_scaling_factor != 1.0
+        ):
             routed_output = routed_output * self.routed_scaling_factor
 
         if self.shared_experts is not None:

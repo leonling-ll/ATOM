@@ -528,6 +528,7 @@ def _select_logical(
         num_fused_shared_experts=num_fused_shared_experts,
         fused_shared_experts_scoring_func=layer.shared_expert_scoring_func,
         routed_scaling_factor=layer.routed_scaling_factor,
+        fold_routed_scaling_factor=getattr(layer, "fold_routed_scaling_factor", False),
     )
 
 
@@ -3781,6 +3782,9 @@ class FusedMoE(torch.nn.Module):
             if config is not None and atom_config.torch_dtype != torch.float16
             else 1.0
         )
+        # Set by a model that wants the routed scale in the routing weights (one
+        # fewer elementwise pass over the output) where routing leaves it out.
+        self.fold_routed_scaling_factor = False
         if (
             self.expert_layout.uses_dispatch_remap
             and custom_routing_function is not None
@@ -5409,6 +5413,7 @@ class FusedMoE(torch.nn.Module):
         num_fused_shared_experts: int = 0,
         fused_shared_experts_scoring_func: str | None = None,
         routed_scaling_factor: float = 1.0,
+        fold_routed_scaling_factor: bool = False,
     ):
 
         # custom_routing_function takes precedence (e.g. DeepSeek-V4 hash routing
@@ -5478,10 +5483,13 @@ class FusedMoE(torch.nn.Module):
                     )
 
                 # MiniMax-M3 applies the routed scale outside MoE when shared
-                # experts are not fused; DeepSeek-V4 folds it into routing.
+                # experts are not fused, unless it asks for the fold;
+                # DeepSeek-V4 folds it into routing.
                 route_scale = (
                     routed_scaling_factor
-                    if fuse_shared or scoring_func == "sqrtsoftplus"
+                    if fuse_shared
+                    or scoring_func == "sqrtsoftplus"
+                    or fold_routed_scaling_factor
                     else 1.0
                 )
                 topk_gating(
