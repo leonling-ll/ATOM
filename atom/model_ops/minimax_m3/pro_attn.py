@@ -154,7 +154,7 @@ class ProVariants:
     # Kernel launch shape: programs per token over the selected blocks (0: by batch size)
     # and blocks per step.
     attn_splits: int = 0
-    attn_nblk: int = 2
+    attn_nblk: int = 4
     # MXFP8 activation quant (E4M3, group-32 E8M0 scales, ``quantize_fp8``'s bytes) written
     # by the ops that produce the activations -- the norms after the all-reduces, the
     # lookahead norm, the SwiGLU -- instead of a ``quantize_fp8`` launch before each native
@@ -768,8 +768,12 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
         )
         scale = self.scale * v.scale_mult
         nblk = v.attn_nblk
+        # MI355X, decode over top-128 (opt/kv/bench_decode_attn.py, valid_first, nblk 4):
+        # 32 / 16 / 8 splits at 1-16 / 32 / 64 rows put bs1 at aiter's 13 us (from 26)
         splits = v.attn_splits or (
-            8 if n <= 16 else 4 if n <= 64 else 2 if n <= 256 else 1
+            32
+            if n <= 16
+            else 16 if n <= 32 else 8 if n <= 64 else 4 if n <= 128 else 2 if n <= 256 else 1
         )
 
         day0 = (
