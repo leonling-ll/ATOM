@@ -10,6 +10,7 @@ new_tests_dir: tests
 publish_language: English
 conversation_language: Chinese
 max_tasks: 4
+task_label: m31pro
 ---
 
 Target and constraints: issue #7. Every brief and PR follows its section 4 (InferenceX rules) and section 5 (accuracy gate).
