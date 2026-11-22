@@ -175,6 +175,11 @@ class ProVariants:
     # two; 0: one): the rows of a sequence read each tile of block keys once, one dot for
     # all their query heads. A plain decode (one row a sequence) keeps one.
     score_tq: int = 0
+    # Rows (tokens) at or below which those fused all-reduce + norm sites run as aiter's
+    # Lamport all-reduce + ``add_rmsnorm_mxfp8`` (two launches, same bytes) instead of
+    # the fused 1-stage kernel: 7.5 vs 9.6 us at 1 row, 9.7 vs 12.6 at 16 (TP8, 7168).
+    # Needs the Lamport path on (AITER_CUSTOM_AR_DISABLE_LAMPORT unset); 0 turns it off.
+    ar_lamport_rows: int = 0
 
 
 # Below it the all-gather costs more than the scoring it saves (moo's threshold).

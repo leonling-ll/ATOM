@@ -279,6 +279,16 @@ def _ar_worker(tp, rank, init_method, bench):
             check(f"atom-helper 1stage={override}", m, r, (h[0], h[3], h[1], h[2]))
     comm._ar_1stage_override = None
 
+    # ProVariants.ar_lamport_rows: Lamport all-reduce + add_rmsnorm_mxfp8 (needs
+    # AITER_CUSTOM_AR_DISABLE_LAMPORT unset; else the helper keeps the fused route)
+    for m in AR_M:
+        if m > 64:
+            continue
+        x = _rows(m, HIDDEN, seed=1000 * rank + m)
+        res = _rows(m, HIDDEN, seed=m + 7)
+        h = fused_allreduce_gemma_rms_norm_mxfp8(x, res, norm, lamport_rows=64)
+        check("atom-helper lamport", m, ref(x, res), (h[0], h[3], h[1], h[2]))
+
     # CUDA graphs: the registered-buffer path of the custom all-reduce
     for m in (1, 4, 16, 32, 64):
         x = _rows(m, HIDDEN, seed=1000 * rank + m)

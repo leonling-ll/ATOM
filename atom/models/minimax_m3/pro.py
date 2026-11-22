@@ -414,7 +414,7 @@ class MiniMaxM3ProDecoderLayer(MiniMaxM3DecoderLayer):
         elif fuse_attn_in:
             _, hidden_states, hidden_states_scale, residual = (
                 fused_allreduce_gemma_rms_norm_mxfp8(
-                    hidden_states, residual, self.input_layernorm
+                    hidden_states, residual, self.input_layernorm, v.ar_lamport_rows
                 )
             )
         else:
@@ -447,7 +447,10 @@ class MiniMaxM3ProDecoderLayer(MiniMaxM3DecoderLayer):
         if fuse_ffn_in:
             hidden_states, ffn_x, ffn_x_scale, residual = (
                 fused_allreduce_gemma_rms_norm_mxfp8(
-                    hidden_states, residual, self.post_attention_layernorm
+                    hidden_states,
+                    residual,
+                    self.post_attention_layernorm,
+                    v.ar_lamport_rows,
                 )
             )
         else:

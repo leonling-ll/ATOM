@@ -1121,21 +1121,62 @@ def gemma_rms_norm_mxfp8(
     return out, q, q_scale, res_out
 
 
+@functools.cache
+def _lamport_ar_on() -> bool:
+    """Whether aiter's custom all-reduce took the Lamport kernels at init (every rank
+    agrees on it there, so every rank takes the same route here)."""
+    from aiter.dist.parallel_state import get_tp_group
+
+    ca = getattr(get_tp_group().device_communicator, "ca_comm", None)
+    return bool(ca is not None and getattr(ca, "lamport_enabled", False))
+
+
+def _lamport_ar_rms_norm_mxfp8(
+    hidden_states: torch.Tensor, residual: torch.Tensor, norm: GemmaRMSNorm
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Plain all-reduce (the Lamport kernel at these sizes) + ``add_rmsnorm_mxfp8``:
+    ``(out, q, q_scale, residual_out)`` as ``fused_allreduce_gemma_rms_norm_mxfp8``."""
+    from aiter.dist.communication_op import tensor_model_parallel_all_reduce
+    from aiter.utility.dtypes import fp8
+
+    x = tensor_model_parallel_all_reduce(hidden_states.contiguous())
+    m, n = x.shape
+    out, residual_out = torch.empty_like(x), torch.empty_like(x)
+    q = torch.empty((m, n), dtype=fp8, device=x.device)
+    q_scale = torch.empty((m, n // 32), dtype=torch.uint8, device=x.device)
+    aiter.add_rmsnorm_mxfp8(
+        out,
+        q,
+        q_scale,
+        x,
+        residual,
+        residual_out,
+        norm.weight,
+        norm.variance_epsilon,
+        True,
+    )
+    return out, q, q_scale.view(torch.float8_e8m0fnu), residual_out
+
+
 def fused_allreduce_gemma_rms_norm_mxfp8(
     hidden_states: torch.Tensor,
     residual: torch.Tensor,
     norm: GemmaRMSNorm,
+    lamport_rows: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """``fused_allreduce_gemma_rms_norm`` with its output also as MXFP8 (the bytes of
     ``quantize_fp8`` of it): ``(out, q, q_scale, residual_out)``. The quant rides on the
     norm's kernel where there is a form of it that does (aiter's custom all-reduce
     epilogue and add_rmsnorm at TP > 1, ``gemma_rms_norm_mxfp8`` at TP 1); every other
-    route runs the unfused pair."""
+    route runs the unfused pair. Up to ``lamport_rows`` rows, where aiter's Lamport
+    all-reduce is on, it runs that all-reduce + ``add_rmsnorm_mxfp8`` instead."""
     from atom.model_ops.blockscale import quantize_fp8
 
     if get_tensor_model_parallel_world_size() > 1:
         from aiter.dist import communication_op
 
+        if 0 < hidden_states.shape[0] <= lamport_rows and _lamport_ar_on():
+            return _lamport_ar_rms_norm_mxfp8(hidden_states, residual, norm)
         fused = getattr(
             communication_op,
             "tensor_model_parallel_fused_allreduce_rmsnorm_mxfp8_quant",
