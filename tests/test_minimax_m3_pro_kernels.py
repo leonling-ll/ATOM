@@ -1291,3 +1291,57 @@ class TestKOnly:
         got = torch.zeros_like(ref)
         K.attention_day0(q16, c.kc4, c.bt, c.seq, c.pos, sel, got, D**-0.5)
         assert _close(got, ref)
+
+
+def _nv_pages(rows):
+    """``[N, PG, 72]`` NVFP4 rows -> the ``[N, PG * 72]`` pages ``prep`` writes: all the
+    tokens' 64 data bytes, then all their 8 scale bytes."""
+    n = rows.shape[0]
+    return torch.cat([rows[..., :64].reshape(n, -1), rows[..., 64:].reshape(n, -1)], 1)
+
+
+class TestNvfp4Index:
+    """``--index-cache-dtype nvfp4`` for Pro: [page x 64 B e2m1 | page x 8 B e4m3] a block,
+    written by ``prep`` as vLLM's ``_quant4``, read by the tiled scorer."""
+
+    def test_reference_round_trip_error(self):
+        g = torch.Generator().manual_seed(11)
+        x = (torch.randn(64, DI, generator=g) * 3).to(torch.bfloat16)
+        d = K.nvfp4_dequant_rows(K.nvfp4_rows(x)).reshape(64, 8, 16)
+        xg = x.float().reshape(64, 8, 16)
+        step = xg.abs().amax(-1, keepdim=True) / 6  # the e2m1 grid's unit, up to e4m3
+        assert ((d - xg).abs() <= step * 1.13 + 1e-6).all()  # half of the widest gap (2)
+
+    @needs_fp8
+    def test_prep_writes_the_reference_rows(self):
+        ref = Case([150, 97], seed=8)
+        ref.run_prep()
+        nv = Case([150, 97], seed=8)
+        nv.ic = torch.zeros(nv.ic.shape[0], PG * 72, dtype=torch.uint8, device=DEV)
+        nv.run_prep()
+        want = _nv_pages(K.nvfp4_rows(ref.ic))
+        used = torch.zeros(nv.ic.shape[0], dtype=torch.bool, device=DEV)
+        used[nv.slot // PG] = True
+        # unwritten slots of a used page stay zero in both
+        assert torch.equal(nv.ic[used], want[used]) and not nv.ic[~used].any()
+
+    @pytest.mark.parametrize(
+        "mode,var",
+        [
+            (K.BLOCK_POOL4MAX, {}),
+            (K.BLOCK_TOKLSE, {"block_score": "lse", "head_reduce": "lse"}),
+        ],
+    )
+    def test_scorer_reads_the_pages_as_their_dequantized_keys(self, case, mode, var):
+        c = case
+        rows = K.nvfp4_rows(c.ic)
+        deq = K.nvfp4_dequant_rows(rows).to(c.ic.dtype)
+        nb = c.bt.shape[1]
+        head = K.HEAD_LSE if var else K.HEAD_MAX
+        sc = DI**-0.5 if var else 1.0
+        cq = c.impl.index_compress_query.data
+        args = (c.bt, c.seq, c.pos, nb, cq, c.init, c.local, sc)
+        kw = dict(block_mode=mode, head_mode=head, pool_temp=DI**-0.5)
+        want = K.scores(c.iq, deq, *args, **kw)
+        got = K.scores(c.iq, _nv_pages(rows), *args, **kw)
+        assert torch.allclose(got, want, rtol=1e-4, atol=1e-4)

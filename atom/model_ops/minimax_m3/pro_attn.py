@@ -631,13 +631,19 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
         return tok, o.reshape(r, h * self.value_head_dim).to(q.dtype)
 
     # ------------------------------------------------------------ kernel path --
-    @staticmethod
-    def _aiter_prep(v: ProVariants) -> bool:
+    def _aiter_prep(self, v: ProVariants) -> bool:
+        """aiter's prep: it scales an fp8 K and writes no NVFP4 index rows."""
         return (
             v.prep == "aiter"
             and not v.k_plain_fp8
+            and not self._index_nvfp4()
             and pro_kernels.aiter_prep_available()
         )
+
+    def _index_nvfp4(self) -> bool:
+        """``--index-cache-dtype nvfp4``: uint8 pages the Triton kernels alone read."""
+        ic = self.index_cache
+        return ic is not None and ic.dtype == torch.uint8
 
     def _aiter_attn(self, v: ProVariants) -> bool:
         """aiter's paged attention, which reads a V cache: not on the K-only one."""
@@ -948,6 +954,10 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
             )
             return out
 
+        if self._index_nvfp4():
+            raise NotImplementedError(
+                'an NVFP4 index cache needs the kernel path ({"kernels": true})'
+            )
         if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
             raise RuntimeError(
                 'MiniMax-M3-Pro decode graphs need {"kernels": true} in ATOM_M3PRO_VARIANTS '
