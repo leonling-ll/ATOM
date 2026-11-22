@@ -638,15 +638,19 @@ def _score_tile_kernel(
     BLOCK_MODE: tl.constexpr,
     HEAD_MODE: tl.constexpr,
     CAUSAL: tl.constexpr,
+    STRIDE: tl.constexpr,
 ):
     """_score_kernel's scores: BB blocks' keys in one [BB*PG, DI] tile. ``CAUSAL``: the
-    programs of a token stride over its causal tiles only (the blocks past it are left
-    unwritten, their cost spared), else one tile a program, future blocks -inf."""
+    blocks past a token are left unwritten (a program on them exits at once); with
+    ``STRIDE`` a token's fewer programs stride over its causal tiles, else (and without
+    ``CAUSAL``) one tile a program, future blocks -inf. A dynamic trip count slows the
+    tile's code on long rows: ``STRIDE`` trades that for fewer programs on short ones.
+    """
     t = tl.program_id(0)
     qpos = tl.load(pos_ptr + t)
     qb = qpos // PG
     obase = out_ptr + t.to(tl.int64) * stride_out
-    if CAUSAL:
+    if STRIDE:
         stop = tl.cdiv(tl.minimum(qb + 1, NB), BB)
         step = tl.num_programs(1)
     else:
@@ -656,7 +660,10 @@ def _score_tile_kernel(
         j0 = jt * BB
         jb = j0 + tl.arange(0, BB)
         if j0 > qb:
-            tl.store(obase + jb, tl.full([BB], float("-inf"), tl.float32), mask=jb < NB)
+            if not CAUSAL:
+                tl.store(
+                    obase + jb, tl.full([BB], float("-inf"), tl.float32), mask=jb < NB
+                )
         else:
             seq = tl.load(seq_ptr + t)
             r = tl.arange(0, BB * PG)
@@ -744,8 +751,8 @@ def scores(
     ``tiled``: score ``bb`` blocks per dot (_score_tile_kernel; by default 4 for up to 16
     tokens, else 8) instead of one (_score_kernel). ``causal`` (tiled only): only each
     token's causal blocks are written -- all a selection that reads no further needs --
-    by ``programs`` a token (default: about 4096 over the batch, 16 a CU; the idle ones
-    exit at once), so the cost follows the context, not ``nb``."""
+    by ``programs`` a token (default: one a tile; the ones past the token exit at once,
+    fewer stride over its tiles), so the cost follows the context, not ``nb``."""
     t = iq.shape[0]
     out = torch.empty(t, nb, dtype=torch.float32, device=iq.device)
     assert ic.stride(-1) == 1 and (tiled or not causal)
@@ -753,9 +760,11 @@ def scores(
         bb = 4 if tiled and t <= 16 else 8
     tiles = triton.cdiv(nb, bb)
     if causal:
-        programs = min(tiles, programs or triton.cdiv(4096, t))
+        # a program a tile by default: striding (fewer programs) wins on short rows but
+        # loses up to a third on long ones (MI355X, 8192-block table)
+        programs = min(tiles, programs or tiles)
     grid = (t, programs if causal else tiles)
-    kw = {"CAUSAL": causal} if tiled else {}
+    kw = {"CAUSAL": causal, "STRIDE": causal and programs < tiles} if tiled else {}
     (_score_tile_kernel if tiled else _score_kernel)[grid](
         iq,
         ic,
