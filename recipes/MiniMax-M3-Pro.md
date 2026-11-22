@@ -48,7 +48,7 @@ The fast configuration (kernel path, decode graphs, FP8 KV and index caches):
 
 ```bash
 export AITER_CUSTOM_AR_DISABLE_LAMPORT=1
-export ATOM_M3PRO_VARIANTS='{"kernels": true, "attn": "aiter", "topk": "fused"}'
+export ATOM_M3PRO_VARIANTS='{"kernels": true, "attn": "aiter", "topk": "split"}'
 
 python -m atom.entrypoints.openai_server \
   --model /data/models/yuhua/m3-pro \
@@ -370,6 +370,22 @@ token a row whose length is its causal block count, short rows padded with -1) i
 power-of-two top-k, which Pro's 128 is) selects and builds the aiter page tables in one Triton
 kernel: `tl.topk` over the scores' order-preserving integer bits packed with the block index (ties
 go to the lower block), then the same rows rule as the separate rows kernel.
+
+`"topk": "split"` builds the same tables bit for bit, and its cost follows the context. A decode
+graph holds the block table's full width (max-model-len / 16 blocks: 8192 at 131072), and
+`"fused"` sorts all of it for every token, about 29 us per layer whatever the context. `"split"`
+works in two steps:
+- Spans of 1024-block chunks reduce each row to its 128 best keys in separate programs, and the
+  last span program to finish merges them. Spans past a row's own block exit at once.
+- The scores fill only each token's causal blocks: those selections read no further.
+
+It is the recommended setting. Measured on 8x MI355X, max-model-len 131072:
+- Per decode step, scores plus selection take 0.68 instead of 2.35 ms at bs 1 (1k context), and
+  1.15 instead of 4.08 ms at bs 64.
+- TPOT drops 11–14% at 1k/1k (c 1–64) and 9–12% at 8k/1k.
+- GSM8K is unchanged: the same tables.
+- At a 1M context (65536 blocks) the sort alone is 0.7–0.8 ms per layer for `"fused"` and
+  3–66 us for `"split"`.
 
 The block scores run as a tiled kernel (4 or 8 blocks x 16 tokens per program, one `tl.dot`); the
 softmax-pool weights depend on the keys alone, so the pooled scores are the token dots weighted per
