@@ -123,16 +123,13 @@ def test_split_selection_is_the_full_selection(mode, tp):
     assert torch.equal(full[:, :k], rows) and torch.equal(full[:, k], ctx)
 
 
-def test_kernel_attention_with_a_split_hands_aiter_the_full_tables(monkeypatch):
-    """``_kernel_attention(split=...)`` on rank 1 of 4: the page tables it gives the attention
-    equal the unsplit path's (the other ranks' shares stand in for the all-gather)."""
-    tp, rank, k = 4, 1, 4
-    b = _batch(CHUNKS, seed=3)
+def _mini_impl(b, k, monkeypatch):
+    """A ProSparseAttentionImpl over batch ``b`` whose prep hands back ``b``'s index q and
+    whose aiter attention records the page tables it is given (returned list)."""
     impl = object.__new__(ProSparseAttentionImpl)
     impl.page, impl.topk, impl.init_blocks, impl.local_blocks = PG, k, 1, 2
     impl.index_head_dim = DI
     impl.__dict__["index_compress_query"] = SimpleNamespace(data=b.cq)
-    v = ProVariants(kernels=True, attn="aiter", topk="fused")
     q = torch.zeros(b.n, H, D, device=DEV)
     monkeypatch.setattr(K, "prep", lambda *a, **kw: (q, b.iq))
     seen = []
@@ -141,6 +138,27 @@ def test_kernel_attention_with_a_split_hands_aiter_the_full_tables(monkeypatch):
         "attention_aiter",
         lambda q, kc, vc, rows, ctx, out, *a, **kw: seen.append((rows, ctx)),
     )
+    impl.rotary_emb = SimpleNamespace(
+        cos_cache=torch.zeros(1, 1, device=DEV), sin_cache=torch.zeros(1, 1, device=DEV)
+    )
+    impl.q_norm = impl.k_norm = impl.index_q_norm = impl.index_k_norm = SimpleNamespace(
+        weight=SimpleNamespace(data=None), variance_epsilon=1e-6
+    )
+    impl.num_heads, impl.scale, impl.layer_num = H, D**-0.5, 0
+    layer = SimpleNamespace(
+        k_cache=torch.zeros(1, 1, 1, 1, 1, device=DEV),
+        v_cache=torch.zeros(1, 1, 1, 1, 1, device=DEV),
+    )
+    return impl, seen, (None, b.pos, b.seq, None, b.bt, layer, b.ic, b.nb)
+
+
+def test_kernel_attention_with_a_split_hands_aiter_the_full_tables(monkeypatch):
+    """``_kernel_attention(split=...)`` on rank 1 of 4: the page tables it gives the attention
+    equal the unsplit path's (the other ranks' shares stand in for the all-gather)."""
+    tp, rank, k = 4, 1, 4
+    b = _batch(CHUNKS, seed=3)
+    impl, seen, args = _mini_impl(b, k, monkeypatch)
+    v = ProVariants(kernels=True, attn="aiter", topk="fused")
     shares = []
     for r in range(tp):
         idx, seg = row_split_index(b.n, tp, r, DEV)
@@ -153,23 +171,31 @@ def test_kernel_attention_with_a_split_hands_aiter_the_full_tables(monkeypatch):
         return torch.cat(shares)
 
     monkeypatch.setattr(comm, "tensor_model_parallel_all_gather", gather)
-    layer = SimpleNamespace(
-        k_cache=torch.zeros(1, 1, 1, 1, 1, device=DEV),
-        v_cache=torch.zeros(1, 1, 1, 1, 1, device=DEV),
-    )
-    impl.rotary_emb = SimpleNamespace(
-        cos_cache=torch.zeros(1, 1, device=DEV), sin_cache=torch.zeros(1, 1, device=DEV)
-    )
-    impl.q_norm = impl.k_norm = impl.index_q_norm = impl.index_k_norm = SimpleNamespace(
-        weight=SimpleNamespace(data=None), variance_epsilon=1e-6
-    )
-    impl.num_heads, impl.scale, impl.layer_num = H, D**-0.5, 0
     idx, seg = row_split_index(b.n, tp, rank, DEV)
-    args = (None, b.pos, b.seq, None, b.bt, layer, b.ic, b.nb, v, None)
-    impl._kernel_attention(*args, split=(idx, seg, b.n, tp))
-    impl._kernel_attention(*args)
+    impl._kernel_attention(*args, v, None, split=(idx, seg, b.n, tp))
+    impl._kernel_attention(*args, v, None)
     (rows_split, ctx_split), (rows, ctx) = seen
     assert torch.equal(rows_split, rows) and torch.equal(ctx_split, ctx)
+
+
+@pytest.mark.parametrize("rows_per_seq", [1, 4])
+def test_static_verify_takes_query_blocked_scores(monkeypatch, rows_per_seq):
+    """In the decode graph's static path a speculative verify (k + 1 rows a sequence) scores
+    with score_tq and selects as the one-row kernel does; a plain decode keeps one row.
+    """
+    b = _batch([(c, rows_per_seq) for c in (90, 160, 300, 41)], seed=8)
+    impl, seen, args = _mini_impl(b, 4, monkeypatch)
+    calls = []
+    real = K.scores
+    monkeypatch.setattr(
+        K, "scores", lambda *a, **kw: calls.append(kw["tq"]) or real(*a, **kw)
+    )
+    for tq in (0, 4):
+        v = ProVariants(kernels=True, attn="aiter", topk="fused", score_tq=tq)
+        impl._kernel_attention(*args, v, None, static=True)
+    assert calls == [0, 4 if rows_per_seq > 1 else 0]
+    (r0, c0), (r1, c1) = seen
+    assert torch.equal(r0, r1) and torch.equal(c0, c1)
 
 
 def _plan(monkeypatch, n_tok, ctx_lens, prefill=True, **variant):
