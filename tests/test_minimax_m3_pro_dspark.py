@@ -208,3 +208,88 @@ def test_yarn_magnitude_is_the_configs_attention_factor():
 def test_unscaled_rope_stays_unscaled():
     cfg = _pro_text_config(rope_scaling=None)
     assert pro_dspark.M3ProDSparkAttention._rope_scaling(None, cfg) is None
+
+
+def _paged_proposer(model, num_spec):
+    """A `DSparkProposer` of the paged (separate-draft) flavor, with nothing
+    built but what the block width reads: the draft model and the k resolved
+    from a Pro draft config."""
+    from atom.spec_decode.dspark_proposer import DSparkProposer
+
+    cfg = _pro_text_config()
+    SpeculativeConfig.hf_config_override(cfg)
+    p = DSparkProposer.__new__(DSparkProposer)
+    p.speculative_config = types.SimpleNamespace(
+        draft_model_hf_config=cfg,
+        num_speculative_tokens=num_spec,
+        use_dspark_with_draft=lambda: True,
+    )
+    p.mtp_k = p._resolve_mtp_k()
+    p.model = model
+    return p
+
+
+@pytest.mark.parametrize("k", range(1, 9))
+def test_the_pro_draft_drafts_its_trained_block_below_it(k):
+    p = _paged_proposer(pro_dspark.MiniMaxM3ProDSpark, k)
+    assert p.mtp_k == k
+    # The block is bidirectional, so a narrower one changes every drafted
+    # token: below 7 the draft still runs all 7, above it the verify's k.
+    assert p.draft_tokens_per_seq == max(k, 7)
+
+
+@pytest.mark.parametrize("k", [3, 7])
+def test_a_paged_draft_without_a_trained_block_drafts_k(k):
+    """Kimi-K3's draft is width-agnostic: its block is whatever k says."""
+    p = _paged_proposer(types.SimpleNamespace(), k)
+    assert p.draft_tokens_per_seq == k
+
+
+@pytest.mark.parametrize("k", [1, 4, 7])
+def test_the_verify_gets_k_drafts_of_the_wider_block(k):
+    """The block pass returns its whole width; the verify, and the verify
+    scheduler's confidence, get only the first k columns."""
+    model = types.SimpleNamespace(
+        drafts_trained_block=True, block_attention_is_mla=False
+    )
+    p = _paged_proposer(model, k)
+    scheduled_bs, running_bs, width = 3, 4, p.draft_tokens_per_seq
+    ids = torch.arange(running_bs * width, dtype=torch.int32).view(running_bs, -1)
+    conf = torch.rand(running_bs, width)
+    seen = {}
+    # The block buffers, sized as the server sizes them, and the block's
+    # positions built from them; the pool is not bound, so nothing past that.
+    p.config = types.SimpleNamespace(max_num_seqs=8)
+    p.device = torch.device("cpu")
+    p._init_draft_block_buffers()
+    p._blk_dtype_q = torch.bfloat16
+    p._bound_draft_k_cache = lambda fc: None
+    p._publish_draft_shape = lambda fc, **kw: seen.update(kw)
+    p.runner = types.SimpleNamespace(
+        block_size=16,
+        forward_vars={"batch_info": types.SimpleNamespace(gpu=torch.zeros(3))},
+    )
+    p._verify_scheduler = types.SimpleNamespace(
+        compute_ell=lambda c: seen.setdefault("ell_shape", tuple(c.shape)),
+        set_last_ell=lambda ell: None,
+    )
+    pass_ = types.SimpleNamespace(
+        label=lambda s, r: "eager", run=lambda bs, **kw: (ids[:bs], conf[:bs])
+    )
+    fc = types.SimpleNamespace(
+        context=types.SimpleNamespace(running_bs=running_bs, is_prefill=True)
+    )
+    md = types.SimpleNamespace(max_seqlen_k=32)
+    staged = {"anchor_positions": torch.arange(running_bs, dtype=torch.int64) * 10}
+
+    out = p._propose_with_draft(pass_, fc, md, staged, scheduled_bs)
+
+    assert out.tolist() == ids[:scheduled_bs, :k].tolist()
+    anchors = staged["anchor_positions"].view(-1, 1)
+    assert (
+        p._blk_positions[:running_bs].tolist()
+        == (anchors + torch.arange(1, width + 1)).tolist()
+    )
+    assert seen["ell_shape"] == (scheduled_bs, k)
+    # The pass itself is the whole block.
+    assert seen["running_tokens"] == running_bs * width
