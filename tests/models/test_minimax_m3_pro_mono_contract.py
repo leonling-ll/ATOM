@@ -28,14 +28,23 @@ def arch():
         yield
 
 
+@pytest.mark.parametrize("upto", ["norm", "ffn"])
 @pytest.mark.parametrize("rows", ROWS)
 @pytest.mark.parametrize("lookahead", [True, False])
-def test_the_layer_kernel_holds(arch, rows, lookahead):
-    contract.check_build(P1Build(tokens=rows, lookahead=lookahead))
+def test_the_layer_kernel_holds(arch, rows, lookahead, upto):
+    contract.check_build(P1Build(tokens=rows, upto=upto, lookahead=lookahead))
 
 
-def test_the_debug_build_holds(arch):
-    contract.check_build(P1Build(tokens=16, debug=True))
+@pytest.mark.parametrize("upto", ["norm", "ffn"])
+def test_the_debug_build_holds(arch, upto):
+    contract.check_build(P1Build(tokens=16, upto=upto, debug=True))
+
+
+# the FFN builds whose norm runs two passes with a partial one (an SGPR peak:
+# a value of the o stage held into the FFN spilled at 9 .. 13 rows)
+@pytest.mark.parametrize("rows", [9, 13])
+def test_the_ffn_builds_past_one_pass_hold(arch, rows):
+    contract.check_build(P1Build(tokens=rows, upto="ffn", lookahead=True))
 
 
 @pytest.fixture(scope="module")
@@ -44,6 +53,15 @@ def traced(arch):
     from atom.mono.runtime.compile import trace
 
     key = P1Build(tokens=8)
+    return key, trace(contract.build_layer(key), ABI)
+
+
+@pytest.fixture(scope="module")
+def traced_ffn(arch):
+    from atom.models.minimax_m3.pro_mono.kernels.layer import ABI
+    from atom.mono.runtime.compile import trace
+
+    key = P1Build(tokens=8, upto="ffn")
     return key, trace(contract.build_layer(key), ABI)
 
 
@@ -57,6 +75,26 @@ def traced(arch):
 )
 def test_a_wrong_declaration_is_caught(traced, wrong, msg):
     key, rec = traced
+    check(rec, decls(key))
+    bad = [
+        dataclasses.replace(d, **wrong[d.name]) if d.name in wrong else d
+        for d in decls(key)
+    ]
+    with pytest.raises(ContractError, match=msg):
+        check(rec, bad)
+
+
+@pytest.mark.parametrize(
+    "wrong, msg",
+    [
+        ({"ugf": {"writer": "down"}}, "ugf put by ug, its writer is down"),
+        ({"rlog": {"space": Space.SCRATCH}}, "rlog in router as peer"),
+        ({"route": {"writer": "union"}}, "route put by route, its writer is union"),
+        ({"rpart": {"exchange": False}}, "rpart polled by its own writer router"),
+    ],
+)
+def test_a_wrong_ffn_declaration_is_caught(traced_ffn, wrong, msg):
+    key, rec = traced_ffn
     check(rec, decls(key))
     bad = [
         dataclasses.replace(d, **wrong[d.name]) if d.name in wrong else d
