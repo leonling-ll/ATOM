@@ -176,6 +176,11 @@ class ProVariants:
     # No effect: index q and k share one packed GEMM (index_qk_proj), so every row's
     # index q is computed; kept so variants files that set it still parse.
     index_split_proj: bool = True
+    # Decode / speculative-verify indexer split over the TP ranks: in a graph of at least
+    # this many rows (0: off), a multiple of the TP size, on aiter's page tables, each rank
+    # scores and selects one contiguous share of the rows and the [page table | ctx] rows are
+    # all-gathered back in order. Bit for bit the same selection, an eighth of the work.
+    index_split_decode: int = 0
     # Prefill and speculative-verify scores take ``score_tq`` rows per program (a power of
     # two; 0: one): the rows of a sequence read each tile of block keys once, one dot for
     # all their query heads. A plain decode (one row a sequence) keeps one.
@@ -802,6 +807,7 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
         static: bool = False,
         split=None,
         mx_scale=None,
+        dsplit=None,
     ):
         """The whole layer in four launches (``prep`` / ``scores`` + top-k / ``attention``).
 
@@ -812,7 +818,8 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
         table's width), so the selection runs even where every block would fit.
         ``split``: this forward's ``index_split`` plan; the indexer scores this rank's
         rows only (the other rows' index q may be unset). ``mx_scale`` ``[n, H x 192 / 32]``
-        uint8 (with ``out`` E4M3): the day0 decode writes o_proj's MXFP8 input.
+        uint8 (with ``out`` E4M3): the day0 decode writes o_proj's MXFP8 input. ``dsplit``:
+        a decode's ``(first, end)`` rows this rank selects (``decode_split``).
         """
         kc4 = layer.k_cache[:, 0]
         vc4 = None if self.k_only else layer.v_cache[:, 0]
@@ -972,6 +979,10 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
         k = min(self.topk, nb)
         rq, rseq, rpos = iq, seq_id, positions  # the rows the indexer scores
         rps = n // block_tables.shape[0]  # rows a sequence (static: k + 1 for a verify)
+        if dsplit is not None:
+            # whole sequences a rank (decode_split), so no score tile spans two of them
+            r0, r1 = dsplit
+            rq, rseq, rpos = iq[r0:r1], seq_id[r0:r1], positions[r0:r1]
         if split is not None:
             # every row scores alone, so this rank's rows come out as they would in full
             idx, seg, n_rows, tp = split
@@ -1010,6 +1021,30 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
         )
         # day0 (prefill and decode) and Triton take block ids, aiter pages
         logical = day0 or day0_dec or not aiter_attn
+        if dsplit is not None:
+            from aiter.dist.communication_op import tensor_model_parallel_all_gather
+
+            if logical:
+                # block ids for the day0 decode / Triton: each row selects alone, and the
+                # shares are contiguous and in rank order, so gathered they are in place
+                valid_first = True
+                mine = pro_kernels.select_logical(
+                    score, rpos, k, split=v.topk == "split"
+                )
+                return attend(tensor_model_parallel_all_gather(mine, dim=0).contiguous())
+            # this rank's [page table | ctx] rows, written in place by the selection
+            mine = torch.empty(r1 - r0, k + 1, dtype=torch.int32, device=iq.device)
+            if select is pro_kernels.select_rows_split:
+                select(
+                    score, block_tables, rseq, rpos, k, rows=mine[:, :k], ctx=mine[:, k]
+                )
+            else:
+                rows, ctx = select(score, block_tables, rseq, rpos, k)
+                mine[:, :k], mine[:, k] = rows, ctx
+            # the shares are contiguous and in rank order: gathered, the rows are in place;
+            # aiter takes the page table at any row stride, the lengths contiguous
+            full = tensor_model_parallel_all_gather(mine, dim=0)
+            return attend(None, (full[:, :k], full[:, k].contiguous()))
         if split is not None:
             from aiter.dist.communication_op import tensor_model_parallel_all_gather
 
@@ -1045,6 +1080,28 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
         return attend(sel)
 
     # ---------------------------------------------------------------- forward --
+    def decode_split(self, n: int, v: ProVariants, seqs: int = 0):
+        """This rank's ``(first, end)`` rows of a graph's ``n`` decode rows of ``seqs``
+        sequences under ``index_split_decode``, or ``None``: every rank selects every row.
+        A rank's share holds whole sequences (``n / seqs`` rows each). The shapes alone
+        decide, so every rank and layer agrees and a graph holds it."""
+        if not v.index_split_decode or n < v.index_split_decode:
+            return None
+        if not self._aiter_attn(v, n) or v.topk not in ("fused", "split"):
+            return None
+        from aiter.dist.parallel_state import (
+            get_tensor_model_parallel_rank,
+            get_tensor_model_parallel_world_size,
+        )
+
+        tp = get_tensor_model_parallel_world_size()
+        rps = n // seqs if seqs else 1
+        if tp == 1 or n % tp or (n // tp) % rps:
+            return None
+        share = n // tp
+        rank = get_tensor_model_parallel_rank()
+        return rank * share, (rank + 1) * share
+
     def index_split(self, n_tok: int):
         """This forward's ``index_split`` plan, ``(idx, seg, n, tp)`` (``row_split_index``
         of the forward's ``n`` rows for this rank), or ``None``: every rank scores every
@@ -1197,6 +1254,11 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
                 static=static,
                 split=None if static else self.index_split(n_tok),
                 mx_scale=None if mx_scale is None else mx_scale[:n],
+                dsplit=(
+                    self.decode_split(n, v, md.block_tables.shape[0])
+                    if static
+                    else None
+                ),
             )
             if mx:
                 self._mx_scale = mx_scale.view(torch.float8_e8m0fnu)

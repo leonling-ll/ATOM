@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import itertools
 import os
+import sys
 
 import pytest
 import torch
@@ -25,6 +26,7 @@ if not torch.cuda.is_available():
 pytest.importorskip("triton")
 pytest.importorskip("aiter", reason="pro_attn imports the ATOM attention base")
 
+from dataclasses import replace
 from types import SimpleNamespace
 
 import triton
@@ -1222,6 +1224,88 @@ class TestImplGlue:
         )
         assert _close(got[:2], out[tok[:2]])
         assert all(torch.equal(a, b) for a, b in zip(caches, (c.kc4, c.vc4, c.ic)))
+
+    @pytest.mark.parametrize("topk", ["fused", "split"])
+    def test_decode_split_over_ranks_equals_one_rank(self, topk, monkeypatch):
+        # index_split_decode: each of 4 ranks selects its contiguous quarter of 8 decode
+        # rows; the all-gathered [page table | ctx] rows give every rank the same output as
+        # one rank selecting all of them
+        # the conftest stands torch.distributed in for aiter.dist
+        comm = SimpleNamespace(tensor_model_parallel_all_gather=None)
+        monkeypatch.setitem(sys.modules, "aiter.dist.communication_op", comm)
+        c = Case([150, 97], topk=8, seed=3)
+        self._run(c, {}, {"attn": "aiter", "topk": topk}, monkeypatch)
+        tok = torch.tensor(
+            [
+                c.lens[0] - 1,
+                c.T - 1,
+                140,
+                c.lens[0] + 90,
+                100,
+                c.lens[0] + 60,
+                130,
+                149,
+            ],
+            device=DEV,
+        )
+        seq = (tok >= c.lens[0]).long()
+        wide = torch.cat([c.bt, torch.zeros_like(c.bt).repeat(1, 4)], dim=1)
+        v = ProVariants(attn="aiter", topk=topk, index_split_decode=8)
+
+        def run(dsplit):
+            got = torch.zeros(len(tok), H * VD, dtype=DT, device=DEV)
+            c.impl._kernel_attention(
+                c.qkv[tok],
+                c.pos[tok],
+                seq,
+                c.slot[tok],
+                wide,
+                c.layer,
+                c.ic,
+                wide.shape[1],
+                v,
+                got,
+                static=True,
+                dsplit=dsplit,
+            )
+            return got
+
+        want = run(None)
+        shares, tp = [], 4
+        monkeypatch.setattr(
+            comm,
+            "tensor_model_parallel_all_gather",
+            lambda x, dim: (shares.append(x.clone()), x.repeat(tp, 1))[1],
+        )
+        for r in range(tp):
+            run((2 * r, 2 * r + 2))
+        mine = list(shares)
+        monkeypatch.setattr(
+            comm, "tensor_model_parallel_all_gather", lambda x, dim: torch.cat(mine)
+        )
+        for r in range(tp):
+            assert torch.equal(run((2 * r, 2 * r + 2)), want), r
+
+    def test_decode_split_plan(self, monkeypatch):
+        ps = SimpleNamespace(
+            get_tensor_model_parallel_world_size=lambda: 8,
+            get_tensor_model_parallel_rank=lambda: 3,
+        )
+        monkeypatch.setitem(sys.modules, "aiter.dist.parallel_state", ps)
+        c = Case([150, 97], topk=8, seed=3)
+        v = ProVariants(attn="aiter", topk="split", index_split_decode=64)
+        assert c.impl.decode_split(512, v) == (192, 256)
+        assert c.impl.decode_split(32, v) is None  # under the threshold
+        assert c.impl.decode_split(68, v) is None  # not a multiple of the TP size
+        assert c.impl.decode_split(512, replace(v, index_split_decode=0)) is None
+        assert c.impl.decode_split(512, replace(v, topk="torch")) is None
+        assert c.impl.decode_split(512, replace(v, attn="triton")) is None
+        # whole sequences a rank: 512 rows of 64 sequences (8 each) split, of 128 (4 each)
+        # too; 520 rows of 65 sequences: 65 rows a rank would cut a sequence
+        assert c.impl.decode_split(512, v, 64) == (192, 256)
+        assert c.impl.decode_split(512, v, 128) == (192, 256)
+        assert c.impl.decode_split(520, v, 65) is None
+        assert c.impl.decode_split(512, v, 4) is None  # 64 rows a rank, 128 a sequence
 
     @pytest.mark.skipif(not GPU, reason="CUDA graphs need a GPU")
     @pytest.mark.parametrize(

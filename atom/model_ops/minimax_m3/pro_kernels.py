@@ -1575,6 +1575,7 @@ def _store_rows(
     rows_ptr,
     stride_rows,
     ctx_ptr,
+    stride_ctx,
     K: tl.constexpr,
     PG: tl.constexpr,
     LOGICAL: tl.constexpr = False,
@@ -1603,7 +1604,7 @@ def _store_rows(
     rbase = rows_ptr + t.to(tl.int64) * stride_rows
     tl.store(rbase + slot, phys, mask=valid)
     tl.store(rbase + e, tl.zeros_like(e), mask=e >= n_full + has_tail)
-    tl.store(ctx_ptr + t, n_full * PG + has_tail * (qpos - qb * PG + 1))
+    tl.store(ctx_ptr + t * stride_ctx, n_full * PG + has_tail * (qpos - qb * PG + 1))
 
 
 @triton.jit
@@ -1638,6 +1639,7 @@ def _select_rows_kernel(
         rows_ptr,
         stride_rows,
         ctx_ptr,
+        1,
         K,
         PG,
         LOGICAL,
@@ -1702,7 +1704,9 @@ def _merge_keys(base, count, K: tl.constexpr, VOLATILE: tl.constexpr):
     return best
 
 
-@triton.jit(do_not_specialize=["stride_s", "stride_bt", "stride_rows", "NB"])
+@triton.jit(
+    do_not_specialize=["stride_s", "stride_bt", "stride_rows", "stride_ctx", "NB"]
+)
 def _select_split_kernel(
     score_ptr,
     stride_s,
@@ -1713,6 +1717,7 @@ def _select_split_kernel(
     rows_ptr,
     stride_rows,
     ctx_ptr,
+    stride_ctx,
     part_ptr,  # [T, P, K] int64 scratch
     count_ptr,  # [T] int32 arrivals, zero between calls (FUSED only)
     NB,
@@ -1745,6 +1750,7 @@ def _select_split_kernel(
             rows_ptr,
             stride_rows,
             ctx_ptr,
+            stride_ctx,
             K,
             PG,
             LOGICAL,
@@ -1777,6 +1783,7 @@ def _select_split_kernel(
                 rows_ptr,
                 stride_rows,
                 ctx_ptr,
+                stride_ctx,
                 K,
                 PG,
                 LOGICAL,
@@ -1784,7 +1791,7 @@ def _select_split_kernel(
             tl.atomic_xchg(count_ptr + t, 0, sem="relaxed", scope="gpu")
 
 
-@triton.jit(do_not_specialize=["stride_bt", "stride_rows", "NB", "P"])
+@triton.jit(do_not_specialize=["stride_bt", "stride_rows", "stride_ctx", "NB", "P"])
 def _select_merge_kernel(
     bt_ptr,
     stride_bt,
@@ -1793,6 +1800,7 @@ def _select_merge_kernel(
     rows_ptr,
     stride_rows,
     ctx_ptr,
+    stride_ctx,
     part_ptr,
     NB,
     P,
@@ -1821,6 +1829,7 @@ def _select_merge_kernel(
         rows_ptr,
         stride_rows,
         ctx_ptr,
+        stride_ctx,
         K,
         PG,
         LOGICAL,
@@ -1859,6 +1868,8 @@ def select_rows_split(
     fused=None,
     num_warps=4,
     logical=False,
+    rows=None,
+    ctx=None,
 ):
     """``select_rows``' tables (bit for bit), each row's causal blocks split into ``parts``
     spans that separate programs reduce to their ``k`` best, merged per row by the last
@@ -1869,8 +1880,11 @@ def select_rows_split(
     assert k & (k - 1) == 0 and chunk >= 4 * k and chunk & (chunk - 1) == 0, (k, chunk)
     t, nb = score.shape
     dev = score.device
-    rows = torch.empty(t, k, dtype=torch.int32, device=dev)
-    ctx = torch.empty(t, dtype=torch.int32, device=dev)
+    if rows is None:  # else the caller's: any row stride, unit column stride
+        rows = torch.empty(t, k, dtype=torch.int32, device=dev)
+    if ctx is None:
+        ctx = torch.empty(t, dtype=torch.int32, device=dev)
+    assert rows.shape == (t, k) and rows.stride(1) == 1 and ctx.shape == (t,)
     if t == 0:
         return rows, ctx
     chunks = triton.cdiv(nb, chunk)
@@ -1895,6 +1909,7 @@ def select_rows_split(
         rows,
         rows.stride(0),
         ctx,
+        ctx.stride(0),
         part,
         count,
         nb,
@@ -1916,6 +1931,7 @@ def select_rows_split(
             rows,
             rows.stride(0),
             ctx,
+            ctx.stride(0),
             part,
             nb,
             parts,
