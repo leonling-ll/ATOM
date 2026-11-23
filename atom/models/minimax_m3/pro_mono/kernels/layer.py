@@ -1,0 +1,504 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+"""The phase-1 MoE layer kernel of MiniMax-M3.1-Pro, ``upto = "norm"``: o_proj,
+the first all-reduce and the post-attention Gemma RMSNorm with its MXFP8 output,
+plus the lookahead norm of layer L + 2 (stages: ``layout``'s docstring).
+
+Numerics are production's at <= 16 rows under the combo config (Lamport
+all-reduce, then aiter ``add_rmsnorm_mxfp8(..., gemma=True)``)::
+
+    a    = bf16(fp32 sum of the 8 bf16 partials, rank order 0 .. 7)
+    v    = f32(a) + f32(res)                    (unrounded)
+    h_mid = bf16(v)
+    rstd = rsq(sum_f32(v * v) / 7168 + eps)
+    x    = bf16((v * rstd) * (f32(w) + 1))
+    x8   = MXFP8 1x32 of x: code = ceil_pow2(max(amax, 1e-10) * f32(1 / 448))
+
+and the lookahead (aiter ``fused_qk_rmsnorm_group_quant``, gemma, on the bf16
+residual)::
+
+    rstd2 = rsq(sum_f32(bf16(v)^2) / 7168 + eps2)
+    la8   = MXFP8 of bf16((bf16(v) * rstd2) * (f32(w2) + 1))
+
+o_proj's input is quantized as ``quantize_fp8`` does it (the same recipe, on the
+bf16 core rows), so the GEMM reads production's operand bytes; its sum order
+over K differs from aiter's tuned GEMM, so a partial can differ in its last bf16
+bit (design section 12).
+
+The AR + norm stages are the gate #3 spike's ``rsag_sq`` mode
+(``pro_opt/mono/spike_ar/arnorm_kernel.py``), which matched the reference on 8
+MI355X (h_mid bit-exact) before this port; the o_proj stage is MiniMax-M3's
+MXFP8 o stage (``minimax_m3/mono/kernels/stages/attention.py``) at Pro's K.
+"""
+
+import functools
+
+import flydsl.compiler as flyc
+import flydsl.expr as fx
+from aiter.ops.flydsl.kernels import buffer_ops as bo
+from flydsl.expr import const_expr, gpu, range_constexpr
+from flydsl.expr.typing import Int32, Int64, T
+
+from atom.models.minimax_m3.pro_mono.config import COLS, HIDDEN
+from atom.models.minimax_m3.pro_mono.layout import (
+    ABI_NAMES,
+    NT,
+    O_CPW,
+    O_K,
+    O_ROW,
+    O_ROWS,
+    O_SCALES_PW,
+    O_TASKS,
+    O_TASKS_OWN,
+    OSC_ROW,
+    OWN,
+    REGIONS,
+    TL_POINTS,
+    TP,
+    P1Build,
+    ag_pair,
+    agsq_pair,
+    peer_layout,
+    rs_pair,
+    scratch_layout,
+)
+from atom.models.minimax_m3.pro_mono.sources import SOURCES
+from atom.mono.device.mx import (
+    FP8_MAX,
+    clamp_fp8,
+    code_ceil,
+    mfma_scaled,
+    rcp_pow2,
+)
+from atom.mono.device.ops import (
+    CM_NT,
+    bf2_f32,
+    bf16_pair,
+    bf16_round,
+    butterfly,
+    fp8_pack4,
+    hw_rsq,
+    kernel_symbol,
+    launcher,
+    load_ptr64,
+    row_sum,
+    rsrc,
+    traced,
+    wave_sum,
+    xshfl,
+)
+from atom.mono.device.ranks import peer_bases, sum_partials
+from atom.mono.device.stamps import stamp, stamp_begin, stamp_flush
+from atom.mono.device.sync import Mailbox, preg
+from atom.mono.plan.build_key import key_tuple, symbol_params
+from atom.mono.plan.execution import BLOCKS, THREADS, WAVES
+from atom.mono.plan.trace import enter_stage
+from atom.mono.runtime.abi import KernelAbi
+from atom.mono.runtime.debug import region_ids
+
+ABI = KernelAbi(ABI_NAMES)
+_STREAM = fx.Stream(None)
+# the core rows' load unit: 8 bf16 (one dwordx4), 4 a 32-block
+CORE_ITEMS = O_K // 8
+
+
+def _f32_of(w):
+    return fx.Int32(w).bitcast(fx.Float32)
+
+
+def _ld_words(addr, word, n):
+    """``n`` (1 or 2) plain i32 words of a buffer from word ``word``."""
+    if const_expr(n == 1):
+        return [fx.Int32(bo.buffer_load(rsrc(addr), word, vec_width=1, dtype=T.i32))]
+    v = fx.Vector(bo.buffer_load(rsrc(addr), word, vec_width=n, dtype=T.i32))
+    return [fx.Int32(v[e]) for e in range(n)]
+
+
+def _st_words(words, addr, word):
+    if const_expr(len(words) == 1):
+        bo.buffer_store(fx.Int32(words[0]), rsrc(addr), word)
+    else:
+        bo.buffer_store(fx.Vector.from_elements(words, fx.Int32), rsrc(addr), word)
+
+
+def _unpack(words):
+    """bf16 pair words -> f32 values, low half first."""
+    out = []
+    for w in words:
+        out += list(bf2_f32(w))
+    return out
+
+
+def _pack(vals):
+    """f32 values -> bf16 pair words (RNE)."""
+    return [
+        bf16_pair(vals[2 * i], vals[2 * i + 1]).bitcast(fx.Int32)
+        for i in range(len(vals) // 2)
+    ]
+
+
+def _absmax(vals):
+    am = fx.max(vals[0], -vals[0])
+    for v in vals[1:]:
+        am = fx.max(am, fx.max(v, -v))
+    return am
+
+
+def _code(am):
+    """The E8M0 code of a 32-block of absolute maximum ``am``: ``quantize_fp8``'s
+    ceil_pow2(max(amax, 1e-10) * f32(1 / 448))."""
+    return code_ceil(fx.max(am, fx.Float32(1e-10)) * fx.Float32(1.0 / FP8_MAX))
+
+
+def _or(a, b):
+    return a | b
+
+
+# ------------------------------------------------------------------ o_proj
+
+
+@traced
+def load_core(c):
+    """The core rows (bf16 [S, 3072], plain loads: the attention wrote them)
+    -> MXFP8 1x32 in LDS: e4m3 words at ``xs`` (token t's at t O_ROW), their
+    E8M0 codes four a word at ``osc``. A thread takes 8 values, 4 threads a
+    block; S * 384 items is a multiple of 16, so a 16-lane group is either all
+    live or all past the end (clamped, nothing stored)."""
+    s, tid = c["S"], c["tid"]
+    n = s * CORE_ITEMS
+    r_core = rsrc(c["core"])
+    for i in range_constexpr(-(-n // THREADS)):
+        e = fx.min(tid + THREADS * i, n - 1)
+        t = e // CORE_ITEMS
+        q = e % CORE_ITEMS
+        v = fx.Vector(
+            bo.buffer_load(r_core, (t * O_K + 8 * q) // 2, vec_width=4, dtype=T.i32)
+        )
+        vals = _unpack([fx.Int32(v[d]) for d in range(4)])
+        code = _code(butterfly(_absmax(vals), (1, 2), fx.max))
+        inv = rcp_pow2(code)
+        qv = [clamp_fp8(x * inv) for x in vals]
+        w0 = fp8_pack4(qv[0], qv[1], qv[2], qv[3])
+        w1 = fp8_pack4(qv[4], qv[5], qv[6], qv[7])
+        # blocks 4 m .. 4 m + 3 (items 16 m ..) in one word, block k in byte k
+        codes = butterfly(code << (8 * ((q // 4) % 4)), (4, 8), _or)
+        if tid + THREADS * i < n:
+            fx.ptr_store(w0, c["xs"] + (t * O_ROW + 2 * q))
+            fx.ptr_store(w1, c["xs"] + (t * O_ROW + 2 * q + 1))
+            if q % 16 == 0:
+                fx.ptr_store(codes, c["osc"] + (t * OSC_ROW + q // 16))
+
+
+@traced
+def stage_o(c):
+    """CTA t < O_TASKS: o_proj rows 32 t .. + 32 (two 16-row groups, a group's
+    4 waves each a quarter of K) -> bf16 partial rows -> the owner rank's
+    ``rs`` (this rank's slot). The weight and its scales are in flight while
+    the core rows are quantized."""
+    s, tid, lane, wave, bid = c["S"], c["tid"], c["lane"], c["wave"], c["bid"]
+    g4 = lane // 16
+    l16 = lane % 16
+    q4 = wave % 4
+    v4f = fx.Vector.make_type(4, fx.Float32)
+    if bid < O_TASKS:
+        t = bid
+        rg = t * 2 + wave // 4
+        r_wo = rsrc(c["w_o"])
+        wts = [
+            fx.Vector(
+                bo.buffer_load(
+                    r_wo,
+                    ((rg * (O_K // 32) + (q4 * O_CPW + cc) * 2) * 512 + lane * 16) // 4,
+                    vec_width=4,
+                    dtype=T.i32,
+                    cache_modifier=CM_NT,
+                )
+            )
+            for cc in range(O_CPW)
+        ]
+        # lane (row l16, block g4): the E8M0 bytes of this wave's 24 blocks,
+        # row-major [7168, 96]; MFMA p takes block g4 of dword p
+        sw = (rg * 16 + l16) * (O_K // 32 // 4) + q4 * (O_SCALES_PW // 4)
+        r_so = rsrc(c["s_o"])
+        s_lo = fx.Vector(bo.buffer_load(r_so, sw, vec_width=4, dtype=T.i32))
+        s_hi = fx.Vector(bo.buffer_load(r_so, sw + 4, vec_width=2, dtype=T.i32))
+        ws = [s_lo[d] for d in range(4)] + [s_hi[d] for d in range(2)]
+        load_core(c)
+        gpu.barrier()
+        c["stamp"](1)
+        # B column l16 is token l16 (the last token past S: its column is
+        # discarded); chunks 2p, 2p + 1 in one 16x16x128 scaled MFMA, its lane
+        # holding k 16 g4 .. + 16 of each 64-k chunk
+        col_tok = fx.min(l16, s - 1)
+        acc = fx.Vector.filled(4, 0.0, fx.Float32)
+        for p in range_constexpr(O_CPW // 2):
+            xb = [
+                fx.Vector(
+                    fx.ptr_load(
+                        c["xs"]
+                        + (col_tok * O_ROW + (q4 * O_CPW + 2 * p + h) * 16 + g4 * 4),
+                        result_type=v4f,
+                    )
+                ).bitcast(fx.Int32)
+                for h in range(2)
+            ]
+            sb = fx.ptr_load(c["osc"] + (col_tok * OSC_ROW + q4 * (O_CPW // 2) + p))
+            acc = mfma_scaled(
+                fx.Vector.from_elements(
+                    [wts[2 * p + h][e] for h in range(2) for e in range(4)], fx.Int32
+                ),
+                fx.Vector.from_elements(
+                    [xb[h][e] for h in range(2) for e in range(4)], fx.Int32
+                ),
+                acc,
+                fx.Int32(ws[p]) >> (g4 * 8),
+                fx.Int32(sb) >> (g4 * 8),
+            )
+        fx.ptr_store(acc, c["red"] + (wave * 64 + lane) * 4)
+        gpu.barrier()
+        # the 4 K quarters summed in wave order: thread (token, row of 32)
+        if tid < O_ROWS * s:
+            tk = tid // O_ROWS
+            grp = (tid % O_ROWS) // 16
+            tot = row_sum(c["red"], tid % 16, tk, [grp * 4 + w for w in range(4)])
+            fx.ptr_store(bf16_round(tot), c["misc"] + tid)
+        gpu.barrier()
+        # a pair of rows a thread -> the owner of these columns, this rank's slot
+        if tid < (O_ROWS // 2) * s:
+            tk = tid // (O_ROWS // 2)
+            rp = tid % (O_ROWS // 2)
+            v0 = fx.ptr_load(c["misc"] + (tk * O_ROWS + 2 * rp))
+            v1 = fx.ptr_load(c["misc"] + (tk * O_ROWS + 2 * rp + 1))
+            col = (t % O_TASKS_OWN) * O_ROWS + 2 * rp
+            c["put_bf"](
+                preg(c["o_owner"], c["off"]["rs"], "rs"),
+                2 * rs_pair(c["rank"], tk, col),
+                [v0, v1],
+            )
+
+
+# ------------------------------------------------------- all-reduce + norm
+
+
+@traced
+def ar_reduce(c, ins):
+    """Stages reduce / gather, a pass a token: -> the f32 v = bf16(sum) + res of
+    this lane's two columns. The owner of the columns sums the ranks' partials,
+    sends the bf16 sum and the task's sums of squares to every rank."""
+    lane, la = c["lane"], c["lookahead"]
+    held = []
+    for k in range_constexpr(len(ins)):
+        t, col, rr = ins[k][0], ins[k][1], ins[k][2]
+        # bound before the traced ifs: names their branches bind are not seen
+        # past them otherwise
+        v0, v1 = fx.Float32(0.0), fx.Float32(0.0)
+        enter_stage("reduce")
+        if c["is_owner"]:
+            lo, hi = sum_partials(
+                c["poll"],
+                preg(c["own"], c["off"]["rs"], "rs"),
+                lambda src, t=t, col=col: rs_pair(src, t, col - c["obeg"]),
+                TP,
+            )
+            lo, hi = bf16_round(lo), bf16_round(hi)
+            for p in range_constexpr(TP):
+                c["put_bf"](
+                    preg(c["bases"][p], c["off"]["ag"], "ag"),
+                    2 * ag_pair(t, col),
+                    [lo, hi],
+                )
+            v0 = lo + rr[0]
+            v1 = hi + rr[1]
+            words = [wave_sum(v0 * v0 + v1 * v1).bitcast(fx.Int32)]
+            if const_expr(la):
+                b0, b1 = bf16_round(v0), bf16_round(v1)
+                words.append(wave_sum(b0 * b0 + b1 * b1).bitcast(fx.Int32))
+            if lane == 0:
+                for p in range_constexpr(TP):
+                    c["put_words"](
+                        preg(c["bases"][p], c["off"]["agsq"], "agsq"),
+                        agsq_pair(c["j"], t),
+                        words,
+                    )
+        enter_stage("gather")
+        if c["not_owner"]:
+            w = c["poll"]([(preg(c["own"], c["off"]["ag"], "ag"), ag_pair(t, col), 1)])
+            g0, g1 = bf2_f32(w[0][0])
+            v0 = g0 + rr[0]
+            v1 = g1 + rr[1]
+        held.append([v0, v1])
+    return held
+
+
+@traced
+def mx_store(c, q8, q8s, t, col, o):
+    """MXFP8 1x32 of this lane's two bf16 outputs ``o`` (16 lanes a block):
+    e4m3 words (an even lane stores its and its neighbour's) at ``q8`` [S,
+    7168] and the task's 4 codes in one dword of ``q8s`` [S, 224]."""
+    lane = c["lane"]
+    code = _code(butterfly(_absmax(o), (1, 2, 4, 8), fx.max))
+    inv = rcp_pow2(code)
+    qv = [clamp_fp8(oe * inv) for oe in o]
+    nb = [xshfl(qe, 1) for qe in qv]
+    word = fp8_pack4(qv[0], qv[1], nb[0], nb[1])
+    if lane % 2 == 0:
+        bo.buffer_store(word, rsrc(q8), (t * HIDDEN + col) // 4)
+    # blocks 0 .. 3 of the task on lanes 0 / 16 / 32 / 48: byte k of one dword
+    codes = butterfly(code << (8 * (lane // 16)), (16, 32), _or)
+    if lane == 0:
+        bo.buffer_store(codes, rsrc(q8s), t * (HIDDEN // COLS) + c["j"])
+
+
+@traced
+def ar_norm(c, ins, held, w_post, w_ahead):
+    """Stage norm: the 56 tasks' sums of squares (lane q polls task q's; one
+    wave sums them in a fixed butterfly, so every CTA and rank gets the same
+    bits), then the stores."""
+    lane, la = c["lane"], c["lookahead"]
+    enter_stage("norm")
+    sq_at = preg(c["own"], c["off"]["agsq"], "agsq")
+    q = fx.min(lane, NT - 1)
+    got = c["poll"](
+        [(sq_at, agsq_pair(q, ins[k][0]), 2 if la else 1) for k in range(len(ins))]
+    )
+    c["stamp"](4)
+    wf = [w + fx.Float32(1.0) for w in _unpack(w_post)]
+    if const_expr(la):
+        wf2 = [w + fx.Float32(1.0) for w in _unpack(w_ahead)]
+    for k in range_constexpr(len(ins)):
+        t, col = ins[k][0], ins[k][1]
+        word = (t * HIDDEN + col) // 2
+        part = (lane < NT).select(_f32_of(got[k][0]), fx.Float32(0.0))
+        r = hw_rsq(wave_sum(part) / float(HIDDEN) + fx.Float32(c["eps"]))
+        v = held[k]
+        y = [(v[e] * r) * wf[e] for e in range(2)]
+        _st_words(_pack(v), c["h_mid"], word)
+        _st_words(_pack(y), c["x"], word)
+        mx_store(c, c["x8"], c["x8s"], t, col, [bf16_round(ye) for ye in y])
+        if const_expr(la):
+            part2 = (lane < NT).select(_f32_of(got[k][1]), fx.Float32(0.0))
+            r2 = hw_rsq(wave_sum(part2) / float(HIDDEN) + fx.Float32(c["eps_ahead"]))
+            vb = [bf16_round(ve) for ve in v]
+            y2 = [bf16_round((vb[e] * r2) * wf2[e]) for e in range(2)]
+            mx_store(c, c["la8"], c["la8s"], t, col, y2)
+
+
+@traced
+def ar_tokens(c, ps):
+    """A wave's tokens (pass indices ``ps``: token wave + 8 p) of this CTA's
+    128 columns, two a lane: reduce, gather, norm."""
+    lane, wave, j = c["lane"], c["wave"], c["j"]
+    col = j * COLS + 2 * lane
+    ins = []
+    for k in range_constexpr(len(ps)):
+        t = wave + 8 * ps[k]
+        ins.append((t, col, _unpack(_ld_words(c["res"], (t * HIDDEN + col) // 2, 1))))
+    # the weights before any poll
+    w_post = _ld_words(c["g_post"], col // 2, 1)
+    w_ahead = None
+    if const_expr(c["lookahead"]):
+        w_ahead = _ld_words(c["g_ahead"], col // 2, 1)
+    held = ar_reduce(c, ins)
+    c["stamp"](3)
+    ar_norm(c, ins, held, w_post, w_ahead)
+
+
+# ------------------------------------------------------------------ build
+
+
+@functools.cache
+def build(key: P1Build):
+    """The launcher of ``key`` (cached per process); its kernel takes
+    ``ABI_NAMES``."""
+    s = key.tokens
+    passes = -(-s // WAVES)
+    play = peer_layout()
+    slay = scratch_layout(key)
+    tl_on = key.timeline
+    keyed = key_tuple(key, SOURCES)
+    name = kernel_symbol("minimax_m3_pro_mono_layer", **symbol_params(key))
+
+    @fx.struct
+    class Smem:
+        xs: fx.Array[fx.Int32, s * O_ROW, 16]
+        osc: fx.Array[fx.Int32, s * OSC_ROW, 16]
+        red: fx.Array[fx.Float32, WAVES * 64 * 4, 16]
+        misc: fx.Array[fx.Float32, O_ROWS * s, 16]
+        tls: fx.Array[fx.Int64, TL_POINTS, 16]
+
+    @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
+    def p1_layer(
+        core: Int64, w_o: Int64, s_o: Int64, res: Int64, g_post: Int64,
+        g_ahead: Int64, h_mid: Int64, x: Int64, x8: Int64, x8s: Int64,
+        la8: Int64, la8s: Int64, scratch: Int64, peers: Int64, rank: Int32,
+        layer: Int32, tl: Int64,
+    ):  # fmt: skip
+        _ = keyed
+        tid = fx.thread_idx.x
+        bid = fx.block_idx.x
+        lds = fx.SharedAllocator().allocate(Smem).peek()
+        tls = lds.tls.ptr
+        stamp_begin(tl_on, tls, tid, TL_POINTS)
+        if const_expr(key.debug):
+            mb = Mailbox(
+                layer, scratch + fx.Int64(slay["diag"][0]), region_ids(REGIONS)
+            )
+        else:
+            mb = Mailbox(layer)
+        lane = tid % 64
+        wave = tid // 64
+        j = bid
+        owner = j // (OWN // COLS)
+        c = {
+            "S": s, "lookahead": key.lookahead, "eps": key.eps,
+            "eps_ahead": key.eps_ahead, "tid": tid, "bid": bid, "lane": lane,
+            "wave": wave, "j": j, "rank": rank,
+            "bases": peer_bases(peers, TP), "own": load_ptr64(peers, rank),
+            # the rank owning this CTA's o task's columns
+            "o_owner": load_ptr64(
+                peers, fx.min(bid, O_TASKS - 1) // O_TASKS_OWN
+            ),
+            "obeg": owner * OWN, "is_owner": owner == rank,
+            "not_owner": owner != rank,
+            "off": {r: play[r][0] for r in REGIONS},
+            "core": core, "w_o": w_o, "s_o": s_o, "res": res,
+            "g_post": g_post, "g_ahead": g_ahead, "h_mid": h_mid, "x": x,
+            "x8": x8, "x8s": x8s, "la8": la8, "la8s": la8s,
+            "xs": lds.xs.ptr, "osc": lds.osc.ptr, "red": lds.red.ptr,
+            "misc": lds.misc.ptr,
+            "put_bf": mb.put_bf, "put_words": mb.put_words, "poll": mb.poll,
+            "stamp": lambda k: stamp(tl_on, tls, tid, k),
+        }  # fmt: skip
+        enter_stage("o")
+        stage_o(c)
+        stamp(tl_on, tls, tid, 2)
+        if const_expr(passes == 1):
+            if (bid < NT) & (wave < s):
+                ar_tokens(c, [0])
+        else:
+            both = s - WAVES  # waves holding a token in both passes
+            if (bid < NT) & (wave < both):
+                ar_tokens(c, [0, 1])
+            if const_expr(both < WAVES):  # noqa: SIM102
+                if (bid < NT) & (wave >= both):
+                    ar_tokens(c, [0])
+        stamp(tl_on, tls, tid, 5)
+        stamp(tl_on, tls, tid, TL_POINTS - 1)
+        stamp_flush(tl_on, tls, tl, tid, bid, TL_POINTS)
+
+    @launcher(name)
+    def launch(
+        core: Int64, w_o: Int64, s_o: Int64, res: Int64, g_post: Int64,
+        g_ahead: Int64, h_mid: Int64, x: Int64, x8: Int64, x8s: Int64,
+        la8: Int64, la8s: Int64, scratch: Int64, peers: Int64, rank: Int32,
+        layer: Int32, tl: Int64,
+        stream: fx.Stream = _STREAM,
+    ):  # fmt: skip
+        _ = keyed
+        p1_layer(
+            core, w_o, s_o, res, g_post, g_ahead, h_mid, x, x8, x8s, la8, la8s,
+            scratch, peers, rank, layer, tl,
+        ).launch(grid=(BLOCKS,), block=(THREADS,), stream=stream)  # fmt: skip
+
+    ABI.check(p1_layer, launch)
+    return launch
