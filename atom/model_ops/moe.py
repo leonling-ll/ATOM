@@ -528,6 +528,7 @@ def _select_logical(
         num_fused_shared_experts=num_fused_shared_experts,
         fused_shared_experts_scoring_func=layer.shared_expert_scoring_func,
         routed_scaling_factor=layer.routed_scaling_factor,
+        fold_routed_scaling_factor=getattr(layer, "fold_routed_scaling_factor", False),
     )
 
 
@@ -3781,6 +3782,9 @@ class FusedMoE(torch.nn.Module):
             if config is not None and atom_config.torch_dtype != torch.float16
             else 1.0
         )
+        # Set by a model that wants the routed scale in the routing weights (one
+        # fewer elementwise pass over the output) where routing leaves it out.
+        self.fold_routed_scaling_factor = False
         if (
             self.expert_layout.uses_dispatch_remap
             and custom_routing_function is not None
@@ -3965,6 +3969,9 @@ class FusedMoE(torch.nn.Module):
         # Override weight padding alignment before create_weights consumes it.
         # Must happen here (pre-create_weights) — setting it on quant_method
         # after FusedMoE construction is a no-op since weights are already sized.
+        # Kept for the online-quant method swap, whose fresh method would
+        # otherwise size its weights with its own default.
+        self.pad_align_override = pad_align
         if pad_align is not None:
             self.quant_method.pad_align = pad_align
 
@@ -4424,6 +4431,8 @@ class FusedMoE(torch.nn.Module):
         self.moe_quant_params["params_dtype"] = online_quant_dtype
         # Target buffers must use real storage.
         self._stream_online_quant = False
+        if getattr(self, "pad_align_override", None) is not None:
+            self.quant_method.pad_align = self.pad_align_override
         with torch.device(device):
             self.quant_method.create_weights(layer=self, **self.moe_quant_params)
         if pinned_intermediate_pad is not None and hasattr(
@@ -5409,6 +5418,7 @@ class FusedMoE(torch.nn.Module):
         num_fused_shared_experts: int = 0,
         fused_shared_experts_scoring_func: str | None = None,
         routed_scaling_factor: float = 1.0,
+        fold_routed_scaling_factor: bool = False,
     ):
 
         # custom_routing_function takes precedence (e.g. DeepSeek-V4 hash routing
@@ -5478,10 +5488,13 @@ class FusedMoE(torch.nn.Module):
                     )
 
                 # MiniMax-M3 applies the routed scale outside MoE when shared
-                # experts are not fused; DeepSeek-V4 folds it into routing.
+                # experts are not fused, unless it asks for the fold;
+                # DeepSeek-V4 folds it into routing.
                 route_scale = (
                     routed_scaling_factor
-                    if fuse_shared or scoring_func == "sqrtsoftplus"
+                    if fuse_shared
+                    or scoring_func == "sqrtsoftplus"
+                    or fold_routed_scaling_factor
                     else 1.0
                 )
                 topk_gating(

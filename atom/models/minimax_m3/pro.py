@@ -6,8 +6,10 @@ Against M3.1-Flash, only the attention differs (the MoE / dense MLP / norms / lo
 are the Flash modules, with Pro's sizes read from the config):
 
 * q_proj (128 heads x 256, TP-sharded), k_proj (1 head x 256, replicated): no v_proj
-  -- V is K with the 64 rope dims dropped, so ``o_proj`` takes 128 x 192;
-* a 16-head x 128 indexer (``index_q_proj`` / ``index_k_proj``, replicated) whose
+  -- V is K with the 64 rope dims dropped, so ``o_proj`` takes 128 x 192; the two run
+  as one GEMM (``qk_proj``);
+* a 16-head x 128 indexer (``index_q_proj`` / ``index_k_proj``, replicated, one GEMM
+  ``index_qk_proj``) whose
   inputs, from layer 2 on, are the state of the layer two back
   (``sparse_indexer_lookahead_*``, source ``pre_ffn_norm``: its residual before the FFN
   norm, here put through the reading layer's input norm), and which scores 16-token
@@ -17,7 +19,9 @@ are the Flash modules, with Pro's sizes read from the config):
 The attention math is ``model_ops.minimax_m3.pro_attn`` (torch, correctness first).
 """
 
-from functools import partial
+import logging
+import re
+from functools import cache, partial
 from typing import ClassVar
 
 import torch
@@ -27,11 +31,17 @@ from torch import nn
 from transformers import PretrainedConfig
 
 from atom.config import Config, QuantizationConfig
+from atom.model_loader.weight_names import WeightsMapper
 from atom.model_ops.base_attention import Attention
-from atom.model_ops.layernorm import GemmaRMSNorm, fused_allreduce_gemma_rms_norm
+from atom.model_ops.layernorm import (
+    GemmaRMSNorm,
+    fused_allreduce_gemma_rms_norm,
+    fused_allreduce_gemma_rms_norm_mxfp8,
+    gemma_rms_norm_mxfp8,
+)
 from atom.model_ops.linear import (
-    ColumnParallelLinear,
-    ReplicatedLinear,
+    MergedReplicatedLinear,
+    QKVParallelLinear,
     RowParallelLinear,
 )
 from atom.model_ops.minimax_m3.pro_attn import ProSparseAttentionImpl, variants
@@ -43,6 +53,8 @@ from atom.models.minimax_m3.model import (
     _rope_theta,
 )
 from atom.models.minimax_m3.vl import MiniMaxM3SparseForConditionalGenerationVL
+
+logger = logging.getLogger("atom")
 
 
 def _quantized_once(x: torch.Tensor, x_scale: torch.Tensor | None, linears) -> tuple:
@@ -56,6 +68,32 @@ def _quantized_once(x: torch.Tensor, x_scale: torch.Tensor | None, linears) -> t
 
         return quantize_fp8(x)
     return x, x_scale
+
+
+def _native_a8(*linears) -> bool:
+    """Whether every one of ``linears`` runs the native group32 FP8 GEMM, i.e. takes an
+    MXFP8 ``(x, x_scale)`` (and would ``quantize_fp8`` a bf16 ``x`` itself)."""
+    return all(getattr(m, "native_a8_group_rows", None) is not None for m in linears)
+
+
+@cache
+def _aiter_mx_norm() -> bool:
+    """Whether this aiter's norm kernels can write MXFP8 (``add_rmsnorm_mxfp8`` and the
+    E8M0 mode of ``fused_qk_rmsnorm_group_quant`` come in together); without them the
+    fuse_mxfp8_quant norms keep the unfused path."""
+    import aiter
+    from aiter.dist import communication_op
+
+    ok = hasattr(aiter, "add_rmsnorm_mxfp8")
+    logger.info(
+        "M3-Pro fuse_mxfp8_quant: aiter MXFP8 norms %s, all-reduce MXFP8 epilogue %s",
+        ok,
+        hasattr(
+            communication_op,
+            "tensor_model_parallel_fused_allreduce_rmsnorm_mxfp8_quant",
+        ),
+    )
+    return ok
 
 
 class ProLookaheadState:
@@ -77,7 +115,10 @@ class ProLookaheadState:
         # every layer's input_layernorm (the decoder layers register them): with them the
         # ``resid_in`` source is normed when it is put, keyed by the layer that reads it
         self.norms: dict[int, GemmaRMSNorm] = {}
-        self.resid_in: dict[int, torch.Tensor] = {}
+        # and their attentions' indexer projection: a ``resid_in`` entry for a reader whose
+        # projection is native group32 FP8 is put as MXFP8 ``(x, x_scale)`` under fuse_mxfp8_quant
+        self.index_linears: dict[int, tuple[nn.Module, ...]] = {}
+        self.resid_in: dict[int, torch.Tensor | tuple[torch.Tensor, torch.Tensor]] = {}
 
     @staticmethod
     def _normed(norm: GemmaRMSNorm, x: torch.Tensor) -> torch.Tensor:
@@ -89,9 +130,10 @@ class ProLookaheadState:
 
     def source_for(
         self, layer: int, norm: GemmaRMSNorm | None = None
-    ) -> torch.Tensor | None:
-        """The indexer input of ``layer`` (``None``: its own attention input). ``norm`` is the
-        layer's input_layernorm, which the ``resid_in`` source goes through."""
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor] | None:
+        """The indexer input of ``layer`` (``None``: its own attention input), bf16 or
+        MXFP8 ``(x, x_scale)``. ``norm`` is the layer's input_layernorm, which the
+        ``resid_in`` source goes through."""
         v = variants()
         if not (self.ahead and v.lookahead and layer >= self.start):
             return None
@@ -132,7 +174,20 @@ class ProLookaheadState:
         elif v.lookahead_src == "resid_in" and self.norms:
             # the reader's input norm now, one kernel writing a new tensor: no copy
             if v.lookahead and reader >= self.start and reader in self.norms:
-                self.resid_in[reader] = self.norms[reader].forward_cuda(resid)
+                norm = self.norms[reader]
+                linears = self.index_linears.get(reader)
+                if (
+                    v.fuse_mxfp8_quant
+                    and linears is not None
+                    and _native_a8(*linears)
+                    and _aiter_mx_norm()
+                ):
+                    _, q, q_scale, _ = gemma_rms_norm_mxfp8(
+                        resid, None, norm, write_bf16=False
+                    )
+                    self.resid_in[reader] = (q, q_scale)
+                else:
+                    self.resid_in[reader] = norm.forward_cuda(resid)
         elif v.lookahead_src in ("resid", "resid_in"):
             self.resid[layer] = resid.clone()
         else:
@@ -155,9 +210,9 @@ class MiniMaxM3ProAttention(nn.Module):
         index_cache_config: str = "auto",
     ) -> None:
         super().__init__()
-        if index_cache_config not in ("auto", "bf16", "fp8"):
+        if index_cache_config not in ("auto", "bf16", "fp8", "nvfp4"):
             raise NotImplementedError(
-                "MiniMax-M3-Pro keeps a bf16 or fp8 index cache, got "
+                "MiniMax-M3-Pro keeps a bf16, fp8 or nvfp4 index cache, got "
                 f"--index-cache-dtype {index_cache_config}"
             )
         sparse_cfg = config.sparse_attention_config
@@ -183,33 +238,30 @@ class MiniMaxM3ProAttention(nn.Module):
         self.idx_head_dim = sparse_cfg["sparse_index_dim"]
         self.scaling = self.head_dim**-0.5
 
-        self.q_proj = ColumnParallelLinear(
-            self.hidden_size,
-            self.total_num_heads * self.head_dim,
-            bias=False,
-            quant_config=quant_config,
-            prefix=f"{prefix}.q_proj",
-        )
-        self.k_proj = ReplicatedLinear(
+        # q (TP-sharded) + the one K head (replicated, as QKV replicates a KV head
+        # below the TP size) in one GEMM; no V
+        self.qk_proj = QKVParallelLinear(
             self.hidden_size,
             self.head_dim,
+            self.total_num_heads,
+            1,
             bias=False,
             quant_config=quant_config,
-            prefix=f"{prefix}.k_proj",
+            prefix=f"{prefix}.qk_proj",
+            v_head_size=0,
         )
-        self.index_q_proj = ReplicatedLinear(
-            self.hidden_size,
+        self.qk_sizes = [self.num_heads * self.head_dim, self.head_dim]
+        # index q + index k: both replicated, and both read the indexer input
+        self.index_qk_sizes = [
             self.num_idx_heads * self.idx_head_dim,
-            bias=False,
-            quant_config=quant_config,
-            prefix=f"{prefix}.index_q_proj",
-        )
-        self.index_k_proj = ReplicatedLinear(
-            self.hidden_size,
             self.idx_head_dim,
+        ]
+        self.index_qk_proj = MergedReplicatedLinear(
+            self.hidden_size,
+            self.index_qk_sizes,
             bias=False,
             quant_config=quant_config,
-            prefix=f"{prefix}.index_k_proj",
+            prefix=f"{prefix}.index_qk_proj",
         )
         self.o_proj = RowParallelLinear(
             self.total_num_heads * self.value_dim,
@@ -265,42 +317,44 @@ class MiniMaxM3ProAttention(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         hidden_states_scale: torch.Tensor | None = None,
-        index_src: torch.Tensor | None = None,
+        index_src: torch.Tensor | tuple[torch.Tensor, torch.Tensor] | None = None,
         diag_srcs: dict[str, torch.Tensor | None] | None = None,
     ) -> torch.Tensor:
-        own = [self.q_proj, self.k_proj]
+        own = [self.qk_proj]
         if index_src is None:
-            own += [self.index_q_proj, self.index_k_proj]
+            own.append(self.index_qk_proj)
         x, xs = _quantized_once(hidden_states, hidden_states_scale, own)
-        q = self.q_proj(x, x_scale=xs)
-        k = self.k_proj(x, x_scale=xs)
+        q, k = self.qk_proj(x, x_scale=xs).split(self.qk_sizes, dim=-1)
         if index_src is None:
-            iq = self.index_q_proj(x, x_scale=xs)
-            ik = self.index_k_proj(x, x_scale=xs)
+            iq, ik = self._index_qk(x, xs)
         else:
-            ix, ixs = _quantized_once(
-                index_src, None, [self.index_q_proj, self.index_k_proj]
+            ix, ixs = (
+                index_src
+                if isinstance(index_src, tuple)
+                else _quantized_once(index_src, None, [self.index_qk_proj])
             )
-            iq = self.index_q_proj(ix, x_scale=ixs)
-            ik = self.index_k_proj(ix, x_scale=ixs)
+            iq, ik = self._index_qk(ix, ixs)
         if diag_srcs is not None:
             # raw indexer projections of every candidate input, for `pro_diag`
             own = (
                 (iq, ik)
                 if index_src is None
-                else (
-                    self.index_q_proj(hidden_states, x_scale=hidden_states_scale),
-                    self.index_k_proj(hidden_states, x_scale=hidden_states_scale),
-                )
+                else self._index_qk(hidden_states, hidden_states_scale)
             )
             raw = {"own": own}
             for name, src in diag_srcs.items():
                 if src is not None:
-                    raw[name] = (self.index_q_proj(src), self.index_k_proj(src))
+                    raw[name] = self._index_qk(src)
             self.attn.impl._diag_raw = raw
-        # the impl reads the four projections where they are: index k rides in ``qkv``
+        # the impl reads the four projections where they are (column slices of the two
+        # GEMM outputs): index k rides in ``qkv``
         out = self.attn(q, k, iq, positions, qkv=ik)
         return self.o_proj(out)
+
+    def _index_qk(self, x, x_scale=None) -> tuple[torch.Tensor, torch.Tensor]:
+        return tuple(
+            self.index_qk_proj(x, x_scale=x_scale).split(self.index_qk_sizes, dim=-1)
+        )
 
 
 class MiniMaxM3ProDecoderLayer(MiniMaxM3DecoderLayer):
@@ -311,6 +365,7 @@ class MiniMaxM3ProDecoderLayer(MiniMaxM3DecoderLayer):
         self._pro_state = state
         super().__init__(*args, **kwargs)
         state.norms[self.layer_num] = self.input_layernorm
+        state.index_linears[self.layer_num] = (self.self_attn.index_qk_proj,)
 
     def _make_attention(
         self,
@@ -339,9 +394,29 @@ class MiniMaxM3ProDecoderLayer(MiniMaxM3DecoderLayer):
     ):
         # Plain (unfused-quant) norms: the lookahead needs the bf16 FFN input of
         # every layer, which a fused norm + per-token-FP8 quant does not produce.
+        # fuse_mxfp8_quant: the norms whose output a native group32 FP8 GEMM reads
+        # also write it as MXFP8 (the same bytes its quantize_fp8 would), the bf16
+        # output kept where anything else reads it.
+        v = variants()
+        fuse = v.fuse_mxfp8_quant and not v.diag
+        mx_norm = fuse and _aiter_mx_norm()
+        attn = self.self_attn
+        fuse_attn_in = mx_norm and _native_a8(attn.qk_proj, attn.index_qk_proj)
+        hidden_states_scale = None
         if residual is None:
             residual = hidden_states
-            hidden_states = self.input_layernorm(hidden_states)
+            if fuse_attn_in:
+                _, hidden_states, hidden_states_scale, _ = gemma_rms_norm_mxfp8(
+                    hidden_states, None, self.input_layernorm, write_bf16=False
+                )
+            else:
+                hidden_states = self.input_layernorm(hidden_states)
+        elif fuse_attn_in:
+            _, hidden_states, hidden_states_scale, residual = (
+                fused_allreduce_gemma_rms_norm_mxfp8(
+                    hidden_states, residual, self.input_layernorm, v.ar_lamport_rows
+                )
+            )
         else:
             hidden_states, residual = fused_allreduce_gemma_rms_norm(
                 hidden_states, residual, self.input_layernorm
@@ -349,35 +424,82 @@ class MiniMaxM3ProDecoderLayer(MiniMaxM3DecoderLayer):
         aux_hidden_state = residual.clone() if capture_aux else None
 
         state = self._pro_state
-        hidden_states = self.self_attn(
+        hidden_states = attn(
             positions=positions,
             hidden_states=hidden_states,
+            hidden_states_scale=hidden_states_scale,
             index_src=state.source_for(self.layer_num, self.input_layernorm),
             diag_srcs=(
                 state.diag_sources(self.layer_num, self.input_layernorm)
-                if variants().diag
+                if v.diag
                 else None
             ),
         )
         ffn = self.block_sparse_moe if self.is_moe_layer else self.mlp
-        hidden_states, residual = fused_allreduce_gemma_rms_norm(
-            hidden_states, residual, self.post_attention_layernorm
+        # the MoE's router and routed experts read the bf16 output; its shared expert
+        # (or the dense MLP) can read the MXFP8 one
+        ffn_gate_up = (
+            None
+            if self.is_moe_layer and ffn.shared_experts is None
+            else (ffn.shared_experts if self.is_moe_layer else ffn).gate_up_proj
         )
+        fuse_ffn_in = mx_norm and ffn_gate_up is not None and _native_a8(ffn_gate_up)
+        if fuse_ffn_in:
+            hidden_states, ffn_x, ffn_x_scale, residual = (
+                fused_allreduce_gemma_rms_norm_mxfp8(
+                    hidden_states,
+                    residual,
+                    self.post_attention_layernorm,
+                    v.ar_lamport_rows,
+                )
+            )
+        else:
+            hidden_states, residual = fused_allreduce_gemma_rms_norm(
+                hidden_states, residual, self.post_attention_layernorm
+            )
         state.put(self.layer_num, hidden_states, residual)
-        hidden_states = ffn(hidden_states)
+        if not fuse:
+            hidden_states = ffn(hidden_states)
+        elif self.is_moe_layer:
+            hidden_states = ffn(
+                hidden_states,
+                shared_input=(ffn_x, ffn_x_scale) if fuse_ffn_in else None,
+                quant_down=True,
+            )
+        elif fuse_ffn_in:
+            hidden_states = ffn(ffn_x, ffn_x_scale, quant_down=True)
+        else:
+            hidden_states = ffn(hidden_states, quant_down=True)
         if aux_hidden_state is not None:
             return hidden_states, residual, aux_hidden_state
         return hidden_states, residual
 
 
+_TEXT_QK = re.compile(r"(model\.layers\.\d+\.self_attn\.)([qk])_proj\.")
+
+
+class _TextQKNames(WeightsMapper):
+    """The text layers' ``self_attn.{q,k}_proj`` renamed ``attn_{q,k}_proj``: a packed
+    mapping matches substrings, and the vision tower's attention uses the same names."""
+
+    def _map_name(self, key: str) -> str | None:
+        return _TEXT_QK.sub(r"\1attn_\2_proj.", key)
+
+
 class MiniMaxM3ProForCausalLM(MiniMaxM3SparseForCausalLM):
     """The text model: Flash's ``MiniMaxM3Model`` over Pro's decoder layers."""
 
-    # No q/k/v pack: the projections are separate modules named as the checkpoint's.
+    # q / k into ``qk_proj`` under the names ``weights_mapper`` gives the text layers'
+    # (the vision tower's q/k/v_proj keep theirs); index q / k into ``index_qk_proj``.
     packed_modules_mapping: ClassVar[dict[str, tuple[str, str | int]]] = {
+        ".index_q_proj": (".index_qk_proj", 0),
+        ".index_k_proj": (".index_qk_proj", 1),
+        ".attn_q_proj": (".qk_proj", "q"),
+        ".attn_k_proj": (".qk_proj", "k"),
         ".gate_proj": (".gate_up_proj", 0),
         ".up_proj": (".gate_up_proj", 1),
     }
+    weights_mapper: ClassVar[WeightsMapper] = _TextQKNames()
 
     def __init__(self, atom_config: Config, prefix: str = "") -> None:
         text = getattr(atom_config.hf_config, "text_config", atom_config.hf_config)
@@ -394,6 +516,7 @@ class MiniMaxM3ProForConditionalGenerationTextOnly(
     """Text-only view of the Pro checkpoint (vision tower and DSpark head skipped)."""
 
     packed_modules_mapping = MiniMaxM3ProForCausalLM.packed_modules_mapping
+    weights_mapper = MiniMaxM3ProForCausalLM.weights_mapper
     skip_weight_prefixes: ClassVar[list[str]] = [
         *MiniMaxM3SparseForConditionalGenerationTextOnly.skip_weight_prefixes,
         # the embedded DSpark draft (5 layers + Markov / confidence heads)
@@ -420,6 +543,7 @@ class MiniMaxM3ProForConditionalGenerationVL(
     (``image_input_refusal``) it is the text-only model."""
 
     packed_modules_mapping = MiniMaxM3ProForCausalLM.packed_modules_mapping
+    weights_mapper = MiniMaxM3ProForCausalLM.weights_mapper
     skip_weight_prefixes: ClassVar[list[str]] = ["language_model.model.dspark."]
     # The packed mapping has no q/k/v renames: Pro's text attention keeps those names.
     fused_vision_qkv: ClassVar[bool] = False

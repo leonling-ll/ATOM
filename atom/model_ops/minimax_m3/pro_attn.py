@@ -25,6 +25,7 @@ At most 2048 tokens (128 blocks of 16) selection is the identity, so short promp
 for the parts of the formulas the checkpoint does not pin down.
 """
 
+import functools
 import json
 import logging
 import os
@@ -45,6 +46,10 @@ except ImportError:  # pragma: no cover
 logger = logging.getLogger("atom")
 
 _NEG_INF = float("-inf")
+# On the K-only cache aiter's gluon decode reads V from the K rows about 3 us a layer slower
+# than from a V cache, and the Triton attention wins up to 16 rows (opt/kv/test_vrows.py, MI355X:
+# bs1 16.0 vs 13.9 us, b16 16.1 vs 15.5, b32 at 8k 16.7 vs 20.7, b64 22.4 vs 30.3)
+_K_ROWS_AITER_MIN = 17
 # Forced blocks are pinned above every real score, init above local (as the M3
 # selector's 1e30 / 1e29): a block that is both ends up local.
 _PIN_INIT = 1e30
@@ -134,6 +139,12 @@ class ProVariants:
     # handful of launches per layer instead of ~100, no host sync past the lengths.
     # Every other switch above either is honoured by them or sends the layer back to torch.
     kernels: bool = False
+    # The prep of the kernel path (norm + rope of q / k / index q / index k, the K / V /
+    # index-K cache writes): "triton" (``pro_kernels.prep``) or "aiter"
+    # (``pro_kernels.prep_aiter``: aiter's fused_qk_norm_rope_cache_mqa, the same math in
+    # one HIP launch, any number of local heads, Triton's at most 32). "aiter" runs
+    # Triton's where this aiter lacks it.
+    prep: str = "triton"
     # The attention of the kernel path: "triton" (``pro_kernels.attention``) or "aiter":
     # aiter's paged-attention decode (gluon, as ATOM's M3 runs it) with every token a
     # sequence of its own over a page table of its selected blocks, V from the V cache.
@@ -142,12 +153,73 @@ class ProVariants:
     attn_fp8_compute: bool = True
     # The kernels' block selection: "torch" (torch.topk over the block table's width),
     # "aiter" (aiter's per-row top-k over each token's causal blocks only) or, for the
-    # "aiter" attention, "fused": selection and page tables in one kernel (select_rows).
+    # "aiter" attention, "fused": selection and page tables in one kernel (select_rows),
+    # "split": the same tables with each row split over several programs
+    # (select_rows_split; its cost follows the context, not the block table's width).
     topk: str = "torch"
     # Kernel launch shape: programs per token over the selected blocks (0: by batch size)
     # and blocks per step.
     attn_splits: int = 0
-    attn_nblk: int = 2
+    attn_nblk: int = 4
+    # MXFP8 activation quant (E4M3, group-32 E8M0 scales, ``quantize_fp8``'s bytes) written
+    # by the ops that produce the activations -- the norms after the all-reduces, the
+    # lookahead norm, the SwiGLU -- instead of a ``quantize_fp8`` launch before each native
+    # group32 FP8 GEMM (``pro.py``). Off under ``diag``; the norms keep the unfused path on
+    # an aiter without the MXFP8 norm outputs.
+    fuse_mxfp8_quant: bool = True
+    # Prefill indexer split over the TP ranks: each rank scores and selects only its share
+    # of a long prefill's rows (``row_split_index``), then the page tables are all-gathered.
+    # Every row is computed as before, so the selection is the same bit for bit. Needs the
+    # kernel path with "topk": "fused" or "split"; only prefills of at least _SPLIT_MIN_TOKENS rows
+    # that select (more than ``topk`` blocks) split.
+    index_split: bool = False
+    # No effect: index q and k share one packed GEMM (index_qk_proj), so every row's
+    # index q is computed; kept so variants files that set it still parse.
+    index_split_proj: bool = True
+    # Prefill and speculative-verify scores take ``score_tq`` rows per program (a power of
+    # two; 0: one): the rows of a sequence read each tile of block keys once, one dot for
+    # all their query heads. A plain decode (one row a sequence) keeps one.
+    score_tq: int = 0
+    # Rows (tokens) at or below which those fused all-reduce + norm sites run as aiter's
+    # Lamport all-reduce + ``add_rmsnorm_mxfp8`` (two launches, same bytes) instead of
+    # the fused 1-stage kernel: 7.5 vs 9.6 us at 1 row, 9.7 vs 12.6 at 16 (TP8, 7168).
+    # Needs the Lamport path on (AITER_CUSTOM_AR_DISABLE_LAMPORT unset); 0 turns it off.
+    ar_lamport_rows: int = 0
+    # The K-only cache (``ProKOnlyLayout``): one 256-wide row a token, V read from its tail,
+    # no V cache (776 -> 520 B a token and layer with an fp8 KV and a bf16 index cache).
+    # The attention is then the Triton one. Read once, when the layers are built: the
+    # pool's layout cannot change while it serves.
+    k_only: bool = False
+    # An fp8 K cache as a plain (clamped) cast, its scale plane all 1.0: what moo's and
+    # amd-kernels-day0's kernels read. The normed K is O(1), within e4m3's range. Triton
+    # prep only (aiter's scales every row).
+    k_plain_fp8: bool = False
+    # The prefill attention of the K-only cache: "triton", or "day0" (amd-kernels-day0's
+    # FlyDSL fp8_sparse_prefill; needs k_plain_fp8, 16 local heads and the package, else
+    # "triton").
+    prefill_attn: str = "triton"
+
+
+# Below it the all-gather costs more than the scoring it saves (moo's threshold).
+_SPLIT_MIN_TOKENS = 1024
+
+
+def row_split_index(n: int, tp: int, rank: int, device=None):
+    """``rank``'s rows of ``n``, cut into ``2 * tp`` segments of ``seg``: segment ``rank`` and
+    its mirror ``2 * tp - 1 - rank`` (causal cost grows along a prefill, so the pairs even
+    out). ``(idx [2 * seg] int64, seg)``; the last segments' rows past ``n`` repeat ``n - 1``.
+    """
+    seg = -(-n // (2 * tp))
+    s = torch.arange(seg, device=device)
+    idx = torch.cat([rank * seg + s, (2 * tp - 1 - rank) * seg + s])
+    return idx.clamp_(max=n - 1), seg
+
+
+def assemble_rows(gathered: torch.Tensor, seg: int, n: int, tp: int) -> torch.Tensor:
+    """The ranks' ``row_split_index`` rows, all-gathered ``[tp * 2 * seg, ...]``, back in row
+    order ``[n, ...]``."""
+    g = gathered.view(tp, 2, seg, *gathered.shape[1:])
+    return torch.cat([g[:, 0], g[:, 1].flip(0)]).flatten(0, 1)[:n]
 
 
 _variants = ProVariants()
@@ -198,6 +270,48 @@ def variants() -> ProVariants:
     return _variants
 
 
+@dataclass(frozen=True)
+class ProKOnlyLayout:
+    """Pro's K-only pages as an ``MhaKvPool`` layout: per token one 256-wide K row, the
+    page row-major (``[blocks, 1, 1, page, 256]``: the SHUFFLE view at ``x`` = 256, which
+    the prep kernels and the Triton attention address alike), V its last 192 dims. An fp8
+    cache keeps one per-token K scale plane. ``kv_views`` gives K for V too: nothing
+    writes a V."""
+
+    kv_dtype: torch.dtype
+    tag = "konly"
+
+    def check(self, block_size: int, head_dim: int, blocks_per_entry: int) -> None:
+        if head_dim != 256:
+            raise ValueError(f"the Pro K-only page is 256 wide, not {head_dim}")
+
+    def cache_fields(self, layers, entry_tokens, num_kv_heads, head_dim):
+        from atom.model_ops.attentions.mha_kv_pool import mha_kv_fields
+
+        return mha_kv_fields(
+            layers=layers,
+            entry_tokens=entry_tokens,
+            num_kv_heads=num_kv_heads,
+            head_dim=head_dim,
+            kv_dtype=self.kv_dtype,
+        )[:1]
+
+    def scale_fields(self, layers, entry_tokens, num_kv_heads):
+        from atom.model_ops.attentions.mha_kv_pool import mha_kv_scale_fields
+
+        return mha_kv_scale_fields(
+            layers=layers,
+            entry_tokens=entry_tokens,
+            num_kv_heads=num_kv_heads,
+            kv_dtype=self.kv_dtype,
+        )[:1]
+
+    def kv_views(self, pool, layer):
+        nh, hd, bs = pool.num_kv_heads, pool.head_dim, pool.block_size
+        k = pool.field_view("k", layer, self.kv_dtype, (-1, nh, 1, bs, hd))
+        return k, k
+
+
 def _index_rows(ik: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
     """Index keys as the index cache holds them: an fp8 cache a plain cast clamped to its
     range (M3's fp8 index cache; the keys are normed), as ``pro_kernels.prep`` writes.
@@ -232,6 +346,7 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
     """
 
     is_indexed_sparse_attention = True
+    k_only = False  # the pool is ``ProKOnlyLayout`` (no V cache)
 
     def __init__(
         self,
@@ -303,6 +418,11 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
         # Bound by `AiterAttentionMetadataBuilder.build_kv_cache_tensor`:
         # the index-key cache, (blocks, page, index_head_dim).
         self.index_cache: torch.Tensor | None = None
+        self.k_only = refresh_variants(force=True).k_only
+        if self.k_only:
+            from atom.config import kv_cache_torch_dtype
+
+            self.kv_layout = ProKOnlyLayout(kv_cache_torch_dtype(kv_cache_dtype))
 
     # ------------------------------------------------------------------ rope --
     def _cos_sin(self, positions: torch.Tensor, v: ProVariants):
@@ -457,14 +577,14 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
         x = kc4.shape[-1]
         kr = k.reshape(n, d)
         vr = kr[:, d - dv :]
-        write_v = v.v_src == "post"
+        write_v = v.v_src == "post" and not self.k_only
         if kc4.element_size() == 1:
             from atom.model_ops.minimax_m3.pro_kernels import quant_fp8_rows
 
-            kr, ksc = quant_fp8_rows(kr, kc4.dtype)
+            kr, ksc = quant_fp8_rows(kr, kc4.dtype, plain=v.k_plain_fp8)
             layer.k_scale[blk, 0, off] = ksc
             if write_v:
-                vr, vsc = quant_fp8_rows(vr, kc4.dtype)
+                vr, vsc = quant_fp8_rows(vr, kc4.dtype, plain=v.k_plain_fp8)
                 layer.v_scale[blk, 0, off] = vsc
         kc4[blk, :, off, :] = kr.reshape(n, d // x, x)
         if write_v:
@@ -557,6 +677,28 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
         return tok, o.reshape(r, h * self.value_head_dim).to(q.dtype)
 
     # ------------------------------------------------------------ kernel path --
+    def _aiter_prep(self, v: ProVariants) -> bool:
+        """aiter's prep: it scales an fp8 K and writes no NVFP4 index rows."""
+        return (
+            v.prep == "aiter"
+            and not v.k_plain_fp8
+            and not self._index_nvfp4()
+            and pro_kernels.aiter_prep_available()
+        )
+
+    def _index_nvfp4(self) -> bool:
+        """``--index-cache-dtype nvfp4``: uint8 pages the Triton kernels alone read."""
+        ic = self.index_cache
+        return ic is not None and ic.dtype == torch.uint8
+
+    def _aiter_attn(self, v: ProVariants, n: int = _K_ROWS_AITER_MIN) -> bool:
+        """aiter's paged attention for ``n`` rows: on the K-only cache only where it reads V
+        from the K rows (``value_rows``), and from ``_K_ROWS_AITER_MIN`` rows up."""
+        return v.attn == "aiter" and (
+            not self.k_only
+            or (n >= _K_ROWS_AITER_MIN and pro_kernels.aiter_value_rows_available())
+        )
+
     def _use_kernels(self, v: ProVariants) -> bool:
         """Whether the Triton kernels cover this layer and these variants."""
         return (
@@ -569,8 +711,10 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
             and v.index_rope
             and v.block_score in ("max", "pool4", "lse")
             and v.head_reduce in ("sum", "mean", "max", "lse")
+            and v.prep in ("triton", "aiter")
             and self.num_heads % 16 == 0
-            and self.num_heads <= 32  # prep holds all of a token's heads in one program
+            # Triton's prep holds all of a token's heads in one program
+            and (self.num_heads <= 32 or self._aiter_prep(v))
             and (self.head_dim, self.rotary_dim, self.value_head_dim) == (256, 64, 192)
             and (self.num_idx_heads, self.index_head_dim, self.page) == (16, 128, 16)
             and v.attn_nblk in (1, 2, 4, 8)
@@ -578,8 +722,8 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
             and (
                 v.topk in ("torch", "aiter")
                 or (
-                    v.topk == "fused"
-                    and v.attn == "aiter"
+                    v.topk in ("fused", "split")
+                    and (v.attn == "aiter" or self.k_only)
                     and self.topk & (self.topk - 1) == 0
                 )
             )
@@ -618,6 +762,7 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
         v: ProVariants,
         out,
         static: bool = False,
+        split=None,
     ):
         """The whole layer in four launches (``prep`` / ``scores`` + top-k / ``attention``).
 
@@ -626,11 +771,16 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
         ``layer`` the layer's caches, ``nb`` the most blocks any sequence of the batch
         holds, ``out`` ``[n, H * 192]``. ``static``: ``nb`` is only a bound (the block
         table's width), so the selection runs even where every block would fit.
+        ``split``: this forward's ``index_split`` plan; the indexer scores this rank's
+        rows only (the other rows' index q may be unset).
         """
-        kc4, vc4 = layer.k_cache[:, 0], layer.v_cache[:, 0]
+        kc4 = layer.k_cache[:, 0]
+        vc4 = None if self.k_only else layer.v_cache[:, 0]
         fp8 = kc4.element_size() == 1
-        ks, vs = (layer.k_scale, layer.v_scale) if fp8 else (None, None)
+        ks = layer.k_scale if fp8 else None
+        vs = layer.v_scale if fp8 and vc4 is not None else None
         n = positions.shape[0]
+        aiter_attn = self._aiter_attn(v, n)
         rope = self.rotary_emb
         cos = rope.cos_cache.view(rope.cos_cache.shape[0], -1)
         sin = rope.sin_cache.view(rope.sin_cache.shape[0], -1)
@@ -640,7 +790,17 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
         else:
             ratio = (1.0 if v.mscale == "hf" else float(v.mscale)) / aiter_m
         eps = self.q_norm.variance_epsilon
-        q, iq = pro_kernels.prep(
+        prep = functools.partial(pro_kernels.prep, k_unit=fp8 and v.k_plain_fp8)
+        if self._aiter_prep(v):
+            if pro_kernels.prep_aiter_fits(qkv, self.num_heads):
+                prep = pro_kernels.prep_aiter
+            elif not getattr(self, "_warned_prep", False):
+                self._warned_prep = True
+                logger.warning(
+                    "M3-Pro layer %d: unaligned projection rows, Triton prep",
+                    self.layer_num,
+                )
+        q, iq = prep(
             qkv,
             positions,
             slots,
@@ -661,12 +821,42 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
         )
         scale = self.scale * v.scale_mult
         nblk = v.attn_nblk
+        # MI355X, decode over top-128 (opt/kv/bench_decode_attn.py, valid_first, nblk 4):
+        # 32 / 16 / 8 splits at 1-16 / 32 / 64 rows put bs1 at aiter's 13 us (from 26)
         splits = v.attn_splits or (
-            8 if n <= 16 else 4 if n <= 64 else 2 if n <= 256 else 1
+            32
+            if n <= 16
+            else (
+                16
+                if n <= 32
+                else 8 if n <= 64 else 4 if n <= 128 else 2 if n <= 256 else 1
+            )
         )
 
+        day0 = (
+            not static
+            and v.prefill_attn == "day0"
+            and self.k_only
+            and fp8
+            and v.k_plain_fp8
+            # its picks: valid first, -1 after (select_logical)
+            and v.topk in ("fused", "split")
+            and self.num_heads == 16
+            and self.topk == pro_kernels.TOPK
+            and pro_kernels.day0_prefill_available()
+        )
+
+        valid_first = False  # set where the selection is select_logical's
+
         def attend(sel, rows=None):
-            if v.attn == "aiter":
+            if day0:
+                assert (
+                    rows is None
+                ), "day0 takes block ids (select_logical), not page tables"
+                return pro_kernels.attention_day0(
+                    q, kc4, block_tables, seq_id, positions, sel, out, scale
+                )
+            if aiter_attn:
                 if rows is None:
                     rows = pro_kernels.sparse_rows(
                         sel, block_tables, seq_id, positions, nb
@@ -683,6 +873,7 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
                     k_scale=ks,
                     v_scale=vs,
                     fp8_compute=v.attn_fp8_compute,
+                    k_rows=self.k_only,
                 )
             return pro_kernels.attention(
                 q,
@@ -697,6 +888,7 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
                 nblk=nblk,
                 n_blocks=nb if sel is None else None,
                 k_scale=ks,
+                valid_first=valid_first,
             )
 
         if v.dense_only or (nb <= self.topk and not static):
@@ -719,12 +911,18 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
         sc = v.index_scale * (
             self.index_head_dim**-0.5 if v.block_score == "lse" else 1.0
         )
+        k = min(self.topk, nb)
+        rq, rseq, rpos = iq, seq_id, positions  # the rows the indexer scores
+        if split is not None:
+            # every row scores alone, so this rank's rows come out as they would in full
+            idx, seg, n_rows, tp = split
+            rq, rseq, rpos = iq[idx], seq_id[idx], positions[idx]
         score = pro_kernels.scores(
-            iq,
+            rq,
             ic,
             block_tables,
-            seq_id,
-            positions,
+            rseq,
+            rpos,
             nb,
             self.index_compress_query.data if pool else None,
             init,
@@ -733,12 +931,47 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
             block_mode=block_mode,
             head_mode=head_mode,
             pool_temp=v.pool_scale,
+            # torch.topk reads the whole width; the others only each token's causal blocks
+            causal=v.topk != "torch",
+            # decode: one row a sequence, nothing to share; a verify has k + 1 (graph-safe:
+            # the shapes alone decide, and tiles across sequences score row by row)
+            tq=v.score_tq if not static or n > block_tables.shape[0] else 0,
         )
-        k = min(self.topk, nb)
-        if v.topk == "fused" and k & (k - 1) == 0:
-            return attend(
-                None, pro_kernels.select_rows(score, block_tables, seq_id, positions, k)
+        # select_rows_split matches select_rows bit for bit; its cost follows the context
+        select = (
+            pro_kernels.select_rows_split
+            if v.topk == "split"
+            else pro_kernels.select_rows
+        )
+        logical = day0 or not aiter_attn  # day0 and Triton take block ids, aiter pages
+        if split is not None:
+            from aiter.dist.communication_op import tensor_model_parallel_all_gather
+
+            if logical:
+                mine = pro_kernels.select_logical(
+                    score, rpos, k, split=v.topk == "split"
+                )
+                valid_first = True
+                return attend(
+                    assemble_rows(
+                        tensor_model_parallel_all_gather(mine, dim=0), seg, n_rows, tp
+                    ).contiguous()
+                )
+            rows, ctx = select(score, block_tables, rseq, rpos, k)
+            mine = torch.cat([rows, ctx[:, None]], dim=1)
+            full = assemble_rows(
+                tensor_model_parallel_all_gather(mine, dim=0), seg, n_rows, tp
             )
+            return attend(None, (full[:, :k].contiguous(), full[:, k].contiguous()))
+        if v.topk in ("fused", "split") and k & (k - 1) == 0:
+            if logical:
+                valid_first = True
+                return attend(
+                    pro_kernels.select_logical(
+                        score, positions, k, split=v.topk == "split"
+                    )
+                )
+            return attend(None, select(score, block_tables, seq_id, positions, k))
         if v.topk == "aiter":
             sel = pro_kernels.select_blocks(score, positions, k)
         else:
@@ -746,6 +979,44 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
         return attend(sel)
 
     # ---------------------------------------------------------------- forward --
+    def index_split(self, n_tok: int):
+        """This forward's ``index_split`` plan, ``(idx, seg, n, tp)`` (``row_split_index``
+        of the forward's ``n`` rows for this rank), or ``None``: every rank scores every
+        row. Decided once a forward (the first layer's call, before its projections) from
+        the host lengths alone, so every rank and layer agrees."""
+        fwd = get_forward_context()
+        md = fwd.attn_metadata
+        plan = getattr(md, "_m3pro_split", False)
+        if plan is not False:
+            return plan
+        plan = None
+        v = refresh_variants()
+        if (
+            v.index_split
+            and fwd.context.is_prefill
+            and not fwd.context.is_dummy_run
+            and self._use_kernels(v)
+            and v.attn == "aiter"
+            and v.topk in ("fused", "split")
+            and not v.dense_only
+        ):
+            from aiter.dist.parallel_state import (
+                get_tensor_model_parallel_rank,
+                get_tensor_model_parallel_world_size,
+            )
+
+            tp = get_tensor_model_parallel_world_size()
+            cu, ctx = self._cpu_lengths(md)
+            n = min(n_tok, int(cu[-1]))
+            nb = (max(ctx, default=0) + self.page - 1) // self.page
+            if tp > 1 and n >= _SPLIT_MIN_TOKENS and nb > self.topk:
+                idx, seg = row_split_index(
+                    n, tp, get_tensor_model_parallel_rank(), md.slot_mapping.device
+                )
+                plan = (idx, seg, n, tp)
+        md._m3pro_split = plan
+        return plan
+
     def _cpu_lengths(self, md):
         """``(cu_seqlens_q, context_lens)`` as lists, synced once per forward."""
         cached = getattr(md, "_m3pro_cpu", None)
@@ -784,11 +1055,20 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
         md = fwd.attn_metadata
         if self._use_kernels(v):
             layer = fwd.kv_cache_data[f"layer_{self.layer_num}"]
-            if self.layer_num == 0 and getattr(self, "_logged_kernels", None) != v.attn:
-                self._logged_kernels = v.attn
+            prep_impl = "aiter" if self._aiter_prep(v) else "triton"
+            attn_impl = (
+                ("aiter (K rows) past 16 rows, else triton" if self.k_only else "aiter")
+                if self._aiter_attn(v)
+                else "triton"
+            )
+            logged = (attn_impl, prep_impl)
+            if self.layer_num == 0 and getattr(self, "_logged_kernels", None) != logged:
+                self._logged_kernels = logged
                 logger.info(
-                    "M3-Pro attention: kernels, %s attention, %s KV cache (%s)",
-                    v.attn,
+                    "M3-Pro attention: kernels, %s prep, %s attention, %s%s KV cache (%s)",
+                    prep_impl,
+                    attn_impl,
+                    "K-only " if self.k_only else "",
                     layer.k_cache.dtype,
                     v,
                 )
@@ -821,9 +1101,14 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
                 v,
                 out[:n],
                 static=static,
+                split=None if static else self.index_split(n_tok),
             )
             return out
 
+        if self._index_nvfp4():
+            raise NotImplementedError(
+                'an NVFP4 index cache needs the kernel path ({"kernels": true})'
+            )
         if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
             raise RuntimeError(
                 'MiniMax-M3-Pro decode graphs need {"kernels": true} in ATOM_M3PRO_VARIANTS '
@@ -892,6 +1177,8 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
         ic[blk, off] = _index_rows(ik.reshape(n, self.index_head_dim), ic.dtype)
         vc = None
         if v.v_src == "pre":
+            if self.k_only:
+                raise NotImplementedError("v_src='pre' keeps a V cache: not K-only")
             if ks is not None:
                 raise NotImplementedError(
                     "v_src='pre' keeps its V unscaled: bf16 KV cache only"

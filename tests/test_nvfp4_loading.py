@@ -837,6 +837,37 @@ def _nvfp4_moe_layer(
     )
 
 
+def test_nvfp4_moe_online_conversion_keeps_the_pad_align_override(monkeypatch):
+    """`FusedMoE(pad_align=...)` sizes the MX target's weights too, not only the
+    NVFP4 source method's: the swap builds a fresh method with its own default."""
+    target = LayerQuantConfig(
+        quant_type=QuantType.per_1x32,
+        quant_dtype=dtypes.fp4x2,
+        is_dynamic=True,
+        quant_method="quark",
+    )
+    seen = []
+
+    class Stop(Exception):
+        pass
+
+    class FakeTargetMethod:
+        pad_align = 256
+
+        def create_weights(self, layer, **_kwargs):
+            seen.append(self.pad_align)
+            raise Stop
+
+    monkeypatch.setattr(
+        moe_mod, "_make_mxfp4_moe_method", lambda *_a, **_k: FakeTargetMethod()
+    )
+    layer = _nvfp4_moe_layer(_nvfp4_spec(), target, 32, 1)
+    layer.pad_align_override = 128
+    with pytest.raises(Stop):
+        FusedMoE._online_quant(layer)
+    assert seen == [128]
+
+
 @pytest.mark.parametrize(
     ("source_intermediate", "tp_size"),
     [(32, 1), (32, 2)],

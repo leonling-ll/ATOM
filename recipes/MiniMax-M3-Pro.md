@@ -48,7 +48,7 @@ The fast configuration (kernel path, decode graphs, FP8 KV and index caches):
 
 ```bash
 export AITER_CUSTOM_AR_DISABLE_LAMPORT=1
-export ATOM_M3PRO_VARIANTS='{"kernels": true, "attn": "aiter", "topk": "fused"}'
+export ATOM_M3PRO_VARIANTS='{"kernels": true, "attn": "aiter", "topk": "split"}'
 
 python -m atom.entrypoints.openai_server \
   --model /data/models/yuhua/m3-pro \
@@ -371,6 +371,22 @@ power-of-two top-k, which Pro's 128 is) selects and builds the aiter page tables
 kernel: `tl.topk` over the scores' order-preserving integer bits packed with the block index (ties
 go to the lower block), then the same rows rule as the separate rows kernel.
 
+`"topk": "split"` builds the same tables bit for bit, and its cost follows the context. A decode
+graph holds the block table's full width (max-model-len / 16 blocks: 8192 at 131072), and
+`"fused"` sorts all of it for every token, about 29 us per layer whatever the context. `"split"`
+works in two steps:
+- Spans of 1024-block chunks reduce each row to its 128 best keys in separate programs, and the
+  last span program to finish merges them. Spans past a row's own block exit at once.
+- The scores fill only each token's causal blocks: those selections read no further.
+
+It is the recommended setting. Measured on 8x MI355X, max-model-len 131072:
+- Per decode step, scores plus selection take 0.68 instead of 2.35 ms at bs 1 (1k context), and
+  1.15 instead of 4.08 ms at bs 64.
+- TPOT drops 11–14% at 1k/1k (c 1–64) and 9–12% at 8k/1k.
+- GSM8K is unchanged: the same tables.
+- At a 1M context (65536 blocks) the sort alone is 0.7–0.8 ms per layer for `"fused"` and
+  3–66 us for `"split"`.
+
 The block scores run as a tiled kernel (4 or 8 blocks x 16 tokens per program, one `tl.dot`); the
 softmax-pool weights depend on the keys alone, so the pooled scores are the token dots weighted per
 group of 4, in the same tile. The module hands the four
@@ -389,6 +405,28 @@ alternatives; the other switches (`index_rope: false`, `v_src: "pre"`, gptj rope
 the layer back to torch. `tests/test_minimax_m3_pro_kernels.py` checks them against the torch
 reference on a CPU (Triton interpreter, fp32 and bf16, aiter through torch stand-ins) and on one
 MI355X (fp8 caches, aiter's own kernels, a decode graph replayed on another batch).
+
+`"prep": "aiter"` (with `"kernels": true`; default `"triton"`) runs prep as aiter's
+`fused_qk_norm_rope_cache_mqa` (one HIP launch, a 32-lane group per head row) instead of the Triton
+prep, falling back to Triton where the installed aiter lacks the op. Same math and rounding points:
+K, V, index K and the fp8 codes and scales match Triton's; q / index q differ on ~1e-5 of the
+values by one bf16 step (Triton's own fma contraction; both within that of the torch reference).
+It takes any number of local heads, which removes the Triton prep's 32-heads-per-rank limit on the
+kernel path (TP 2 / 1: 64 / 128 local heads); the rest of TP < 8 is still unverified. GPU time per
+call in a CUDA graph (MI355X, Triton -> aiter, us):
+
+| local heads, KV / index | 1 token | 128 tokens | 1024 tokens | 8192 tokens |
+|---|---|---|---|---|
+| 16, bf16 | 6.2 -> 3.9 | 6.8 -> 4.9 | 15.5 -> 10.7 | 79.7 -> 48.4 |
+| 16, fp8 | 6.9 -> 4.9 | 7.4 -> 6.0 | 15.7 -> 13.2 | 85.2 -> 51.1 |
+| 128, bf16 | 10.2 -> 3.9 | 11.9 -> 7.3 | 48.1 -> 27.5 | 439 -> 214 |
+| 128, fp8 | 10.7 -> 4.9 | 12.2 -> 8.3 | 49.6 -> 28.5 | 440 -> 209 |
+
+End to end (TP8, the fused-selection configuration, fp8 KV / bf16 index cache, graphs, 1k in /
+512 out) it is ~1%: TPOT at concurrency 1 / 8 / 32 12.73 -> 12.56, 14.82 -> 14.68, 20.66 -> 20.64
+ms, a bs1 decode step 14.29 -> 14.13 ms; GSM8K (20-shot, all 1319) 0.9356 against 0.9303 / 0.9363
+for two baseline runs. `tests/test_minimax_m3_pro_prep_aiter.py` checks it against the Triton prep
+and the torch reference.
 
 End to end on 8x MI355X (TP8, `--max-num-batched-tokens 16384`, 256 tokens out, greedy; TPOT in
 steady decode, ms per token):
@@ -422,5 +460,40 @@ Where a decode step's GPU time goes (torch profiler, bf16, bs1, 1k context, 13.5
 the profiler): Pro's attention kernels 22% (aiter attention 10%, prep, scores and selection 12%),
 the MXFP8 / router GEMMs 24%, the MoE with its routing and elementwise ops 26%, the all-reduces 11%,
 the activation quantization 11%, norms and the shared expert's activation 4%.
+
+## Fused MXFP8 activation quantization
+
+`fuse_mxfp8_quant` (a `ProVariants` field, on by default; `{"fuse_mxfp8_quant": false}` in
+`ATOM_M3PRO_VARIANTS` turns it off, and `diag` does too) has the ops that produce the inputs of the
+native MXFP8 (group-32) linears write them as MXFP8 themselves -- E4M3 values and E8M0 scales, the
+bytes `quantize_fp8` would give -- instead of a separate `quantize_fp8` launch before the GEMM:
+
+- the all-reduce + input norm writes the q / k / indexer projections' input (layer 0: the norm);
+- the all-reduce + post-attention norm writes the dense MLP's or the shared expert's gate_up input,
+  and still writes the bf16 rows the router and the routed experts read;
+- the lookahead norm in `ProLookaheadState.put` writes the reading layer's indexer input;
+- the SwiGLU writes down_proj's input (one Triton kernel).
+
+o_proj's input, written by the paged attention, is still quantized on its own: `quantize_fp8` per
+layer goes from 5 launches to 1.
+
+The norms need aiter's MXFP8 norm outputs ([zhuyuhua-v/aiter-M3#2](https://github.com/zhuyuhua-v/aiter-M3/pull/2): the custom all-reduce
+MXFP8 epilogue, `add_rmsnorm_mxfp8` for the RCCL route and an E8M0 mode of
+`fused_qk_rmsnorm_group_quant`). On an aiter without them the norms keep the unfused path (a log
+line at startup says which aiter features were found) and the SwiGLU is still fused. Where the
+all-reduce takes a route the MXFP8 epilogue does not cover (the reduce-scatter 2-stage kernel above
+80 rows, gluon, Lamport, quick-reduce), that norm runs unfused too. Every fused output is checked
+byte for byte against the unfused pair (`tests/test_m3pro_mxfp8_fusion.py`, TP1 and TP8, eager and
+in CUDA graphs).
+
+End to end with the server command above (TP8, fp8 KV cache), off -> on:
+
+| | c=1 | c=8 | c=32 |
+|---|---|---|---|
+| TPOT, ms | 12.73 -> 12.29 | 14.82 -> 14.35 | 20.66 -> 20.09 |
+
+Decode step under the torch profiler: bs1 14.29 -> 13.24 ms, bs32 20.03 -> 18.92 ms. GSM8K (20-shot,
+all 1319): 0.9303 and 0.9363 off (two runs), 0.9318 on. Greedy outputs differ between the two no
+more than two runs of the same setting do.
 
 Not done: TP other than 8. Untested: video input, prefix caching on the torch reference path.

@@ -1332,6 +1332,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # One-pass prefix-hit walk (`BlockManager._hit_walk`) whose ids `allocate`
     # claims. "0" walks block by block with a token compare per block.
     "ATOM_PREFIX_FAST_WALK": lambda: os.getenv("ATOM_PREFIX_FAST_WALK", "1") == "1",
+    # --- startup warmup ---
+    # Extra one-sequence prefill forwards after `warmup_model`, one per token count, so
+    # the kernels tuned per M bucket (FlyDSL GEMM / MoE) compile at startup instead of in
+    # the first requests that reach a new bucket. "" off; "auto": aiter's padded-M ladder
+    # (1, 2, 4, 8, 16..256 by 16, 288..1024 by 32, then powers of two); or "n1,n2,...".
+    "ATOM_WARMUP_TOKENS": lambda: os.getenv("ATOM_WARMUP_TOKENS", ""),
     # --- TBO prefill ubatch splitting ---
     # Minimum prefill tokens (per rank) required to TBO-split.
     "ATOM_TBO_PREFILL_MIN_TOKENS": lambda: int(

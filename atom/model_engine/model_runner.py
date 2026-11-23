@@ -799,6 +799,23 @@ def _profile_runner_stage(method):
     return wrapped
 
 
+def warmup_token_sweep(spec: str, limit: int) -> list[int]:
+    """``ATOM_WARMUP_TOKENS``' token counts up to ``limit``: "" none, "auto" aiter's
+    padded-M ladder (each bucket its tuned kernels pick by), else a comma list."""
+    spec = spec.strip()
+    if not spec:
+        return []
+    if spec == "auto":
+        counts = [1, 2, 4, 8, *range(16, 257, 16), *range(288, 1025, 32)]
+        p = 2048
+        while p <= limit:
+            counts.append(p)
+            p *= 2
+    else:
+        counts = [int(x) for x in spec.split(",") if x.strip()]
+    return sorted({n for n in counts if 0 < n <= limit})
+
+
 class ModelRunner:
     # The installed model's own head output (its `compute_head`, resolved at
     # install: `_head_output`), None for a model whose head output is its
@@ -1379,35 +1396,45 @@ class ModelRunner:
                 f"Using {num_seqs} seq(s) with length {seq_len} for warmup."
             )
 
-        seqs = [
-            Sequence(
-                [0] * seq_len,
-                block_size=self.block_size,
+        total_tokens_num = self._dummy_prefill(num_seqs, seq_len)
+        sweep = warmup_token_sweep(envs.ATOM_WARMUP_TOKENS, warmup_max_tokens)
+        sweep_start = time.time()
+        for n in sweep:
+            self._dummy_prefill(1, n)
+        torch.cuda.empty_cache()
+        logger.info(
+            f"{self.label}: warmup_model {time.time() - start_time:.2f} seconds with {num_seqs} reqs {total_tokens_num} tokens"
+            + (
+                f", then {len(sweep)} token-count forwards ({sweep[0]}..{sweep[-1]}) "
+                f"in {time.time() - sweep_start:.2f} seconds"
+                if sweep
+                else ""
             )
-            for _ in range(num_seqs)
+        )
+
+    def _dummy_prefill(self, num_seqs: int, seq_len: int) -> int:
+        """One dummy prefill forward of ``num_seqs`` sequences of ``seq_len`` tokens."""
+        seqs = [
+            Sequence([0] * seq_len, block_size=self.block_size) for _ in range(num_seqs)
         ]
         for seq in seqs:
             seq.type = SequenceType.PREFILL
         seqs = {seq.id: seq for seq in seqs}
-
         num_scheduled_tokens = np.array([seq_len] * num_seqs, dtype=np.int32)
         total_tokens_num = int(num_scheduled_tokens.sum())
-
-        dummy_batch = ScheduledBatch(
-            seqs=seqs,
-            num_scheduled_tokens=num_scheduled_tokens,
-            total_tokens_num=total_tokens_num,
-            total_tokens_num_prefill=total_tokens_num,
-            total_seqs_num=num_seqs,
-            total_seqs_num_prefill=num_seqs,
-            is_dummy_run=True,
+        self.forward(
+            ScheduledBatch(
+                seqs=seqs,
+                num_scheduled_tokens=num_scheduled_tokens,
+                total_tokens_num=total_tokens_num,
+                total_tokens_num_prefill=total_tokens_num,
+                total_seqs_num=num_seqs,
+                total_seqs_num_prefill=num_seqs,
+                is_dummy_run=True,
+            )
         )
-        self.forward(dummy_batch)
         self.tokenID_processor.clean()
-        torch.cuda.empty_cache()
-        logger.info(
-            f"{self.label}: warmup_model {time.time() - start_time:.2f} seconds with {num_seqs} reqs {total_tokens_num} tokens"
-        )
+        return total_tokens_num
 
     def profile_dynamic_chunking(self):
         """Fit chunk overhead from startup dummy forwards (engine RPC)."""

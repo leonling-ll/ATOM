@@ -368,10 +368,11 @@ class MhaKvPool:
         `KeyError` here is a binder asking for a scale this pool never needed.
         """
         shape = (-1, self.num_kv_heads, self.block_size)
-        return (
-            self.field_view("k_scale", layer, torch.float32, shape),
-            self.field_view("v_scale", layer, torch.float32, shape),
-        )
+        k = self.field_view("k_scale", layer, torch.float32, shape)
+        # a K-only layout (MiniMax-M3-Pro's: V is part of K) has the one plane
+        if "v_scale" not in self._views:
+            return k, k
+        return k, self.field_view("v_scale", layer, torch.float32, shape)
 
     def region_tensors(self) -> list[tuple[str, torch.Tensor]]:
         """One `(role, tensor)` per (field, layer), in declared field order.

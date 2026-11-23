@@ -45,7 +45,7 @@ from atom.model_ops.minimax_m3.sparse_attn import (
     SPARSE_BLOCK_SIZE,
 )
 from atom.model_ops.moe import FusedMoE
-from atom.model_ops.swiglu_oai import swiglu_oai_split
+from atom.model_ops.swiglu_oai import swiglu_oai_split, swiglu_oai_split_mxfp8
 from atom.model_ops.utils import atom_parameter
 from atom.models.minimax_m3.mono.dispatch import MonoDecode
 from atom.models.utils import (
@@ -331,9 +331,26 @@ class MiniMaxM3MLP(nn.Module):
         self.swiglu_limit = getattr(config, "swiglu_limit", 7.0)
 
     def forward(
-        self, x: torch.Tensor, x_scale: torch.Tensor | None = None
+        self,
+        x: torch.Tensor,
+        x_scale: torch.Tensor | None = None,
+        quant_down: bool = False,
     ) -> torch.Tensor:
+        """``quant_down``: a native group32 FP8 down_proj gets its input as MXFP8 from
+        the SwiGLU kernel (``swiglu_oai_split_mxfp8``), not quantised by the GEMM."""
         gate_up = self.gate_up_proj(x, x_scale=x_scale)
+        if (
+            quant_down
+            and getattr(self.down_proj, "native_a8_group_rows", None) is not None
+            and gate_up.shape[-1] % 64 == 0
+        ):
+            x, x_scale = swiglu_oai_split_mxfp8(
+                gate_up,
+                alpha=self.swiglu_alpha,
+                beta=self.swiglu_beta,
+                limit=self.swiglu_limit,
+            )
+            return self.down_proj(x, x_scale=x_scale)
         x = swiglu_oai_split(
             gate_up,
             alpha=self.swiglu_alpha,
@@ -405,6 +422,18 @@ class MiniMaxM3MoE(nn.Module):
         self.fuse_shared_experts = (
             getattr(self.experts, "num_fused_shared_experts", 0) > 0
         )
+        # The routed scale rides in the routing weights (aiter topk_gating), not a
+        # pass over the output: bit-exact for a power-of-two scale (M3's 2.0),
+        # otherwise only the rounding point moves (fp32 weight, not bf16 output).
+        # Only the plain sigmoid routing takes it, so the others keep the multiply.
+        self.experts.fold_routed_scaling_factor = (
+            not self.fuse_shared_experts
+            and self.experts.scoring_func == "sigmoid"
+            and not self.experts.use_grouped_topk
+            and self.experts.custom_routing_function is None
+            # FusedMoE keeps 1.0 under fp16, where the multiply must stay
+            and self.experts.routed_scaling_factor == self.routed_scaling_factor
+        )
 
         self.shared_experts: MiniMaxM3MLP | None = None
         if getattr(config, "n_shared_experts", 0) and not self.fuse_shared_experts:
@@ -416,7 +445,14 @@ class MiniMaxM3MoE(nn.Module):
                 prefix=f"{prefix}.shared_experts",
             )
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        shared_input: tuple[torch.Tensor, torch.Tensor] | None = None,
+        quant_down: bool = False,
+    ) -> torch.Tensor:
+        """``shared_input``: ``hidden_states`` already quantised (``(x, x_scale)``) for
+        the shared expert; ``quant_down``: see ``MiniMaxM3MLP.forward``."""
         orig_shape = hidden_states.shape
         hidden_states = hidden_states.view(-1, orig_shape[-1])
         router_logits = self.gate(hidden_states)
@@ -425,11 +461,24 @@ class MiniMaxM3MoE(nn.Module):
             hidden_states=hidden_states,
             router_logits=router_logits,
         )
-        if not self.fuse_shared_experts and self.routed_scaling_factor != 1.0:
+        if (
+            not self.fuse_shared_experts
+            and not self.experts.fold_routed_scaling_factor
+            and self.routed_scaling_factor != 1.0
+        ):
             routed_output = routed_output * self.routed_scaling_factor
 
         if self.shared_experts is not None:
-            routed_output = routed_output + self.shared_experts(hidden_states)
+            if shared_input is None:
+                shared = self.shared_experts(hidden_states, quant_down=quant_down)
+            else:
+                sx, sx_scale = shared_input
+                shared = self.shared_experts(
+                    sx.view(-1, sx.shape[-1]),
+                    sx_scale.view(-1, sx_scale.shape[-1]),
+                    quant_down=quant_down,
+                )
+            routed_output = routed_output + shared
 
         return routed_output.view(orig_shape)
 

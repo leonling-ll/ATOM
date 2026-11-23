@@ -33,6 +33,7 @@ import triton.language as tl
 from atom.model_ops.layernorm import GemmaRMSNorm
 from atom.model_ops.minimax_m3 import pro_kernels as K
 from atom.model_ops.minimax_m3.pro_attn import (
+    ProKOnlyLayout,
     ProSparseAttentionImpl,
     ProVariants,
 )
@@ -64,7 +65,15 @@ def _impl(topk, init, local):
 
 class Case:
     def __init__(
-        self, seq_lens, topk=4, init=1, local=2, seed=0, kv_dtype=None, ic_dtype=None
+        self,
+        seq_lens,
+        topk=4,
+        init=1,
+        local=2,
+        seed=0,
+        kv_dtype=None,
+        ic_dtype=None,
+        k_only=False,
     ):
         g = torch.Generator().manual_seed(seed)
         self.lens, self.topk, self.init, self.local = seq_lens, topk, init, local
@@ -89,14 +98,20 @@ class Case:
         )
         kvdt = kv_dtype or DT
         self.fp8 = kvdt.itemsize == 1
-        self.x = 16 if self.fp8 else X  # ATOM's shuffle: 16 bytes
+        # ATOM's shuffle packs 16 bytes; the K-only page is row-major (x = 256), no V
+        self.x = D if k_only else 16 if self.fp8 else X
         self.kc4 = torch.zeros(total, D // self.x, PG, self.x, dtype=kvdt, device=DEV)
-        self.vc4 = torch.zeros(total, PG // self.x, D, self.x, dtype=kvdt, device=DEV)
+        self.vc4 = (
+            None
+            if k_only
+            else torch.zeros(total, PG // self.x, D, self.x, dtype=kvdt, device=DEV)
+        )
         scales = lambda: torch.zeros(total, 1, PG, device=DEV) if self.fp8 else None
-        self.ks, self.vs = scales(), scales()
+        self.ks = scales()
+        self.vs = None if k_only else scales()
         self.layer = SimpleNamespace(
             k_cache=self.kc4.unsqueeze(1),
-            v_cache=self.vc4.unsqueeze(1),
+            v_cache=self.kc4.unsqueeze(1) if k_only else self.vc4.unsqueeze(1),
             k_scale=self.ks,
             v_scale=self.vs,
         )
@@ -145,6 +160,7 @@ class Case:
             vc4=self.vc4,
             k_scale=self.ks,
             v_scale=self.vs,
+            k_unit=getattr(self, "k_unit", False),
         )
 
     def seq_slice(self, s):
@@ -421,6 +437,24 @@ class TestScores:
     @pytest.mark.parametrize(
         "mode", [K.BLOCK_TOKMAX, K.BLOCK_TOKLSE, K.BLOCK_POOL4MAX, K.BLOCK_POOL4MEAN]
     )
+    def test_causal_scores_equal_the_full_width_ones(self, case, mode):
+        # however many tiles a program strides over, a causal block's score is the full
+        # launch's, bit for bit (same tile size); nothing past the token is read after
+        nb = case.bt.shape[1]
+        pool = mode in (K.BLOCK_POOL4MAX, K.BLOCK_POOL4MEAN)
+        cq = case.impl.index_compress_query.data if pool else None
+        args = (case.iq, case.ic, case.bt, case.seq, case.pos, nb, cq, 2, 3, 0.1)
+        kw = {"block_mode": mode, "head_mode": K.HEAD_LSE, "pool_temp": DI**-0.5}
+        causal = torch.arange(nb, device=DEV)[None, :] <= (case.pos // PG)[:, None]
+        for bb in (4, 8):
+            full = K.scores(*args, **kw, bb=bb)
+            for programs in (1, 2, None):
+                got = K.scores(*args, **kw, bb=bb, causal=True, programs=programs)
+                assert torch.equal(got[causal], full[causal]), (bb, programs)
+
+    @pytest.mark.parametrize(
+        "mode", [K.BLOCK_TOKMAX, K.BLOCK_TOKLSE, K.BLOCK_POOL4MAX, K.BLOCK_POOL4MEAN]
+    )
     def test_every_tile_size_scores_like_the_per_block_kernel(self, case, mode):
         nb = case.bt.shape[1]
         pool = mode in (K.BLOCK_POOL4MAX, K.BLOCK_POOL4MEAN)
@@ -641,8 +675,9 @@ class TestSelectRows:
     of each row (any order of the full ones, the token's own block last), scores as
     ``scores`` writes them: pins finite, future blocks -inf."""
 
+    @pytest.mark.parametrize("select", ["select_rows", "select_rows_split"])
     @pytest.mark.parametrize("width,k", [(40, 8), (1024, 128), (100, 128)])
-    def test_against_topk_and_the_rows_rule(self, width, k):
+    def test_against_topk_and_the_rows_rule(self, width, k, select):
         g = torch.Generator(device=DEV).manual_seed(1)
         t, s = 37, 5
         bt = (
@@ -662,7 +697,7 @@ class TestSelectRows:
         score[:, 0] = 1e30
         score = torch.where((j[None, :] >= qb[:, None] - 2), 1e29, score)
         score = torch.where(j[None, :] <= qb[:, None], score, float("-inf"))
-        rows, ctx = K.select_rows(score, bt, seq, pos, k)
+        rows, ctx = getattr(K, select)(score, bt, seq, pos, k)
         assert rows.shape == (t, k) and rows.dtype == ctx.dtype == torch.int32
         for r in range(t):
             n, q = int(qb[r]) + 1, int(qb[r])
@@ -676,16 +711,192 @@ class TestSelectRows:
             assert not any(got[len(full) + 1 :]), r
             assert int(ctx[r]) == len(full) * PG + int(pos[r]) % PG + 1, r
 
-    def test_ties_go_to_the_lower_block(self):
+    @pytest.mark.parametrize("select", ["select_rows", "select_rows_split"])
+    def test_ties_go_to_the_lower_block(self, select):
         score = torch.zeros(1, 16, device=DEV)
         score[0, 15] = 1.0
         bt = torch.arange(16, dtype=torch.int32, device=DEV)[None] + 100
         pos = torch.tensor([15 * PG], device=DEV)
-        rows, ctx = K.select_rows(
+        rows, ctx = getattr(K, select)(
             score, bt, torch.zeros(1, dtype=torch.long, device=DEV), pos, 4
         )
         assert sorted(rows[0, :3].tolist()) == [100, 101, 102] and rows[0, 3] == 115
         assert ctx.tolist() == [3 * PG + 1]
+
+
+class TestSelectRowsSplit:
+    """``select_rows_split`` writes ``select_rows``' tables bit for bit, however a row is
+    split, merged or wide, and reads none of a row's scores past its own block."""
+
+    @staticmethod
+    def _case(t, width, seed, ties=False, ctx=None):
+        g = torch.Generator(device=DEV).manual_seed(seed)
+        bt = torch.randint(1, 1 << 20, (3, width), generator=g, device=DEV).to(
+            torch.int32
+        )
+        seq = torch.randint(0, 3, (t,), generator=g, device=DEV)
+        pos = torch.randint(0, width * PG, (t,), generator=g, device=DEV)
+        pos[0], pos[-1] = width * PG - 1, 3  # the widest row and a one-block one
+        if ctx is not None:  # a uniform decode batch, as the bench runs it
+            pos.fill_(ctx - 1)
+        j = torch.arange(width, device=DEV)
+        qb = pos // PG
+        if ties:  # a few distinct values: most picks are decided by the block index
+            score = torch.randint(-2, 3, (t, width), generator=g, device=DEV).float()
+            score[:, 1::7] = float("-inf")  # causal -inf blocks are never picked
+        else:
+            score = torch.randn(t, width, generator=g, device=DEV)
+        score[:, :1] = 1e30
+        score = torch.where(j[None, :] >= qb[:, None] - 2, 1e29, score)
+        # what scores writes past the token is never read: garbage must not change a pick
+        score = torch.where(j[None, :] <= qb[:, None], score, float("nan"))
+        return score, bt, seq, pos
+
+    @pytest.mark.parametrize("ties", [False, True])
+    @pytest.mark.parametrize(
+        "t,width,k,chunk,parts,fused",
+        [
+            (5, 40, 8, 32, 1, None),  # one span, looped chunks
+            (5, 40, 8, 32, 2, True),
+            (5, 40, 8, 32, 2, False),
+            (3, 300, 8, 32, None, True),  # a span program per chunk
+            (19, 300, 8, 32, 4, False),
+            (19, 300, 8, 64, 3, None),
+            (4, 1000, 32, 128, None, None),
+            (2, 100, 128, 512, None, None),  # fewer blocks than k
+        ],
+    )
+    def test_equals_select_rows(self, t, width, k, chunk, parts, fused, ties):
+        score, bt, seq, pos = self._case(t, width, seed=t + width + k, ties=ties)
+        want = K.select_rows(
+            score.masked_fill(score.isnan(), float("-inf")), bt, seq, pos, k
+        )
+        got = K.select_rows_split(
+            score, bt, seq, pos, k, parts=parts, chunk=chunk, fused=fused
+        )
+        assert torch.equal(got[0], want[0]) and torch.equal(got[1], want[1])
+
+    @pytest.mark.parametrize(
+        "t,width,k,chunk,parts,fused",
+        [
+            (5, 40, 8, 32, 1, None),
+            (5, 40, 8, 32, 2, True),
+            (19, 300, 8, 32, 4, False),
+            (2, 100, 128, 512, None, None),  # fewer blocks than k: -1 after
+        ],
+    )
+    def test_logical_equals_select_logical(self, t, width, k, chunk, parts, fused):
+        # the K-only cache's block ids (day0, Triton attention) through the split path
+        score, bt, seq, pos = self._case(t, width, seed=t + width + k, ties=True)
+        want = K.select_logical(score.masked_fill(score.isnan(), float("-inf")), pos, k)
+        got = K.select_rows_split(
+            score, bt, pos, pos, k, parts=parts, chunk=chunk, fused=fused, logical=True
+        )[0]
+        assert torch.equal(got, want)
+        if parts is None:
+            assert torch.equal(K.select_logical(score, pos, k, split=True), want)
+
+    def test_rearms_its_counters(self):
+        # the fused merge zeroes its arrival counters: a second call (a graph replay)
+        # selects alike
+        score, bt, seq, pos = self._case(3, 300, seed=9)
+        args = {"parts": None, "chunk": 32, "fused": True}
+        a = K.select_rows_split(score, bt, seq, pos, 8, **args)
+        b = K.select_rows_split(score, bt, seq, pos, 8, **args)
+        assert torch.equal(a[0], b[0]) and torch.equal(a[1], b[1])
+
+    @staticmethod
+    def _poison_scratch():
+        """Fill every partial scratch with keys above any real one (a block id read back
+        from them is garbage); the arrival counters must be back at zero."""
+        for (_, _, kind), bufs in K._split_buffers.items():
+            for b in bufs:
+                if kind == "part":
+                    b.random_(1 << 62)
+                else:
+                    assert not b.any(), "an arrival counter was left armed"
+
+    # (rows, width, ctx) in the 004 bench order that faulted (a few rows over the whole
+    # table, then many rows with several spans each) and wider ones; the interpreter
+    # runs them scaled down (k 8 over chunks of 32 blocks: the same spans and merges)
+    SEQUENCE_GPU = (
+        (16, 8192, 131072),
+        (64, 8192, 1024),
+        (64, 8192, 8192),
+        (64, 8192, 32768),
+        (200, 8192, 32768),
+        (64, 8192, 131072),
+        (200, 8192, 131072),
+        (64, 65536, 32768),
+        (200, 65536, 131072),
+        (16, 65536, 1048576),
+    )
+    SEQUENCE_CPU = ((16, 256, 4096), (64, 256, 128), (64, 256, 2048), (40, 512, 8192))
+
+    @pytest.mark.parametrize("fused", [None, True, False])
+    def test_shape_sequence_over_garbage_scratch(self, fused):
+        k, chunk = (128, 1024) if GPU else (8, 32)
+        for i, (t, width, ctx) in enumerate(
+            self.SEQUENCE_GPU if GPU else self.SEQUENCE_CPU
+        ):
+            score, bt, seq, pos = self._case(t, width, seed=i, ctx=ctx)
+            want = K.select_rows(
+                score.masked_fill(score.isnan(), float("-inf")), bt, seq, pos, k
+            )
+            for _ in range(2):
+                self._poison_scratch()
+                got = K.select_rows_split(
+                    score, bt, seq, pos, k, chunk=chunk, fused=fused
+                )
+                assert torch.equal(got[0], want[0]) and torch.equal(got[1], want[1]), (
+                    t,
+                    width,
+                    ctx,
+                )
+        self._poison_scratch()
+
+    @pytest.mark.skipif(not GPU, reason="wide rows take long in the interpreter")
+    @pytest.mark.parametrize("t", [1, 16, 64, 200])
+    @pytest.mark.parametrize("width", [1024, 8192, 65536])
+    def test_wide_rows_equal_select_rows(self, t, width):
+        score, bt, seq, pos = self._case(t, width, seed=t * width)
+        want = K.select_rows(
+            score.masked_fill(score.isnan(), float("-inf")), bt, seq, pos, 128
+        )
+        for fused in (True, False):
+            got = K.select_rows_split(score, bt, seq, pos, 128, fused=fused)
+            assert torch.equal(got[0], want[0]) and torch.equal(got[1], want[1])
+
+    @pytest.mark.skipif(not GPU, reason="CUDA graphs need a GPU")
+    @pytest.mark.parametrize("t", [4, 32])
+    def test_graph_replays_other_rows(self, t):
+        # captured once over a wide table, replayed for other scores and positions: the
+        # spans past each row exit, the fused merge's counters are rearmed every replay
+        score, bt, seq, pos = self._case(t, 8192, seed=t)
+        s_buf, p_buf = score.clone(), pos.clone()
+        side = torch.cuda.Stream()
+        side.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(side):
+            K.select_rows_split(s_buf, bt, seq, p_buf, 128)
+        torch.cuda.current_stream().wait_stream(side)
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g):
+            out = K.select_rows_split(s_buf, bt, seq, p_buf, 128)
+        for seed in (1, 2):
+            sc, _, _, po = self._case(t, 8192, seed=100 + seed)
+            po[1] = 8192 * PG - 1 - seed  # keep a long row in the batch
+            sc = torch.where(
+                torch.arange(8192, device=DEV)[None, :] <= (po // PG)[:, None],
+                sc.masked_fill(sc.isnan(), 0.5),
+                float("nan"),
+            )
+            s_buf.copy_(sc), p_buf.copy_(po)
+            g.replay()
+            want = K.select_rows(
+                sc.masked_fill(sc.isnan(), float("-inf")), bt, seq, po, 128
+            )
+            torch.cuda.synchronize()
+            assert torch.equal(out[0], want[0]) and torch.equal(out[1], want[1])
 
 
 class TestAttentionAiter:
@@ -959,10 +1170,11 @@ class TestImplGlue:
     def test_fused_selection_matches_the_torch_reference(self, variant, monkeypatch):
         # select_rows takes a power-of-two k: 8 > the 5 blocks init 2 + local 3 force
         c = Case([150, 97], topk=8, seed=3)
-        v, seen, out = self._run(
-            c, variant, {"topk": "fused", "attn": "aiter"}, monkeypatch
-        )
-        assert _close(out, self._reference(c, v, seen))
+        for topk in ("fused", "split"):
+            v, seen, out = self._run(
+                c, variant, {"topk": topk, "attn": "aiter"}, monkeypatch
+            )
+            assert _close(out, self._reference(c, v, seen))
 
     @needs_fp8
     @pytest.mark.parametrize("attn", ["triton", "aiter"])
@@ -978,12 +1190,13 @@ class TestImplGlue:
             ("aiter", "torch"),
             ("aiter", "aiter"),
             ("aiter", "fused"),
+            ("aiter", "split"),
         ],
     )
     def test_static_decode_equals_the_dynamic_path(self, attn, topk, monkeypatch):
         # decode as a graph runs it: the last token of each sequence plus a padding row
         # (slot -1), over a block table wider than any sequence, selection throughout
-        c = Case([150, 97], topk=8 if topk == "fused" else 6, seed=3)
+        c = Case([150, 97], topk=8 if topk in ("fused", "split") else 6, seed=3)
         kw = {"attn": attn, "topk": topk}
         _, _, out = self._run(c, {}, kw, monkeypatch)
         caches = [t.clone() for t in (c.kc4, c.vc4, c.ic)]
@@ -1017,13 +1230,16 @@ class TestImplGlue:
             ("aiter", "torch"),
             ("aiter", "aiter"),
             ("aiter", "fused"),
+            ("aiter", "split"),
         ],
     )
     def test_decode_graph_replays_another_batch(self, attn, topk):
         # the static path captured over fixed buffers (a graph's decode), replayed for
         # other sequences at other positions plus a padding row; the token -> sequence
         # map comes from the metadata as in ATOM, whose capture reuses its warmup's
-        c = Case([1500, 970, 610, 200], topk=64 if topk == "fused" else 40, seed=5)
+        c = Case(
+            [1500, 970, 610, 200], topk=64 if topk in ("fused", "split") else 40, seed=5
+        )
         kw = {"attn": attn, "topk": topk}
         v = ProVariants(**kw)
         m = self._impl_with_rope(c, v)
@@ -1118,6 +1334,49 @@ class TestImplGlue:
         assert len(pa.calls) == (kw.get("attn") == "aiter")
         return v, seen, out
 
+    def test_day0_takes_block_ids_beside_aiter_k_rows(self, monkeypatch):
+        # K-only fp8 cache, aiter reading the K rows: a day0 prefill still gets
+        # select_logical's block ids, never aiter's page tables (dispatch only: the
+        # interpreter's fp8 rounding does not matter here)
+        c = Case([150, 97], topk=8, seed=3, kv_dtype=FP8, k_only=True)
+        c.impl.k_only = True
+        self._impl_with_rope(c, ProVariants())
+        monkeypatch.setattr(K, "TOPK", 8)
+        monkeypatch.setattr(K, "aiter_value_rows_available", lambda: True)
+        monkeypatch.setattr(K, "day0_prefill_available", lambda: True)
+        got = {}
+
+        def fake_day0(q, kc4, bt, seq, pos, sel, out, scale):
+            got["sel"] = sel
+            return out
+
+        def no_aiter(*a, **k):
+            pytest.fail("aiter page tables in a day0 prefill")
+
+        monkeypatch.setattr(K, "attention_day0", fake_day0)
+        monkeypatch.setattr(K, "attention_aiter", no_aiter)
+        kw = {"topk": "fused", "attn": "aiter", "k_only": True}
+        kw.update(k_plain_fp8=True, prefill_attn="day0")
+        out = torch.zeros(c.T, H * VD, dtype=DT, device=DEV)
+        c.impl._kernel_attention(
+            c.qkv,
+            c.pos,
+            c.seq,
+            c.slot,
+            c.bt,
+            c.layer,
+            c.ic,
+            c.bt.shape[1],
+            ProVariants(**kw),
+            out,
+        )
+        sel = got["sel"]
+        assert sel is not None and tuple(sel.shape) == (c.T, 8)
+        qb = (c.pos // PG).unsqueeze(1).expand_as(sel)
+        valid = sel >= 0
+        assert (sel[valid] <= qb[valid]).all()
+        assert torch.equal(valid.sum(1), torch.clamp(c.pos // PG + 1, max=8))
+
     def _reference(self, c, v, seen, v_cache=False):
         k_all, ik_all = c.cached()
         v_all = c.cached_v() if v_cache else None
@@ -1164,3 +1423,230 @@ class TestImplGlue:
         assert m._use_kernels(ProVariants(kernels=True, attn="aiter", topk="fused"))
         m.topk = 6
         assert not m._use_kernels(ProVariants(kernels=True, attn="aiter", topk="fused"))
+
+
+class TestKOnly:
+    """The K-only cache (``k_only``): row-major K pages (x = 256), V read from K's tail,
+    no V cache; the Triton attention over it, the selection as block ids."""
+
+    @pytest.mark.parametrize("kv", [None, pytest.param(FP8, marks=needs_fp8)])
+    def test_prep_writes_the_same_k_as_the_shuffled_cache(self, kv):
+        sh = Case([150, 97], seed=3, kv_dtype=kv)
+        ko = Case([150, 97], seed=3, kv_dtype=kv, k_only=True)
+        q0, iq0 = sh.run_prep()
+        q1, iq1 = ko.run_prep()
+        assert torch.equal(q1, q0) and torch.equal(iq1, iq0)
+        assert torch.equal(ko.ic, sh.ic)
+        k0, k1 = sh.cached()[0], ko.cached()[0]
+        assert torch.equal(k1, k0)
+        if kv is not None:
+            assert torch.equal(ko.ks, sh.ks)
+        used = torch.zeros(ko.kc4.shape[0], dtype=torch.bool, device=DEV)
+        used[ko.slot // PG] = True
+        assert not ko.kc4[~used].view(torch.uint8).any()
+
+    @pytest.mark.parametrize("kv", [None, pytest.param(FP8, marks=needs_fp8)])
+    @pytest.mark.parametrize("dense", [False, True])
+    def test_triton_attention_reads_v_from_the_row_cache(self, kv, dense):
+        c = Case([150, 97], kv_dtype=kv, k_only=True)
+        c.q, c.iq = c.run_prep()
+        att = TestAttention()
+        got = att._run(
+            c, None, 2, dense=dense, n_blocks=c.bt.shape[1] if dense else None
+        )
+        assert _close(got, att._ref(c, dense=dense))
+
+    @pytest.mark.parametrize("width,k", [(40, 8), (1024, 128), (100, 128)])
+    def test_select_logical_is_select_rows_as_block_ids(self, width, k):
+        g = torch.Generator(device=DEV).manual_seed(5)
+        t, s = 29, 3
+        bt = torch.randperm(s * width, generator=g, device=DEV).view(s, width)
+        bt = bt.to(torch.int32) + 1
+        seq = torch.randint(0, s, (t,), generator=g, device=DEV)
+        pos = torch.randint(0, width * PG, (t,), generator=g, device=DEV)
+        pos[:2] = torch.tensor([0, 3 * PG + 1], device=DEV)
+        qb = pos // PG
+        j = torch.arange(width, device=DEV)
+        score = torch.randn(t, width, generator=g, device=DEV)
+        score[:, 0] = 1e30
+        score = torch.where((j[None, :] >= qb[:, None] - 2), 1e29, score)
+        score = torch.where(j[None, :] <= qb[:, None], score, float("-inf"))
+        sel = K.select_logical(score, pos, k)
+        rows, _ctx = K.select_rows(score, bt, seq, pos, k)
+        assert sel.shape == (t, k) and sel.dtype == torch.int32
+        for r in range(t):
+            n = min(k, int(qb[r]) + 1)
+            got = sel[r].tolist()
+            assert all(x >= 0 for x in got[:n]) and all(x == -1 for x in got[n:]), r
+            phys = {int(bt[seq[r], x]) for x in got[:n]}
+            assert phys == set(rows[r, :n].tolist()), r
+
+    def test_pool_holds_k_and_one_scale_plane(self):
+        from atom.model_ops.attentions.mha_kv_pool import MhaKvPool
+
+        kw = {
+            "layers": 2,
+            "block_size": PG,
+            "num_kv_heads": 1,
+            "head_dim": D,
+            "kv_dtype": FP8,
+        }
+        shuffle = MhaKvPool(**kw)
+        konly = MhaKvPool(**kw, layout=ProKOnlyLayout(FP8))
+        assert [f.name for f in konly.cache_fields + konly.scale_fields] == [
+            "k",
+            "k_scale",
+        ]
+        assert konly.entry_bytes < shuffle.entry_bytes * 0.52
+        konly.allocate(5, "cpu")
+        k, v = konly.kv_views(1)
+        assert tuple(k.shape) == (5, 1, 1, PG, D) and v is k
+        assert k[:, 0, 0].stride()[1:] == (
+            D,
+            1,
+        )  # rows of 256 bytes, as day0 / moo read
+        ks, vs = konly.scale_views(1)
+        assert tuple(ks.shape) == (5, 1, PG) and vs is ks
+
+    @needs_fp8
+    def test_plain_fp8_k_is_the_clamped_cast(self):
+        c = Case([150, 97], seed=4, kv_dtype=FP8, k_only=True)
+        c.k_unit = True
+        c.q, c.iq = c.run_prep()
+        rk = c.ref_prep()[1][:, 0]
+        blk, off = c.slot // PG, c.slot % PG
+        assert torch.equal(c.ks[blk, 0, off], torch.ones_like(c.ks[blk, 0, off]))
+        want = K.quant_fp8_rows(c.cached()[0], FP8, plain=True)[
+            0
+        ]  # a fixed point of it
+        assert torch.equal(c.kc4[blk, 0, off], want)
+        rtol = 1e-2 if BF16 else 1e-4
+        got = c.cached()[0]
+        assert (
+            (got - rk.float()).abs()
+            <= rk.float().abs() * (1 / 16 + rtol) + 2**-9 + ATOL
+        ).all()
+
+    @pytest.mark.skipif(
+        not (GPU and K.day0_prefill_available()), reason="amd-kernels-day0 on a GPU"
+    )
+    @pytest.mark.parametrize("dense", [False, True])
+    def test_day0_prefill_matches_the_triton_attention(self, dense):
+        c = Case([300, 197], topk=K.TOPK, seed=6, kv_dtype=FP8, k_only=True)
+        c.k_unit = True
+        c.q, c.iq = c.run_prep()
+        nb = c.bt.shape[1]
+        sel = None
+        if not dense:
+            sc = K.scores(
+                c.iq, c.ic, c.bt, c.seq, c.pos, nb, None, c.init, c.local, 1.0
+            )
+            sel = K.select_logical(sc, c.pos, K.TOPK)
+        q16 = c.q[:, :16].contiguous()
+        ref = torch.zeros(c.T, 16 * VD, dtype=DT, device=DEV)
+        # the reference sees what day0 does: q cast to fp8
+        K.attention(
+            q16.to(FP8).to(DT),
+            c.kc4,
+            c.bt,
+            c.seq,
+            c.pos,
+            sel,
+            ref,
+            D**-0.5,
+            2,
+            n_blocks=nb if dense else None,
+            k_scale=c.ks,
+        )
+        got = torch.zeros_like(ref)
+        K.attention_day0(q16, c.kc4, c.bt, c.seq, c.pos, sel, got, D**-0.5)
+        assert _close(got, ref)
+
+
+def _nv_pages(rows):
+    """``[N, PG, 72]`` NVFP4 rows -> the ``[N, PG * 72]`` pages ``prep`` writes: all the
+    tokens' 64 data bytes, then all their 8 scale bytes."""
+    n = rows.shape[0]
+    return torch.cat([rows[..., :64].reshape(n, -1), rows[..., 64:].reshape(n, -1)], 1)
+
+
+class TestNvfp4Index:
+    """``--index-cache-dtype nvfp4`` for Pro: [page x 64 B e2m1 | page x 8 B e4m3] a block,
+    written by ``prep`` as vLLM's ``_quant4``, read by the tiled scorer."""
+
+    def test_reference_round_trip_error(self):
+        g = torch.Generator().manual_seed(11)
+        x = (torch.randn(64, DI, generator=g) * 3).to(torch.bfloat16)
+        d = K.nvfp4_dequant_rows(K.nvfp4_rows(x)).reshape(64, 8, 16)
+        xg = x.float().reshape(64, 8, 16)
+        step = xg.abs().amax(-1, keepdim=True) / 6  # the e2m1 grid's unit, up to e4m3
+        assert (
+            (d - xg).abs() <= step * 1.13 + 1e-6
+        ).all()  # half of the widest gap (2)
+
+    @needs_fp8
+    def test_prep_writes_the_reference_rows(self):
+        ref = Case([150, 97], seed=8)
+        ref.run_prep()
+        nv = Case([150, 97], seed=8)
+        nv.ic = torch.zeros(nv.ic.shape[0], PG * 72, dtype=torch.uint8, device=DEV)
+        nv.run_prep()
+        want = _nv_pages(K.nvfp4_rows(ref.ic))
+        used = torch.zeros(nv.ic.shape[0], dtype=torch.bool, device=DEV)
+        used[nv.slot // PG] = True
+        # unwritten slots of a used page stay zero in both
+        assert torch.equal(nv.ic[used], want[used]) and not nv.ic[~used].any()
+
+    @pytest.mark.parametrize(
+        "mode,var",
+        [
+            (K.BLOCK_POOL4MAX, {}),
+            (K.BLOCK_TOKLSE, {"block_score": "lse", "head_reduce": "lse"}),
+        ],
+    )
+    def test_scorer_reads_the_pages_as_their_dequantized_keys(self, case, mode, var):
+        c = case
+        rows = K.nvfp4_rows(c.ic)
+        deq = K.nvfp4_dequant_rows(rows).to(c.ic.dtype)
+        nb = c.bt.shape[1]
+        head = K.HEAD_LSE if var else K.HEAD_MAX
+        sc = DI**-0.5 if var else 1.0
+        cq = c.impl.index_compress_query.data
+        args = (c.bt, c.seq, c.pos, nb, cq, c.init, c.local, sc)
+        kw = {"block_mode": mode, "head_mode": head, "pool_temp": DI**-0.5}
+        want = K.scores(c.iq, deq, *args, **kw)
+        got = K.scores(c.iq, _nv_pages(rows), *args, **kw)
+        assert torch.allclose(got, want, rtol=1e-4, atol=1e-4)
+
+
+class TestValidFirst:
+    """``attention(valid_first=True)`` over ``select_logical``'s rows (valid blocks first):
+    the splits share each row's valid blocks; the same output as the reference."""
+
+    @pytest.mark.parametrize("splits", [1, 3, 8])
+    def test_matches_the_reference(self, case, splits):
+        c = case
+        nb = c.bt.shape[1]
+        sc = K.scores(c.iq, c.ic, c.bt, c.seq, c.pos, nb, None, c.init, c.local, 1.0)
+        k = 1 << (min(c.topk, nb) - 1).bit_length() >> 1 or 1
+        sel = K.select_logical(sc, c.pos, k)
+        out = torch.zeros(c.T, H * VD, dtype=DT, device=DEV)
+        K.attention(
+            c.q,
+            c.kc4,
+            c.bt,
+            c.seq,
+            c.pos,
+            sel,
+            out,
+            D**-0.5,
+            splits,
+            nblk=2,
+            k_scale=c.ks,
+            valid_first=True,
+        )
+        ref = torch.zeros_like(out)
+        K.attention(
+            c.q, c.kc4, c.bt, c.seq, c.pos, sel, ref, D**-0.5, 1, nblk=2, k_scale=c.ks
+        )
+        assert _close(out, ref)
