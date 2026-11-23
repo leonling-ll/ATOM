@@ -975,6 +975,7 @@ def _score_qtile_kernel(
     PG: tl.constexpr,
     BLOCK_MODE: tl.constexpr,
     HEAD_MODE: tl.constexpr,
+    CAUSAL: tl.constexpr = False,
 ):
     """_score_tile_kernel's scores for ``TQ`` rows at once: rows of one sequence share each
     tile of block keys (loaded once, one dot for the ``TQ * NI`` query heads); a tile whose
@@ -990,8 +991,9 @@ def _score_qtile_kernel(
     optr = out_ptr + trc.to(tl.int64)[:, None] * stride_out + jb[None, :]
     omask = rmask[:, None] & (jb < NB)[None, :]
     last = tl.max(qpos, axis=0) // PG
-    if j0 > last:
-        tl.store(optr, tl.full([TQ, BB], float("-inf"), tl.float32), mask=omask)
+    if j0 > last:  # past every row's own block: -inf, or (CAUSAL) left unwritten
+        if not CAUSAL:
+            tl.store(optr, tl.full([TQ, BB], float("-inf"), tl.float32), mask=omask)
     elif tl.min(seqs, axis=0) == tl.max(seqs, axis=0):
         ik, live = _load_block_keys(
             ic_ptr,
@@ -1104,8 +1106,8 @@ def scores(
     by ``programs`` a token (default: about 4096 over the batch; one a tile, or fewer
     striding over its tiles; the ones past the token exit at once), so the cost follows
     the context, not ``nb``. ``tq`` > 0: ``tq`` rows per program (_score_qtile_kernel),
-    each tile of keys read once for them (a power of two); it writes every block, future
-    ones -inf, so ``causal`` does not apply."""
+    each tile of block keys read once for them (a power of two); ``causal`` leaves the tiles
+    past every row of a program unwritten (else -inf), the rest as without it."""
     t = iq.shape[0]
     out = torch.empty(t, nb, dtype=torch.float32, device=iq.device)
     assert ic.stride(-1) == 1 and (tiled or not causal)
@@ -1141,6 +1143,7 @@ def scores(
             PG=PAGE,
             BLOCK_MODE=block_mode,
             HEAD_MODE=head_mode,
+            CAUSAL=causal,
         )
         return out
     tiles = triton.cdiv(nb, bb)

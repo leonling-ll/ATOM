@@ -181,6 +181,10 @@ class ProVariants:
     # scores and selects one contiguous share of the rows and the [page table | ctx] rows are
     # all-gathered back in order. Bit for bit the same selection, an eighth of the work.
     index_split_decode: int = 0
+    # The score_tq kernel (prefill, speculative verify) leaves the tiles past a program's
+    # rows unwritten instead of -inf, as the selections that read only causal blocks allow
+    # (fused / split / aiter): its cost follows the context, not the block table's width.
+    score_tq_causal: bool = False
     # Prefill and speculative-verify scores take ``score_tq`` rows per program (a power of
     # two; 0: one): the rows of a sequence read each tile of block keys once, one dot for
     # all their query heads. A plain decode (one row a sequence) keeps one.
@@ -987,6 +991,11 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
             # every row scores alone, so this rank's rows come out as they would in full
             idx, seg, n_rows, tp = split
             rq, rseq, rpos = iq[idx], seq_id[idx], positions[idx]
+        # decode: one row a sequence, nothing to share; a verify has k + 1 rows a
+        # sequence, so the tile is the largest power of two dividing them (at most
+        # score_tq): a tile never spans two sequences, which would score row by row
+        # (k = 3: 4 rows, not 8). Graph-safe: the shapes alone decide.
+        tq = v.score_tq if not static else min(v.score_tq, rps & -rps) if rps > 1 else 0
         score = pro_kernels.scores(
             rq,
             ic,
@@ -1002,16 +1011,9 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
             head_mode=head_mode,
             pool_temp=v.pool_scale,
             # torch.topk reads the whole width; the others only each token's causal blocks
-            causal=v.topk != "torch",
-            # decode: one row a sequence, nothing to share; a verify has k + 1 rows a
-            # sequence, so the tile is the largest power of two dividing them (at most
-            # score_tq): a tile never spans two sequences, which would score row by row
-            # (k = 3: 4 rows, not 8). Graph-safe: the shapes alone decide.
-            tq=(
-                v.score_tq
-                if not static
-                else min(v.score_tq, rps & -rps) if rps > 1 else 0
-            ),
+            # (the score_tq kernel only with score_tq_causal)
+            causal=v.topk != "torch" and (v.score_tq_causal or tq == 0),
+            tq=tq,
         )
         # select_rows_split matches select_rows bit for bit; its cost follows the context
         select = (
@@ -1089,6 +1091,15 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
             return None
         if not self._aiter_attn(v, n) or v.topk not in ("fused", "split"):
             return None
+        from atom.distributed.dcp_utils import get_dcp_world_size
+
+        try:
+            if (
+                get_dcp_world_size() > 1
+            ):  # DCP shards the index cache by block, not rows
+                return None
+        except AssertionError:  # no ATOM config (unit tests): no DCP
+            pass
         from aiter.dist.parallel_state import (
             get_tensor_model_parallel_rank,
             get_tensor_model_parallel_world_size,

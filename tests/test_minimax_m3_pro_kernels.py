@@ -454,6 +454,10 @@ class TestScores:
             for programs in (1, 2, None):
                 got = K.scores(*args, **kw, bb=bb, causal=True, programs=programs)
                 assert torch.equal(got[causal], full[causal]), (bb, programs)
+            for tq in (2, 8):  # the score_tq kernel: the same causal scores either way
+                want = K.scores(*args, **kw, bb=bb, tq=tq)
+                got = K.scores(*args, **kw, bb=bb, tq=tq, causal=True)
+                assert torch.equal(got[causal], want[causal]), (bb, tq)
 
     @pytest.mark.parametrize(
         "mode", [K.BLOCK_TOKMAX, K.BLOCK_TOKLSE, K.BLOCK_POOL4MAX, K.BLOCK_POOL4MEAN]
@@ -1306,6 +1310,11 @@ class TestImplGlue:
         assert c.impl.decode_split(512, v, 128) == (192, 256)
         assert c.impl.decode_split(520, v, 65) is None
         assert c.impl.decode_split(512, v, 4) is None  # 64 rows a rank, 128 a sequence
+        # under DCP the index cache is sharded by block: DCP's own split, not this one
+        from atom.distributed import dcp_utils
+
+        monkeypatch.setattr(dcp_utils, "get_dcp_world_size", lambda: 8)
+        assert c.impl.decode_split(512, v, 64) is None
 
     @pytest.mark.skipif(not GPU, reason="CUDA graphs need a GPU")
     @pytest.mark.parametrize(
