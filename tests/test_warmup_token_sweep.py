@@ -1,4 +1,8 @@
-from atom.model_engine.model_runner import warmup_token_sweep
+from aiter_stub import stubbed_aiter
+
+# model_runner imports aiter at module level, which a CPU runner does not have.
+with stubbed_aiter():
+    from atom.model_engine.model_runner import warmup_token_sweep
 
 
 def test_off_by_default():

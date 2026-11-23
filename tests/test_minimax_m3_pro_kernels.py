@@ -787,7 +787,7 @@ class TestSelectRowsSplit:
     )
     def test_logical_equals_select_logical(self, t, width, k, chunk, parts, fused):
         # the K-only cache's block ids (day0, Triton attention) through the split path
-        score, bt, seq, pos = self._case(t, width, seed=t + width + k, ties=True)
+        score, bt, _seq, pos = self._case(t, width, seed=t + width + k, ties=True)
         want = K.select_logical(score.masked_fill(score.isnan(), float("-inf")), pos, k)
         got = K.select_rows_split(
             score, bt, pos, pos, k, parts=parts, chunk=chunk, fused=fused, logical=True
