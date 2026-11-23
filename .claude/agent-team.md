@@ -13,11 +13,11 @@ max_tasks: 4
 task_label: m31pro
 ---
 
-Target and constraints: issue #7. Every brief and PR follows its section 4 (InferenceX rules) and section 5 (accuracy gate).
+Target and constraints: issue #7. Every brief and PR follows its section 4 (global constraints), section 5 (accuracy gate) and section 11 (InferenceX / SemiAnalysis rules: no FLOP reduction, the DSpark draft as released and excluded from online quantization, golden AL per draft length with the chat template, no integer-quantized all-reduce, CPU-DRAM-only KV offload within the per-server cap, the stream-interval cap, images run unpatched). A PR that cannot meet section 11 says so and escalates.
 
 Recipe first: weights, quantization, launch flags and DSpark k=7 follow recipes/MiniMax-M3-Pro.md. A deviation needs before/after data in the PR.
 
-Landing: PRs into hatwu/m3.1-pro-infx land automatically after a reviewer agent's APPROVE. When the work is accepted, one PR from hatwu/m3.1-pro-infx into yuhzhu/m3.1-pro goes to zhuyuhua-v for review; agents never push to yuhzhu/m3.1-pro.
+Landing: PRs into hatwu/m3.1-pro-infx land automatically after a reviewer agent's APPROVE. The upstream and final merge branch is yuhua/m3.1-pro: it is merged into hatwu/m3.1-pro-infx daily (merge commit, never rebased or squashed), and one standing PR from hatwu/m3.1-pro-infx into yuhua/m3.1-pro goes to zhuyuhua-v for review; agents never push to yuhua/m3.1-pro.
 
 Kernel work lands in zhuyuhua-v/aiter-M3 by PR, merged by its owner, not by `run`. The ATOM-side task depends on that PR and pins the aiter commit.
 
