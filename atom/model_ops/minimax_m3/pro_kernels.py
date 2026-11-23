@@ -21,6 +21,10 @@ host sync:
                  rope dims, read from the same cache), optionally split over the blocks
                  for small batches, followed by ``combine``.
 
+``prep_aiter`` is the alternative to ``prep``: aiter's ``fused_qk_norm_rope_cache_mqa``, the
+same math (and rounding points) in one HIP launch of a 32-lane group per head row, any
+number of local heads.
+
 ``attention_aiter`` is the alternative to ``attention``: ``sparse_rows`` turns every
 token's selected blocks into a page table of its own (its own block last, so the context
 length masks the part of it past the token), and aiter's paged-attention decode runs over
@@ -58,12 +62,15 @@ FP8_AMAX_FLOOR = 1e-6
 F8_FLOOR = tl.constexpr(FP8_AMAX_FLOOR)
 
 
-def quant_fp8_rows(x: torch.Tensor, dtype: torch.dtype):
+def quant_fp8_rows(x: torch.Tensor, dtype: torch.dtype, plain: bool = False):
     """Per-row fp8 quantization as ``prep`` does it: ``(q, scale)`` with
-    ``x ~= q * scale[:, None]``, ``scale = max(amax, floor) / fp8_max`` (fp32)."""
+    ``x ~= q * scale[:, None]``, ``scale = max(amax, floor) / fp8_max`` (fp32); ``plain``
+    the clamped cast, every scale 1.0 (``prep``'s ``k_unit``)."""
     fmax = torch.finfo(dtype).max
     xf = x.float()
     scale = xf.abs().amax(dim=-1).clamp(min=FP8_AMAX_FLOOR) / fmax
+    if plain:
+        scale = torch.ones_like(scale)
     q = (xf / scale.unsqueeze(-1)).clamp(-fmax, fmax).to(dtype)
     return q, scale
 
@@ -71,6 +78,92 @@ def quant_fp8_rows(x: torch.Tensor, dtype: torch.dtype):
 @triton.jit
 def _to_fp8(x, scale, fp8_max, DT: tl.constexpr):
     return tl.minimum(tl.maximum(x / scale, -fp8_max), fp8_max).to(DT)
+
+
+# An NVFP4 index row (``--index-cache-dtype nvfp4``): 128 e2m1 (64 B, the low nibble the
+# even dim) and 8 e4m3 scales, one per 16 dims, no global scale; a page of PAGE tokens is
+# [PAGE x 64 B data | PAGE x 8 B scales]. Quantized as vLLM's ``_quant4``: the scale
+# e4m3(min(amax * RN(1/6), 448)), the elements x / that scale (decoded), RNE to e2m1.
+NV_DATA_BYTES = IDX_DIM // 2
+NV_SCALE_BYTES = IDX_DIM // 16
+NV_ROW_BYTES = NV_DATA_BYTES + NV_SCALE_BYTES
+NV_RCP6 = tl.constexpr(0.1666666716337204)  # RN(1/6) in fp32 (0x3E2AAAAB)
+
+
+@triton.jit
+def _nvfp4_store(x, G: tl.constexpr, data_ptr, scale_ptr):
+    """``x`` ``[1, 16 G]`` (fp32 of bf16 values): its G groups' 8 G packed e2m1 bytes at
+    ``data_ptr``, their G e4m3 scale bytes at ``scale_ptr``."""
+    xg = tl.reshape(x, (G, 16))
+    sf = tl.minimum(tl.max(tl.abs(xg), axis=1) * NV_RCP6, 448.0)
+    s8 = sf.to(tl.float8e4nv)
+    sv = s8.to(tl.float32)
+    y = xg * tl.where(sv != 0.0, 1.0 / sv, 0.0)[:, None]
+    a = tl.abs(y)
+    # RNE onto 0, .5, 1, 1.5, 2, 3, 4, 6: a tie goes to the even code
+    c = (
+        (a > 0.25).to(tl.int32)
+        + (a >= 0.75).to(tl.int32)
+        + (a > 1.25).to(tl.int32)
+        + (a >= 1.75).to(tl.int32)
+        + (a > 2.5).to(tl.int32)
+        + (a >= 3.5).to(tl.int32)
+        + (a > 5.0).to(tl.int32)
+    )
+    c = tl.where(y < 0, c + 8, c)
+    ev, od = tl.split(tl.reshape(c, (G * 8, 2)))
+    tl.store(data_ptr + tl.arange(0, G * 8), (ev | (od << 4)).to(tl.uint8))
+    tl.store(scale_ptr + tl.arange(0, G), s8.to(tl.uint8, bitcast=True))
+
+
+@triton.jit
+def _nvfp4_rows(dat, sc, R: tl.constexpr):
+    """``[R, 128]`` fp32 index keys from their ``[R, 64]`` e2m1 bytes and ``[R, 8]`` e4m3
+    scale bytes."""
+    c = tl.reshape(tl.join((dat & 15).to(tl.int32), (dat >> 4).to(tl.int32)), (R, 128))
+    e = (c >> 1) & 3
+    m = (c & 1).to(tl.float32)
+    mag = tl.where(e == 0, 0.5 * m, (1.0 + 0.5 * m) * tl.exp2((e - 1).to(tl.float32)))
+    v = tl.where((c & 8) != 0, -mag, mag)
+    s = sc.to(tl.float8e4nv, bitcast=True).to(tl.float32)
+    return tl.reshape(tl.reshape(v, (R, 8, 16)) * s[:, :, None], (R, 128))
+
+
+def nvfp4_rows(x: torch.Tensor) -> torch.Tensor:
+    """The torch reference of an NVFP4 index row: ``[..., 128]`` -> the ``[..., 72]`` uint8
+    row ``prep`` writes (64 data bytes, 8 scale bytes)."""
+    xg = x.float().reshape(*x.shape[:-1], 8, 16)
+    sf = (xg.abs().amax(-1) * 0.1666666716337204).clamp(max=448.0)
+    s8 = sf.to(torch.float8_e4m3fn)
+    sv = s8.float()
+    y = xg * torch.where(sv != 0, 1.0 / sv, torch.zeros_like(sv)).unsqueeze(-1)
+    a = y.abs()
+    c = sum(
+        (op(a, t)).int()
+        for op, t in (
+            (torch.gt, 0.25),
+            (torch.ge, 0.75),
+            (torch.gt, 1.25),
+            (torch.ge, 1.75),
+            (torch.gt, 2.5),
+            (torch.ge, 3.5),
+            (torch.gt, 5.0),
+        )
+    )
+    c = torch.where(y < 0, c + 8, c).reshape(*x.shape[:-1], 64, 2)
+    data = (c[..., 0] | (c[..., 1] << 4)).to(torch.uint8)
+    return torch.cat([data, s8.view(torch.uint8)], dim=-1)
+
+
+def nvfp4_dequant_rows(rows: torch.Tensor) -> torch.Tensor:
+    """``[..., 72]`` uint8 NVFP4 rows -> ``[..., 128]`` fp32."""
+    dat, sc = rows[..., :64].int(), rows[..., 64:]
+    c = torch.stack([dat & 15, dat >> 4], dim=-1).reshape(*rows.shape[:-1], 128)
+    e, m = (c >> 1) & 3, (c & 1).float()
+    mag = torch.where(e == 0, 0.5 * m, (1 + 0.5 * m) * torch.exp2((e - 1).float()))
+    v = torch.where((c & 8) != 0, -mag, mag).reshape(*rows.shape[:-1], 8, 16)
+    s = sc.view(torch.float8_e4m3fn).float().unsqueeze(-1)
+    return (v * s).reshape(*rows.shape[:-1], 128)
 
 
 # --------------------------------------------------------------------------- prep --
@@ -151,6 +244,8 @@ def _prep_kernel(
     WRITE_V: tl.constexpr,
     KV_FP8: tl.constexpr,
     IC_FP8: tl.constexpr,
+    K_UNIT: tl.constexpr,
+    IC_NV: tl.constexpr,
 ):
     t = tl.program_id(0)
     OUT_DT = q_out_ptr.dtype.element_ty
@@ -211,6 +306,8 @@ def _prep_kernel(
                 tl.maximum(tl.max(tl.abs(lo_f)), tl.max(tl.abs(hi_f))), vmax
             )
             ksc = tl.maximum(kmax, F8_FLOOR) / fp8_max
+            if K_UNIT:  # a plain cast: what moo's / day0's kernels read
+                ksc = ksc * 0.0 + 1.0
             lo_k = _to_fp8(lo_f, ksc, fp8_max, KV_DT)
             hi_k = _to_fp8(hi_f, ksc, fp8_max, KV_DT)
             r0_k = _to_fp8(r0_f, ksc, fp8_max, KV_DT)
@@ -218,6 +315,8 @@ def _prep_kernel(
             tl.store(ks_ptr + blk * s_sb + off, ksc)
             if WRITE_V:
                 vsc = tl.maximum(vmax, F8_FLOOR) / fp8_max
+                if K_UNIT:
+                    vsc = vsc * 0.0 + 1.0
                 r0_v = _to_fp8(r0_f, vsc, fp8_max, KV_DT)
                 r1_v = _to_fp8(r1_f, vsc, fp8_max, KV_DT)
                 tl.store(vs_ptr + blk * s_sb + off, vsc)
@@ -281,7 +380,14 @@ def _prep_kernel(
     lo, hi, r0, z1 = _norm_rope_rows(
         lo, hi, r0, z1, wl, wh, w0, tl.zeros([32], tl.float32), c, s, eps, D_IDX, OUT_DT
     )
-    if slot >= 0:
+    if IC_NV:  # [page x 64 B e2m1 | page x 8 B e4m3 scales] a block
+        if slot >= 0:
+            nd = ic_ptr + blk * ic_sb + off * 64
+            ns = ic_ptr + blk * ic_sb + PG * 64 + off * 8
+            _nvfp4_store(lo.to(tl.float32), 2, nd, ns)
+            _nvfp4_store(hi.to(tl.float32), 2, nd + 16, ns + 2)
+            _nvfp4_store(r0.to(tl.float32), 4, nd + 32, ns + 4)
+    elif slot >= 0:
         lo_i, hi_i, r0_i = lo, hi, r0
         if IC_FP8:  # a plain cast, as M3's fp8 index cache: the keys are normed
             IC_DT = ic_ptr.dtype.element_ty
@@ -292,6 +398,19 @@ def _prep_kernel(
         tl.store(ib + a32[None, :], lo_i)
         tl.store(ib + 32 + a32[None, :], hi_i)
         tl.store(ib + 64 + a64[None, :], r0_i)
+
+
+def _split_rows(qkv, heads):
+    """``(q, k, index q, index k)`` from the packed rows or the tuple of the four."""
+    if isinstance(qkv, torch.Tensor):
+        o = heads * HEAD_DIM
+        qkv = (
+            qkv,
+            qkv[:, o:],
+            qkv[:, o + HEAD_DIM :],
+            qkv[:, o + HEAD_DIM + IDX_HEADS * IDX_DIM :],
+        )
+    return qkv
 
 
 def prep(
@@ -312,6 +431,7 @@ def prep(
     vc4=None,
     k_scale=None,
     v_scale=None,
+    k_unit=False,
 ):
     """Norm + rope the raw projections and write K / V / index-K to the caches.
 
@@ -321,16 +441,10 @@ def prep(
     ``kc4`` is the K cache ``[N, D/x, page, x]``, ``vc4`` (optional) the V cache
     ``[N, page/x, 256, x]``, ``ic`` the index cache ``[N, page, 128]``. An fp8 ``kc4``
     takes the per-token dequant scales ``k_scale`` / ``v_scale`` ``[N, 1, page]``; an fp8
-    ``ic`` holds the keys cast (clamped to the fp8 range), unscaled.
+    ``ic`` holds the keys cast (clamped to the fp8 range), unscaled. ``k_unit``: an fp8 K /
+    V cache a plain cast too, its scales written 1.0.
     """
-    if isinstance(qkv, torch.Tensor):
-        o = heads * HEAD_DIM
-        qkv = (
-            qkv,
-            qkv[:, o:],
-            qkv[:, o + HEAD_DIM :],
-            qkv[:, o + HEAD_DIM + IDX_HEADS * IDX_DIM :],
-        )
+    qkv = _split_rows(qkv, heads)
     q, k, iq, ik = qkv
     t = q.shape[0]
     q_out = torch.empty(t, heads, HEAD_DIM, dtype=q.dtype, device=q.device)
@@ -343,7 +457,8 @@ def prep(
     assert q.shape[-1] >= heads * HEAD_DIM and k.shape[-1] >= HEAD_DIM
     assert iq.shape[-1] >= IDX_HEADS * IDX_DIM and ik.shape[-1] >= IDX_DIM
     fp8 = kc4.element_size() == 1
-    ic_fp8 = ic.element_size() == 1
+    ic_nv = ic.dtype == torch.uint8  # NVFP4 rows, [N, page * 72]
+    ic_fp8 = ic.element_size() == 1 and not ic_nv
     write_v = vc4 is not None
     if write_v:
         assert vc4.dtype == kc4.dtype and vc4.stride(-1) == 1
@@ -400,8 +515,121 @@ def prep(
         WRITE_V=write_v,
         KV_FP8=fp8,
         IC_FP8=ic_fp8,
+        K_UNIT=k_unit,
+        IC_NV=ic_nv,
     )
     return q_out, iq_out
+
+
+_fused_prep = (
+    None  # aiter's fused_qk_norm_rope_cache_mqa (tests swap it); False: missing
+)
+
+
+def _aiter_prep():
+    global _fused_prep
+    if _fused_prep is None:
+        try:
+            from aiter.ops.fused_qk_norm_rope_cache_mqa import (
+                fused_qk_norm_rope_cache_mqa,
+            )
+        except ImportError:
+            _fused_prep = False
+        else:
+            _fused_prep = fused_qk_norm_rope_cache_mqa
+    return _fused_prep
+
+
+def aiter_prep_available() -> bool:
+    """Whether this aiter has ``fused_qk_norm_rope_cache_mqa`` (``prep_aiter``)."""
+    return bool(_aiter_prep())
+
+
+def prep_aiter_fits(qkv, heads) -> bool:
+    """Whether ``prep_aiter`` takes these rows: 2-D, rows 16-byte (q, k) / 8-byte (index)
+    aligned (its vector loads)."""
+
+    def ok(x, vec):
+        return (
+            x.dim() == 2
+            and x.stride(-1) == 1
+            and x.stride(0) % vec == 0
+            and x.data_ptr() % (vec * x.element_size()) == 0
+        )
+
+    q, k, iq, ik = _split_rows(qkv, heads)
+    return ok(q, 8) and ok(k, 8) and ok(iq, 4) and ok(ik, 4)
+
+
+def prep_aiter(
+    qkv,
+    positions,
+    slots,
+    cos,
+    sin,
+    ratio,
+    wq,
+    wk,
+    wiq,
+    wik,
+    eps,
+    kc4,
+    ic,
+    heads,
+    vc4=None,
+    k_scale=None,
+    v_scale=None,
+):
+    """``prep`` in one launch of aiter's ``fused_qk_norm_rope_cache_mqa``: the same arguments
+    and results (rows as ``prep_aiter_fits`` takes them), any number of heads. The op takes
+    the norm weights and cos / sin in the activation dtype; others go to ``prep``."""
+    q, k, iq, ik = _split_rows(qkv, heads)
+    if any(t.dtype != q.dtype for t in (wq, wk, wiq, wik, cos, sin)):
+        return prep(
+            qkv,
+            positions,
+            slots,
+            cos,
+            sin,
+            ratio,
+            wq,
+            wk,
+            wiq,
+            wik,
+            eps,
+            kc4,
+            ic,
+            heads,
+            vc4=vc4,
+            k_scale=k_scale,
+            v_scale=v_scale,
+        )
+    fp8 = kc4.element_size() == 1
+    return _aiter_prep()(
+        q,
+        k,
+        iq,
+        ik,
+        positions,
+        slots,
+        cos,
+        sin,
+        wq,
+        wk,
+        wiq,
+        wik,
+        kc4,
+        ic,
+        heads,
+        eps,
+        rope_scale=ratio,
+        v_cache=vc4,
+        k_scale=k_scale if fp8 else None,
+        v_scale=v_scale if fp8 and vc4 is not None else None,
+        num_index_heads=IDX_HEADS,
+        kv_fp8_max=torch.finfo(kc4.dtype).max if fp8 else None,
+        index_fp8_max=torch.finfo(ic.dtype).max if ic.element_size() == 1 else None,
+    )
 
 
 # ------------------------------------------------------------------------- scores --
@@ -516,65 +744,336 @@ def _score_tile_kernel(
     PG: tl.constexpr,
     BLOCK_MODE: tl.constexpr,
     HEAD_MODE: tl.constexpr,
+    CAUSAL: tl.constexpr,
+    STRIDE: tl.constexpr,
+    IC_NV: tl.constexpr,
 ):
-    """_score_kernel's scores: BB blocks' keys in one [BB*PG, DI] tile."""
+    """_score_kernel's scores: BB blocks' keys in one [BB*PG, DI] tile. ``CAUSAL``: the
+    blocks past a token are left unwritten (a program on them exits at once); with
+    ``STRIDE`` a token's fewer programs stride over its causal tiles, else (and without
+    ``CAUSAL``) one tile a program, future blocks -inf. A dynamic trip count slows the
+    tile's code on long rows: ``STRIDE`` trades that for fewer programs on short ones.
+    ``IC_NV``: keys from NVFP4 pages.
+    """
     t = tl.program_id(0)
-    j0 = tl.program_id(1) * BB
     qpos = tl.load(pos_ptr + t)
     qb = qpos // PG
-    jb = j0 + tl.arange(0, BB)
     obase = out_ptr + t.to(tl.int64) * stride_out
-    if j0 > qb:
-        tl.store(obase + jb, tl.full([BB], float("-inf"), tl.float32), mask=jb < NB)
+    if STRIDE:
+        stop = tl.cdiv(tl.minimum(qb + 1, NB), BB)
+        step = tl.num_programs(1)
     else:
-        seq = tl.load(seq_ptr + t)
-        r = tl.arange(0, BB * PG)
-        jr = j0 + r // PG
-        live = (jr <= qb) & (jr < NB)
-        phys = tl.load(bt_ptr + seq * stride_bt + jr, mask=live, other=0).to(tl.int64)
-        ar_d = tl.arange(0, DI)
-        ar_i = tl.arange(0, NI)
-        ik = tl.load(
-            ic_ptr + phys[:, None] * ic_sb + (r % PG)[:, None] * ic_so + ar_d[None, :],
-            mask=live[:, None],
-            other=0.0,
-        )
-        iq = tl.load(
-            iq_ptr + t.to(tl.int64) * (NI * DI) + ar_i[:, None] * DI + ar_d[None, :]
-        )
-        dots = tl.dot(iq, tl.trans(ik.to(iq.dtype))) * sc  # [NI, BB*PG]
-        if BLOCK_MODE == 0 or BLOCK_MODE == 3:
-            vis = (j0 * PG + r) <= qpos
-            # a block past the query scores 0 here (no NaN on the way) and -inf below
-            hide = tl.where(live, float("-inf"), 0.0)
-            dm = tl.reshape(tl.where(vis[None, :], dots, hide[None, :]), (NI, BB, PG))
-            bs = tl.max(dm, axis=2)  # [NI, BB]
-            if BLOCK_MODE == 3:
-                bs = tl.log(tl.sum(tl.exp(dm - bs[:, :, None]), axis=2)) + bs
+        stop = tl.program_id(1) + 1
+        step = 1
+    for jt in range(tl.program_id(1), stop, step):
+        j0 = jt * BB
+        jb = j0 + tl.arange(0, BB)
+        if j0 > qb:
+            if not CAUSAL:
+                tl.store(
+                    obase + jb, tl.full([BB], float("-inf"), tl.float32), mask=jb < NB
+                )
         else:
-            # no token mask: only the query's own block holds keys past it, and it is pinned
-            cq = tl.load(cq_ptr + ar_d).to(tl.float32)
-            lg = tl.sum(ik.to(tl.float32) * cq[None, :], axis=1) * pool_temp  # [BB*PG]
-            lg = tl.reshape(lg, (BB * PG // 4, 4))
-            e = tl.exp(lg - tl.max(lg, axis=1)[:, None])
-            w = tl.reshape(e / tl.sum(e, axis=1)[:, None], (BB * PG,))
-            cent = tl.sum(tl.reshape(dots * w[None, :], (NI, BB * PG // 4, 4)), axis=2)
-            cent = tl.reshape(cent, (NI, BB, PG // 4))  # q . centroid
-            if BLOCK_MODE == 1:
-                bs = tl.max(cent, axis=2)
+            seq = tl.load(seq_ptr + t)
+            r = tl.arange(0, BB * PG)
+            jr = j0 + r // PG
+            live = (jr <= qb) & (jr < NB)
+            phys = tl.load(bt_ptr + seq * stride_bt + jr, mask=live, other=0).to(
+                tl.int64
+            )
+            ar_d = tl.arange(0, DI)
+            ar_i = tl.arange(0, NI)
+            if IC_NV:
+                pg = ic_ptr + phys[:, None] * ic_sb
+                dat = tl.load(
+                    pg + (r % PG)[:, None] * 64 + tl.arange(0, 64)[None, :],
+                    mask=live[:, None],
+                    other=0,
+                )
+                scb = tl.load(
+                    pg + PG * 64 + (r % PG)[:, None] * 8 + tl.arange(0, 8)[None, :],
+                    mask=live[:, None],
+                    other=0,
+                )
+                ik = _nvfp4_rows(dat, scb, BB * PG)
             else:
-                bs = tl.sum(cent, axis=2) / (PG // 4)
-        if HEAD_MODE == 0:
-            score = tl.sum(bs, axis=0)
-        elif HEAD_MODE == 1:
-            score = tl.max(bs, axis=0)
+                ik = tl.load(
+                    ic_ptr
+                    + phys[:, None] * ic_sb
+                    + (r % PG)[:, None] * ic_so
+                    + ar_d[None, :],
+                    mask=live[:, None],
+                    other=0.0,
+                )
+            iq = tl.load(
+                iq_ptr + t.to(tl.int64) * (NI * DI) + ar_i[:, None] * DI + ar_d[None, :]
+            )
+            dots = tl.dot(iq, tl.trans(ik.to(iq.dtype))) * sc  # [NI, BB*PG]
+            if BLOCK_MODE == 0 or BLOCK_MODE == 3:
+                vis = (j0 * PG + r) <= qpos
+                # a block past the query scores 0 here (no NaN on the way) and -inf below
+                hide = tl.where(live, float("-inf"), 0.0)
+                dm = tl.reshape(
+                    tl.where(vis[None, :], dots, hide[None, :]), (NI, BB, PG)
+                )
+                bs = tl.max(dm, axis=2)  # [NI, BB]
+                if BLOCK_MODE == 3:
+                    bs = tl.log(tl.sum(tl.exp(dm - bs[:, :, None]), axis=2)) + bs
+            else:
+                # no token mask: only the query's own block holds keys past it, and it
+                # is pinned
+                cq = tl.load(cq_ptr + ar_d).to(tl.float32)
+                lg = (
+                    tl.sum(ik.to(tl.float32) * cq[None, :], axis=1) * pool_temp
+                )  # [BB*PG]
+                lg = tl.reshape(lg, (BB * PG // 4, 4))
+                e = tl.exp(lg - tl.max(lg, axis=1)[:, None])
+                w = tl.reshape(e / tl.sum(e, axis=1)[:, None], (BB * PG,))
+                cent = tl.sum(
+                    tl.reshape(dots * w[None, :], (NI, BB * PG // 4, 4)), axis=2
+                )
+                cent = tl.reshape(cent, (NI, BB, PG // 4))  # q . centroid
+                if BLOCK_MODE == 1:
+                    bs = tl.max(cent, axis=2)
+                else:
+                    bs = tl.sum(cent, axis=2) / (PG // 4)
+            if HEAD_MODE == 0:
+                score = tl.sum(bs, axis=0)
+            elif HEAD_MODE == 1:
+                score = tl.max(bs, axis=0)
+            else:
+                mx = tl.max(bs, axis=0)
+                score = tl.log(tl.sum(tl.exp(bs - mx[None, :]), axis=0)) + mx
+            score = tl.where(jb < init_blocks, 1e30, score)
+            score = tl.where(jb >= qb + 1 - local_blocks, 1e29, score)
+            score = tl.where(jb <= qb, score, float("-inf"))
+            tl.store(obase + jb, score, mask=jb < NB)
+
+
+@triton.jit
+def _row_tile_scores(
+    iq_ptr,
+    t,
+    rmask,
+    qpos,
+    ik,
+    live,
+    j0,
+    cq_ptr,
+    sc,
+    pool_temp,
+    init_blocks,
+    local_blocks,
+    R: tl.constexpr,
+    BB: tl.constexpr,
+    NI: tl.constexpr,
+    DI: tl.constexpr,
+    PG: tl.constexpr,
+    BLOCK_MODE: tl.constexpr,
+    HEAD_MODE: tl.constexpr,
+):
+    """_score_tile_kernel's scores ``[R, BB]`` of the ``R`` rows ``t`` (``rmask`` the real
+    ones, ``qpos`` their positions) over one tile of keys ``ik`` ``[BB*PG, DI]`` of blocks
+    ``j0..`` (``live`` the loaded keys): one dot for all ``R * NI`` query heads."""
+    ar_d = tl.arange(0, DI)
+    ar_i = tl.arange(0, NI)
+    qrow = tl.reshape(
+        t.to(tl.int64)[:, None] * (NI * DI) + ar_i[None, :] * DI, (R * NI,)
+    )
+    qm = tl.reshape(tl.broadcast_to(rmask[:, None], (R, NI)), (R * NI,))
+    iq = tl.load(iq_ptr + qrow[:, None] + ar_d[None, :], mask=qm[:, None], other=0.0)
+    dots = tl.dot(iq, tl.trans(ik.to(iq.dtype))) * sc  # [R*NI, BB*PG]
+    qb = qpos // PG
+    if BLOCK_MODE == 0 or BLOCK_MODE == 3:
+        r = tl.arange(0, BB * PG)
+        vis = (j0 * PG + r)[None, :] <= qpos[:, None]  # [R, BB*PG]
+        hide = tl.where(live, float("-inf"), 0.0)
+        d3 = tl.reshape(dots, (R, NI, BB * PG))
+        dm = tl.where(vis[:, None, :], d3, hide[None, None, :])
+        dm = tl.reshape(dm, (R, NI, BB, PG))
+        bs = tl.max(dm, axis=3)  # [R, NI, BB]
+        if BLOCK_MODE == 3:
+            bs = tl.log(tl.sum(tl.exp(dm - bs[:, :, :, None]), axis=3)) + bs
+    else:
+        cq = tl.load(cq_ptr + ar_d).to(tl.float32)
+        lg = tl.sum(ik.to(tl.float32) * cq[None, :], axis=1) * pool_temp  # [BB*PG]
+        lg = tl.reshape(lg, (BB * PG // 4, 4))
+        e = tl.exp(lg - tl.max(lg, axis=1)[:, None])
+        w = tl.reshape(e / tl.sum(e, axis=1)[:, None], (BB * PG,))
+        cent = tl.sum(tl.reshape(dots * w[None, :], (R, NI, BB * PG // 4, 4)), axis=3)
+        cent = tl.reshape(cent, (R, NI, BB, PG // 4))  # q . centroid
+        if BLOCK_MODE == 1:
+            bs = tl.max(cent, axis=3)
         else:
-            mx = tl.max(bs, axis=0)
-            score = tl.log(tl.sum(tl.exp(bs - mx[None, :]), axis=0)) + mx
-        score = tl.where(jb < init_blocks, 1e30, score)
-        score = tl.where(jb >= qb + 1 - local_blocks, 1e29, score)
-        score = tl.where(jb <= qb, score, float("-inf"))
-        tl.store(obase + jb, score, mask=jb < NB)
+            bs = tl.sum(cent, axis=3) / (PG // 4)
+    if HEAD_MODE == 0:
+        score = tl.sum(bs, axis=1)
+    elif HEAD_MODE == 1:
+        score = tl.max(bs, axis=1)
+    else:
+        mx = tl.max(bs, axis=1)
+        score = tl.log(tl.sum(tl.exp(bs - mx[:, None, :]), axis=1)) + mx
+    jb = j0 + tl.arange(0, BB)
+    score = tl.where(jb[None, :] < init_blocks, 1e30, score)
+    score = tl.where(jb[None, :] >= qb[:, None] + 1 - local_blocks, 1e29, score)
+    return tl.where(jb[None, :] <= qb[:, None], score, float("-inf"))  # [R, BB]
+
+
+@triton.jit
+def _load_block_keys(
+    ic_ptr,
+    ic_sb,
+    ic_so,
+    bt_ptr,
+    stride_bt,
+    seq,
+    j0,
+    last,
+    NB,
+    BB: tl.constexpr,
+    DI: tl.constexpr,
+    PG: tl.constexpr,
+):
+    """Keys ``[BB*PG, DI]`` of blocks ``j0..j0+BB-1`` of sequence ``seq`` up to block ``last``,
+    and which rows are loaded (0 elsewhere)."""
+    r = tl.arange(0, BB * PG)
+    jr = j0 + r // PG
+    live = (jr <= last) & (jr < NB)
+    phys = tl.load(bt_ptr + seq * stride_bt + jr, mask=live, other=0).to(tl.int64)
+    ar_d = tl.arange(0, DI)
+    ik = tl.load(
+        ic_ptr + phys[:, None] * ic_sb + (r % PG)[:, None] * ic_so + ar_d[None, :],
+        mask=live[:, None],
+        other=0.0,
+    )
+    return ik, live
+
+
+@triton.jit
+def _score_qtile_kernel(
+    iq_ptr,
+    ic_ptr,
+    ic_sb,
+    ic_so,
+    bt_ptr,
+    stride_bt,
+    seq_ptr,
+    pos_ptr,
+    cq_ptr,
+    out_ptr,
+    stride_out,
+    sc,
+    pool_temp,
+    init_blocks,
+    local_blocks,
+    T,
+    NB,
+    TQ: tl.constexpr,
+    BB: tl.constexpr,
+    NI: tl.constexpr,
+    DI: tl.constexpr,
+    PG: tl.constexpr,
+    BLOCK_MODE: tl.constexpr,
+    HEAD_MODE: tl.constexpr,
+):
+    """_score_tile_kernel's scores for ``TQ`` rows at once: rows of one sequence share each
+    tile of block keys (loaded once, one dot for the ``TQ * NI`` query heads); a tile whose
+    rows span sequences scores them one by one."""
+    t0 = tl.program_id(0) * TQ
+    j0 = tl.program_id(1) * BB
+    tr = t0 + tl.arange(0, TQ)
+    rmask = tr < T
+    trc = tl.minimum(tr, T - 1)
+    qpos = tl.load(pos_ptr + trc)
+    seqs = tl.load(seq_ptr + trc)
+    jb = j0 + tl.arange(0, BB)
+    optr = out_ptr + trc.to(tl.int64)[:, None] * stride_out + jb[None, :]
+    omask = rmask[:, None] & (jb < NB)[None, :]
+    last = tl.max(qpos, axis=0) // PG
+    if j0 > last:
+        tl.store(optr, tl.full([TQ, BB], float("-inf"), tl.float32), mask=omask)
+    elif tl.min(seqs, axis=0) == tl.max(seqs, axis=0):
+        ik, live = _load_block_keys(
+            ic_ptr,
+            ic_sb,
+            ic_so,
+            bt_ptr,
+            stride_bt,
+            tl.max(seqs, axis=0),
+            j0,
+            last,
+            NB,
+            BB,
+            DI,
+            PG,
+        )
+        score = _row_tile_scores(
+            iq_ptr,
+            trc,
+            rmask,
+            qpos,
+            ik,
+            live,
+            j0,
+            cq_ptr,
+            sc,
+            pool_temp,
+            init_blocks,
+            local_blocks,
+            TQ,
+            BB,
+            NI,
+            DI,
+            PG,
+            BLOCK_MODE,
+            HEAD_MODE,
+        )
+        tl.store(optr, score, mask=omask)
+    else:
+        one = tl.arange(0, 1)
+        for i in range(TQ):
+            t = tl.minimum(t0 + i, T - 1) + one
+            p = tl.load(pos_ptr + t)
+            ik, live = _load_block_keys(
+                ic_ptr,
+                ic_sb,
+                ic_so,
+                bt_ptr,
+                stride_bt,
+                tl.max(tl.load(seq_ptr + t), axis=0),
+                j0,
+                tl.max(p, axis=0) // PG,
+                NB,
+                BB,
+                DI,
+                PG,
+            )
+            score = _row_tile_scores(
+                iq_ptr,
+                t,
+                (t0 + i + one) < T,
+                p,
+                ik,
+                live,
+                j0,
+                cq_ptr,
+                sc,
+                pool_temp,
+                init_blocks,
+                local_blocks,
+                1,
+                BB,
+                NI,
+                DI,
+                PG,
+                BLOCK_MODE,
+                HEAD_MODE,
+            )
+            tl.store(
+                out_ptr + t.to(tl.int64)[:, None] * stride_out + jb[None, :],
+                score,
+                mask=((t0 + i + one) < T)[:, None] & (jb < NB)[None, :],
+            )
 
 
 def scores(
@@ -593,17 +1092,69 @@ def scores(
     pool_temp=1.0,
     bb=None,
     tiled=True,
+    causal=False,
+    programs=None,
+    tq=0,
 ):
     """Indexer block scores ``[T, nb]`` (fp32): pins and ``-inf`` for future blocks applied.
 
     ``tiled``: score ``bb`` blocks per dot (_score_tile_kernel; by default 4 for up to 16
-    tokens, else 8) instead of one (_score_kernel)."""
+    tokens, else 8) instead of one (_score_kernel). ``causal`` (tiled only): only each
+    token's causal blocks are written -- all a selection that reads no further needs --
+    by ``programs`` a token (default: about 4096 over the batch; one a tile, or fewer
+    striding over its tiles; the ones past the token exit at once), so the cost follows
+    the context, not ``nb``. ``tq`` > 0: ``tq`` rows per program (_score_qtile_kernel),
+    each tile of keys read once for them (a power of two); it writes every block, future
+    ones -inf, so ``causal`` does not apply."""
     t = iq.shape[0]
     out = torch.empty(t, nb, dtype=torch.float32, device=iq.device)
-    assert ic.stride(-1) == 1
+    assert ic.stride(-1) == 1 and (tiled or not causal)
+    nv = ic.dtype == torch.uint8
+    assert tiled or not nv, "NVFP4 index pages: the tiled scorer only"
+    assert not (tq and nv), "NVFP4 index pages: score_tq unsupported"
     if bb is None:
         bb = 4 if tiled and t <= 16 else 8
-    grid = (t, triton.cdiv(nb, bb))
+    if tq:
+        assert tq & (tq - 1) == 0, tq
+        _score_qtile_kernel[(triton.cdiv(t, tq), triton.cdiv(nb, bb))](
+            iq,
+            ic,
+            ic.stride(0),
+            ic.stride(1),
+            block_tables,
+            block_tables.stride(0),
+            seq_id,
+            positions,
+            cq if cq is not None else iq,
+            out,
+            out.stride(0),
+            sc,
+            pool_temp,
+            init,
+            local,
+            t,
+            nb,
+            TQ=tq,
+            BB=bb,
+            NI=IDX_HEADS,
+            DI=IDX_DIM,
+            PG=PAGE,
+            BLOCK_MODE=block_mode,
+            HEAD_MODE=head_mode,
+        )
+        return out
+    tiles = triton.cdiv(nb, bb)
+    if causal:
+        # about 4096 programs by default (a program a tile when that is fewer): striding
+        # saves the idle programs' cost on short rows and loses up to a third on rows of
+        # 100k+ tokens at 16+ rows, a batch no KV pool here holds (MI355X)
+        programs = min(tiles, programs or triton.cdiv(4096, t))
+    grid = (t, programs if causal else tiles)
+    kw = (
+        {"CAUSAL": causal, "STRIDE": causal and programs < tiles, "IC_NV": nv}
+        if tiled
+        else {}
+    )
     (_score_tile_kernel if tiled else _score_kernel)[grid](
         iq,
         ic,
@@ -627,6 +1178,7 @@ def scores(
         PG=PAGE,
         BLOCK_MODE=block_mode,
         HEAD_MODE=head_mode,
+        **kw,
     )
     return out
 
@@ -664,6 +1216,8 @@ def _attn_kernel(
     NBLK: tl.constexpr,
     XK: tl.constexpr,
     KV_FP8: tl.constexpr,
+    VALID_FIRST: tl.constexpr = False,
+    EP2: tl.constexpr = 1,
 ):
     t = tl.program_id(0)
     sp = tl.program_id(1)
@@ -690,8 +1244,20 @@ def _attn_kernel(
     acc2 = tl.zeros([16, 64], tl.float32)
     acc3 = tl.zeros([16, 64], tl.float32)
 
-    lo_i = sp * CHUNK
-    hi_i = tl.minimum(lo_i + CHUNK, n_entries)
+    if VALID_FIRST:
+        # the selection's valid blocks lead (select_logical): the splits share those,
+        # not the fixed width (a short context leaves most of it -1)
+        ep = tl.arange(0, EP2)
+        ids = tl.load(
+            sel_ptr + t.to(tl.int64) * stride_sel + ep, mask=ep < n_entries, other=-1
+        )
+        n_valid = tl.sum((ids >= 0).to(tl.int32), axis=0)
+        chunk = tl.cdiv(tl.cdiv(n_valid, SPLITS), NBLK) * NBLK
+        lo_i = sp * chunk
+        hi_i = tl.minimum(lo_i + chunk, n_valid)
+    else:
+        lo_i = sp * CHUNK
+        hi_i = tl.minimum(lo_i + CHUNK, n_entries)
     d = ar_c[:, None]
     for i in range(lo_i, hi_i, NBLK):
         e = i + ar_b
@@ -712,13 +1278,17 @@ def _attn_kernel(
             kb + (d // XK) * k_sg + (d % XK), mask=vis[None, :], other=0.0
         )  # [64, TN]
         k1 = tl.load(
-            kb + ((64 + d) // XK) * k_sg + (d % XK), mask=vis[None, :], other=0.0
+            kb + ((64 + d) // XK) * k_sg + ((64 + d) % XK), mask=vis[None, :], other=0.0
         )
         k2 = tl.load(
-            kb + ((128 + d) // XK) * k_sg + (d % XK), mask=vis[None, :], other=0.0
+            kb + ((128 + d) // XK) * k_sg + ((128 + d) % XK),
+            mask=vis[None, :],
+            other=0.0,
         )
         k3 = tl.load(
-            kb + ((192 + d) // XK) * k_sg + (d % XK), mask=vis[None, :], other=0.0
+            kb + ((192 + d) // XK) * k_sg + ((192 + d) % XK),
+            mask=vis[None, :],
+            other=0.0,
         )
         if KV_FP8:  # per-token dequant; V is K's tail, so it shares K's scale here
             ksc = tl.load(ks_ptr + phys * s_sb + ar_o, mask=vis, other=0.0)[None, :]
@@ -813,6 +1383,7 @@ def attention(
     nblk=4,
     n_blocks=None,
     k_scale=None,
+    valid_first=False,
 ):
     """Attention of every token's local heads over its selected blocks.
 
@@ -820,7 +1391,8 @@ def attention(
     (``None``: dense, every block up to the token's own, ``n_blocks`` of them at most),
     ``out`` ``[T, H * 192]``. ``splits`` cuts the blocks over that many programs per token
     (for few tokens), ``nblk`` blocks are processed per step. An fp8 ``kc4`` takes its
-    per-token scales ``k_scale`` ``[N, 1, page]``.
+    per-token scales ``k_scale`` ``[N, 1, page]``. ``valid_first``: ``sel``'s valid blocks
+    lead each row (``select_logical``), and the splits divide those.
     """
     t, h, _ = q.shape
     assert h % 16 == 0 and kc4.stride(-1) == 1 and q.stride(-1) == 1
@@ -869,6 +1441,8 @@ def attention(
         NBLK=nblk,
         XK=kc4.shape[-1],
         KV_FP8=fp8,
+        VALID_FIRST=valid_first and not dense,
+        EP2=triton.next_power_of_2(n_entries),
     )
     if splits > 1:
         _combine_kernel[(t, h)](
@@ -975,7 +1549,61 @@ def select_blocks(score, positions, k):
     return sel
 
 
-_NEG_INF_KEY = tl.constexpr(-2139095041)  # _select_rows_kernel's key of a -inf score
+_NEG_INF_KEY = tl.constexpr(-2139095041)  # the sort key of a -inf score
+
+
+@triton.jit
+def _block_keys(score_row, start, hi, W: tl.constexpr, K: tl.constexpr):
+    """The ``K`` best sort keys, descending, of blocks ``[start, start + W)`` below ``hi``
+    (the others score -inf): the fp32 bits as an int ordered like the floats, the block
+    index (reversed: the lower wins a tie) below them, so all keys are distinct."""
+    j = start + tl.arange(0, W)
+    s = tl.load(score_row + j, mask=j < hi, other=float("-inf"))
+    b = s.to(tl.int32, bitcast=True)
+    key = (b ^ ((b >> 31) & 0x7FFFFFFF)).to(tl.int64)
+    return tl.topk((key << 32) | (0x7FFFFFFF - j).to(tl.int64), K)
+
+
+@triton.jit
+def _store_rows(
+    top,
+    t,
+    seq,
+    qpos,
+    bt_ptr,
+    stride_bt,
+    rows_ptr,
+    stride_rows,
+    ctx_ptr,
+    K: tl.constexpr,
+    PG: tl.constexpr,
+    LOGICAL: tl.constexpr = False,
+):
+    """A token's page table from its ``K`` best keys, as ``_rows_kernel``: the full
+    blocks in key order, the token's own block last, cut by the context length.
+    ``LOGICAL``: the block ids themselves, best first, the valid ones leading and -1
+    after (no page table, no ``ctx``)."""
+    qb = qpos // PG
+    jj = (0x7FFFFFFF - (top & 0x7FFFFFFF)).to(tl.int32)
+    valid = (top >> 32) > _NEG_INF_KEY  # fewer than K causal blocks leave -inf ones in
+    # a key read back from the scratch must be one this launch wrote: a causal block
+    tl.device_assert(~valid | ((jj >= 0) & (jj <= qb)), "selected block out of range")
+    if LOGICAL:
+        tl.store(
+            rows_ptr + t.to(tl.int64) * stride_rows + tl.arange(0, K),
+            tl.where(valid, jj, -1),
+        )
+        return
+    full = (valid & (jj < qb)).to(tl.int32)
+    n_full = tl.sum(full, axis=0)
+    has_tail = tl.sum((valid & (jj == qb)).to(tl.int32), axis=0)
+    slot = tl.where(full > 0, tl.cumsum(full, axis=0) - full, n_full)
+    phys = tl.load(bt_ptr + seq * stride_bt + jj, mask=valid, other=0)
+    e = tl.arange(0, K)
+    rbase = rows_ptr + t.to(tl.int64) * stride_rows
+    tl.store(rbase + slot, phys, mask=valid)
+    tl.store(rbase + e, tl.zeros_like(e), mask=e >= n_full + has_tail)
+    tl.store(ctx_ptr + t, n_full * PG + has_tail * (qpos - qb * PG + 1))
 
 
 @triton.jit
@@ -993,37 +1621,27 @@ def _select_rows_kernel(
     K: tl.constexpr,
     BW: tl.constexpr,
     PG: tl.constexpr,
+    LOGICAL: tl.constexpr,
 ):
     t = tl.program_id(0)
     seq = tl.load(seq_ptr + t)
     qpos = tl.load(pos_ptr + t)
-    qb = qpos // PG
-    j = tl.arange(0, BW)
-    s = tl.load(
-        score_ptr + t.to(tl.int64) * stride_s + j,
-        mask=(j < NB) & (j <= qb),
-        other=float("-inf"),
+    hi = tl.minimum(qpos // PG + 1, NB)
+    top = _block_keys(score_ptr + t.to(tl.int64) * stride_s, 0, hi, BW, K)
+    _store_rows(
+        top,
+        t,
+        seq,
+        qpos,
+        bt_ptr,
+        stride_bt,
+        rows_ptr,
+        stride_rows,
+        ctx_ptr,
+        K,
+        PG,
+        LOGICAL,
     )
-    # fp32 bits as an int ordered like the floats, the block index (reversed: the lower
-    # wins a tie) below them: K distinct keys
-    b = s.to(tl.int32, bitcast=True)
-    key = (b ^ ((b >> 31) & 0x7FFFFFFF)).to(tl.int64)
-    top = tl.topk((key << 32) | (BW - 1 - j).to(tl.int64), K)
-    jj = BW - 1 - top.to(tl.int32)
-    valid = (
-        top >> 32
-    ) > _NEG_INF_KEY  # a causal block: fewer than K leave -inf ones in
-    full = (valid & (jj < qb)).to(tl.int32)
-    n_full = tl.sum(full, axis=0)
-    has_tail = tl.sum((valid & (jj == qb)).to(tl.int32), axis=0)
-    # as _rows_kernel: the token's own block last, cut by the context length
-    slot = tl.where(full > 0, tl.cumsum(full, axis=0) - full, n_full)
-    phys = tl.load(bt_ptr + seq * stride_bt + jj, mask=valid, other=0)
-    e = tl.arange(0, K)
-    rbase = rows_ptr + t.to(tl.int64) * stride_rows
-    tl.store(rbase + slot, phys, mask=valid)
-    tl.store(rbase + e, tl.zeros_like(e), mask=e >= n_full + has_tail)
-    tl.store(ctx_ptr + t, n_full * PG + has_tail * (qpos - qb * PG + 1))
 
 
 def select_rows(score, block_tables, seq_id, positions, k, num_warps=8):
@@ -1048,9 +1666,296 @@ def select_rows(score, block_tables, seq_id, positions, k, num_warps=8):
         K=k,
         BW=max(triton.next_power_of_2(nb), k),
         PG=PAGE,
+        LOGICAL=False,
         num_warps=num_warps,
     )
     return rows, ctx
+
+
+@triton.jit
+def _span_keys(score_row, lo, hi, K: tl.constexpr, CHUNK: tl.constexpr):
+    """The ``K`` best keys of blocks ``[lo, hi)`` (``hi > lo``), a ``CHUNK`` at a time;
+    a range of at most ``4K`` blocks is sorted at the narrowest width that holds it."""
+    n = hi - lo
+    if n <= K:
+        best = _block_keys(score_row, lo, hi, K, K)
+    elif n <= 2 * K:
+        best = _block_keys(score_row, lo, hi, 2 * K, K)
+    elif n <= 4 * K:
+        best = _block_keys(score_row, lo, hi, 4 * K, K)
+    else:
+        best = _block_keys(score_row, lo, hi, CHUNK, K)
+        for start in range(lo + CHUNK, hi, CHUNK):
+            tile = _block_keys(score_row, start, hi, CHUNK, K)
+            best = tl.topk(tl.reshape(tl.join(best, tile), (2 * K,)), K)
+    return best
+
+
+@triton.jit
+def _merge_keys(base, count, K: tl.constexpr, VOLATILE: tl.constexpr):
+    """The ``K`` best of the ``count`` (a multiple of ``K``) partial keys at ``base``."""
+    e = tl.arange(0, K)
+    best = tl.load(base + e, volatile=VOLATILE)
+    for start in range(K, count, K):
+        tile = tl.load(base + start + e, volatile=VOLATILE)
+        best = tl.topk(tl.reshape(tl.join(best, tile), (2 * K,)), K)
+    return best
+
+
+@triton.jit(do_not_specialize=["stride_s", "stride_bt", "stride_rows", "NB"])
+def _select_split_kernel(
+    score_ptr,
+    stride_s,
+    bt_ptr,
+    stride_bt,
+    seq_ptr,
+    pos_ptr,
+    rows_ptr,
+    stride_rows,
+    ctx_ptr,
+    part_ptr,  # [T, P, K] int64 scratch
+    count_ptr,  # [T] int32 arrivals, zero between calls (FUSED only)
+    NB,
+    SPAN: tl.constexpr,
+    K: tl.constexpr,
+    CHUNK: tl.constexpr,
+    PG: tl.constexpr,
+    FUSED: tl.constexpr,
+    IS_HIP: tl.constexpr,
+    LOGICAL: tl.constexpr = False,
+):
+    t = tl.program_id(0)
+    part = tl.program_id(1)
+    qpos = tl.load(pos_ptr + t)
+    hi = tl.minimum(qpos // PG + 1, NB)
+    lo = part * SPAN
+    if lo >= hi:  # past the token's causal blocks: the cost follows the context
+        return
+    score_row = score_ptr + t.to(tl.int64) * stride_s
+    seq = tl.load(seq_ptr + t)
+    if hi <= SPAN:  # one span holds them all: no merge
+        best = _span_keys(score_row, 0, hi, K, CHUNK)
+        _store_rows(
+            best,
+            t,
+            seq,
+            qpos,
+            bt_ptr,
+            stride_bt,
+            rows_ptr,
+            stride_rows,
+            ctx_ptr,
+            K,
+            PG,
+            LOGICAL,
+        )
+        return
+    best = _span_keys(score_row, lo, tl.minimum(lo + SPAN, hi), K, CHUNK)
+    base = part_ptr + t.to(tl.int64) * tl.num_programs(1) * K
+    tl.device_assert(part < tl.num_programs(1), "span past the scratch")
+    tl.store(base + part * K + tl.arange(0, K), best)
+    if FUSED:
+        # the release publishes this span's keys; the last arrival acquires every
+        # span's, merges them and rearms the counter. On AMD the barrier waits on LDS
+        # only, so each wave drains its own stores first.
+        if IS_HIP:
+            tl.inline_asm_elementwise(
+                "s_waitcnt vmcnt(0)", "=r,r", [t], dtype=tl.int32, is_pure=False, pack=1
+            )
+        tl.debug_barrier()
+        spans = tl.cdiv(hi, SPAN)
+        arrival = tl.atomic_add(count_ptr + t, 1, sem="acq_rel", scope="gpu")
+        if arrival == spans - 1:
+            best = _merge_keys(base, spans * K, K, True)
+            _store_rows(
+                best,
+                t,
+                seq,
+                qpos,
+                bt_ptr,
+                stride_bt,
+                rows_ptr,
+                stride_rows,
+                ctx_ptr,
+                K,
+                PG,
+                LOGICAL,
+            )
+            tl.atomic_xchg(count_ptr + t, 0, sem="relaxed", scope="gpu")
+
+
+@triton.jit(do_not_specialize=["stride_bt", "stride_rows", "NB", "P"])
+def _select_merge_kernel(
+    bt_ptr,
+    stride_bt,
+    seq_ptr,
+    pos_ptr,
+    rows_ptr,
+    stride_rows,
+    ctx_ptr,
+    part_ptr,
+    NB,
+    P,
+    SPAN: tl.constexpr,
+    K: tl.constexpr,
+    PG: tl.constexpr,
+    LOGICAL: tl.constexpr = False,
+):
+    t = tl.program_id(0)
+    qpos = tl.load(pos_ptr + t)
+    hi = tl.minimum(qpos // PG + 1, NB)
+    if hi <= SPAN:  # written by the span kernel
+        return
+    tl.device_assert(tl.cdiv(hi, SPAN) <= P, "more spans than the scratch holds")
+    best = _merge_keys(
+        part_ptr + t.to(tl.int64) * P * K, tl.cdiv(hi, SPAN) * K, K, False
+    )
+    seq = tl.load(seq_ptr + t)
+    _store_rows(
+        best,
+        t,
+        seq,
+        qpos,
+        bt_ptr,
+        stride_bt,
+        rows_ptr,
+        stride_rows,
+        ctx_ptr,
+        K,
+        PG,
+        LOGICAL,
+    )
+
+
+# Grow-only scratch per (device, stream, kind): a captured graph keeps the addresses it
+# ran with, and the arrival counters must not be shared by concurrent streams.
+# shortcut: the counters' zeros are written when allocated, which a capture only records;
+# ATOM warms each graph's shape up eagerly on its capture stream first, so they never are
+# allocated in a capture there. A caller that captures first must replay that graph before
+# any other use of the stream's counters.
+_split_buffers: dict[tuple, list[torch.Tensor]] = {}
+
+
+def _split_buffer(kind, numel, dtype, device):
+    stream = (
+        torch.cuda.current_stream(device).cuda_stream if device.type == "cuda" else 0
+    )
+    bufs = _split_buffers.setdefault((device, stream, kind), [])
+    if not bufs or bufs[-1].numel() < numel:
+        bufs.append(
+            torch.zeros(triton.next_power_of_2(numel), dtype=dtype, device=device)
+        )
+    return bufs[-1]
+
+
+def select_rows_split(
+    score,
+    block_tables,
+    seq_id,
+    positions,
+    k,
+    parts=None,
+    chunk=1024,
+    fused=None,
+    num_warps=4,
+    logical=False,
+):
+    """``select_rows``' tables (bit for bit), each row's causal blocks split into ``parts``
+    spans that separate programs reduce to their ``k`` best, merged per row by the last
+    span program to finish (``fused``, the default) or a second launch. Spans
+    past a row's blocks exit at once, so the cost follows the context, not ``score``'s
+    width; the grid depends only on the shapes, so a graph can hold it. Any width (block
+    ids below 2**31)."""
+    assert k & (k - 1) == 0 and chunk >= 4 * k and chunk & (chunk - 1) == 0, (k, chunk)
+    t, nb = score.shape
+    dev = score.device
+    rows = torch.empty(t, k, dtype=torch.int32, device=dev)
+    ctx = torch.empty(t, dtype=torch.int32, device=dev)
+    if t == 0:
+        return rows, ctx
+    chunks = triton.cdiv(nb, chunk)
+    if parts is None:  # about two programs per CU over the batch; whole chunks each
+        parts = max(1, min(chunks, triton.cdiv(512, t)))
+    span = triton.cdiv(chunks, parts) * chunk
+    parts = triton.cdiv(nb, span)
+    if fused is None:
+        # fused saves the merge launch. Its device-scope releases outcost that only when
+        # many rows each span several programs, and a KV pool that fits 16+ rows of 16k+
+        # tokens is not one we have (a span is a 16k-token chunk past 32 rows)
+        fused = True
+    part = _split_buffer("part", t * parts * k, torch.int64, dev)
+    count = _split_buffer("count", t, torch.int32, dev)
+    _select_split_kernel[(t, parts)](
+        score,
+        score.stride(0),
+        block_tables,
+        block_tables.stride(0),
+        seq_id,
+        positions,
+        rows,
+        rows.stride(0),
+        ctx,
+        part,
+        count,
+        nb,
+        SPAN=span,
+        K=k,
+        CHUNK=chunk,
+        PG=PAGE,
+        FUSED=fused,
+        IS_HIP=dev.type == "cuda" and torch.version.hip is not None,
+        LOGICAL=logical,
+        num_warps=num_warps,
+    )
+    if not fused and parts > 1:
+        _select_merge_kernel[(t,)](
+            block_tables,
+            block_tables.stride(0),
+            seq_id,
+            positions,
+            rows,
+            rows.stride(0),
+            ctx,
+            part,
+            nb,
+            parts,
+            SPAN=span,
+            K=k,
+            PG=PAGE,
+            LOGICAL=logical,
+            num_warps=num_warps,
+        )
+    return rows, ctx
+
+
+def select_logical(score, positions, k, num_warps=8, split=False):
+    """``select_rows``' selection as block ids, for the Triton attention: ``[T, k]`` int32,
+    best first, the token's valid (causal) blocks leading and -1 after. ``split``: by
+    ``select_rows_split`` (same ids; its cost follows the context, not the width)."""
+    assert k & (k - 1) == 0, k
+    if split:
+        # no page table in this mode: the positions stand in for the unread seq ids
+        return select_rows_split(score, score, positions, positions, k, logical=True)[0]
+    t, nb = score.shape
+    sel = torch.empty(t, k, dtype=torch.int32, device=score.device)
+    _select_rows_kernel[(t,)](
+        score,
+        score.stride(0),
+        sel,
+        0,
+        positions,
+        positions,
+        sel,
+        sel.stride(0),
+        sel,
+        nb,
+        K=k,
+        BW=max(triton.next_power_of_2(nb), k),
+        PG=PAGE,
+        LOGICAL=True,
+        num_warps=num_warps,
+    )
+    return sel
 
 
 _pa_decode = None  # aiter's paged-attention decode as ATOM wraps it (tests swap it)
@@ -1075,6 +1980,28 @@ def _default_partitions(t: int) -> int:
     return min(get_recommended_splits(t, 1), max(1, units // t))
 
 
+_gluon_value_rows = (
+    None  # aiter's pa_decode_gluon if it takes value_rows; False: it does not
+)
+
+
+def aiter_value_rows_available() -> bool:
+    """Whether this aiter's gluon paged attention reads V from the K cache's rows
+    (``pa_decode_gluon(value_rows=True)``): ``attention_aiter(k_rows=True)``."""
+    global _gluon_value_rows
+    if _gluon_value_rows is None:
+        import inspect
+
+        try:
+            from aiter.ops.triton.gluon.pa_decode_gluon import pa_decode_gluon
+        except ImportError:
+            _gluon_value_rows = False
+        else:
+            ok = "value_rows" in inspect.signature(pa_decode_gluon).parameters
+            _gluon_value_rows = pa_decode_gluon if ok else False
+    return bool(_gluon_value_rows)
+
+
 def attention_aiter(
     q,
     k_cache,
@@ -1088,6 +2015,7 @@ def attention_aiter(
     fp8_compute=True,
     partitions=None,
     value_dim=VALUE_DIM,
+    k_rows=False,
 ):
     """``attention`` on aiter's paged-attention decode (gluon, persistent dispatch), every
     token a sequence of its own over its ``sparse_rows`` table.
@@ -1095,14 +2023,48 @@ def attention_aiter(
     ``k_cache`` ``[N, 1, 256/x, page, x]`` and ``v_cache`` ``[N, 1, page/x, 256, x]`` are the
     5-D caches (V in the first ``value_dim`` rows), ``out`` ``[T, H * value_dim]``. An fp8
     cache takes its per-token scales ``[N, 1, page]``; ``fp8_compute`` runs the dots in fp8
-    as well.
+    as well. ``k_rows``: ``k_cache`` is the K-only row cache ``[N, 1, 1, page, 256]`` (no V
+    cache, ``v_cache`` / ``v_scale`` unused): aiter reads K through its SHUFFLE view and V
+    as the rows' last ``value_dim`` dims (``aiter_value_rows_available``).
     """
     t, h, _ = q.shape
     fp8 = k_cache.element_size() == 1
-    assert (k_scale is not None and v_scale is not None) or not fp8
+    assert (k_scale is not None and (v_scale is not None or k_rows)) or not fp8
     if partitions is None:
         partitions = _default_partitions(t)
     partitions = max(1, min(partitions, triton.cdiv(rows.shape[1] * PAGE, 256)))
+    if k_rows:
+        assert (
+            aiter_value_rows_available()
+        ), "this aiter's pa_decode_gluon has no value_rows"
+        n, sb, o = k_cache.shape[0], k_cache.stride(0), k_cache.storage_offset()
+        xk = 16 // k_cache.element_size()
+        k_view = k_cache.as_strided(
+            (n, 1, HEAD_DIM // xk, PAGE, xk), (sb, sb, xk, HEAD_DIM, 1), o
+        )
+        v_view = k_cache.as_strided(
+            (n, 1, PAGE, value_dim), (sb, sb, HEAD_DIM, 1), o + HEAD_DIM - value_dim
+        )
+        ks = k_scale.unsqueeze(-1) if fp8 else None
+        _gluon_value_rows(
+            out.view(t, h, value_dim),
+            q,
+            k_view,
+            v_view,
+            ctx,
+            rows,
+            scale,
+            1,
+            partitions,
+            256,
+            k_cache.dtype if (fp8 and fp8_compute) else q.dtype,
+            None,
+            ks,
+            ks,
+            ps=True,
+            value_rows=True,
+        )
+        return out
     _pa()(
         out.view(t, h, value_dim),
         q,
@@ -1119,5 +2081,46 @@ def attention_aiter(
         k_scale.unsqueeze(-1) if fp8 else None,
         v_scale.unsqueeze(-1) if fp8 else None,
         ps=True,
+    )
+    return out
+
+
+_day0_prefill = None  # amd-kernels-day0's fp8_sparse_prefill; False: not installed
+
+
+def day0_prefill_available() -> bool:
+    """Whether amd-kernels-day0's FlyDSL sparse prefill (``attention_day0``) imports."""
+    global _day0_prefill
+    if _day0_prefill is None:
+        try:
+            from amd_kernels.attention.fp8_sparse_prefill_gqa16_d256_v192_b16_top128.host import (
+                fp8_sparse_prefill,
+            )
+        except ImportError:
+            _day0_prefill = False
+        else:
+            _day0_prefill = fp8_sparse_prefill
+    return bool(_day0_prefill)
+
+
+def attention_day0(q, kc4, block_tables, seq_id, positions, sel, out, scale):
+    """``attention`` on amd-kernels-day0's FlyDSL fp8 sparse prefill, over the K-only cache
+    as a plain fp8 cast (``kc4`` ``[N, 1, page, 256]``): ``q`` ``[T, 16, 256]`` is cast to
+    fp8 as well. ``sel`` ``[T, 128]`` block ids, valid first and -1 after (``select_logical``),
+    or None: every causal block (at most 128)."""
+    t = q.shape[0]
+    if sel is None:
+        j = torch.arange(TOPK, device=q.device, dtype=torch.int32)
+        sel = torch.where(j[None, :] <= (positions // PAGE)[:, None], j[None, :], -1)
+        sel = sel.to(torch.int32)
+    _day0_prefill(
+        q.to(torch.float8_e4m3fn),
+        kc4[:, 0],
+        sel,
+        block_tables,
+        seq_id.to(torch.int32),
+        positions.to(torch.int32),
+        scale,
+        out.view(t, IDX_HEADS, VALUE_DIM),
     )
     return out

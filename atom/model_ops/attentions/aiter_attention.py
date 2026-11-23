@@ -508,6 +508,17 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             # the one geometry check of an MXFP4 page, as the K / V layout makes it
             Mxfp4KvLayout().check(self.block_size, dim, entry_tokens // self.block_size)
             return _IndexCacheSpec(rows, (PAGE_BYTES,), torch.uint8, (-1, PAGE_BYTES))
+        if index_dtype == "nvfp4" and self._has_pro_sparse_attention:
+            from atom.model_ops.minimax_m3.pro_kernels import NV_ROW_BYTES
+
+            # Pro's page of one block: [page x 64 B e2m1 | page x 8 B e4m3 scales]
+            page_bytes = self.block_size * NV_ROW_BYTES
+            return _IndexCacheSpec(
+                rows,
+                (entry_tokens * NV_ROW_BYTES,),
+                torch.uint8,
+                (-1, page_bytes),
+            )
         if index_dtype == "nvfp4":
             from atom.model_ops.minimax_m3.nvfp4_pages import (
                 HEAD_DIM,
