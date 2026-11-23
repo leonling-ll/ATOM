@@ -82,8 +82,10 @@ def _inputs(case):
     return case_inputs(s, [_weight(r) for r in range(TP)], 1000 * (case + 1))
 
 
-def _worker(rank, port, queue, inputs):
-    """``inputs``: per case, (this rank's core rows, the residual)."""
+def _worker(rank, port, queue, done, inputs):
+    """``inputs``: per case, (this rank's core rows, the residual). The worker stays
+    alive until the parent has received every rank's results (``done``): torch hands
+    tensors over the queue as file descriptors that the sender must still hold."""
     import torch.distributed as dist
     from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
     from aiter.ops.shuffle import shuffle_mxfp8_bpreshuffle_scale, shuffle_weight
@@ -152,6 +154,7 @@ def _worker(rank, port, queue, inputs):
                 del got["la8"], got["la8s"]
             results.append((key.tokens, key.lookahead, waits, got))
         queue.put((rank, results, None))
+        done.wait(TIMEOUT_S)
     except Exception as e:  # noqa: BLE001 - reported to the parent by name
         import traceback
 
@@ -173,12 +176,13 @@ def ranks():
     os.environ.setdefault("ARCH", "gfx950")
     ctx = mp.get_context("spawn")
     queue = ctx.Queue()
+    done = ctx.Event()
     port = _free_port()
     ins = [_inputs(i) for i in range(len(CASES))]
     procs = [
         ctx.Process(
             target=_worker,
-            args=(r, port, queue, [(cores[r], res) for cores, _, res in ins]),
+            args=(r, port, queue, done, [(cores[r], res) for cores, _, res in ins]),
         )
         for r in range(TP)
     ]
@@ -193,6 +197,7 @@ def ranks():
             else:
                 got[rank] = results
     finally:
+        done.set()
         for p in procs:
             p.join(timeout=60)
             if p.is_alive():
