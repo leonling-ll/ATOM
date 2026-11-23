@@ -498,4 +498,34 @@ def load_model(
                 peak_gpu_memory_gb,
             )
 
+    if torch.cuda.is_available():
+        # what the load left behind: reserved past allocated is holes a live tensor pins
+        logger.info(
+            "[%s] After weight loading: allocated %.2f GB, reserved %.2f GB",
+            rank_tag(),
+            torch.cuda.memory_allocated() / (1 << 30),
+            torch.cuda.memory_reserved() / (1 << 30),
+        )
+    if os.environ.get("ATOM_DEBUG_WEIGHT_HASH") == "1":
+        _log_moe_weight_hashes(model)
     return loaded_weights_record
+
+
+def _log_moe_weight_hashes(model) -> None:
+    """Debug: SHA-1 of a few MoE layers' converted expert weights and scales (rank 0), to
+    compare two load paths for bit-identity."""
+    import hashlib
+
+    if torch.distributed.is_initialized() and torch.distributed.get_rank() != 0:
+        return
+    for name, param in model.named_parameters():
+        if (".experts.w13" in name or ".experts.w2" in name) and any(
+            f"layers.{i}." in name for i in (5, 30, 60)
+        ):
+            data = param.data.detach().contiguous().view(torch.uint8).cpu().numpy()
+            logger.info(
+                "weight hash %s %s %s",
+                name,
+                tuple(param.shape),
+                hashlib.sha1(data).hexdigest(),
+            )
