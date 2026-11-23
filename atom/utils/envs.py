@@ -192,6 +192,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_PREFIX_CACHE_PROTECTED_RATIO": lambda: float(
         os.getenv("ATOM_PREFIX_CACHE_PROTECTED_RATIO", "0.5")
     ),
+    # Admit waiting requests with the most HBM-resident prefix first, so a
+    # session's next turn runs before queueing evicts its prefix; requests
+    # waiting longer than the max wait go first, oldest first. Opt-in.
+    "ATOM_CACHE_AWARE_ADMISSION": lambda: _flag_env("ATOM_CACHE_AWARE_ADMISSION", "0"),
+    "ATOM_CACHE_AWARE_MAX_WAIT_S": lambda: _positive_float_env(
+        "ATOM_CACHE_AWARE_MAX_WAIT_S", "120"
+    ),
     # DeepSeek-V4 bounded replay: when the compressed history hits further than
     # the nearest state checkpoint by more than the window's receptive field,
     # keep the whole hit and recompute only that field (W + (L-1)(W-1) tokens)

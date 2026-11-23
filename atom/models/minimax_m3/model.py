@@ -413,6 +413,10 @@ class MiniMaxM3MoE(nn.Module):
             prefix=f"{prefix}.experts",
             config=config,
             shared_expert_prefix=f"{prefix}.shared_experts",
+            # Pro's 640-wide TP8 rank slice stays unpadded (256 would pad it to 768,
+            # +1/5 routed-expert memory, all of it taken from the KV pool); aiter
+            # serves 640 with the FlyDSL a16w4 kernels. Flash keeps the default.
+            pad_align=128 if is_minimax_m3_pro_config(config) else None,
         )
         if hasattr(self.experts.quant_method, "intermediate_pad"):
             # MiniMax-M3 pads expert weights at load time; computing the full

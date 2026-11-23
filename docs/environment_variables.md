@@ -114,6 +114,13 @@ make duplicate prefill useful. Pure-attention models do not use checkpoint waits
 | **ATOM_PREFILL_DELAYER_DEBUG** | bool | false | Per-tick FIRE/HOLD debug logging. |
 | **ATOM_PREFILL_DELAYER_LOG_EVERY** | int | 1000 | Emit aggregate stats (per-exit fire counts + hold rate) every N decisions (0 disables). |
 
+## Cache-aware admission
+
+| Variable | Type | Default | Description |
+|---|---|---|---|
+| **ATOM_CACHE_AWARE_ADMISSION** | bool | false | Order the plain waiting requests among the first 128 by how many of their prompt blocks are resident in the HBM prefix cache, most first, so a multi-turn session's next turn is admitted before queueing evicts its prefix. Offload loads, resumes and remote-KV waiters keep their queue slots. |
+| **ATOM_CACHE_AWARE_MAX_WAIT_S** | float | 120 | A request waiting longer than this goes first, oldest first, whatever its resident prefix: the bound on how long a cold request can be passed over. |
+
 ## Dynamic chunking
 
 Interpolates pipeline-parallel chunk sizes between the configured batch budget

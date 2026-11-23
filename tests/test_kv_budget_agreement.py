@@ -11,7 +11,7 @@ with less, and a stand-in ``group_min`` returns the smaller of the two.
 import pytest
 
 from atom.distributed import group_agreement
-from atom.distributed.group_agreement import agree_kv_budget
+from atom.distributed.group_agreement import agree_kv_budget, free_after_runtime_reserve
 from atom.model_ops.attentions.pool_layout.sub_pool_spec import page_pool, plan_pools
 
 _ENTRY_BYTES = 1024
@@ -115,3 +115,16 @@ def test_world_size_one_keeps_this_rank_budget(monkeypatch):
     agreed = agree_kv_budget(8_000, 7_000, 0, (tp, pcp))
     assert reduced == [pcp.cpu_group, pcp.cpu_group]
     assert agreed.available_for_kv == 6_000
+
+
+def test_free_clamp_keeps_back_what_serving_allocates_after_the_pool():
+    gb = 1 << 30
+    # beststack's F1 on 106: 18.1 GB free after warmup, the activation high-water 3 GB
+    # above the weights, graphs 0.46 GB, margin 5.76 GB -> the pool gets ~8.9 GB, not 18
+    got = free_after_runtime_reserve(
+        int(18.1 * gb), 217 * gb, 214 * gb, int(0.46 * gb), int(5.76 * gb)
+    )
+    assert got == int(18.1 * gb) - 3 * gb - int(0.46 * gb) - int(5.76 * gb)
+    # never negative, and a peak below the steady state charges nothing
+    assert free_after_runtime_reserve(gb, 10 * gb, 9 * gb, gb, gb) == 0
+    assert free_after_runtime_reserve(20 * gb, 5 * gb, 6 * gb, 0, gb) == 19 * gb

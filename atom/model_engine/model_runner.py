@@ -32,7 +32,11 @@ from torch.profiler import record_function
 
 from atom import structured_output
 from atom.config import Config, set_current_atom_config
-from atom.distributed.group_agreement import agree_kv_budget, group_min
+from atom.distributed.group_agreement import (
+    agree_kv_budget,
+    free_after_runtime_reserve,
+    group_min,
+)
 from atom.distributed.pcp_utils import (
     PcpBalGroup,
     cut_pcp_prefill_ubatches,
@@ -1981,17 +1985,26 @@ class ModelRunner:
         if not hasattr(hf_config, "head_dim") or hf_config.head_dim is None:
             hf_config.head_dim = hf_config.hidden_size // hf_config.num_attention_heads
 
+        # Cached blocks are not free to the KV pool's one large allocation: give them
+        # back first. What stays reserved past this is segments a live tensor pins.
+        torch.cuda.empty_cache()
         free, total = torch.cuda.mem_get_info()
         peak = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
         current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
+        reserved = torch.cuda.memory_reserved()
         # weights + peak activation tensors (PyTorch allocator high-water).
         peak_torch = max(peak, current)
         # RCCL/NCCL buffers etc. held outside the allocator: device-used minus
         # torch-reserved. Ignoring it over-allocates KV and OOMs at runtime.
-        non_torch = max((total - free) - torch.cuda.memory_reserved(), 0)
+        non_torch = max((total - free) - reserved, 0)
 
         cudagraph_overhead = self._estimate_cudagraph_overhead()
         safety_margin = int(total * 0.02)
+        # `free` is measured with the warmup's activations released, but serving
+        # allocates them again (a full prefill chunk), and CUDA graphs and the
+        # communicators' lazy buffers come after the pool. The physical clamp keeps
+        # all of that back, not only the budget does.
+        transient = max(peak - current, 0)
 
         budget = int(total * config.gpu_memory_utilization)
         non_kv_overhead = peak_torch + non_torch + cudagraph_overhead + safety_margin
@@ -2015,8 +2028,15 @@ class ModelRunner:
             if torch.distributed.is_initialized()
             else ()
         )
-        free, available_for_kv_budget, free_for_kv, available_for_kv = agree_kv_budget(
-            free, available_for_kv_budget, connector_bytes, groups
+        free_after_runtime, available_for_kv_budget, free_for_kv, available_for_kv = (
+            agree_kv_budget(
+                free_after_runtime_reserve(
+                    free, peak, current, cudagraph_overhead, safety_margin
+                ),
+                available_for_kv_budget,
+                connector_bytes,
+                groups,
+            )
         )
 
         torch.set_default_device(None)
@@ -2182,6 +2202,11 @@ class ModelRunner:
         logger.info(
             f"Memory budget: total_gpu={total / (1 << 30):.2f}GB, "
             f"free={free / (1 << 30):.2f}GB, "
+            f"reserved={reserved / (1 << 30):.2f}GB, "
+            f"allocated={current / (1 << 30):.2f}GB, "
+            f"transient={transient / (1 << 30):.2f}GB, "
+            f"free_after_runtime={free_after_runtime / (1 << 30):.2f}GB, "
+            f"bound_by={'free' if free_for_kv < available_for_kv_budget else 'budget'}, "
             f"utilization={config.gpu_memory_utilization}, "
             f"budget={budget / (1 << 30):.2f}GB, "
             f"peak_torch={peak_torch / (1 << 30):.2f}GB, "

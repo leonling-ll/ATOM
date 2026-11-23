@@ -52,6 +52,16 @@ class AgreedKvBudget(NamedTuple):
     available_for_kv: int
 
 
+def free_after_runtime_reserve(
+    free: int, peak: int, current: int, cudagraph_bytes: int, safety_bytes: int
+) -> int:
+    """Free HBM the KV pool may take: ``free`` (measured with the warmup's activations
+    released) less what serving allocates after the pool -- the warmup's activation
+    high-water above the steady state (``peak - current``), CUDA graphs, and a safety
+    margin for the communicators' lazy buffers."""
+    return max(free - max(peak - current, 0) - cudagraph_bytes - safety_bytes, 0)
+
+
 def agree_kv_budget(
     free: int,
     available_for_kv_budget: int,
