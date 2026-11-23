@@ -31,6 +31,10 @@
 #   MAX_MODEL_LEN    [MAX_CONTEXT + 1024: room for the chat template]
 #   PORT             server port [8300]
 #   SERVER_EXTRA     more server flags, split on spaces, e.g. --load_dummy=xavier []
+#   ATOM_M3PRO_VARIANTS  Pro attention variants
+#                    [{"kernels": true, "attn": "aiter", "topk": "fused"}]
+#   The server inherits the rest of the environment, so CPU offload's LMCACHE_*
+#   settings go there and its --kv-transfer-config in SERVER_EXTRA.
 
 set -euo pipefail
 
@@ -70,7 +74,8 @@ NUM_TRACES=$(find "$OUT_DIR/traces" -maxdepth 1 -name '*.json' | wc -l)
 # --- 2. server: the recipe's fast configuration, DSpark k=7, forced AL ---
 export AITER_LOG_LEVEL=WARNING
 export AITER_CUSTOM_AR_DISABLE_LAMPORT=1
-export ATOM_M3PRO_VARIANTS='{"kernels": true, "attn": "aiter", "topk": "fused"}'
+default_variants='{"kernels": true, "attn": "aiter", "topk": "fused"}'
+export ATOM_M3PRO_VARIANTS="${ATOM_M3PRO_VARIANTS:-$default_variants}"
 export KV_CACHE_DTYPE=fp8
 export GPU_MEM_UTIL=0.85
 export MAX_NUM_SEQS
