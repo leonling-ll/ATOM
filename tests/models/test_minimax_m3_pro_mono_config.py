@@ -237,3 +237,12 @@ def test_variants_take_the_row_limit():
     )
     assert pro_attn.ProVariants().mono_ffn_rows == 0
     assert pro_attn._parse_variants({"mono_ffn_rows": 8}).mono_ffn_rows == 8
+
+
+@pytest.mark.parametrize("level", [1, 2, 3])
+def test_a_compiled_level_is_refused(servable, level):
+    """The gate is Python in the decoder layer's forward: only level 0 runs it
+    as written."""
+    cfg = _atom_config()
+    cfg.compilation_config.level = level
+    assert config_refusal(cfg) is not None

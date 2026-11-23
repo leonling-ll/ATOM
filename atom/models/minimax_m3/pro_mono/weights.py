@@ -202,6 +202,22 @@ def _router(moe, dims: ProDims, rank: int, name: str):
     return band, bias.data
 
 
+def native_a8(linears) -> bool:
+    """Whether every one of ``linears`` runs the native group32 FP8 GEMM
+    (``pro._native_a8``: it reads an MXFP8 input)."""
+    return all(getattr(m, "native_a8_group_rows", None) is not None for m in linears)
+
+
+def lookahead_reader(layer_id: int, state) -> int | None:
+    """The layer whose indexer reads layer ``layer_id``'s lookahead, or None:
+    ``ProLookaheadState.put``'s ``resid_in`` rule with the lookahead on (the
+    variants ``route`` latches)."""
+    reader = layer_id + state.ahead
+    if not state.ahead or reader < state.start or reader not in state.norms:
+        return None
+    return reader
+
+
 @dataclass(frozen=True)
 class ProMoeLayer:
     """One MoE layer's kernel operands, every tensor production's own storage."""
