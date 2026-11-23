@@ -114,3 +114,6 @@ class MiniMaxM3ProDSpark(MiniMaxM3DSpark):
 
     layer_cls = M3ProDSparkDecoderLayer
     weights_mapper: ClassVar[WeightsMapper] = _DraftTensorsOnly()
+    # Drafts its trained block (`dspark_block_size`, 7) whole when
+    # --num-speculative-tokens is smaller; the verify reads the first k.
+    drafts_trained_block: ClassVar[bool] = True

@@ -262,7 +262,7 @@ class DSparkProposer(Drafter):
     def _init_draft_block_buffers(self) -> None:
         """Preallocate the block-pass metadata the separate-draft path rebinds."""
         max_bs = self.config.max_num_seqs
-        t = self.mtp_k
+        t = self.draft_tokens_per_seq
         i64 = {"dtype": torch.int64, "device": self.device}
         i32 = {"dtype": torch.int32, "device": self.device}
         # Block absolute positions, [max_bs, T]; passed into forward_spec.
@@ -380,7 +380,7 @@ class DSparkProposer(Drafter):
             (rpm_sz, rpm_ty),
         ) = get_mla_metadata_info_v1(
             max_bs,
-            self.mtp_k,  # max_seqlen_qo = block width T
+            self.draft_tokens_per_seq,  # max_seqlen_qo = block width T
             self._blk_padded_heads,
             dtype_q,
             dtype_kv,
@@ -472,10 +472,18 @@ class DSparkProposer(Drafter):
 
         The separate-draft flavor has no window to cap against: its context
         lives in the paged pool addressed by absolute position, so what bounds
-        `[context ++ draft]` is the request's own length, not a ring.
+        `[context ++ draft]` is the request's own length, not a ring. A draft
+        that sets ``drafts_trained_block`` drafts at least its trained width
+        (`dspark_block_size`) and the verify takes the first ``mtp_k``: the
+        block attention is bidirectional, so a narrower block changes every
+        drafted token, not only the ones the verify drops.
         """
         window = getattr(self.model, "window_size", None)
-        return self.mtp_k if window is None else min(self.mtp_k, int(window))
+        if window is not None:
+            return min(self.mtp_k, int(window))
+        if getattr(self.model, "drafts_trained_block", False):
+            return max(self.mtp_k, self.dspark_block_size)
+        return self.mtp_k
 
     def _resolve_mtp_k(self) -> int:
         draft_cfg = self.speculative_config.draft_model_hf_config
@@ -1260,10 +1268,12 @@ class DSparkProposer(Drafter):
         with record_function(f"propose_dspark[{label} T={T}]"):
             draft_token_ids, confidence = pass_.run(running_bs, **staged)
 
+        # The verify walks `mtp_k`, which is T unless the block is wider.
+        k = self.mtp_k
         if self.verify_scheduler is not None:
             self.verify_scheduler.set_last_ell(
-                self.verify_scheduler.compute_ell(confidence[:scheduled_bs, :T])
+                self.verify_scheduler.compute_ell(confidence[:scheduled_bs, :k])
                 if confidence is not None
                 else None
             )
-        return draft_token_ids[:scheduled_bs, :T]
+        return draft_token_ids[:scheduled_bs, :k]

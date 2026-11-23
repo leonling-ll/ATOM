@@ -45,12 +45,13 @@ def lossless_unsupported_reason(drafter) -> str | None:
     config = drafter.config
     if drafter.draft_tokens_per_seq != drafter.mtp_k:
         # The store holds `draft_tokens_per_seq` rows per slot but the verify
-        # walks `mtp_k`: a narrower draft would read into the next slot.
+        # walks `mtp_k`: with the two strides apart (a narrower draft, or
+        # MiniMax-M3-Pro's 7-token block below k=7) it reads the wrong rows.
         return (
             "needs the draft block to be as wide as the verify "
             f"(draft_tokens_per_seq={drafter.draft_tokens_per_seq}, "
-            f"mtp_k={drafter.mtp_k}): the verify would read q rows past each "
-            "request's slot."
+            f"mtp_k={drafter.mtp_k}): the verify's q rows would not line up "
+            "with each request's slot."
         )
     if not AITER_TOPK_TOPP_AVAILABLE:
         # The verify filters as aiter does; `Sampler`'s native fallback would

@@ -170,6 +170,18 @@ In a standalone service, all forward modes share the same step distribution.
 These histograms aggregate observations; the report does not retain or display
 individual step timestamps or request records.
 
+### Forward dispatch
+
+Counted on TP rank 0 of each DP rank, always on. Labels: `dp_rank`,
+`engine_role`, `model`, `phase`, `cudagraph`.
+
+| Metric | Type / unit | Definition |
+| --- | --- | --- |
+| `atom:forward_steps_total` | Counter, forwards | Real forwards (no dummy steps). `model="target"`: the target forward, `cudagraph="true"` when it replayed a captured request graph (`ForwardMode.use_cudagraph`). `model="draft"`: the drafter's declared passes, `cudagraph="true"` when every one replayed at the step's batch (`Drafter.draft_replays`). `phase` is the target step's. Startup warmup and capture forwards are not counted. |
+
+`atom:forward_steps_total{model="target",phase="decode",cudagraph="false"}` is
+the number of eager decode steps.
+
 ### Prefix cache and KV reuse
 
 | Metric | Type / unit | Definition |

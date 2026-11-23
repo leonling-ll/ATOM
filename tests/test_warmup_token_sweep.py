@@ -1,3 +1,9 @@
+import pytest
+
+# model_runner imports aiter (and aiter.dist) at module level; a CPU runner has
+# neither, so this file runs only where aiter is installed.
+pytest.importorskip("aiter.dist.utils")
+
 from atom.model_engine.model_runner import warmup_token_sweep
 
 

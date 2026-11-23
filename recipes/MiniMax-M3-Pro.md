@@ -279,8 +279,8 @@ the pool allocated and before it filled (process RSS and `free -g`): each TP pro
 the pool and about 100 GiB of its own, and the node showed 2,171 of 2,751 GiB used, 583 GiB available.
 InferenceX allows CPU DRAM only, up to 3 TB per MI355X server.
 
-Measured on a 15-minute agentic proxy (`scripts/m31pro/proxy_bench.sh 32` on `hatwu/m3.1-pro-infx`: an
-aiperf replay of 64 `semianalysisai/cc-traces-weka-062126` sessions capped at 128k,
+Measured on the 15-minute agentic proxy (`scripts/m31pro/proxy_bench.sh 32`: an aiperf replay of 64
+`semianalysisai/cc-traces-weka-062126` sessions capped at 128k,
 DSpark k=7 at a forced acceptance length of 4.0) with
 `ATOM_M3PRO_VARIANTS='{"kernels": true, "attn": "aiter", "topk": "fused", "k_only": true}'`, both arms on
 one tree; the HBM pool is 18,600 blocks (about 298k tokens):
@@ -317,6 +317,20 @@ against 40% and 76). It
 accepts 43% of the drafted tokens on GSM8K (4.0 tokens per target forward), the same with prefix
 caching on, where the draft's context for cached blocks comes from the cache too: copying lines out of
 an 8k-token list, it accepts 40% cold and 42-43% with the list cached.
+
+### Decode graphs at large batch
+
+A decode step replays a captured graph when its batch fits the capture ladder
+(`--cudagraph-capture-sizes`, default `[1..8, 16, 32, 48, 64, 128, 256, 512]`),
+cut at startup to what the scheduler can form: `min(max-num-seqs,
+max-num-batched-tokens // (k + 1))`. A DSpark verify graph holds `k + 1` rows a
+sequence, and the draft's block pass is captured at the same batch sizes. At the
+agentic proxy's c32 point (`--max-num-seqs 64`, 16384 tokens, k=7) that is
+`[1..8, 16, 32, 48, 64]`, so every decode batch replays.
+
+`atom:forward_steps_total` on `/metrics` counts forwards by `model` (target,
+draft), `phase` and `cudagraph`; eager decode steps are
+`atom:forward_steps_total{model="target",phase="decode",cudagraph="false"}`.
 
 ## What is verified, and what is not
 
