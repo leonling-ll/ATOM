@@ -322,6 +322,8 @@ def test_launch_passes_every_abi_argument(monkeypatch, reader):
     assert args["moe_w"] == table.data_ptr()
     assert args["plain"] == r.plain.data_ptr()
     assert args["scratch"] == r.scratch.data_ptr() and args["rank"] == 3
+    # no forward context: every row real
+    assert args["nvalid"] == 0
     assert args["ffn_out"] == out["ffn_out"].data_ptr()
     assert out["ffn_out"].shape == (2, HIDDEN)
     for name in ("la8", "la8s"):
@@ -329,3 +331,20 @@ def test_launch_passes_every_abi_argument(monkeypatch, reader):
             assert args[name] == 0 and name not in out
         else:
             assert args[name] == out[name].data_ptr()
+
+
+def test_the_real_row_count_is_the_forward_contexts(monkeypatch):
+    """``nvalid``: production's own row count tensor when it covers the pass's
+    rows, else 0 (every row routed)."""
+    count = torch.tensor([5], dtype=torch.int32)
+    monkeypatch.setattr(
+        runner_mod,
+        "pass_scheduled_tokens_gpu",
+        lambda rows: count if rows == 8 else None,
+    )
+    assert runner_mod._real_rows_ptr(8) == count.data_ptr()
+    assert runner_mod._real_rows_ptr(4) == 0
+    wide = torch.tensor([5], dtype=torch.int64)
+    monkeypatch.setattr(runner_mod, "pass_scheduled_tokens_gpu", lambda rows: wide)
+    with pytest.raises(RuntimeError):
+        runner_mod._real_rows_ptr(8)

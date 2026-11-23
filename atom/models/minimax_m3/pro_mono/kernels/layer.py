@@ -532,7 +532,7 @@ def build(key: P1Build):
         core: Int64, w_o: Int64, s_o: Int64, res: Int64, g_post: Int64,
         g_ahead: Int64, moe_w: Int64, h_mid: Int64, x: Int64, x8: Int64,
         x8s: Int64, la8: Int64, la8s: Int64, ffn_out: Int64, scratch: Int64,
-        plain: Int64,
+        plain: Int64, nvalid: Int64,
         peers: Int64, rank: Int32, layer: Int32, tl: Int64,
     ):  # fmt: skip
         _ = keyed
@@ -609,6 +609,7 @@ def build(key: P1Build):
                 "smsc": fl.smsc.ptr,
                 "contrib": fl.contrib.ptr, "cand": fl.cand.ptr,
                 "csig": fl.csig.ptr, "scan": fl.scan.ptr,
+                "nvalid": nvalid,
                 "rt": {
                     "route": fl.route.ptr, "mask": fl.mask.ptr,
                     "slot": fl.slot.ptr, "expert": fl.expert.ptr,
@@ -632,14 +633,14 @@ def build(key: P1Build):
         core: Int64, w_o: Int64, s_o: Int64, res: Int64, g_post: Int64,
         g_ahead: Int64, moe_w: Int64, h_mid: Int64, x: Int64, x8: Int64,
         x8s: Int64, la8: Int64, la8s: Int64, ffn_out: Int64, scratch: Int64,
-        plain: Int64,
+        plain: Int64, nvalid: Int64,
         peers: Int64, rank: Int32, layer: Int32, tl: Int64,
         stream: fx.Stream = _STREAM,
     ):  # fmt: skip
         _ = keyed
         p1_layer(
             core, w_o, s_o, res, g_post, g_ahead, moe_w, h_mid, x, x8, x8s,
-            la8, la8s, ffn_out, scratch, plain, peers, rank, layer, tl,
+            la8, la8s, ffn_out, scratch, plain, nvalid, peers, rank, layer, tl,
         ).launch(grid=(BLOCKS,), block=(THREADS,), stream=stream)  # fmt: skip
 
     ABI.check(p1_layer, launch)

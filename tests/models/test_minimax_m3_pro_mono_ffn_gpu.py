@@ -25,7 +25,11 @@ What must hold:
   their renormalization x 2 (``route_failures``);
 * each rank's FFN partial within ``FFN_BOUND`` per row (``ffn_failures``: the
   CPU test shows the bound passes summation-order noise and catches a lost
-  scale, weight, operand, pick, K block, the clamp, the shared expert).
+  scale, weight, operand, pick, K block, the clamp, the shared expert);
+* with padding rows (``nvalid`` below the width, ``PADDED``) the real rows'
+  FFN partial is the unpadded launch's bit for bit, and the padding rows'
+  finite: a padding row is routed nowhere, so the union may shrink and the
+  routed tasks land on other CTAs, but no real row's sum changes.
 
 Needs 8 GPUs of 256 CUs (MI355X), aiter and FlyDSL, about 7 GB a GPU; skipped
 otherwise.
@@ -77,13 +81,22 @@ INTER_V, INTER_R, INTER_S = 640, 768, 640
 # (rows, lookahead, routed_act). A16W4: one row, the decode widths 2 / 4, a
 # partial wave, an 8-row verify, two passes, the widest (+ the widest without
 # the lookahead); W4A8 (32/32 on GPU at 05a6fc80) and W4A4 (26/26 at
-# c467bcf9) at one row and the widest, so every format stays covered
+# c467bcf9) at one row and the widest, so every format stays covered (and
+# runs padded)
 CASES = (
     (1, True, "bf16"), (2, True, "bf16"), (3, True, "bf16"), (4, True, "bf16"),
     (8, True, "bf16"), (9, True, "bf16"), (16, True, "bf16"),
     (16, False, "bf16"),
     (1, True, "fp8"), (16, True, "fp8"), (1, True, "fp4"), (16, True, "fp4"),
 )  # fmt: skip
+
+
+# a case run again with only its first rows real (``nvalid``): A16W4 at 8 -> 5
+# and 16 -> 9 real rows, the other formats at 16 -> 9
+PADDED = {
+    (8, True, "bf16"): 5, (16, True, "bf16"): 9,
+    (16, True, "fp8"): 9, (16, True, "fp4"): 9,
+}  # fmt: skip
 
 
 def _inputs(case):
@@ -226,24 +239,29 @@ def _worker(rank, port, queue, done, inputs):
                 "la8": z(s, HIDDEN), "la8s": z(s, HIDDEN // 32),
                 "ffn_out": z(s, HIDDEN, dt=torch.bfloat16),
             }  # fmt: skip
-            args = ABI.pack(
-                {
-                    "core": core.data_ptr(), "w_o": w_o.data_ptr(),
-                    "s_o": s_o.data_ptr(), "res": res.data_ptr(),
-                    "g_post": w_post.data_ptr(), "g_ahead": w_ahead.data_ptr(),
-                    "moe_w": moe_w.data_ptr(),
-                    **{k: v.data_ptr() for k, v in out.items()},
-                    "scratch": scratch.data_ptr(), "plain": plain.data_ptr(),
-                    "peers": peers.addresses.data_ptr(), "rank": rank,
-                    "layer": LAYER, "tl": 0,
-                }
-            )  # fmt: skip
-            dist.barrier(group=group)
-            mbx.begin_step()
-            _run_compiled(launch, *args, torch.cuda.current_stream())
-            torch.cuda.synchronize()
-            waits = given_up_waits(diag, region_namer(L.REGIONS))
-            waits += [f"fence: rank {r}" for r in mbx.missing_ranks()]
+
+            def run(nvalid=0, out=out, core=core, res=res, launch=launch):
+                args = ABI.pack(
+                    {
+                        "core": core.data_ptr(), "w_o": w_o.data_ptr(),
+                        "s_o": s_o.data_ptr(), "res": res.data_ptr(),
+                        "g_post": w_post.data_ptr(), "g_ahead": w_ahead.data_ptr(),
+                        "moe_w": moe_w.data_ptr(),
+                        **{k: v.data_ptr() for k, v in out.items()},
+                        "scratch": scratch.data_ptr(), "plain": plain.data_ptr(),
+                        "nvalid": nvalid,
+                        "peers": peers.addresses.data_ptr(), "rank": rank,
+                        "layer": LAYER, "tl": 0,
+                    }
+                )  # fmt: skip
+                dist.barrier(group=group)
+                mbx.begin_step()
+                _run_compiled(launch, *args, torch.cuda.current_stream())
+                torch.cuda.synchronize()
+                got = given_up_waits(diag, region_namer(L.REGIONS))
+                return got + [f"fence: rank {r}" for r in mbx.missing_ranks()]
+
+            waits = run()
             # the route record and the gathered logits (tagged pairs: values)
             rec = scratch[route_at : route_at + s * 2 * TOPK * 8].view(torch.int32)
             rec = rec.view(s, 2 * TOPK, 2)[..., 0]
@@ -265,6 +283,27 @@ def _worker(rank, port, queue, done, inputs):
                 shared["deq"], act=key.routed_act,
             )  # fmt: skip
             got = out["ffn_out"]
+            pad = None
+            nv = PADDED.get((s, key.lookahead, key.routed_act))
+            if nv is not None:
+                # the same rows again, only the first nv real: the real rows'
+                # partial bit for bit, the padding rows' finite
+                out_p = {k: torch.zeros_like(v) for k, v in out.items()}
+                count = torch.tensor([nv], dtype=torch.int32, device=dev)
+                waits += run(count.data_ptr(), out_p)
+                fp = out_p["ffn_out"]
+                pad = {
+                    "rows": nv,
+                    "same": torch.equal(
+                        fp[:nv].view(torch.int16), got[:nv].view(torch.int16)
+                    ),
+                    "worst_rel": row_relnorm(fp[:nv].cpu(), got[:nv].cpu()),
+                    "finite": bool(torch.isfinite(fp.float()).all()),
+                    "norm_same": all(
+                        torch.equal(out_p[k], out[k]) for k in out if k != "ffn_out"
+                    ),
+                    "union": len(set(picks[:nv].flatten().tolist())),
+                }
             norm = {k: v.cpu() for k, v in out.items() if k != "ffn_out"}
             norm["x8"] = norm["x8"].view(torch.float8_e4m3fn)
             norm["la8"] = norm["la8"].view(torch.float8_e4m3fn)
@@ -279,6 +318,7 @@ def _worker(rank, port, queue, done, inputs):
                     "ffn_bad": ffn_failures(got.cpu(), want.cpu()),
                     "ffn_rel": row_relnorm(got.cpu(), want.cpu()),
                     "union": len(set(picks.flatten().tolist())),
+                    "pad": pad,
                 }
             )  # fmt: skip
         queue.put((rank, results, None))
@@ -375,3 +415,18 @@ def test_every_ranks_ffn_partial_matches_the_reference(ranks, case):
             f" |U| {r['union']}"
         )
         assert not r["ffn_bad"], (rank, r["rows"], r["act"], r["ffn_bad"])
+
+
+@pytest.mark.parametrize("case", [i for i, c in enumerate(CASES) if c in PADDED])
+def test_padding_rows_change_no_real_row(ranks, case):
+    for rank in range(TP):
+        r = ranks[rank][case]
+        p = r["pad"]
+        print(
+            f"rows {r['rows']} {r['act']} of which {p['rows']} real, rank {rank}:"
+            f" |U| {r['union']} -> {p['union']}, real rows same {p['same']}"
+            f" (rel {p['worst_rel']:.3g})"
+        )
+        assert p["same"] and p["finite"] and p["norm_same"], (
+            rank, r["rows"], r["act"], p,
+        )  # fmt: skip

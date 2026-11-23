@@ -409,7 +409,8 @@ def pick_expert(rt, p):
 
 @traced
 def load_route(c):
-    """``route`` -> LDS (ids, weights); the union U (ascending): expert[slot],
+    """``route`` -> LDS (ids, weights), the real rows' (``real_rows``: a
+    graph's padding rows enlarge no union); the union U (ascending): expert[slot],
     slot[e], first[slot] (``first[|U|]`` = every pick) and the picks in slot
     order, a slot's tokens ascending (``order``: pick ids 4 t + k), the row
     order of ``inter``. Returns |U|.
@@ -421,10 +422,12 @@ def load_route(c):
     s, tid, lane, wave = c["S"], c["tid"], c["lane"], c["wave"]
     rt = c["rt"]
     mw = mask_words(s)
+    nv = c["nv"]
+    # the real rows' picks only: a padding row's never come (``stage_route``)
     n = s * 2 * TOPK
     for i in range_constexpr(passes(n)):
         j = tid + THREADS * i
-        if j < n:
+        if j < nv * (2 * TOPK):
             v = c["poll"]([(c["route"], j, 1)])[0][0]
             fx.ptr_store(v, rt["route"] + j)
     for i in range_constexpr(passes(EXPERTS * mw)):
@@ -434,7 +437,7 @@ def load_route(c):
     gpu.barrier()
     for i in range_constexpr(passes(s * TOPK)):
         p = tid + THREADS * i
-        if p < s * TOPK:
+        if p < nv * TOPK:
             route.mark_token(rt["mask"], mw, pick_expert(rt, p), p // TOPK)
     gpu.barrier()
     # two experts a thread: their pick counts; slots and first picks by scans
@@ -462,7 +465,7 @@ def load_route(c):
     gpu.barrier()
     for i in range_constexpr(passes(s * TOPK)):
         p = tid + THREADS * i
-        if p < s * TOPK:
+        if p < nv * TOPK:
             t = p // TOPK
             e = pick_expert(rt, p)
             # the tokens below t that picked e: the picks before p in its slot
@@ -1106,6 +1109,8 @@ def stage_down(c, rgd, nu, ops0, sops):
             y = fx.ptr_load(c["contrib"] + (tt * TOPK * DOWN_ROWS + r))
             for k in range_constexpr(1, TOPK):
                 y = y + fx.ptr_load(c["contrib"] + ((tt * TOPK + k) * DOWN_ROWS + r))
+            # a padding row has no picks (its contribs were never written)
+            y = (tt < c["nv"]).select(y, fx.Float32(0.0))
             sh = bf16_round(row_sum(red, r, tt, waves=range(SD_STEPS)))
             out.append(bf16_round(y) + sh)
         bo.buffer_store(
@@ -1119,11 +1124,25 @@ def stage_down(c, rgd, nu, ops0, sops):
 # ------------------------------------------------------------ the FFN
 
 
+def real_rows(c):
+    """The pass's real rows (``nvalid``'s count, 1 .. S), or S when
+    ``nvalid`` is 0: an empty buffer range reads 0 without a fault."""
+    s, p = c["S"], c["nvalid"]
+    has = p != fx.Int64(0)
+    got = fx.Int32(
+        bo.buffer_load(
+            rsrc(p, has.select(fx.Int32(4), fx.Int32(0))), 0, vec_width=1, dtype=T.i32
+        )
+    )
+    return uniform(has.select(fx.max(fx.min(got, s), 1), fx.Int32(s)))
+
+
 @traced
 def run_ffn(c, bid):
     """Every FFN stage of this CTA, in program order (``layout``'s
     placement): router / shared / route tasks, the union, ug, down."""
     s = c["S"]
+    c["nv"] = real_rows(c)
     enter_stage("router")
     rt_task = bid - R0
     if bid >= R0:
@@ -1134,7 +1153,8 @@ def run_ffn(c, bid):
         stage_shared(c, sj, sh_loads(c, sj))
     enter_stage("route")
     rt_tok = bid - RT0
-    if (bid >= RT0) & (rt_tok < s):
+    # a padding row is routed nowhere (production's ``num_valid_rows``)
+    if (bid >= RT0) & (rt_tok < s) & (rt_tok < c["nv"]):
         stage_route(c, rt_tok)
     c["stamp"](6)
     enter_stage("union")

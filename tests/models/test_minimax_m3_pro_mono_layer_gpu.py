@@ -135,7 +135,7 @@ def _worker(rank, port, queue, done, inputs):
                     "core": core.data_ptr(), "w_o": w_o.data_ptr(),
                     "s_o": s_o.data_ptr(), "res": res.data_ptr(),
                     "g_post": w_post.data_ptr(), "g_ahead": w_ahead.data_ptr(),
-                    "moe_w": 0, "ffn_out": 0, "plain": 0,
+                    "moe_w": 0, "ffn_out": 0, "plain": 0, "nvalid": 0,
                     **{k: v.data_ptr() for k, v in out.items()},
                     "scratch": scratch.data_ptr(),
                     "peers": peers.addresses.data_ptr(), "rank": rank,

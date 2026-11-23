@@ -84,6 +84,7 @@ from atom.mono.runtime.mailboxes import StepMailboxes
 from atom.mono.runtime.uncached import uncached_bytes
 from atom.mono.runtime.widths import WidthBuilds
 from atom.utils import envs
+from atom.utils.forward_context import pass_scheduled_tokens_gpu
 
 logger = logging.getLogger("atom")
 
@@ -121,6 +122,20 @@ class MonoLayer:
     def kind(self) -> tuple:
         """What a build of this layer bakes besides the width."""
         return (self.reader is not None, self.w.eps, self.w.eps_ahead or EPS)
+
+
+def _real_rows_ptr(rows: int) -> int:
+    """The device i32 holding the pass's real row count when it covers these
+    rows (the forward context's ``scheduled_tokens_gpu``, what production's
+    routing masks a graph's padding rows by), else 0: every row is routed."""
+    count = pass_scheduled_tokens_gpu(rows)
+    if count is None:
+        return 0
+    if count.dtype != torch.int32:
+        raise RuntimeError(
+            f"scheduled_tokens_gpu is {count.dtype}, the kernel reads i32"
+        )
+    return count.data_ptr()
 
 
 class ProMonoRunner:
@@ -243,6 +258,7 @@ class ProMonoRunner:
             "g_ahead": 0 if w.g_ahead is None else w.g_ahead.data_ptr(),
             "moe_w": lw.moe_w.data_ptr(), **ptrs,
             "scratch": self.scratch.data_ptr(), "plain": self.plain.data_ptr(),
+            "nvalid": _real_rows_ptr(n),
             "peers": self.peers.addresses.data_ptr(), "rank": self.rank,
             "layer": layer_id, "tl": 0,
         }  # fmt: skip

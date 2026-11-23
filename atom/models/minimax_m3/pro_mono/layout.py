@@ -30,9 +30,10 @@ build's the bf16 x)::
             bf16 -> every rank's ``rlog`` (an all-gather of the 384 logits)
     shared  SH_TASKS CTAs from SH0: 8 gate + 8 up rows of the MXFP8 shared
             gate_up against x8 -> bf16 g, u -> SwiGLU-OAI -> bf16 -> ``smid``
-    route   S CTAs from RT0, token t: sigmoid, top-4 of sigmoid + bias, the
-            4 unbiased sigmoids renormalized x 2.0 -> ``route``
-    union   every CTA: ``route`` -> the union U of the step's experts and
+    route   S CTAs from RT0, token t (a real row: t < ``nvalid``'s count):
+            sigmoid, top-4 of sigmoid + bias, the 4 unbiased sigmoids
+            renormalized x 2.0 -> ``route``
+    union   every CTA: ``route`` -> the union U of the real rows' experts and
             their picks (LDS), the routed B operand (x4, x8, or A16W4 the
             CTA's K half of the bf16 x) -> LDS
     ug      |U| x UG_GROUPS tasks round-robin: 32 gate + 32 up rows of an
@@ -45,7 +46,8 @@ build's the bf16 x)::
     down    DOWN_TASKS (16 hidden rows): w2 of every expert of U against its
             picks' mids -> bf16(w acc) a pick, summed in top-k order -> bf16;
             the shared down (MXFP8 of ``smid``) -> bf16; bf16(routed + shared)
-            -> ``ffn_out`` [S, 7168], this rank's FFN partial
+            -> ``ffn_out`` [S, 7168], this rank's FFN partial (a padding
+            row's: its shared expert's alone)
 
 Both builds' outputs are the production pair's residual and the AR #1 norm's
 (``ffn_out``: the MoE's TP-partial output), so the next layer's AR #2 is unchanged.
@@ -262,8 +264,11 @@ def max_u(s: int) -> int:
 ABI_NAMES = (
     "core", "w_o", "s_o", "res", "g_post", "g_ahead", "moe_w",
     "h_mid", "x", "x8", "x8s", "la8", "la8s", "ffn_out",
-    "scratch", "plain", "peers", "rank", "layer", "tl",
+    "scratch", "plain", "nvalid", "peers", "rank", "layer", "tl",
 )  # fmt: skip
+# ``nvalid``: an i32 on the device holding the pass's real row count (the
+# forward context's ``scheduled_tokens_gpu``; rows at or past it are a graph's
+# padding, routed to no expert), or 0: every row is real.
 # ``moe_w``: a device table of the FFN operands' addresses (i64, this order;
 # 0 for a norm build): this rank's band of the bf16 router (48 rows), the fp32
 # correction bias, the routed MXFP4 planes and the shared expert's MXFP8 ones
