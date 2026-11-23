@@ -4,7 +4,7 @@ import pytest
 # neither, so this file runs only where aiter is installed.
 pytest.importorskip("aiter.dist.utils")
 
-from atom.model_engine.model_runner import warmup_token_sweep  # noqa: E402
+from atom.model_engine.model_runner import warmup_token_sweep
 
 
 def test_off_by_default():
