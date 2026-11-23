@@ -4,7 +4,8 @@ integration_branch: hatwu/m3.1-pro-infx
 design_entry: recipes/MiniMax-M3-Pro.md
 # CI scope (.github/scripts/run_unit_tests.sh) + black + ruff 0.16.0 on changed files; see scripts/m31pro/gate.sh
 gate_task: bash scripts/m31pro/gate.sh
-# gate_post_land: add the GPU accuracy gate (GSM8K 64-shot, 1319, >= 0.93) once M0 item 4 delivers its script
+# post-landing accuracy gate (GSM8K 64-shot, bar per #7 section 5); where it runs is in the body
+gate_wave: bash scripts/m31pro/accuracy_gate.sh
 never_touch: ROCm/ATOM, ROCm/aiter
 new_tests_dir: tests
 publish_language: English
@@ -24,6 +25,8 @@ Kernel work lands in zhuyuhua-v/aiter-M3 by PR, merged by its owner, not by `run
 GPU: one 8xMI355X node per person. Unit tests and microbenchmarks may split GPUs with HIP_VISIBLE_DEVICES; end-to-end benchmarks and accuracy runs take the node lock and run one at a time.
 
 Never push to ROCm upstream repositories before the model is public.
+
+Accuracy gate (`gate_wave`, and the per-PR GSM8K run of #7 section 5): run it on the GPU node, inside the ATOM container, from a `git archive` snapshot of the commit under test, under `flock /tmp/m31pro-gpu.lock`, with `M31PRO_MODEL` set to the Pro checkpoint when it is not at the recipe's path. `scripts/m31pro/nightly.sh` runs the same way for the nightly checks.
 
 Gate: `gate_task` runs `scripts/m31pro/gate.sh` in a Linux Python 3.12 environment set up as the "Install dependencies" step of the `unit-tests` job in `.github/workflows/pre-checks.yaml` does, plus `black` and `ruff==0.16.0` (for example a `python:3.12` container on the GPU node). The tree must be a git checkout: ruff checks the files changed against the merge base, and one test calls `git rev-parse HEAD`.
 
