@@ -22,7 +22,8 @@ Stages, in program order (one launch a MoE layer and rank, ``BLOCKS`` CTAs of
 ``upto = "norm"`` ends there and writes x and x8 to HBM, where the
 production MoE reads them. ``upto = "ffn"`` goes on to the rank's FFN partial
 (the norm CTAs flag their columns, ``xrdy``; a W4A4 build's also write x as
-MXFP4 for the routed experts, a W4A8 build's routed experts read x8)::
+MXFP4 for the routed experts, a W4A8 build's routed experts read x8, an A16W4
+build's the bf16 x)::
 
     router  R_TASKS CTAs from R0: this rank's 48 router rows (3 row groups x
             R_PARTS K slices) against bf16 x; part 0 adds the parts in order,
@@ -32,11 +33,15 @@ MXFP4 for the routed experts, a W4A8 build's routed experts read x8)::
     route   S CTAs from RT0, token t: sigmoid, top-4 of sigmoid + bias, the
             4 unbiased sigmoids renormalized x 2.0 -> ``route``
     union   every CTA: ``route`` -> the union U of the step's experts and
-            their picks (LDS), the routed B operand (x4, or x8) -> LDS
+            their picks (LDS), the routed B operand (x4, x8, or A16W4 the
+            CTA's K half of the bf16 x) -> LDS
     ug      |U| x UG_GROUPS tasks round-robin: 32 gate + 32 up rows of an
             expert (MXFP4) against its picks -> SwiGLU-OAI -> bf16 -> MXFP4
-            (W4A4) or MXFP8 (W4A8) mid rows (plain ``inter`` / ``isc``, a
-            task's ``ugf`` flag)
+            (W4A4), MXFP8 (W4A8) or bf16 (A16W4) mid rows (plain ``inter`` /
+            ``isc``, a task's ``ugf`` flag). A16W4 splits each task over the
+            K halves (``ug_split``): the half-1 task sends its fp32 gate / up
+            partials (``ugp``), the half-0 task adds them to its own and
+            finishes the task
     down    DOWN_TASKS (16 hidden rows): w2 of every expert of U against its
             picks' mids -> bf16(w acc) a pick, summed in top-k order -> bf16;
             the shared down (MXFP8 of ``smid``) -> bf16; bf16(routed + shared)
@@ -131,15 +136,47 @@ XSC_WORDS = HIDDEN // 128
 X8_WORDS = HIDDEN // 4
 X8_ROW = X8_WORDS + 4
 INTER8_WORDS = INTER_V // 4
+# A16W4: a token's K half of the bf16 x in LDS (its words, padded alike: the
+# bytes of an x8 row), and a pick's bf16 mid row in ``inter``. A task's K half
+# is 2 quarters of W13_Q steps, a wave each (and its row group)
+UG_HALVES = 2
+XH_WORDS = HIDDEN // UG_HALVES // 2
+XH_ROW = XH_WORDS + 4
+INTERB_WORDS = INTER_V // 2
+W13_Q = W13_HALF // 2  # 14
 # the routed experts' activation format (``config.ROUTED_ACTS``): "fp4" W4A4
 # (aiter a4w4 numerics), "fp8" W4A8 (MXFP8 x and mids, the f8f6f4 MFMA with an
-# fp4 A and an fp8 B)
-ROUTED_ACT_DEFAULT = "fp8"
+# fp4 A and an fp8 B), "bf16" A16W4 (production's a16w4 numerics: bf16 x and
+# mids, the MXFP4 weight dequantized to bf16 in the kernel, the bf16 MFMA)
+ROUTED_ACT_DEFAULT = "bf16"
 
 
 def inter_words(act: str) -> int:
-    """Words of a pick's mid row in ``inter`` (MXFP4 or MXFP8)."""
-    return INTER_WORDS if act == "fp4" else INTER8_WORDS
+    """Words of a pick's mid row in ``inter`` (MXFP4, MXFP8 or bf16)."""
+    return {"fp4": INTER_WORDS, "fp8": INTER8_WORDS, "bf16": INTERB_WORDS}[act]
+
+
+def ug_split(act: str) -> int:
+    """The K slices of an ug task, each its own task on its own CTA: 2 for
+    A16W4 (its bf16 x does not fit LDS whole at 16 rows, a K half does), 1
+    else."""
+    return UG_HALVES if act == "bf16" else 1
+
+
+def xh_word(t, local, kb, j):
+    """A16W4: the LDS word (from ``xs``) of token t's K-half row holding the
+    B operand of bf16 MFMA j of the half's 128-k step ``local`` on lane group
+    ``kb``: k 128 local + 32 kb + 8 j .. + 8 of the half (``fp4_bf16_tile``'s
+    operand j of the w13 tile, k 32 kb + 8 j .. + 8 of its step)."""
+    return t * XH_ROW + local * 64 + kb * 16 + 4 * j
+
+
+def interb_word(row, blk, col):
+    """A16W4: the word of ``inter`` holding the bf16 mid (column 32 ``blk`` +
+    ``col``, an even ``col`` and the next) of pick row ``row``. An ug task
+    stores block g, column col; the down's B operand j of step st, lane group
+    kb, is block 4 st + kb, column 8 j (its 4 words)."""
+    return row * INTERB_WORDS + blk * (UG_COLS // 2) + col // 2
 
 
 # the shared mid as MXFP8 in LDS (the down's B operand): a token's row of e4m3
@@ -153,8 +190,22 @@ SMSC_WORDS = INTER_S // 128
 R0 = BLOCKS - R_TASKS  # 235
 RT0 = R0 - MAX_ROWS  # 219
 SH0 = NT  # 56
+# the first ug round from the CTAs that have no stage between o and ug (past
+# the shared gate_up's, before the route's): a narrow step's tasks start there
+UG_FIRST_CTA = SH0 + SH_TASKS
+
+
+def first_ug(bid):
+    """CTA ``bid``'s first ug task (its next ones ``BLOCKS`` apart; ints or
+    traced values)."""
+    return (bid + (BLOCKS - UG_FIRST_CTA)) & (BLOCKS - 1)
+
 
 assert UG_GROUPS * UG_COLS == INTER_V and INTER_V % 128 == 0
+# A16W4: a CTA's ug tasks are all of one K half (tasks a CTA apart are
+# ``BLOCKS`` apart) and a quarter's steps start on an even step (two steps a
+# w13 scale word)
+assert BLOCKS % 2 == 0 and W13_Q % 2 == 0 and 2 * W13_Q == W13_HALF
 assert R_KLEN == 1024 and SH0 + SH_TASKS <= RT0 and DOWN_TASKS <= 2 * BLOCKS
 assert UG_COLS * MAX_ROWS <= THREADS and SH_ROWS * MAX_ROWS <= THREADS
 
@@ -302,8 +353,10 @@ def peer_bytes() -> int:
 # xrdy  [AR task] a norm CTA's x / x8 / x4 columns are stored
 # rpart [router task][token][row] a router K slice's f32 partial (parts > 0)
 # route [token][8] the picks' experts, then their weights (f32), top-k order
-# ugf   [ug task] a task's mid rows are stored
+# ugf   [ug task] a task's mid rows are stored (A16W4: a K-half pair's)
 # smid  [token][shared mid column] bf16 pairs
+# ugp   (A16W4) [pick row][ug group][mid column] the half-1 task's f32 gate
+#       and up partials, two pairs a cell
 
 
 def rpart_pair(task, t, r):
@@ -320,6 +373,12 @@ def smid_pair(t, col):
     return (t * INTER_S + col) // 2
 
 
+def ugp_pair(row, g, col):
+    """``ugp``'s first pair of pick row ``row``'s mid column ``col`` of ug
+    group ``g``: the gate partial, then the up's."""
+    return ((row * UG_GROUPS + g) * UG_COLS + col) * 2
+
+
 def scratch_layout(key: P1Build) -> dict:
     """Device-scope scratch (tagged pairs only, ``byte_layout``'s rule): a
     debug build's wait records, a FFN build's hand-offs. name -> (byte offset,
@@ -327,6 +386,7 @@ def scratch_layout(key: P1Build) -> dict:
     from atom.mono.runtime.debug import DIAG_BYTES
 
     L = MAX_ROWS_LAYOUT
+    bf16 = key.routed_act == "bf16"
     lay = {"diag": (0, DIAG_BYTES)} if key.debug else {}
     if key.upto == "ffn":
         start = max((o + n for o, n in lay.values()), default=0)
@@ -336,6 +396,8 @@ def scratch_layout(key: P1Build) -> dict:
             ("route", L * 2 * TOPK),
             ("ugf", max_u(L) * UG_GROUPS),
             ("smid", L * INTER_S // 2),
+            # last: the other regions' offsets are every format's
+            *((("ugp", L * TOPK * UG_GROUPS * UG_COLS * 2),) if bf16 else ()),
         )
         lay |= pair_layout(items, align=16, start=start)
     return lay
@@ -351,9 +413,10 @@ def plain_layout(key: P1Build) -> dict:
     """Plain words at device scope, a FFN build's (``plain``; flagged by the
     tagged pairs that announce them): a W4A4 build's x as MXFP4 (``x4``: a
     token's e2m1 words, ``x4s``: its codes four a word, a norm CTA's chunk;
-    a W4A8 build reads the norm's x8 instead) and the routed mids (``inter``:
-    a pick's MXFP4 or MXFP8 row in the union's pick order, ``isc``: its codes,
-    a word each). name -> (byte offset, bytes)."""
+    a W4A8 build reads the norm's x8 instead, an A16W4 build the bf16 x) and
+    the routed mids (``inter``: a pick's MXFP4, MXFP8 or bf16 row in the
+    union's pick order; ``isc``: an MX row's codes, a word each). name ->
+    (byte offset, bytes)."""
     if key.upto != "ffn":
         return {}
     L = MAX_ROWS_LAYOUT
@@ -366,7 +429,7 @@ def plain_layout(key: P1Build) -> dict:
         (
             *x4,
             ("inter", L * TOPK * inter_words(key.routed_act) * 4),
-            ("isc", L * TOPK * UG_GROUPS * 4),
+            *((("isc", L * TOPK * UG_GROUPS * 4),) if key.routed_act != "bf16" else ()),
         )
     )
 
@@ -378,7 +441,7 @@ def plain_bytes(key: P1Build) -> int:
 
 
 NORM_REGIONS = ("rs", "ag", "agsq")
-FFN_REGIONS = ("xrdy", "rpart", "rlog", "route", "ugf", "smid")
+FFN_REGIONS = ("xrdy", "rpart", "rlog", "route", "ugf", "smid", "ugp")
 # every region a build may touch: a debug record names its region by its
 # index here (``region_ids``)
 REGIONS = NORM_REGIONS + FFN_REGIONS
@@ -401,6 +464,9 @@ def decls(key: P1Build) -> list[RegionDecl]:
             RegionDecl("ugf", Space.SCRATCH, "ug"),
             RegionDecl("smid", Space.SCRATCH, "shared"),
         ]
+    if key.upto == "ffn" and key.routed_act == "bf16":
+        # a K-half pair's half-0 task polls its half-1 task's partials
+        out.append(RegionDecl("ugp", Space.SCRATCH, "ug", exchange=True))
     return out
 
 

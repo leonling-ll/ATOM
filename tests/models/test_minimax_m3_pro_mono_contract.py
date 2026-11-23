@@ -28,9 +28,9 @@ def arch():
         yield
 
 
-# (upto, routed_act): the norm build, the FFN build in W4A8 (the default) and
-# in W4A4
-BUILDS = [("norm", "fp8"), ("ffn", "fp8"), ("ffn", "fp4")]
+# (upto, routed_act): the norm build, the FFN build in A16W4 (the default),
+# W4A8 and W4A4
+BUILDS = [("norm", "bf16"), ("ffn", "bf16"), ("ffn", "fp8"), ("ffn", "fp4")]
 
 
 @pytest.mark.parametrize("upto, act", BUILDS)
@@ -49,7 +49,7 @@ def test_the_debug_build_holds(arch, upto, act):
 
 # the FFN builds whose norm runs two passes with a partial one (an SGPR peak:
 # a value of the o stage held into the FFN spilled at 9 .. 13 rows)
-@pytest.mark.parametrize("act", ["fp8", "fp4"])
+@pytest.mark.parametrize("act", ["bf16", "fp8", "fp4"])
 @pytest.mark.parametrize("rows", [9, 13])
 def test_the_ffn_builds_past_one_pass_hold(arch, rows, act):
     contract.check_build(
@@ -101,6 +101,9 @@ def test_a_wrong_declaration_is_caught(traced, wrong, msg):
         ({"rlog": {"space": Space.SCRATCH}}, "rlog in router as peer"),
         ({"route": {"writer": "union"}}, "route put by route, its writer is union"),
         ({"rpart": {"exchange": False}}, "rpart polled by its own writer router"),
+        # A16W4 (the default): the half-0 task polls its half-1 task's partials
+        ({"ugp": {"exchange": False}}, "ugp polled by its own writer ug"),
+        ({"ugp": {"writer": "down"}}, "ugp put by ug, its writer is down"),
     ],
 )
 def test_a_wrong_ffn_declaration_is_caught(traced_ffn, wrong, msg):

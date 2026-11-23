@@ -310,8 +310,11 @@ def rows_refusal(rows: int) -> str | None:
 
 
 # the routed experts' activation formats (``layout.ROUTED_ACTS``: plain
-# strings here, so the gate imports nothing of the kernels)
-ROUTED_ACTS = ("fp4", "fp8")
+# strings here, so the gate imports nothing of the kernels). The order is the
+# latch's agreement index (``latch_rows``): append, never reorder.
+ROUTED_ACTS = ("fp4", "fp8", "bf16")
+# each format's name in the latch line and the docs
+ROUTED_ACT_NAMES = {"fp4": "W4A4", "fp8": "W4A8", "bf16": "A16W4"}
 
 
 def act_refusal(act) -> str | None:
@@ -321,7 +324,7 @@ def act_refusal(act) -> str | None:
     return None
 
 
-def latch_rows(rows, group, act="fp8") -> tuple[int, str | None]:
+def latch_rows(rows, group, act="bf16") -> tuple[int, str | None]:
     """``(the row limit every rank serves, why it is 0 or None)``.
 
     ``rows``: this rank's ``ProVariants.mono_ffn_rows`` at runner creation,

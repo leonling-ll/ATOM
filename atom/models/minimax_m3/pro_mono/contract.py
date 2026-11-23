@@ -5,7 +5,7 @@ compile-only (``ARCH=gfx950``, no launch) and its mailbox hand-offs held to
 ``layout.decls``, its binary to no scratch (a persistent kernel that spills is
 refused) and to the CU's LDS.
 
-Usage: ARCH=gfx950 python -m atom.models.minimax_m3.pro_mono.contract [norm|ffn] [fp4|fp8] [S ...]
+Usage: ARCH=gfx950 python -m atom.models.minimax_m3.pro_mono.contract [norm|ffn] [fp4|fp8|bf16] [S ...]
 (the routed activation format: an FFN build's, default ``layout.ROUTED_ACT_DEFAULT``)
 """
 

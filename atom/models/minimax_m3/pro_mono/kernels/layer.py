@@ -72,6 +72,7 @@ from atom.models.minimax_m3.pro_mono.layout import (
     TP,
     X4_ROW,
     X8_ROW,
+    XH_ROW,
     XSC_WORDS,
     P1Build,
     ag_pair,
@@ -455,10 +456,16 @@ def build(key: P1Build):
     name = kernel_symbol("minimax_m3_pro_mono_layer", **symbol_params(key))
 
     fp8 = ffn_on and key.routed_act == "fp8"
+    bf16 = ffn_on and key.routed_act == "bf16"
     # ``xs``: the o stage's MXFP8 core rows, then (FFN) the router's bf16 x
-    # slice, a W4A8 build's MXFP8 x rows (the routed B operands: union to ug)
-    # and the shared mid's MXFP8 rows (down) -- stages apart, past barriers
-    xs_row = max(O_ROW, X8_ROW) if fp8 else O_ROW
+    # slice, a W4A8 build's MXFP8 x rows or an A16W4 build's bf16 x K halves
+    # (the routed B operands: union to ug) and the shared mid's MXFP8 rows
+    # (down) -- stages apart, past barriers
+    xs_row = O_ROW
+    if fp8:
+        xs_row = max(O_ROW, X8_ROW)
+    if bf16:
+        xs_row = max(O_ROW, XH_ROW)
     assert xs_row >= (ffn.R_KLEN + 8) // 2 and xs_row >= SM_ROW
 
     @fx.struct
@@ -475,11 +482,12 @@ def build(key: P1Build):
 
     @fx.struct
     class FfnLds:
-        # the W4A4 build's MXFP4 x rows (a W4A8 build's x8 rows are in ``xs``;
-        # 16 B unused there)
-        x4l: fx.Array[fx.Int32, 4 if fp8 else s * X4_ROW, 16]
-        # the routed B operands' E8M0 codes, four a word (x4's or x8's)
-        xsl: fx.Array[fx.Int32, s * XSC_WORDS, 16]
+        # the W4A4 build's MXFP4 x rows (a W4A8 build's x8 rows and an A16W4
+        # build's x halves are in ``xs``; 16 B unused there)
+        x4l: fx.Array[fx.Int32, 4 if fp8 or bf16 else s * X4_ROW, 16]
+        # the routed B operands' E8M0 codes, four a word (x4's or x8's; A16W4
+        # has none: 16 B unused)
+        xsl: fx.Array[fx.Int32, 4 if bf16 else s * XSC_WORDS, 16]
         smsc: fx.Array[fx.Int32, s * SMSC_WORDS, 16]
         contrib: fx.Array[fx.Float32, s * TOPK * ffn.DOWN_ROWS, 16]
         route: fx.Array[fx.Int32, s * 2 * TOPK, 16]
@@ -569,7 +577,8 @@ def build(key: P1Build):
                 ],
                 "rlog_own": preg(c["own"], play["rlog"][0], "rlog"),
                 "xl": lds.xs.ptr, "sm8": lds.xs.ptr,
-                "xbl": lds.xs.ptr if fp8 else fl.x4l.ptr, "xsl": fl.xsl.ptr,
+                "xbl": lds.xs.ptr if fp8 or bf16 else fl.x4l.ptr,
+                "xsl": fl.xsl.ptr,
                 "smsc": fl.smsc.ptr,
                 "contrib": fl.contrib.ptr, "cand": fl.cand.ptr,
                 "csig": fl.csig.ptr, "scan": fl.scan.ptr,
@@ -579,7 +588,11 @@ def build(key: P1Build):
                     "first": fl.first.ptr, "order": fl.order.ptr,
                 },
             }  # fmt: skip
-            c |= {r: sreg(scratch, slay[r][0], r) for r in FFN_REGIONS if r != "rlog"}
+            c |= {
+                r: sreg(scratch, slay[r][0], r)
+                for r in FFN_REGIONS
+                if r != "rlog" and r in slay
+            }
             # this CTA's x / x8 / x4 columns are out
             if bid < NT:
                 publish(mb.put, c["xrdy"], bid, fx.Int32(1), tid == 0)

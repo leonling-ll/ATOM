@@ -25,7 +25,12 @@ Plain Python: no aiter or FlyDSL import (the runner is created through
 
 import logging
 
-from atom.models.minimax_m3.pro_mono.config import gate_rows, latch_rows, rows_refusal
+from atom.models.minimax_m3.pro_mono.config import (
+    ROUTED_ACT_NAMES,
+    gate_rows,
+    latch_rows,
+    rows_refusal,
+)
 from atom.mono.runtime.route import LazyRunner
 from atom.utils import envs
 from atom.utils.forward_context import get_forward_context
@@ -75,7 +80,7 @@ class ProMonoRoute:
         self._mono = LazyRunner(create, WHAT)
         self.rows = 0
         # the routed experts' activations the runner builds with (latched)
-        self.routed_act = "fp8"
+        self.routed_act = "bf16"
         self.check = False
         self._latched = False
         if refusal is not None:
@@ -108,7 +113,7 @@ class ProMonoRoute:
             "%s: forwards of 1 .. %d rows, routed experts %s%s",
             WHAT,
             self.rows,
-            "W4A8" if act == "fp8" else "W4A4",
+            ROUTED_ACT_NAMES[act],
             ", checked against production" if self.check else "",
         )
 

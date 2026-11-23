@@ -5,18 +5,24 @@ stages' widths, regions and contract, and the torch reference the 8-GPU test
 (``test_minimax_m3_pro_mono_ffn_gpu``) holds the kernel to -- its MXFP4 rule,
 its router, and that the GPU test's bounds pass summation-order noise and
 catch every injected bug (on a narrow case: hidden 1024, intermediate 96 of
-128, 16 experts), for both routed formats (W4A4 and W4A8).
+128, 16 experts), for every routed format (A16W4, the default, W4A4 and
+W4A8); that the A16W4 reference is aiter's a16w4 math up to rounding order;
+and the A16W4 operand maps (a K half of x in LDS, the bf16 mids, the K-half
+tasks on their CTAs).
 
 At Pro's widths (hidden 7168, 640 of 768, 24 experts, the same generator and
 seeds; CPU, about 15 s) the noise model below gives at most 0.016 per row at
 2^-12 and 0.021 at 2^-9, and the weakest mutation 0.066 (an x8 scale code
-+1), against ``FFN_BOUND`` 0.031."""
++1), against ``FFN_BOUND`` 0.031 (W4A8); A16W4 at most 0.017 at 2^-12, 0.019
+at 2^-9, the weakest mutation 0.068 (an x8 scale code + 1), and its reference
+0.003 from the a16w4 emulation where W4A8's is 0.065 .. 0.070."""
 
 import itertools
 
 import pytest
 import torch
 from minimax_m3_pro_mono_ref import (
+    E2M1,
     FFN_BOUND,
     ROUTE_SCALE,
     ROUTED_ACTS,
@@ -69,8 +75,10 @@ def test_ffn_geometry():
     )  # fmt: skip
     # the pad is whole MXFP4 blocks: skipping it skips whole zero blocks
     assert L.INTER_V % 32 == 0 and L.INTER_R % 32 == 0
-    # a ug task: 4 row groups x 2 K halves, one a wave
+    # a ug task: 4 row groups x 2 K halves, one a wave (A16W4: a task a K
+    # half, its waves 4 row groups x 2 K quarters)
     assert 4 * 2 == WAVES and 2 * L.W13_HALF * 128 == HIDDEN
+    assert 2 * L.W13_Q == L.W13_HALF and L.W13_Q * 128 * 4 == HIDDEN
     # the shared gate_up's K split over the waves, the down's over 5 of them
     assert L.SH_CPW * WAVES * 128 == HIDDEN and L.SD_STEPS <= WAVES
     # thread maps of the epilogues fit a CTA at the widest build
@@ -116,14 +124,33 @@ def test_ffn_regions_are_disjoint_and_sized(debug, act):
     assert (L.smid_pair(t, L.INTER_S - 2) + 1) * 8 == s["smid"][1]
     assert s["ugf"][1] == L.max_u(MAX_ROWS_LAYOUT) * L.UG_GROUPS * 8
     assert s["xrdy"][1] == L.NT * 8
+    # A16W4's K-half partials: two pairs a (pick row, mid column), last, so
+    # every other region sits where the other formats' do
+    if act == "bf16":
+        assert (L.ugp_pair(MAX_ROWS_LAYOUT * L.TOPK - 1, L.UG_GROUPS - 1, 31) + 2) * (
+            8
+        ) == s["ugp"][1]
+        assert max(o for o, _ in s.values()) == s["ugp"][0]
+    else:
+        assert "ugp" not in s
+    other = L.scratch_layout(
+        L.P1Build(tokens=MAX_ROWS, upto="ffn", debug=debug, routed_act="fp4")
+    )
+    assert {k: v for k, v in s.items() if k != "ugp"} == other
     p = L.plain_layout(key)
     if act == "fp4":
         assert p["x4"][1] == MAX_ROWS_LAYOUT * HIDDEN // 2
         assert p["inter"][1] == MAX_ROWS_LAYOUT * L.TOPK * L.INTER_V // 2
     else:
-        # W4A8 reads the norm's x8: no MXFP4 copy of x; a mid is a byte a value
+        # W4A8 reads the norm's x8, A16W4 the bf16 x: no MXFP4 copy of x
         assert "x4" not in p and "x4s" not in p
+    if act == "fp8":
+        # a mid is a byte a value
         assert p["inter"][1] == MAX_ROWS_LAYOUT * L.TOPK * L.INTER_V
+    if act == "bf16":
+        # a bf16 mid: two bytes a value, no codes
+        assert p["inter"][1] == MAX_ROWS_LAYOUT * L.TOPK * L.INTER_V * 2
+        assert "isc" not in p
     peer = L.peer_layout()
     assert (L.rlog_pair(L.TP - 1, t, L.E_RANK - 1) + 1) * 8 == peer["rlog"][1]
     # a norm build has none of them
@@ -136,22 +163,26 @@ def test_ffn_build_key_and_contract_table():
     assert key.upto == "ffn"
     with pytest.raises(ValueError):
         L.P1Build(tokens=1, upto="moe")
-    # W4A8 by default; the format names the kernel symbol (``sym`` "ra")
-    assert key.routed_act == L.ROUTED_ACT_DEFAULT == "fp8"
-    assert set(L.ROUTED_ACTS) == {"fp4", "fp8"}
+    # A16W4 by default; the format names the kernel symbol (``sym`` "ra")
+    assert key.routed_act == L.ROUTED_ACT_DEFAULT == "bf16"
+    assert set(L.ROUTED_ACTS) == {"fp4", "fp8", "bf16"}
     with pytest.raises(ValueError):
-        L.P1Build(tokens=1, upto="ffn", routed_act="bf16")
+        L.P1Build(tokens=1, upto="ffn", routed_act="fp16")
     from atom.mono.plan.build_key import symbol_params
 
-    assert symbol_params(key)["ra"] == "fp8"
-    assert symbol_params(L.P1Build(tokens=1, upto="ffn", routed_act="fp4"))["ra"] == (
-        "fp4"
-    )
+    assert symbol_params(key)["ra"] == "bf16"
+    for act in ("fp4", "fp8"):
+        k = L.P1Build(tokens=1, upto="ffn", routed_act=act)
+        assert symbol_params(k)["ra"] == act
+        # no K-half hand-off outside A16W4
+        assert {d.name for d in L.decls(k)} == set(L.REGIONS) - {"ugp"}
     got = {d.name: (d.space, d.writers, d.exchange) for d in L.decls(key)}
     assert set(got) == set(L.REGIONS)
     assert got["rlog"] == (Space.PEER, ("router",), False)
     assert got["rpart"] == (Space.SCRATCH, ("router",), True)
     assert got["ugf"][:2] == (Space.SCRATCH, ("ug",))
+    # a half-0 ug task polls its half-1 task's partials, ug to ug
+    assert got["ugp"] == (Space.SCRATCH, ("ug",), True)
     assert [d.name for d in L.decls(L.P1Build(tokens=1))] == list(L.NORM_REGIONS)
 
 
@@ -169,17 +200,25 @@ def test_moe_weights_table_names_the_binders_fields():
 def test_ffn_lds_fits_at_the_widest_build(act):
     """The FFN build's LDS (``layer.build``'s structs, counted here) under the
     CU's: the contract run checks the binary's. W4A8 stages the x8 rows in
-    ``xs`` (grown to ``X8_ROW`` words a token), not beside it."""
+    ``xs`` (grown to ``X8_ROW`` words a token), not beside it; A16W4 a K half
+    of the bf16 x there (``XH_ROW``: a whole row, 14 KB, would not fit 16)."""
     s = MAX_ROWS
-    xs_row = max(L.O_ROW, L.X8_ROW) if act == "fp8" else L.O_ROW
-    x4l = 4 if act == "fp8" else s * L.X4_ROW
+    xs_row = {"fp4": L.O_ROW, "fp8": max(L.O_ROW, L.X8_ROW)}.get(
+        act, max(L.O_ROW, L.XH_ROW)
+    )
+    x4l = s * L.X4_ROW if act == "fp4" else 4
+    xsl = 4 if act == "bf16" else s * L.XSC_WORDS
     words = (
         s * xs_row + s * L.OSC_ROW + WAVES * 64 * 4 + L.O_ROWS * s + 2 * 11
-        + x4l + s * L.XSC_WORDS + s * L.SMSC_WORDS
+        + x4l + xsl + s * L.SMSC_WORDS
         + s * L.TOPK * L.DOWN_ROWS + s * 2 * L.TOPK + 2 * EXPERTS
         + 2 * L.max_u(s) + 1 + s * L.TOPK + 3 * (128 + 16) + WAVES
     )  # fmt: skip
     assert 4 * words <= LDS_BYTES
+    if act == "bf16":
+        # whole bf16 x rows would not fit: the reason for the K-half tasks
+        whole = words + s * (2 * L.XH_WORDS + 4 - xs_row)
+        assert 4 * whole > LDS_BYTES
 
 
 def test_x8_rows_and_mids_hold_whole_mfma_steps():
@@ -193,6 +232,53 @@ def test_x8_rows_and_mids_hold_whole_mfma_steps():
     assert L.UG_COLS // 4 == 8 and L.UG_GROUPS * 8 == L.INTER8_WORDS
     last = (L.W2_STEPS - 1) * 32 + 3 * 4 + 16 + 4
     assert last <= L.INTER8_WORDS
+
+
+def test_a16w4_operands_follow_the_w13_and_w2_tiles():
+    """A16W4's bf16 B operands: operand j of a 128-k step on lane group kb is
+    k 128 st + 32 kb + 8 j .. + 8, the k of ``fp4_bf16_tile``'s operand j of
+    the lane's weight tile (``fp4_tile_dword``: k 128 st + 32 kb .. + 32) --
+    for x, the K half ``load_xh`` stages (``xh_word``), and for the mids, the
+    words an ug task stores and the down reads (``interb_word``)."""
+    for h, q, i, kb, j in itertools.product(
+        range(L.UG_HALVES), range(2), range(L.W13_Q), range(4), range(4)
+    ):
+        st = h * L.W13_HALF + q * L.W13_Q + i
+        w = L.xh_word(0, q * L.W13_Q + i, kb, j)
+        # load_xh: x word h XH_WORDS + w of a token -> LDS word w of its row
+        assert 2 * (h * L.XH_WORDS + w) == 128 * st + 32 * kb + 8 * j
+        assert w + 4 <= L.XH_WORDS
+    assert L.xh_word(1, 0, 0, 0) == L.XH_ROW and L.UG_HALVES * L.XH_WORDS * 2 == HIDDEN
+    for st, kb, j in itertools.product(range(L.W2_STEPS), range(4), range(4)):
+        w = L.interb_word(0, 4 * st + kb, 8 * j)
+        assert 2 * w == 128 * st + 32 * kb + 8 * j and w + 4 <= L.INTERB_WORDS
+    # an ug task's even column stores the word of its column and the next
+    for g, col in itertools.product(range(L.UG_GROUPS), range(0, L.UG_COLS, 2)):
+        assert 2 * L.interb_word(0, g, col) == L.UG_COLS * g + col
+    assert L.interb_word(1, 0, 0) == L.INTERB_WORDS == L.INTER_V // 2
+
+
+@pytest.mark.parametrize("nu", [1, 4, 13, 64])
+def test_a16w4_tasks_split_k_halves_over_ctas(nu):
+    """Task 2 p + h of A16W4 is ug pair p's K half h: every task is one CTA's,
+    a CTA's tasks (``BLOCKS`` apart) are all of one half, so a pair's two
+    halves are on two CTAs -- and the half-0 task's wait for the half-1 task's
+    partials never waits on a later task of its own CTA."""
+    total = nu * L.UG_GROUPS * L.ug_split("bf16")
+    owner = {}
+    for bid in range(BLOCKS):
+        task = L.first_ug(bid)
+        halves = set()
+        while task < total:
+            assert task not in owner
+            owner[task] = bid
+            halves.add(task % 2)
+            task += BLOCKS
+        assert len(halves) <= 1 and halves <= {L.first_ug(bid) & 1}
+    assert sorted(owner) == list(range(total))
+    for p in range(nu * L.UG_GROUPS):
+        assert owner[2 * p] != owner[2 * p + 1]
+    assert L.ug_split("fp8") == L.ug_split("fp4") == 1
 
 
 # ------------------------------------------------------------ the reference
@@ -219,6 +305,16 @@ def test_mxfp4_rule():
         b = torch.zeros(1, 32)
         b[0, 7] = 6.0 * 2.0**k
         assert int(mxfp4(b)[1][0, 0]) == 127 + k
+
+
+def test_mxfp4_dequantizes_to_bf16_exactly():
+    """An e2m1 value times an E8M0 scale is a bf16 (codes 1 .. 250): the
+    kernel's in-register dequant (``v_cvt_scalef32_pk_bf16_fp4``, as aiter's
+    a16w4 kernels) loses nothing, so its bf16 MFMA multiplies the weight."""
+    e2m1 = E2M1.repeat(250)
+    scale = torch.exp2(torch.arange(1, 251).repeat_interleave(16).float() - 127)
+    w = e2m1 * scale
+    assert torch.equal(w.to(torch.bfloat16).float(), w)
 
 
 def test_swiglu_oai():
@@ -286,7 +382,8 @@ def test_mxfp8_mid_rule():
 @pytest.mark.parametrize("act", ROUTED_ACTS)
 def test_the_routed_formats_differ_and_w4a8_reads_x8(act):
     """W4A8's routed input is the x8 the shared expert reads (an x8 scale code
-    moves the routed output, x itself does not); W4A4's is MXFP4(x)."""
+    moves the routed output, x itself does not); W4A4's is MXFP4(x), A16W4's
+    the bf16 x itself."""
     c = ffn_case(3, **NARROW, seed=7)
     w_sgu, w_sd = c["shared"]
     routed_only = dict(c, shared=(w_sgu * 0, w_sd * 0))
@@ -305,7 +402,9 @@ def test_the_routed_formats_differ_and_w4a8_reads_x8(act):
 @pytest.mark.parametrize("s", [1, 3, 16])
 def test_the_gpu_tests_ffn_bound_passes_sum_order_noise(s, act):
     """gate / up off by 2^-12 relative, at random (f32 sum order is ~2^-20):
-    the bound holds. Off by 2^-20 nothing moves at all."""
+    the bound holds. Off by 2^-20 nothing moves at all past the MX mids; the
+    bf16 mid of A16W4 has no coarse grid to hide it, so a mid can move a bf16
+    step there, far under the bound."""
     c = ffn_case(s, **NARROW, seed=11 + s)
     want = case_ffn(c, act=act)
     g = torch.Generator().manual_seed(s)
@@ -320,7 +419,11 @@ def test_the_gpu_tests_ffn_bound_passes_sum_order_noise(s, act):
 
         return f
 
-    assert torch.equal(case_ffn(c, swiglu=noisy(2.0**-20), act=act), want)
+    quiet = case_ffn(c, swiglu=noisy(2.0**-20), act=act)
+    if act == "bf16":
+        assert row_relnorm(quiet, want) <= FFN_BOUND / 16
+    else:
+        assert torch.equal(quiet, want)
     assert not ffn_failures(case_ffn(c, swiglu=noisy(2.0**-12), act=act), want)
 
 
@@ -340,6 +443,51 @@ def test_the_gpu_tests_ffn_bound_catches_injected_bugs(s, act):
     assert not missed, missed
     # and each by a margin
     assert min(row_relnorm(v, want) for v in muts.values()) > 2 * FFN_BOUND
+
+
+def a16w4_emulation(c):
+    """The routed output as aiter's a16w4 kernels compute it (gemm1_a16w4 at
+    k_wave 4, gemm2_a16w4's atomic epilog): fp32 gate / up as four K quarters
+    summed ((q0 + q1) + q2) + q3, bf16(SwiGLU), the fp32 down, bf16(w acc) a
+    pick added to a bf16 output (bf16 atomics; top-k order here)."""
+    x = c["x"].float()
+    h = x.shape[1]
+    out = []
+    for t in range(x.shape[0]):
+        y = torch.zeros(h, dtype=torch.bfloat16)
+        for k in range(TOPK):
+            w13, w2 = c["routed"](int(c["picks"][t, k]))
+            qs = [
+                w13[:, q * h // 4 : (q + 1) * h // 4].float()
+                @ x[t, q * h // 4 : (q + 1) * h // 4]
+                for q in range(4)
+            ]
+            gu = ((qs[0] + qs[1]) + qs[2]) + qs[3]
+            i = gu.shape[0] // 2
+            mid = swiglu_oai(gu[:i], gu[i:]).to(torch.bfloat16).float()
+            acc = w2.float() @ mid
+            pick = (acc * c["weights"][t, k].float()).to(torch.bfloat16)
+            y = (y.float() + pick.float()).to(torch.bfloat16)
+        out.append(y)
+    return torch.stack(out)
+
+
+@pytest.mark.parametrize("s", [1, 4, 16])
+def test_the_a16w4_reference_is_aiters_a16w4_math(s):
+    """``ffn_reference(act="bf16")``'s routed output is aiter's a16w4 kernels'
+    up to rounding order (its bf16 picks summed in fp32, theirs by bf16
+    atomics): 0.003 per row here, under a quarter of ``FFN_BOUND``, where the
+    W4A8 / W4A4 references, which quantize the activations, are 0.06 / 0.27
+    away."""
+    c = ffn_case(s, **NARROW, seed=31 + s)
+    w_sgu, w_sd = c["shared"]
+    routed_only = dict(c, shared=(w_sgu * 0, w_sd * 0))
+    want = a16w4_emulation(c)
+    near = row_relnorm(case_ffn(routed_only, act="bf16"), want)
+    assert near <= FFN_BOUND / 4, near
+    for act in ("fp8", "fp4"):
+        far = row_relnorm(case_ffn(routed_only, act=act), want)
+        assert far > 8 * near, (act, far, near)
 
 
 def test_neither_the_routed_nor_the_shared_output_drowns():

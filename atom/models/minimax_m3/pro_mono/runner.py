@@ -9,7 +9,7 @@ A mono layer's segment (``segment``), Option A::
     core (attention output, before o_proj) + residual
       -> layer kernel: o_proj, AR #1, + residual, Gemma norm (+ MXFP8), the
          lookahead norm of layer L + 2 (MXFP8), then (upto = "ffn") the router,
-         the routed experts (W4A8 or W4A4: ``routed_act``) and the shared
+         the routed experts (A16W4, W4A8 or W4A4: ``routed_act``) and the shared
          expert (MXFP8) -> this rank's FFN partial (``ffn_out``)
       -> (FFN partial, residual_mid): what production's segment returns, so
          the next layer's AR #2 + input norm runs unchanged (Option A)
@@ -22,7 +22,8 @@ The lookahead goes where ``ProLookaheadState.put`` would put it
 build hands its (x, x8) to production's MoE instead. Switching is this one
 constant. An "ffn" build reads each layer's FFN weights through ``moe_w``, a
 device table of their addresses (``layout.MOE_WEIGHTS`` order) made once at
-bind time, and stages the routed mids (and, W4A4, x as MXFP4) in ``plain``.
+bind time, and stages the routed mids (and, W4A4, x as MXFP4) in ``plain``
+(and, A16W4, the K halves' gate / up partials in ``scratch``).
 
 Steps: ``begin_step`` (the mailboxes zeroed, the peer fence) once a forward, at
 its first MoE layer, on the current stream, so a decode graph records it.
@@ -127,7 +128,7 @@ class ProMonoRunner:
     builds. Construction is collective over the TP group (bind, agree, then
     the peer handshake)."""
 
-    def __init__(self, layers, state, check: bool, routed_act: str = "fp8") -> None:
+    def __init__(self, layers, state, check: bool, routed_act: str = "bf16") -> None:
         group = get_tp_group().cpu_group
         self.check = check
         # the routed experts' activations (``layout.ROUTED_ACTS``), TP-uniform

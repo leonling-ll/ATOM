@@ -207,11 +207,12 @@ class ProVariants:
     # exposure and official GSM8K 3-run means, AIME26 avg@16 >= 0.95 twice,
     # retrieval 40/40; speed: a faster measured layer and >= 10% proxy TPOT at c1/c4).
     mono_ffn_rows: int = 0
-    # The mono FFN's routed experts' activations: "fp8" (W4A8: the norm's MXFP8 x and
-    # MXFP8 mids against the MXFP4 experts, gfx950's f8f6f4 MFMA) or "fp4" (W4A4, aiter
-    # a4w4 numerics). Production's routed experts run a16w4 at these widths, so either
-    # is a numerics change. Latched with ``mono_ffn_rows`` and agreed over the TP group.
-    mono_routed_act: str = "fp8"
+    # The mono FFN's routed experts' activations: "bf16" (A16W4: bf16 x and mids against
+    # the MXFP4 experts dequantized in the kernel, production's a16w4 numerics at these
+    # widths), "fp8" (W4A8: the norm's MXFP8 x and MXFP8 mids, gfx950's f8f6f4 MFMA) or
+    # "fp4" (W4A4, aiter a4w4 numerics); the last two quantize the activations, a
+    # numerics change. Latched with ``mono_ffn_rows`` and agreed over the TP group.
+    mono_routed_act: str = "bf16"
 
 
 # Below it the all-gather costs more than the scoring it saves (moo's threshold).

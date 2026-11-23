@@ -29,7 +29,7 @@ def _variants(**over):
         "lookahead": True,
         "lookahead_src": "resid_in",
         "ar_lamport_rows": 16,
-        "mono_routed_act": "fp8",
+        "mono_routed_act": "bf16",
     }
     fields.update(over)
     return SimpleNamespace(**fields)
@@ -216,18 +216,32 @@ def test_ranks_that_disagree_turn_it_off_on_every_rank(monkeypatch):
     assert h.created == 0
 
 
-@pytest.mark.parametrize("act", ["fp4", "fp8"])
+@pytest.mark.parametrize("act", ["bf16", "fp4", "fp8"])
 def test_the_routed_format_is_latched_with_the_rows(monkeypatch, act):
-    """The runner builds with the latched ``mono_routed_act`` (W4A8 by
+    """The runner builds with the latched ``mono_routed_act`` (A16W4 by
     default); a later edit is not seen, as for the rows."""
     h = Harness(monkeypatch, mono_routed_act=act)
     assert h.take(1) is h.runner and h.route.routed_act == act
-    h.v.mono_routed_act = "fp4" if act == "fp8" else "fp8"
+    h.v.mono_routed_act = "fp4" if act != "fp4" else "fp8"
     assert h.take(1) is h.runner and h.route.routed_act == act
 
 
+@pytest.mark.parametrize(
+    "act, name", [("bf16", "A16W4"), ("fp8", "W4A8"), ("fp4", "W4A4")]
+)
+def test_the_latch_line_names_the_routed_format(monkeypatch, caplog, act, name):
+    """The latch line names the format (a run's log says which build served:
+    the queue scripts grep it)."""
+    import logging
+
+    h = Harness(monkeypatch, mono_routed_act=act)
+    with caplog.at_level(logging.INFO, logger=route_mod.logger.name):
+        assert h.take(1) is h.runner
+    assert f"routed experts {name}" in caplog.text
+
+
 def test_an_unknown_routed_format_latches_off(monkeypatch):
-    h = Harness(monkeypatch, mono_routed_act="bf16")
+    h = Harness(monkeypatch, mono_routed_act="fp16")
     assert h.take(1) is None
     assert h.created == 0 and h.route.rows == 0
 

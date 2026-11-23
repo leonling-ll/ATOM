@@ -3,10 +3,11 @@
 """The phase-1 layer kernel's ``upto = "ffn"`` build on 8 GPUs: the norm
 stages against the torch reference as ``test_minimax_m3_pro_mono_layer_gpu``
 holds them, then the router and every rank's FFN partial against
-``ffn_reference`` (routed experts in the W4A8 recipe -- the norm's MXFP8 x8
-and MXFP8 mids, the default build -- at every width, and in the W4A4 one,
-aiter a4w4 numerics, at 1 and 16 rows; production runs a16w4 -- and the MXFP8
-shared expert) run on the kernel's own x, x8, picks and weights.
+``ffn_reference`` (routed experts in the A16W4 recipe -- production's a16w4
+numerics: the bf16 x and bf16 mids, the MXFP4 weights dequantized in the
+kernel, the default build -- at every width, and in the W4A8 one (MXFP8 x8
+and mids) and the W4A4 one (aiter a4w4 numerics) at 1 and 16 rows; and the
+MXFP8 shared expert) run on the kernel's own x, x8, picks and weights.
 
 Every rank holds its own random routed planes (384 experts, MXFP4, the
 intermediate 640 zero padded to 768, shuffled as the loader leaves them) and
@@ -73,19 +74,22 @@ from test_minimax_m3_pro_mono_layer_gpu import (
 
 EXPERTS = 384
 INTER_V, INTER_R, INTER_S = 640, 768, 640
-# (rows, lookahead, routed_act). W4A8: one row, the decode widths 2 / 4, a
-# partial wave, an 8-row verify, two passes, the widest; W4A4 (the v1 build,
-# 26/26 on GPU at c467bcf9) at one row and the widest, so both stay covered
+# (rows, lookahead, routed_act). A16W4: one row, the decode widths 2 / 4, a
+# partial wave, an 8-row verify, two passes, the widest (+ the widest without
+# the lookahead); W4A8 (32/32 on GPU at 05a6fc80) and W4A4 (26/26 at
+# c467bcf9) at one row and the widest, so every format stays covered
 CASES = (
-    (1, True, "fp8"), (2, True, "fp8"), (3, True, "fp8"), (4, True, "fp8"),
-    (8, True, "fp8"), (9, True, "fp8"), (16, True, "fp8"), (16, False, "fp8"),
-    (1, True, "fp4"), (16, True, "fp4"),
+    (1, True, "bf16"), (2, True, "bf16"), (3, True, "bf16"), (4, True, "bf16"),
+    (8, True, "bf16"), (9, True, "bf16"), (16, True, "bf16"),
+    (16, False, "bf16"),
+    (1, True, "fp8"), (16, True, "fp8"), (1, True, "fp4"), (16, True, "fp4"),
 )  # fmt: skip
 
 
 def _inputs(case):
     s = CASES[case][0]
-    # a W4A4 case takes its W4A8 twin's inputs (the same rows at that width)
+    # a W4A8 / W4A4 case takes its A16W4 twin's inputs (the same rows at that
+    # width)
     twin = next(i for i, c in enumerate(CASES) if c[:2] == CASES[case][:2])
     return case_inputs(s, [_weight(r) for r in range(TP)], 3000 * (twin + 1))
 
@@ -173,9 +177,10 @@ def _worker(rank, port, queue, done, inputs):
         ]
         launches = compile_kernels([(build(k), ABI) for k in keys])
         peers = PeerBuffer(L.peer_bytes(), group, rank, TP, dev)
-        scratch = uncached_bytes(L.scratch_bytes(keys[0]), dev)
-        # the widest plain layout of the two formats' (W4A8's mids are larger,
-        # W4A4 adds x4)
+        # the widest scratch and plain layouts of the formats' (A16W4 adds the
+        # K-half partials ``ugp`` past the regions every format places alike;
+        # its bf16 mids are the largest, W4A4 adds x4)
+        scratch = uncached_bytes(max(L.scratch_bytes(k) for k in keys), dev)
         plain = uncached_bytes(max(L.plain_bytes(k) for k in keys), dev)
         mbx = StepMailboxes(peers, scratch, debug=True)
         diag = scratch[: L.scratch_layout(keys[0])["diag"][1]]

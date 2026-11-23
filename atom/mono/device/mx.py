@@ -12,7 +12,7 @@ from aiter.ops.flydsl.kernels import buffer_ops as bo
 from flydsl.expr import rocdl
 from flydsl.expr.typing import T, as_ir_value
 
-from atom.mono.device.ops import CM_NT
+from atom.mono.device.ops import CM_NT, mxfp4_to_bf16x8
 
 FP8_MAX = 448.0
 # the f8f6f4 MFMA's operand formats (cbsz / blgp)
@@ -112,3 +112,14 @@ def fp4_pack2(old, a, b, scale, sel):
             sel,
         )
     )
+
+
+def fp4_bf16_tile(tile, code):
+    """A lane's ``fp4_tile_load`` (16 B: its K block of 32 e2m1, one E8M0
+    ``code``) as 4 bf16 MFMA operands (``ops.mxfp4_to_bf16x8``: exact, an
+    e2m1 value times a power of two is a bf16): operand j is k 8 j .. + 8 of
+    the block, so bf16 MFMA j of a 128-k step takes k 32 g + 8 j .. + 8 on
+    lane group g (the operand order of aiter's a16w4 kernels and of
+    ``gemv16``; the B operand must follow it)."""
+    scale = pow2(code)
+    return [mxfp4_to_bf16x8(tile[j], scale) for j in range(4)]
