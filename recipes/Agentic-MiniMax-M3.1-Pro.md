@@ -35,6 +35,7 @@ points of that. Every setting below is there to enlarge the cache or to keep it 
 | LMCache, 184 GiB a rank | Keeps evicted prefixes in host memory (~7.5M tokens for the server). |
 | `--text-only` | Builds and loads no vision tower, projector or patch merger (1.8 GiB of weights a GPU); image requests get a 400. AgentX is text only. |
 | `AITER_REUSE_IDENTICAL_COMM_GROUPS=1` | At TP8 aiter's `ep` group has the same ranks as `tp`; this makes it reuse `tp`'s custom all-reduce instead of building a second one (~2.5 GiB a GPU). |
+| `GPTOSS_SWIGLU_MXFP4_BF16_BOUND=1040` | Keeps the routed MoE's activations in bf16 (a16w4) for steps below 1040 rows. aiter's default of 256 switches DSpark verify steps (sequences × 8 rows) to MXFP4 activations, which costs about 0.01 GSM8K (see Accuracy). Prefill chunks stay a4w4. |
 
 ## Measured (CONC 64 proxy)
 
@@ -51,6 +52,13 @@ server's over the whole run, warmup included; with LMCache it counts GPU and CPU
 | + cache-aware admission | 67.4 GiB | 2.50M | 73.1% | 4.56 | 6862 | 638 |
 | + LMCache 184 GiB a rank | 67.4 GiB | 2.50M + CPU | 77.4% | **30.57** | **10915** | 995 |
 | pad_align 128 row + `--text-only` + comm-group reuse (no admission, no LMCache) | 74.8 GiB | 2.77M | 43.3% | 11.44 | 8585 | 778 |
+| All of the above together, **3600 s** | 74.8 GiB | 2.77M + CPU | 78.1% | **28.88** | **11047** | 5505 |
+| All of the above + `GPTOSS_SWIGLU_MXFP4_BF16_BOUND=1040`, 600 s | 74.8 GiB | 2.83M + CPU | 79.4% | 27.84 | 10910 | 983 |
+
+The 3600 s run held a 77-81% hit ratio and almost no waiting requests in every 10-minute slice,
+with 50.8M tokens loaded back from LMCache and no failed load; one request failed on a client-side
+disconnect. The bound-1040 row is within run-to-run noise of the others (the same configuration
+gave 30.57 / 10915 in one 600 s run and 28.88 / 11047 over 3600 s).
 
 No request failed in any row. In the LMCache row LMCache loaded 10.3M tokens back with no failed
 load, and nothing was preempted. The last row branches off the pad_align 128 row; the launch
@@ -67,7 +75,7 @@ tokens loaded from the CPU tier and the re-ask's TTFT down from 2.85 s to 0.20 s
 |---|---|
 | Hardware | 8×MI355X (`gfx950`) |
 | ATOM | `yuhua/m3.1-pro` (this recipe's commit) |
-| aiter | `yuhua/m3.1-pro` with the inter-640 MoE rows (`[Config] [Tuning] [gfx950] MiniMax-M3.1-Pro MXFP4 MoE rows at inter 640`) |
+| aiter | `yuhua/m3.1-pro` with the inter-640 MoE rows (`[Config] [Tuning] [gfx950] MiniMax-M3.1-Pro MXFP4 MoE rows at inter 640`) and the a16w4 rows at 256/512/1024 tokens |
 | Parallelism | TP8, DCP=1 |
 | KV cache | FP8, K only, `--block-size 16`; index cache FP8 |
 | Prefix cache | on |
@@ -92,6 +100,7 @@ export ATOM_WARMUP_TOKENS=auto
 export ATOM_ONLINE_QUANT_STREAMING=1
 export ATOM_CACHE_AWARE_ADMISSION=1
 export AITER_REUSE_IDENTICAL_COMM_GROUPS=1
+export GPTOSS_SWIGLU_MXFP4_BF16_BOUND=1040     # bf16 MoE activations up to 128 seqs x 8 verify rows
 
 # LMCache CPU offload
 export ATOM_KV_OFFLOAD=lmcache
@@ -132,10 +141,19 @@ Check the startup log:
 
 ### Host memory for LMCache
 
-184 GiB a rank pins about 1.5 TB of host memory. On a node where the NUMA node behind GPUs 0-3
-is short of free memory (page cache from the checkpoint counts), ranks 0-3 can stall in LMCache's
-CPU backend setup and the server never becomes ready. Drop the checkpoint from the page cache
-before starting, or lower `LMCACHE_MAX_LOCAL_CPU_SIZE`.
+Each rank pins its whole LMCache pool (184 GiB, about 198 GB) from the NUMA node it runs on, so
+each node has to supply four ranks' pools, about 790 GB, after the model has loaded. When a node
+is short (page cache from the checkpoint and memory a previous server is still releasing both
+count), the pinning slows down without bound: those ranks stop after `NUMA mapping None`, never
+log `Created backend: LocalCPUBackend`, and the server never becomes ready, with no error. This
+has been seen on two nodes, including a second start right after a successful one. Until the
+launcher handles it:
+
+- make sure the previous server's processes are gone and each NUMA node has more free memory
+  than 4 × `LMCACHE_MAX_LOCAL_CPU_SIZE` (`numactl -H`) before starting;
+- drop the checkpoint from the page cache before starting;
+- lower `LMCACHE_MAX_LOCAL_CPU_SIZE` on hosts with less memory per node;
+- if a start isn't ready within about 15 minutes, stop it and start again.
 
 ### Synthetic acceptance
 
@@ -211,6 +229,28 @@ lm_eval --model local-completions \
 The gate is 0.94; one run has a standard error of about 0.0066, so a single run at 0.933 or above
 is within noise.
 
+### Why `GPTOSS_SWIGLU_MXFP4_BF16_BOUND=1040`
+
+aiter runs the routed MoE with bf16 activations below 256 rows and MXFP4 activations from 256
+rows up. A DSpark verify step is (sequences × 8) rows, so at 32 concurrent requests every verify
+step crosses 256, while plain decode never does. GSM8K, one run each, DSpark k7 at real
+acceptance unless noted:
+
+| Configuration | GSM8K |
+|---|---|
+| DSpark off (4 runs) | 0.936-0.942 |
+| DSpark on, default bound 256 (5 runs) | 0.926-0.937, mean ~0.930 |
+| DSpark off, 256 concurrent, so plain decode reaches 256 rows | 0.9287 |
+| DSpark on, bound 520 (verify in bf16, prefill a4w4) | 0.9462 |
+| DSpark on, bound 1000000 (prefill in bf16 too) | 0.9484 |
+| DSpark on, bound 1040 with the 256/512/1024-row a16w4 rows | 0.9393 |
+
+The drop follows the MoE activation format, not DSpark: verify-row block selection, the
+acceptance rule and attention precision (fp8 or bf16, aiter or Triton) were each ruled out.
+Prefill stays a4w4: bf16 prefill gains nothing measurable and runs the MoE 2.6-3.8× slower.
+The bound only changes activation precision and leaves the weights as shipped. At CONC 64 most
+verify steps are 129-256 rows, where tuned a16w4 is within 3-5% of a4w4 per MoE layer.
+
 ## InferenceX rules this configuration keeps
 
 - Online quantization touches only the routed experts (`*.experts`, NVFP4 to MXFP4). Attention,
@@ -223,8 +263,7 @@ is within noise.
 ## Not covered yet
 
 - Other concurrencies: only CONC 64 has been measured with these settings.
-- A 3600 s run; the table above is 600 s.
-- GSM8K and a greedy identity check with `--text-only` (running); the GSM8K above ran without it
-  and without offload.
+- A 3600 s run with `GPTOSS_SWIGLU_MXFP4_BF16_BOUND=1040`; the 3600 s row above is without it.
+- The intermittent LMCache start hang (see Host memory for LMCache) is not fixed in the launcher.
 - DCP=8, which shards the target's K and index K over the eight GPUs (about 4.9× the cached
   tokens with the DSpark draft unsharded), is being brought up and is not part of this recipe.
