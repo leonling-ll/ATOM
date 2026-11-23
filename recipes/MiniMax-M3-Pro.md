@@ -243,6 +243,70 @@ later chunk of a chunked prefill. Checked on the kernel path with fp8 caches, wi
   scores within run-to-run noise of the same prompts without prefix caching (40 questions turn
   wrong, 51 turn right). Stock GSM8K, whose few-shot examples differ per question, hits almost nothing.
 
+## CPU KV offload
+
+Prefix blocks evicted from HBM can be kept in host DRAM and loaded back instead of recomputed, through
+ATOM's in-process LMCache connector. Pro resolves to its `m3` PAGE layout
+(`atom/kv_transfer/offload/hybrid/m3/`), which saves every byte of a scheduler block: per layer the K
+rows, their fp8 scale plane and the index keys (and the V cache, unless the K-only cache, `"k_only": true`
+in `ATOM_M3PRO_VARIANTS`, leaves none),
+then the DSpark draft's own K / V pages. No Pro-specific code is involved; the layout comes from the
+attention builder's transfer regions.
+
+Add to the server's environment:
+
+```bash
+export PYTHONHASHSEED=0
+export LMCACHE_LOCAL_CPU=True
+export LMCACHE_MAX_LOCAL_CPU_SIZE=160          # GiB per TP rank
+export LMCACHE_CHUNK_SIZE=256
+export LMCACHE_LOOKUP_SERVER_WORKER_IDS=0,1,2,3,4,5,6,7
+export ATOM_PREFIX_CACHE_POLICY=slru
+export ATOM_PREFIX_CACHE_PROTECTED_RATIO=0.5
+export LMCACHE_CACHE_POLICY=ATOM_SLRU
+```
+
+and to its arguments `--kv-transfer-config '{"kv_connector":"lmcache_offload","kv_role":"offload"}'`.
+Prefix caching must stay on. `PYTHONHASHSEED=0` makes every rank key a prompt alike; without it the
+ranks never agree on a hit. The lookup ids name all eight ranks, so a hit counts only as far as every
+rank still holds it.
+
+Host memory, in GiB (`LMCACHE_MAX_LOCAL_CPU_SIZE` is GiB): each rank stores its own copy of the cache
+(Pro's one KV head is the same on every rank), so the pool is `LMCACHE_MAX_LOCAL_CPU_SIZE` times 8:
+1,280 GiB (1.37 TB) at 160 GiB. At 160 GiB a rank holds about 5.9M tokens (463,744 bytes per 16-token
+block, K-only cache, fp8 index cache, DSpark draft). Measured once on the server above, at startup with
+the pool allocated and before it filled (process RSS and `free -g`): each TP process held about 260 GiB,
+the pool and about 100 GiB of its own, and the node showed 2,171 of 2,751 GiB used, 583 GiB available.
+InferenceX allows CPU DRAM only, up to 3 TB per MI355X server.
+
+Measured on a 15-minute agentic proxy (`scripts/m31pro/proxy_bench.sh 32` on `hatwu/m3.1-pro-infx`: an
+aiperf replay of 64 `semianalysisai/cc-traces-weka-062126` sessions capped at 128k,
+DSpark k=7 at a forced acceptance length of 4.0) with
+`ATOM_M3PRO_VARIANTS='{"kernels": true, "attn": "aiter", "topk": "fused", "k_only": true}'`, both arms on
+one tree; the HBM pool is 18,600 blocks (about 298k tokens):
+
+| c32 | tok/s/GPU | p90 E2E-normalized interactivity | failed | requests | prompt tokens served from cache |
+|---|---:|---:|---:|---:|---:|
+| offload off | 1037.5 | 0.60 | 0/157 | 157 | 0.01 |
+| offload on | 3681.0 | 2.25 | 0/496 | 496 | 0.95 (0.12 HBM, 0.83 loaded from CPU) |
+
+Real request rows per decode forward (`atom:decode_batch_size`), share of forwards:
+
+| batch | 1 | 2 | 3-4 | 5-8 | 9+ | mean | forwards |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| offload off | 0 | 0 | 41.3% | 58.6% | 0 | 4.96 | 4,369 |
+| offload on | 0.4% | 1.3% | 46.7% | 51.6% | 0 | 4.56 | 21,426 |
+
+Offload does not raise the running batch: a running request still needs its whole context in HBM, and
+about five contexts of 60k tokens fill the pool. It removes the recompute of evicted prefixes, so the
+same batch runs five times as many decode forwards in the window.
+
+Accuracy with offload on (the server above at max-model-len 16384, the GSM8K section's lm-eval
+command): 0.9363 +- 0.0067 flexible-extract over all 1319 questions, against 0.9416 +- 0.0065 with
+offload off. Stock GSM8K shares no prefix, so nothing is loaded back there; restored KV was checked by
+running the first 450 questions twice on one server, the second pass with 4.60M of its 4.66M prompt
+tokens loaded from CPU: 0.9667 cold, 0.9689 restored, 257 of 450 responses identical.
+
 ## Speculative decoding (DSpark)
 
 `--method dspark --num-speculative-tokens 7` drafts with the checkpoint's own 5-layer DSpark model

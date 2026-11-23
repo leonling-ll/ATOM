@@ -430,3 +430,111 @@ def test_mla_builder_publishes_fp4_index_scale_plane_to_lmcache_mp(
         view[1].copy_(saved)
         physical = regions[i][1][1].view(torch.uint8).flatten()
         torch.testing.assert_close(physical, saved.flatten(), rtol=0, atol=0)
+
+
+@pytest.fixture(scope="module")
+def pro_k_only_layout():
+    # The shipped class without the module around it: pro_attn imports the
+    # GPU attention base, and this geometry is plain torch.
+    source = _REPO_ROOT / "atom/model_ops/minimax_m3/pro_attn.py"
+    module = ast.parse(source.read_text())
+    cls = next(
+        node
+        for node in module.body
+        if isinstance(node, ast.ClassDef) and node.name == "ProKOnlyLayout"
+    )
+    from dataclasses import dataclass
+
+    namespace = {"dataclass": dataclass, "torch": torch}
+    exec(  # noqa: S102 -- execute the local layout under the CPU fixture
+        compile(ast.Module(body=[cls], type_ignores=[]), str(source), "exec"),
+        namespace,
+    )
+    return namespace["ProKOnlyLayout"]
+
+
+# Pro's index cache per token: fp8 keys (128 B), or NVFP4 (64 B e2m1 + 8 B e4m3).
+@pytest.mark.parametrize(
+    "index_bytes, index_view",
+    [
+        (128, (torch.float8_e4m3fn, (-1, 16, 128))),
+        (72, (torch.uint8, (-1, 16 * 72))),
+    ],
+)
+def test_minimax_m3_pro_k_only_pages_cover_every_block_byte(
+    mha_export_method, pro_k_only_layout, monkeypatch, index_bytes, index_view
+):
+    from atom.kv_transfer.offload.hybrid.dsv4.codec import DSV4PageSlotCodec
+    from atom.kv_transfer.offload.page_codec import pure_page_codec
+
+    num_blocks, layers, fp8 = 4, 3, torch.float8_e4m3fn
+    pool = MhaKvPool(
+        layers=layers,
+        block_size=16,
+        num_kv_heads=1,
+        head_dim=256,
+        kv_dtype=fp8,
+        extra_fields=(EntryField("index", layers, (16 * index_bytes,), torch.uint8),),
+        layout=pro_k_only_layout(fp8),
+    )
+    pool.allocate(num_blocks, "cpu")
+    # The DSpark draft's own pool: a plain K / V page of its own dtype.
+    draft = MhaKvPool(
+        layers=1, block_size=16, num_kv_heads=1, head_dim=256, kv_dtype=fp8
+    )
+    draft.allocate(num_blocks, "cpu")
+    modules = [type("Layer", (), {"layer_num": n})() for n in range(layers)]
+    rows = dict(zip(modules, range(layers)))
+    builder = SimpleNamespace(
+        kv_pools={"konly": pool},
+        pool_rows={"konly": rows, "index": rows},
+        block_size=16,
+        block_ratio=1,
+        _index_cache_spec=lambda entry_tokens: SimpleNamespace(
+            view_dtype=index_view[0], view_shape=index_view[1]
+        ),
+    )
+    draft_layer = type("Layer", (), {"layer_num": layers})()
+    draft_builder = SimpleNamespace(
+        kv_pools={"draft": draft},
+        pool_rows={"draft": {draft_layer: 0}},
+        block_size=16,
+        block_ratio=1,
+        _index_cache_spec=lambda entry_tokens: None,
+    )
+
+    transfer = mha_export_method(builder)
+    transfer.merge_pages(mha_export_method(draft_builder))
+    transfer.set_block_count(num_blocks)
+    monkeypatch.setattr(
+        DSV4PageSlotCodec, "has_fused_chunk_major_staging", property(lambda _: True)
+    )
+    codec = pure_page_codec(transfer)
+
+    # K, its one scale plane and the index keys per layer, no V; then the draft.
+    fields = [region.semantic_role.split(".")[-2] for region in codec.page_regions]
+    assert fields == ["k"] * layers + ["k_scale"] * layers + ["index"] * layers + [
+        "k",
+        "v",
+        "k_scale",
+        "v_scale",
+    ]
+    # Every data byte of either pool's block is saved and restored; what the
+    # entries hold beyond it is alignment padding.
+    target_bytes = layers * 16 * (256 + 4 + index_bytes)
+    draft_bytes = 16 * (2 * 256 + 2 * 4)
+    assert codec.bytes_per_block == target_bytes + draft_bytes
+    assert 0 <= pool.entry_bytes + draft.entry_bytes - codec.bytes_per_block < 1024
+    # Each region is the view a writer uses: a byte set in block 2 of the index
+    # keys of layer 1 is in that region's unit 2 and nowhere else.
+    index_region = codec.page_regions[2 * layers + 1]
+    pool.field_view("index", 1, torch.uint8, (num_blocks, -1))[2].fill_(9)
+    views = transfer.block_tensor_views
+    hit = [
+        (i, block)
+        for i, view in enumerate(views)
+        for block in range(num_blocks)
+        if view[block].view(torch.uint8).eq(9).any()
+    ]
+    assert hit == [(2 * layers + 1, 2)]
+    assert index_region.unit_bytes == 16 * index_bytes
