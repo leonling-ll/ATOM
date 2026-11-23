@@ -15,13 +15,15 @@ owners of the all-reduce and the router's expert band by the TP8 split, so any
 other TP size is refused by name (``ShardError``) before anything loads.
 
 The phase is off unless ``ProVariants.mono_ffn_rows`` is set. Its value is
-latched once, when the runner is created, and agreed over the TP group
-(``latch_rows``): the per-forward re-read of ``ATOM_M3PRO_VARIANTS`` must never
-flip it, because a forward whose ranks disagree on mono waits in-kernel for ever.
+latched once, at the first MoE layer of the first forward (``route``), and
+agreed over the TP group (``latch_rows``): the per-forward re-read of
+``ATOM_M3PRO_VARIANTS`` must never flip it, because a forward whose ranks
+disagree on mono waits in-kernel for ever.
 """
 
 from dataclasses import dataclass
 
+from atom.config import CompilationLevel
 from atom.mono.plan.shard import Shard, ShardError, padded
 from atom.mono.runtime.deployment import (
     common_refusals,
@@ -221,7 +223,14 @@ def config_refusal(atom_config) -> str | None:
     checks += common_refusals(
         atom_config, ProDims, SUPPORTED_TP, refuse_decode_cp=False
     ) + resident_grid_refusals(atom_config)
+    level = getattr(getattr(atom_config, "compilation_config", None), "level", None)
     checks += [
+        # The gate is Python in the decoder layer's forward, which a compiled
+        # level would trace (Pro's recipe runs level 0; absent: no compile).
+        (
+            level in (None, CompilationLevel.NO_COMPILATION),
+            f"compilation level {level}",
+        ),
         # P1 reads no KV. Page 16 is refused as a scope limit, not a numeric
         # one: it is the only Pro deployment P1 is built and measured for.
         (
