@@ -78,11 +78,11 @@ def test_pair_indices_are_injective():
 
 def test_build_key():
     assert L.P1Build(tokens=MAX_ROWS).upto == "norm"
-    for bad in ({"tokens": 0}, {"tokens": MAX_ROWS + 1}, {"tokens": 1, "upto": "ffn"}):
+    for bad in ({"tokens": 0}, {"tokens": MAX_ROWS + 1}, {"tokens": 1, "upto": "x"}):
         with pytest.raises(ValueError):
             L.P1Build(**bad)
     names = [d.name for d in L.decls(L.P1Build(tokens=1))]
-    assert names == list(L.REGIONS)
+    assert names == list(L.NORM_REGIONS)
 
 
 def test_debug_scratch_holds_the_wait_records():

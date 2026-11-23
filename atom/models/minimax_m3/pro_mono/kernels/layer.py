@@ -1,8 +1,10 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
-"""The phase-1 MoE layer kernel of MiniMax-M3.1-Pro, ``upto = "norm"``: o_proj,
-the first all-reduce and the post-attention Gemma RMSNorm with its MXFP8 output,
-plus the lookahead norm of layer L + 2 (stages: ``layout``'s docstring).
+"""The phase-1 MoE layer kernel of MiniMax-M3.1-Pro: o_proj, the first
+all-reduce and the post-attention Gemma RMSNorm with its MXFP8 output, plus the
+lookahead norm of layer L + 2 (``upto = "norm"``), then the MoE to this rank's
+FFN partial (``upto = "ffn"``: ``kernels/ffn.py``). Stages: ``layout``'s
+docstring.
 
 The numerics follow production's recipe at <= 16 rows under the combo config
 (Lamport all-reduce, then aiter ``add_rmsnorm_mxfp8(..., gemma=True)``)::
@@ -47,9 +49,12 @@ from aiter.ops.flydsl.kernels import buffer_ops as bo
 from flydsl.expr import const_expr, gpu, range_constexpr
 from flydsl.expr.typing import Int32, Int64, T
 
-from atom.models.minimax_m3.pro_mono.config import COLS, HIDDEN
+from atom.models.minimax_m3.pro_mono.config import COLS, EXPERTS, HIDDEN, TOPK
+from atom.models.minimax_m3.pro_mono.kernels import ffn
 from atom.models.minimax_m3.pro_mono.layout import (
     ABI_NAMES,
+    FFN_REGIONS,
+    NORM_REGIONS,
     NT,
     O_CPW,
     O_K,
@@ -61,12 +66,18 @@ from atom.models.minimax_m3.pro_mono.layout import (
     OSC_ROW,
     OWN,
     REGIONS,
+    SM_ROW,
+    SMSC_WORDS,
     TL_POINTS,
     TP,
+    X4_ROW,
+    XSC_WORDS,
     P1Build,
     ag_pair,
     agsq_pair,
+    max_u,
     peer_layout,
+    plain_layout,
     rs_pair,
     scratch_layout,
 )
@@ -79,6 +90,7 @@ from atom.mono.device.mx import (
     rcp_pow2,
 )
 from atom.mono.device.ops import (
+    CM_DEV,
     CM_NT,
     bf2_f32,
     bf16_pair,
@@ -97,7 +109,7 @@ from atom.mono.device.ops import (
 )
 from atom.mono.device.ranks import peer_bases, sum_partials
 from atom.mono.device.stamps import stamp, stamp_begin, stamp_flush
-from atom.mono.device.sync import Mailbox, preg
+from atom.mono.device.sync import Mailbox, preg, publish, sreg
 from atom.mono.plan.build_key import key_tuple, symbol_params
 from atom.mono.plan.execution import BLOCKS, THREADS, WAVES
 from atom.mono.plan.trace import enter_stage
@@ -122,11 +134,16 @@ def _ld_words(addr, word, n):
     return [fx.Int32(v[e]) for e in range(n)]
 
 
-def _st_words(words, addr, word):
+def _st_words(words, addr, word, cm=0):
     if const_expr(len(words) == 1):
-        bo.buffer_store(fx.Int32(words[0]), rsrc(addr), word)
+        bo.buffer_store(fx.Int32(words[0]), rsrc(addr), word, cache_modifier=cm)
     else:
-        bo.buffer_store(fx.Vector.from_elements(words, fx.Int32), rsrc(addr), word)
+        bo.buffer_store(
+            fx.Vector.from_elements(words, fx.Int32),
+            rsrc(addr),
+            word,
+            cache_modifier=cm,
+        )
 
 
 def _unpack(words):
@@ -339,10 +356,11 @@ def ar_reduce(c, ins):
 
 
 @traced
-def mx_store(c, q8, q8s, t, col, o):
+def mx_store(c, q8, q8s, t, col, o, cm=0):
     """MXFP8 1x32 of this lane's two bf16 outputs ``o`` (16 lanes a block):
     e4m3 words (an even lane stores its and its neighbour's) at ``q8`` [S,
-    7168] and the task's 4 codes in one dword of ``q8s`` [S, 224]."""
+    7168] and the task's 4 codes in one dword of ``q8s`` [S, 224]; ``cm``:
+    device scope where this launch's FFN reads them."""
     lane = c["lane"]
     code = _code(butterfly(_absmax(o), (1, 2, 4, 8), fx.max))
     inv = rcp_pow2(code)
@@ -350,11 +368,13 @@ def mx_store(c, q8, q8s, t, col, o):
     nb = [xshfl(qe, 1) for qe in qv]
     word = fp8_pack4(qv[0], qv[1], nb[0], nb[1])
     if lane % 2 == 0:
-        bo.buffer_store(word, rsrc(q8), (t * HIDDEN + col) // 4)
+        bo.buffer_store(word, rsrc(q8), (t * HIDDEN + col) // 4, cache_modifier=cm)
     # blocks 0 .. 3 of the task on lanes 0 / 16 / 32 / 48: byte k of one dword
     codes = butterfly(code << (8 * (lane // 16)), (16, 32), _or)
     if lane == 0:
-        bo.buffer_store(codes, rsrc(q8s), t * (HIDDEN // COLS) + c["j"])
+        bo.buffer_store(
+            codes, rsrc(q8s), t * (HIDDEN // COLS) + c["j"], cache_modifier=cm
+        )
 
 
 @traced
@@ -380,9 +400,14 @@ def ar_norm(c, ins, held, w_post, w_ahead):
         r = hw_rsq(wave_sum(part) / float(HIDDEN) + fx.Float32(c["eps"]))
         v = held[k]
         y = [(v[e] * r) * wf[e] for e in range(2)]
+        ffn_on = c["ffn_on"]
+        cm = CM_DEV if const_expr(ffn_on) else 0
         _st_words(_pack(v), c["h_mid"], word)
-        _st_words(_pack(y), c["x"], word)
-        mx_store(c, c["x8"], c["x8s"], t, col, [bf16_round(ye) for ye in y])
+        _st_words(_pack(y), c["x"], word, cm)
+        yb = [bf16_round(ye) for ye in y]
+        mx_store(c, c["x8"], c["x8s"], t, col, yb, cm)
+        if const_expr(ffn_on):
+            ffn.mx4_store(c, t, col, yb)
         if const_expr(la):
             part2 = (lane < NT).select(_f32_of(got[k][1]), fx.Float32(0.0))
             r2 = hw_rsq(wave_sum(part2) / float(HIDDEN) + fx.Float32(c["eps_ahead"]))
@@ -419,12 +444,18 @@ def build(key: P1Build):
     """The launcher of ``key`` (cached per process); its kernel takes
     ``ABI_NAMES``."""
     s = key.tokens
+    ffn_on = key.upto == "ffn"
     passes = -(-s // WAVES)
     play = peer_layout()
     slay = scratch_layout(key)
+    play_plain = plain_layout(key)
     tl_on = key.timeline
     keyed = key_tuple(key, SOURCES)
     name = kernel_symbol("minimax_m3_pro_mono_layer", **symbol_params(key))
+
+    # ``xs``: the o stage's MXFP8 core rows, then (FFN) the router's bf16 x
+    # slice and the shared mid's MXFP8 rows -- stages apart, past barriers
+    assert s * O_ROW >= s * (ffn.R_KLEN + 8) // 2 and s * O_ROW >= s * SM_ROW
 
     @fx.struct
     class Smem:
@@ -434,17 +465,39 @@ def build(key: P1Build):
         misc: fx.Array[fx.Float32, O_ROWS * s, 16]
         tls: fx.Array[fx.Int64, TL_POINTS, 16]
 
+    mw = ffn.mask_words(s)
+    nu_max = max_u(s)
+    slots = ffn.ROUTE_SLOTS
+
+    @fx.struct
+    class FfnLds:
+        x4l: fx.Array[fx.Int32, s * X4_ROW, 16]
+        x4sl: fx.Array[fx.Int32, s * XSC_WORDS, 16]
+        smsc: fx.Array[fx.Int32, s * SMSC_WORDS, 16]
+        contrib: fx.Array[fx.Float32, s * TOPK * ffn.DOWN_ROWS, 16]
+        route: fx.Array[fx.Int32, s * 2 * TOPK, 16]
+        mask: fx.Array[fx.Int32, EXPERTS * mw, 16]
+        slot: fx.Array[fx.Int32, EXPERTS, 16]
+        expert: fx.Array[fx.Int32, nu_max, 16]
+        first: fx.Array[fx.Int32, nu_max + 1, 16]
+        order: fx.Array[fx.Int32, s * TOPK, 16]
+        cand: fx.Array[fx.Int32, 2 * slots, 16]
+        csig: fx.Array[fx.Float32, slots, 16]
+        scan: fx.Array[fx.Int32, WAVES, 16]
+
     @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
     def p1_layer(
         core: Int64, w_o: Int64, s_o: Int64, res: Int64, g_post: Int64,
-        g_ahead: Int64, h_mid: Int64, x: Int64, x8: Int64, x8s: Int64,
-        la8: Int64, la8s: Int64, scratch: Int64, peers: Int64, rank: Int32,
-        layer: Int32, tl: Int64,
+        g_ahead: Int64, moe_w: Int64, h_mid: Int64, x: Int64, x8: Int64,
+        x8s: Int64, la8: Int64, la8s: Int64, ffn_out: Int64, scratch: Int64,
+        plain: Int64,
+        peers: Int64, rank: Int32, layer: Int32, tl: Int64,
     ):  # fmt: skip
         _ = keyed
         tid = fx.thread_idx.x
         bid = fx.block_idx.x
-        lds = fx.SharedAllocator().allocate(Smem).peek()
+        alloc = fx.SharedAllocator()
+        lds = alloc.allocate(Smem).peek()
         tls = lds.tls.ptr
         stamp_begin(tl_on, tls, tid, TL_POINTS)
         if const_expr(key.debug):
@@ -468,15 +521,24 @@ def build(key: P1Build):
             ),
             "obeg": owner * OWN, "is_owner": owner == rank,
             "not_owner": owner != rank,
-            "off": {r: play[r][0] for r in REGIONS},
+            "off": {r: play[r][0] for r in NORM_REGIONS},
             "core": core, "w_o": w_o, "s_o": s_o, "res": res,
             "g_post": g_post, "g_ahead": g_ahead, "h_mid": h_mid, "x": x,
             "x8": x8, "x8s": x8s, "la8": la8, "la8s": la8s,
             "xs": lds.xs.ptr, "osc": lds.osc.ptr, "red": lds.red.ptr,
             "misc": lds.misc.ptr,
-            "put_bf": mb.put_bf, "put_words": mb.put_words, "poll": mb.poll,
-            "stamp": lambda k: stamp(tl_on, tls, tid, k),
+            "put": mb.put, "put_bf": mb.put_bf, "put_words": mb.put_words,
+            "poll": mb.poll, "stamp": lambda k: stamp(tl_on, tls, tid, k),
+            "ffn_on": ffn_on,
         }  # fmt: skip
+        if const_expr(ffn_on):
+            # the norm writes MXFP4 x to ``plain`` (one buffer resource over
+            # every plain region, a region a word offset); the rest of the
+            # FFN's context is made past the norm
+            c |= {
+                "plain": plain,
+                "pw": {r: off // 4 for r, (off, _) in play_plain.items()},
+            }
         enter_stage("o")
         stage_o(c)
         stamp(tl_on, tls, tid, 2)
@@ -491,21 +553,45 @@ def build(key: P1Build):
                 if (bid < NT) & (wave >= both):
                     ar_tokens(c, [0])
         stamp(tl_on, tls, tid, 5)
+        if const_expr(ffn_on):
+            fl = alloc.allocate(FfnLds).peek()
+            c |= {
+                "moe_w": moe_w, "ffn": ffn_out,
+                "rlog": [
+                    preg(b, play["rlog"][0], "rlog") for b in c["bases"]
+                ],
+                "rlog_own": preg(c["own"], play["rlog"][0], "rlog"),
+                "xl": lds.xs.ptr, "sm8": lds.xs.ptr,
+                "x4l": fl.x4l.ptr, "x4sl": fl.x4sl.ptr, "smsc": fl.smsc.ptr,
+                "contrib": fl.contrib.ptr, "cand": fl.cand.ptr,
+                "csig": fl.csig.ptr, "scan": fl.scan.ptr,
+                "rt": {
+                    "route": fl.route.ptr, "mask": fl.mask.ptr,
+                    "slot": fl.slot.ptr, "expert": fl.expert.ptr,
+                    "first": fl.first.ptr, "order": fl.order.ptr,
+                },
+            }  # fmt: skip
+            c |= {r: sreg(scratch, slay[r][0], r) for r in FFN_REGIONS if r != "rlog"}
+            # this CTA's x / x8 / x4 columns are out
+            if bid < NT:
+                publish(mb.put, c["xrdy"], bid, fx.Int32(1), tid == 0)
+            ffn.run_ffn(c, bid)
         stamp(tl_on, tls, tid, TL_POINTS - 1)
         stamp_flush(tl_on, tls, tl, tid, bid, TL_POINTS)
 
     @launcher(name)
     def launch(
         core: Int64, w_o: Int64, s_o: Int64, res: Int64, g_post: Int64,
-        g_ahead: Int64, h_mid: Int64, x: Int64, x8: Int64, x8s: Int64,
-        la8: Int64, la8s: Int64, scratch: Int64, peers: Int64, rank: Int32,
-        layer: Int32, tl: Int64,
+        g_ahead: Int64, moe_w: Int64, h_mid: Int64, x: Int64, x8: Int64,
+        x8s: Int64, la8: Int64, la8s: Int64, ffn_out: Int64, scratch: Int64,
+        plain: Int64,
+        peers: Int64, rank: Int32, layer: Int32, tl: Int64,
         stream: fx.Stream = _STREAM,
     ):  # fmt: skip
         _ = keyed
         p1_layer(
-            core, w_o, s_o, res, g_post, g_ahead, h_mid, x, x8, x8s, la8, la8s,
-            scratch, peers, rank, layer, tl,
+            core, w_o, s_o, res, g_post, g_ahead, moe_w, h_mid, x, x8, x8s,
+            la8, la8s, ffn_out, scratch, plain, peers, rank, layer, tl,
         ).launch(grid=(BLOCKS,), block=(THREADS,), stream=stream)  # fmt: skip
 
     ABI.check(p1_layer, launch)
