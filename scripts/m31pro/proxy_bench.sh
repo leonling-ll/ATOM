@@ -30,6 +30,7 @@
 #   MAX_NUM_SEQS     [16 below CONC 8, else 2 x CONC]
 #   MAX_MODEL_LEN    [MAX_CONTEXT + 1024: room for the chat template]
 #   PORT             server port [8300]
+#   GPU_MEM_UTIL     --gpu-memory-utilization [0.94]
 #   SERVER_EXTRA     more server flags, split on spaces, e.g. --load_dummy=xavier []
 #   ATOM_M3PRO_VARIANTS  Pro attention variants
 #                    [{"kernels": true, "attn": "aiter", "topk": "fused"}]
@@ -77,7 +78,7 @@ export AITER_CUSTOM_AR_DISABLE_LAMPORT=1
 default_variants='{"kernels": true, "attn": "aiter", "topk": "fused"}'
 export ATOM_M3PRO_VARIANTS="${ATOM_M3PRO_VARIANTS:-$default_variants}"
 export KV_CACHE_DTYPE=fp8
-export GPU_MEM_UTIL=0.85
+export GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.94}"
 export MAX_NUM_SEQS
 
 stop_server() {

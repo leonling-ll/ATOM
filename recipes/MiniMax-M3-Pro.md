@@ -58,7 +58,7 @@ python -m atom.entrypoints.openai_server \
   --max-model-len 16384 \
   --max-num-seqs 16 \
   --max-num-batched-tokens 16384 \
-  --gpu-memory-utilization 0.85 \
+  --gpu-memory-utilization 0.94 \
   --block-size 16 \
   --kv_cache_dtype fp8 \
   --index-cache-dtype fp8 \
@@ -70,11 +70,10 @@ Add `--method dspark --num-speculative-tokens 7` for speculative decoding with t
 draft. For the torch reference, leave `ATOM_M3PRO_VARIANTS` unset, add `--enforce-eager` and use
 `--kv_cache_dtype bf16 --index-cache-dtype bf16`; prefix caching was checked on the kernel path only.
 
-* With `ATOM_ONLINE_QUANT_STREAMING=1` and Pro's MoE `pad_align` 128 (the default now) the weights
-  take about 175 GiB per GPU and 0.95 works; see [`Agentic-MiniMax-M3.1-Pro.md`](Agentic-MiniMax-M3.1-Pro.md).
-  The note below is for the old padded, non-streaming load.
-* The weights take about 210 GB per GPU, so keep `--gpu-memory-utilization` at 0.85: at 0.88 the
-  KV pool takes every free byte and the first NCCL barrier fails to allocate.
+* The loader hands the blocks that weight processing frees back to the driver between steps, so the
+  post-load conversion leaves no holes in the allocator (before, about 40 GB per GPU stayed stranded
+  and 0.88 or more failed at the first NCCL barrier). `ATOM_ONLINE_QUANT_STREAMING=1` avoids them
+  another way, by converting while loading; see [`Agentic-MiniMax-M3.1-Pro.md`](Agentic-MiniMax-M3.1-Pro.md).
 * `--block-size 16` and `--level 0` are required. Decode graphs need the kernel path: the torch
   path reads the sequence lengths back to the host, raises if a capture reaches it, and runs with
   `--enforce-eager`.
@@ -115,7 +114,7 @@ python -m atom.entrypoints.openai_server \
   --max-model-len 16384 \
   --max-num-seqs 16 \
   --max-num-batched-tokens 16384 \
-  --gpu-memory-utilization 0.85 \
+  --gpu-memory-utilization 0.94 \
   --block-size 16 \
   --kv_cache_dtype fp8 \
   --index-cache-dtype bf16 \
@@ -158,7 +157,7 @@ python -m atom.entrypoints.openai_server \
   --max-model-len 131072 \
   --max-num-seqs 32 \
   --max-num-batched-tokens 16384 \
-  --gpu-memory-utilization 0.85 \
+  --gpu-memory-utilization 0.94 \
   --block-size 16 \
   --kv_cache_dtype fp8 \
   --index-cache-dtype bf16 \
