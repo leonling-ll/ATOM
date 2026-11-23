@@ -1697,13 +1697,29 @@ def _span_keys(score_row, lo, hi, K: tl.constexpr, CHUNK: tl.constexpr):
 
 
 @triton.jit
+def _load_keys(base, start, count, W: tl.constexpr, K: tl.constexpr, VOLATILE):
+    """The ``K`` best of the partial keys ``[start, start + W)`` below ``count`` (the rest
+    padded below every key, -inf ones included)."""
+    e = start + tl.arange(0, W)
+    keys = tl.load(base + e, mask=e < count, other=-(2**63), volatile=VOLATILE)
+    return tl.topk(keys, K)
+
+
+@triton.jit
 def _merge_keys(base, count, K: tl.constexpr, VOLATILE: tl.constexpr):
-    """The ``K`` best of the ``count`` (a multiple of ``K``) partial keys at ``base``."""
-    e = tl.arange(0, K)
-    best = tl.load(base + e, volatile=VOLATILE)
-    for start in range(K, count, K):
-        tile = tl.load(base + start + e, volatile=VOLATILE)
-        best = tl.topk(tl.reshape(tl.join(best, tile), (2 * K,)), K)
+    """The ``K`` best of the ``count`` (a multiple of ``K``) partial keys at ``base``: up to
+    8 partials in one sort at the narrowest width that holds them, more 8 at a time (the
+    keys are distinct, so any grouping picks alike; one wide sort is a shorter chain than
+    a merge a partial)."""
+    if count <= 2 * K:
+        best = _load_keys(base, 0, count, 2 * K, K, VOLATILE)
+    elif count <= 4 * K:
+        best = _load_keys(base, 0, count, 4 * K, K, VOLATILE)
+    else:
+        best = _load_keys(base, 0, count, 8 * K, K, VOLATILE)
+        for start in range(8 * K, count, 8 * K):
+            tile = _load_keys(base, start, count, 8 * K, K, VOLATILE)
+            best = tl.topk(tl.reshape(tl.join(best, tile), (2 * K,)), K)
     return best
 
 
