@@ -3,8 +3,9 @@
 """The phase-1 layer kernel's ``upto = "ffn"`` build on 8 GPUs: the norm
 stages against the torch reference as ``test_minimax_m3_pro_mono_layer_gpu``
 holds them, then the router and every rank's FFN partial against
-``ffn_reference`` (production's a4w4 MoE and MXFP8 shared expert) run on the
-kernel's own x, x8, picks and weights.
+``ffn_reference`` (routed experts in the W4A4 recipe, aiter a4w4 numerics --
+production runs a16w4 -- and the MXFP8 shared expert) run on the kernel's own
+x, x8, picks and weights.
 
 Every rank holds its own random routed planes (384 experts, MXFP4, the
 intermediate 640 zero padded to 768, shuffled as the loader leaves them) and

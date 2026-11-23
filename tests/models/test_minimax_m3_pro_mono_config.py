@@ -165,6 +165,7 @@ def test_deployment_refusals(servable, change, why):
         ({"routed_scaling_factor": 1.0}, "routed scaling 1.0"),
         ({"n_group": 8}, "grouped top-k"),
         ({"swiglu_limit": 10.0}, "SwiGLU limit"),
+        ({"swiglu_beta": 0.0}, "SwiGLU beta"),
     ],
 )
 def test_checkpoint_refusals(servable, over, why):

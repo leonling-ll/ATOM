@@ -28,6 +28,7 @@ def _variants(**over):
         "fuse_mxfp8_quant": True,
         "lookahead": True,
         "lookahead_src": "resid_in",
+        "ar_lamport_rows": 16,
     }
     fields.update(over)
     return SimpleNamespace(**fields)
@@ -175,6 +176,8 @@ def test_a_failed_runner_turns_it_off_for_good(monkeypatch):
         ({"lookahead": False}, "lookahead off"),
         ({"lookahead_src": "ffn_in"}, "lookahead_src 'ffn_in'"),
         ({"lookahead_src": "resid"}, "lookahead_src 'resid'"),
+        ({"ar_lamport_rows": 8}, "ar_lamport_rows 8 below 16"),
+        ({"ar_lamport_rows": 0}, "ar_lamport_rows 0 below 16"),
     ],
 )
 def test_variants_the_hand_off_cannot_serve_latch_off(monkeypatch, over, why):
@@ -182,6 +185,11 @@ def test_variants_the_hand_off_cannot_serve_latch_off(monkeypatch, over, why):
     h = Harness(monkeypatch, **over)
     assert h.take(1) is None
     assert h.created == 0 and h.route.rows == 0
+
+
+def test_a_bad_row_limit_is_left_to_the_latch():
+    # no TypeError against ar_lamport_rows: latch_rows names the bad value
+    assert variants_refusal(_variants(mono_ffn_rows="16"), True) is None
 
 
 def test_without_the_mxfp8_norms_it_is_off(monkeypatch):

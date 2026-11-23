@@ -218,10 +218,11 @@ def layer_failures(rep):
 
 
 # ================================================================= the FFN
-# ``upto = "ffn"``: this rank's FFN partial in production's numerics -- aiter's
-# a4w4 MoE (MXFP4 activations, ``GPTOSS_SWIGLU_MXFP4_BF16_BOUND=0``) over the
-# MXFP4 routed planes, and the MXFP8 shared expert. The widths come from the
-# tensors, so a CPU test can run it narrow.
+# ``upto = "ffn"``: this rank's FFN partial in the W4A4 recipe -- aiter a4w4
+# numerics (MXFP4 activations) over the MXFP4 routed planes, and production's
+# MXFP8 shared expert. Production's routed experts run a16w4 (bf16
+# activations), so this is the kernel's reference, not production's. The widths
+# come from the tensors, so a CPU test can run it narrow.
 
 TOPK = 4
 ROUTE_SCALE = 2.0

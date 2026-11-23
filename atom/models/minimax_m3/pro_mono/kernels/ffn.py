@@ -10,8 +10,10 @@ ug / down tasks over the union) with MiniMax-M3's math
 (``minimax_m3/mono/kernels/stages``: SwiGLU-OAI, the a4w4 activation quant,
 the MXFP8 shared expert's operands) at Pro's TP8 widths.
 
-Numerics, production's a4w4 MoE (aiter ``fused_moe``, MXFP4 activations:
-``GPTOSS_SWIGLU_MXFP4_BF16_BOUND=0``) and its MXFP8 shared expert::
+Numerics: the W4A4 recipe (aiter a4w4 numerics, MXFP4 activations, as
+M3.1-Flash mono's routed stage) and production's MXFP8 shared expert.
+Production's routed experts run a16w4 (bf16 activations) at these widths, so
+the routed stage is not production's bit for bit::
 
     logit  = bf16(x @ w_gate^T)                       (fp32 accumulate)
     s      = sigmoid(logit); picks = top-4 of s + bias (lower expert on a tie)

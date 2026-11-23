@@ -279,6 +279,8 @@ def config_refusal(atom_config) -> str | None:
             float(getattr(hf, "swiglu_limit", SWIGLU_LIMIT)) == SWIGLU_LIMIT,
             "SwiGLU limit",
         ),
+        # the routed and shared stages bake ``u + 1``
+        (float(getattr(hf, "swiglu_beta", 1.0)) == 1.0, "SwiGLU beta"),
         # The lookahead norm the kernel writes is layer L + AHEAD's input.
         (
             int(sparse.get("sparse_indexer_lookahead_num_layers") or 0)

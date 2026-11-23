@@ -25,7 +25,7 @@ Plain Python: no aiter or FlyDSL import (the runner is created through
 
 import logging
 
-from atom.models.minimax_m3.pro_mono.config import gate_rows, latch_rows
+from atom.models.minimax_m3.pro_mono.config import gate_rows, latch_rows, rows_refusal
 from atom.mono.runtime.route import LazyRunner
 from atom.utils import envs
 from atom.utils.forward_context import get_forward_context
@@ -42,13 +42,22 @@ def variants_refusal(v, mx_norm: bool) -> str | None:
     The kernel writes what production's post-attention segment hands on under
     these variants only: the MXFP8 FFN input (``fuse_mxfp8_quant``, the MXFP8
     norm kernels) and the lookahead as the reading layer's input norm of the
-    residual, MXFP8 (``ProLookaheadState.put``'s ``resid_in`` branch)."""
+    residual, MXFP8 (``ProLookaheadState.put``'s ``resid_in`` branch). Its
+    in-kernel AR #1 sums in the Lamport all-reduce's order, so production's
+    AR #1 must be the Lamport one at every width mono serves
+    (``ar_lamport_rows``), or h_mid would differ from production's."""
     checks = [
         (not v.diag, "the diag variant"),
         (v.fuse_mxfp8_quant, "fuse_mxfp8_quant off"),
         (mx_norm, "aiter without the MXFP8 norms"),
         (v.lookahead, "lookahead off"),
         (v.lookahead_src == "resid_in", f"lookahead_src {v.lookahead_src!r}"),
+        (
+            # a value ``latch_rows`` refuses is reported there
+            rows_refusal(v.mono_ffn_rows) is not None
+            or v.ar_lamport_rows >= v.mono_ffn_rows,
+            f"ar_lamport_rows {v.ar_lamport_rows} below {v.mono_ffn_rows}",
+        ),
     ]
     return next((why for ok, why in checks if not ok), None)
 
