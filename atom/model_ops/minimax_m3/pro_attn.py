@@ -913,6 +913,7 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
         )
         k = min(self.topk, nb)
         rq, rseq, rpos = iq, seq_id, positions  # the rows the indexer scores
+        rps = n // block_tables.shape[0]  # rows a sequence (static: k + 1 for a verify)
         if split is not None:
             # every row scores alone, so this rank's rows come out as they would in full
             idx, seg, n_rows, tp = split
@@ -933,9 +934,15 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
             pool_temp=v.pool_scale,
             # torch.topk reads the whole width; the others only each token's causal blocks
             causal=v.topk != "torch",
-            # decode: one row a sequence, nothing to share; a verify has k + 1 (graph-safe:
-            # the shapes alone decide, and tiles across sequences score row by row)
-            tq=v.score_tq if not static or n > block_tables.shape[0] else 0,
+            # decode: one row a sequence, nothing to share; a verify has k + 1 rows a
+            # sequence, so the tile is the largest power of two dividing them (at most
+            # score_tq): a tile never spans two sequences, which would score row by row
+            # (k = 3: 4 rows, not 8). Graph-safe: the shapes alone decide.
+            tq=(
+                v.score_tq
+                if not static
+                else min(v.score_tq, rps & -rps) if rps > 1 else 0
+            ),
         )
         # select_rows_split matches select_rows bit for bit; its cost follows the context
         select = (

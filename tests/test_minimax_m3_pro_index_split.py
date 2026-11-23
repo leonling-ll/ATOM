@@ -198,6 +198,27 @@ def test_static_verify_takes_query_blocked_scores(monkeypatch, rows_per_seq):
     assert torch.equal(r0, r1) and torch.equal(c0, c1)
 
 
+@pytest.mark.parametrize("rows_per_seq", [2, 4, 8])
+def test_static_verify_tile_never_spans_two_sequences(monkeypatch, rows_per_seq):
+    """With score_tq 8, a verify of k + 1 rows a sequence (k = 3 gives 4) scores in tiles
+    of the largest power of two dividing its rows, so no tile spans two sequences (which
+    the kernel would score row by row), and selects as the one-row kernel does.
+    """
+    b = _batch([(c, rows_per_seq) for c in (90, 160, 300, 41)], seed=9)
+    impl, seen, args = _mini_impl(b, 4, monkeypatch)
+    calls = []
+    real = K.scores
+    monkeypatch.setattr(
+        K, "scores", lambda *a, **kw: calls.append(kw["tq"]) or real(*a, **kw)
+    )
+    for tq in (0, 8):
+        v = ProVariants(kernels=True, attn="aiter", topk="fused", score_tq=tq)
+        impl._kernel_attention(*args, v, None, static=True)
+    assert calls == [0, rows_per_seq]
+    (r0, c0), (r1, c1) = seen
+    assert torch.equal(r0, r1) and torch.equal(c0, c1)
+
+
 def _plan(monkeypatch, n_tok, ctx_lens, prefill=True, **variant):
     impl = object.__new__(ProSparseAttentionImpl)
     impl.page, impl.topk = PG, 128
