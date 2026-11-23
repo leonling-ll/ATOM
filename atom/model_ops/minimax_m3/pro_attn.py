@@ -347,6 +347,9 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
 
     is_indexed_sparse_attention = True
     k_only = False  # the pool is ``ProKOnlyLayout`` (no V cache)
+    # The decode context parallel group's size: each rank holds every W-th 16-token block
+    # of the KV and index caches (``pro_kernels.dcp_local_positions``).
+    dcp_world = 1
 
     def __init__(
         self,
@@ -419,6 +422,9 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
         # the index-key cache, (blocks, page, index_head_dim).
         self.index_cache: torch.Tensor | None = None
         self.k_only = refresh_variants(force=True).k_only
+        from atom.config import get_current_atom_config
+
+        self.dcp_world = get_current_atom_config().decode_context_parallel_size
         if self.k_only:
             from atom.config import kv_cache_torch_dtype
 
@@ -694,9 +700,13 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
     def _aiter_attn(self, v: ProVariants, n: int = _K_ROWS_AITER_MIN) -> bool:
         """aiter's paged attention for ``n`` rows: on the K-only cache only where it reads V
         from the K rows (``value_rows``), and from ``_K_ROWS_AITER_MIN`` rows up."""
-        return v.attn == "aiter" and (
-            not self.k_only
-            or (n >= _K_ROWS_AITER_MIN and pro_kernels.aiter_value_rows_available())
+        return (
+            v.attn == "aiter"
+            and self.dcp_world == 1
+            and (
+                not self.k_only
+                or (n >= _K_ROWS_AITER_MIN and pro_kernels.aiter_value_rows_available())
+            )
         )
 
     def _use_kernels(self, v: ProVariants) -> bool:
@@ -819,6 +829,9 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
             k_scale=ks,
             v_scale=vs,
         )
+        if self.dcp_world > 1 and not static:
+            # prep wrote this rank's blocks; the prefill reads every rank's
+            kc4, ks, ic, block_tables = self._dcp_prefill_caches(kc4, ks, ic)
         scale = self.scale * v.scale_mult
         nblk = v.attn_nblk
         # MI355X, decode over top-128 (opt/kv/bench_decode_attn.py, valid_first, nblk 4):
@@ -911,6 +924,11 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
         sc = v.index_scale * (
             self.index_head_dim**-0.5 if v.block_score == "lse" else 1.0
         )
+        if self.dcp_world > 1 and static:
+            score_args = (pool, init, local, sc, block_mode, head_mode)
+            return self._dcp_decode(
+                q, iq, positions, seq_id, block_tables, kc4, ks, ic, v, out, score_args
+            )
         k = min(self.topk, nb)
         rq, rseq, rpos = iq, seq_id, positions  # the rows the indexer scores
         rps = n // block_tables.shape[0]  # rows a sequence (static: k + 1 for a verify)
@@ -984,6 +1002,120 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
         else:
             sel = score.topk(k, dim=-1, sorted=False).indices.to(torch.int32)
         return attend(sel)
+
+    # ------------------------------------------------- decode context parallel --
+    def _dcp_prefill_caches(self, kc4, ks, ic):
+        """A prefill's caches under DCP: every block of its sequences, all-gathered from
+        the ranks that hold them, and the block tables into those (the plan is the
+        forward's, the gather each layer's)."""
+        from atom.distributed.dcp_utils import get_dcp_group
+        from atom.model_ops.dcp_ops import dcp_all_gather
+
+        md = get_forward_context().attn_metadata
+        group, w = get_dcp_group(), self.dcp_world
+        plan = getattr(md, "_m3pro_dcp_plan", None)
+        if plan is None:
+            plan = pro_kernels.dcp_prefill_plan(
+                md.block_tables, self._cpu_lengths(md)[1], w
+            )
+            md._m3pro_dcp_plan = plan
+        rows, tables = plan
+
+        def gather(x):
+            return pro_kernels.dcp_gather_blocks(
+                x, rows, lambda t: dcp_all_gather(group, t, 0), w
+            )
+
+        return gather(kc4), None if ks is None else gather(ks), gather(ic), tables
+
+    def _dcp_decode(
+        self, q, iq, positions, seq_id, block_tables, kc4, ks, ic, v, out, score_args
+    ):
+        """A decode step under DCP: every rank scores its own blocks, the scores are
+        all-gathered so each rank selects from all of them as without DCP, each rank
+        attends all query heads over the selected blocks it holds, and a log-sum-exp
+        merge returns this rank's heads."""
+        from atom.config import get_current_atom_config
+        from atom.distributed.dcp_utils import get_dcp_group
+        from atom.model_ops.dcp_ops import (
+            dcp_all_gather,
+            dcp_all_gather_query_heads,
+            dcp_lse_merge,
+        )
+
+        pool, init, local, sc, block_mode, head_mode = score_args
+        group = get_dcp_group()
+        w, r = self.dcp_world, group.rank_in_group
+        n = q.shape[0]
+        md = get_forward_context().attn_metadata
+        capturing = (
+            torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
+        )
+        cached = getattr(md, "_m3pro_dcp_pos", None)
+        if cached is None or cached[0] != capturing or cached[1].shape[0] != n:
+            md._m3pro_dcp_pos = cached = (
+                capturing,
+                pro_kernels.dcp_local_positions(positions, r, w),
+            )
+        qpos = cached[1]
+        nbl = -(-block_tables.shape[1] // w)
+        score = pro_kernels.scores(
+            iq,
+            ic,
+            block_tables,
+            seq_id,
+            qpos,
+            nbl,
+            self.index_compress_query.data if pool else None,
+            0,
+            0,
+            sc,
+            block_mode=block_mode,
+            head_mode=head_mode,
+            pool_temp=v.pool_scale,
+            causal=True,
+            tq=v.score_tq if n > block_tables.shape[0] else 0,
+        )
+        pro_kernels.dcp_pin(score, positions, r, w, init, local)
+        score = pro_kernels.dcp_interleave(dcp_all_gather(group, score, 0), w)
+        sel = pro_kernels.select_logical(
+            score, positions, min(self.topk, nbl * w), split=v.topk == "split"
+        )
+        sel = pro_kernels.dcp_local_selection(sel, r, w)
+        qf = dcp_all_gather_query_heads(group, q)
+        h = qf.shape[1]
+        dv = self.value_head_dim
+        of = q.new_empty(n, h * dv)
+        lse = torch.empty(n, h, dtype=torch.float32, device=q.device)
+        # a rank holds about 1/w of the selected blocks, for w times the heads
+        splits = max(
+            1, (v.attn_splits or (32 if n <= 16 else 16 if n <= 32 else 8)) // w
+        )
+        pro_kernels.attention(
+            qf,
+            kc4,
+            block_tables,
+            seq_id,
+            qpos,
+            sel,
+            of,
+            self.scale * v.scale_mult,
+            splits,
+            nblk=v.attn_nblk,
+            k_scale=ks,
+            valid_first=True,
+            lse=lse,
+        )
+        # the merge takes power-of-two head widths: each head's 192 as three of 64
+        parts = dv // 64
+        merged = dcp_lse_merge(
+            of.view(n, h * parts, 64),
+            lse.repeat_interleave(parts, dim=1),
+            group,
+            backend=get_current_atom_config().dcp_config.comm_backend,
+        )
+        out.copy_(merged.reshape(n, -1))
+        return out
 
     # ---------------------------------------------------------------- forward --
     def index_split(self, n_tok: int):
@@ -1060,6 +1192,11 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
             v = replace(v, dense_only=True)  # the diagnostic reads the dense trajectory
 
         md = fwd.attn_metadata
+        if self.dcp_world > 1 and (not self._use_kernels(v) or v.dense_only):
+            raise NotImplementedError(
+                "MiniMax-M3-Pro under --decode-context-parallel-size needs the kernel "
+                'path ({"kernels": true} in ATOM_M3PRO_VARIANTS) and the indexer'
+            )
         if self._use_kernels(v):
             layer = fwd.kv_cache_data[f"layer_{self.layer_num}"]
             prep_impl = "aiter" if self._aiter_prep(v) else "triton"

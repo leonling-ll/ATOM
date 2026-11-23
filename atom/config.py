@@ -836,6 +836,27 @@ def is_minimax_m3_pro_config(hf_config: PretrainedConfig) -> bool:
     )
 
 
+def admit_minimax_m3_pro_dcp(config: "Config") -> None:
+    """MiniMax-M3-Pro under decode context parallelism: its KV and index caches are
+    interleaved a whole 16-token sparse block at a time (``dcp_config.interleave_size``
+    = the block size; a block lives on one rank), with no speculative draft (the
+    MiniMax-M3.1 DSpark draft does not run under DCP)."""
+    dcp, page = config.dcp_config, config.kv_cache_block_size
+    if config.speculative_config is not None:
+        raise ValueError(
+            "MiniMax-M3-Pro under --decode-context-parallel-size runs without a "
+            "speculative draft: the MiniMax-M3.1 DSpark draft does not support DCP"
+        )
+    if dcp.interleave_size == 1 and page > 1:
+        dcp.interleave_size = page
+        logger.info("MiniMax-M3-Pro DCP: dcp_config.interleave_size -> %d", page)
+    if dcp.interleave_size != page:
+        raise ValueError(
+            "MiniMax-M3-Pro under DCP needs dcp_config.interleave_size equal to "
+            f"--block-size ({page}), got {dcp.interleave_size}"
+        )
+
+
 def get_hf_config(model: str, trust_remote_code: bool = False) -> PretrainedConfig:
     """``model``'s config, its architecture the one ATOM's tables key
     (``ARCH_ALIASES``)."""
@@ -3252,6 +3273,10 @@ class Config:
         # MXFP4 gate cannot disagree with them on an export that names itself
         # only in `text_config` or `model_type`.
         is_m3 = _is_minimax_m3_config(self.hf_config)
+        if self.decode_context_parallel_size > 1 and is_minimax_m3_pro_config(
+            self.hf_config
+        ):
+            admit_minimax_m3_pro_dcp(self)
         _check_fp4_kv(
             self.kv_cache_dtype,
             is_m3=is_m3,

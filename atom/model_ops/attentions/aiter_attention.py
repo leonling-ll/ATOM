@@ -48,7 +48,7 @@ from .token_layout.decode import (
     query_is_uniform,
     ragged_decode_refusal,
 )
-from .token_layout.slots import slot_mapping
+from .token_layout.slots import dcp_slot_mapping, slot_mapping
 
 logger = logging.getLogger("atom")
 
@@ -1056,13 +1056,24 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
 
         var = self.model_runner.forward_vars
         scheduled_tokens = batch.total_tokens_num_decode
-        var["slot_mapping"].np[:scheduled_tokens] = slot_mapping(
-            positions,
-            lengths,
-            var["block_tables"].np,
-            self.model_runner.block_size,
-            scratch=self.token_axis_scratch,
-        )
+        if self.dcp_world_size > 1:
+            var["slot_mapping"].np[:scheduled_tokens] = dcp_slot_mapping(
+                positions,
+                lengths,
+                var["block_tables"].np,
+                self.model_runner.block_size,
+                self.dcp_world_size,
+                self.dcp_rank,
+                self.cp_kv_cache_interleave_size,
+            )
+        else:
+            var["slot_mapping"].np[:scheduled_tokens] = slot_mapping(
+                positions,
+                lengths,
+                var["block_tables"].np,
+                self.model_runner.block_size,
+                scratch=self.token_axis_scratch,
+            )
         var["positions"].np[:scheduled_tokens] = positions
         self._pad_tokens(scheduled_tokens, running_tokens)
         var["context_lens"].np[:scheduled_bs] = context_lens

@@ -11,7 +11,7 @@
 # tree importable, under the node's end-to-end lock. It
 #   1. writes the session subset (trace_subset.py) to OUT_DIR/traces,
 #   2. starts the server with the Pro recipe's fast configuration plus DSpark
-#      at 7 draft tokens and a forced acceptance length,
+#      at SPEC_TOKENS draft tokens and a forced acceptance length,
 #   3. replays the subset at concurrency CONC for DURATION seconds,
 #   4. stops the server and prints, from aiperf's per-request records, the
 #      90th-percentile E2E-normalized interactivity, tok/s/GPU, the failed
@@ -27,6 +27,7 @@
 #   NUM_SESSIONS     sessions kept [64]
 #   DURATION         replay seconds; aiperf's scenario floor is 900 [900]
 #   ACCEPT_LENGTH    forced DSpark acceptance length [4.0]
+#   SPEC_TOKENS      DSpark draft tokens per step; 0 serves without the draft [7]
 #   MAX_NUM_SEQS     [16 below CONC 8, else 2 x CONC]
 #   MAX_MODEL_LEN    [MAX_CONTEXT + 1024: room for the chat template]
 #   PORT             server port [8300]
@@ -51,6 +52,7 @@ MAX_CONTEXT="${MAX_CONTEXT:-131072}"
 NUM_SESSIONS="${NUM_SESSIONS:-64}"
 DURATION="${DURATION:-900}"
 ACCEPT_LENGTH="${ACCEPT_LENGTH:-4.0}"
+SPEC_TOKENS="${SPEC_TOKENS:-7}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-$((MAX_CONTEXT + 1024))}"
 PORT="${PORT:-8300}"
 TP=8
@@ -59,6 +61,11 @@ if [ -z "${MAX_NUM_SEQS:-}" ]; then
     [ "$MAX_NUM_SEQS" -ge 16 ] || MAX_NUM_SEQS=16
 fi
 read -r -a server_extra <<<"${SERVER_EXTRA:-}"
+spec_args=()
+if [ "$SPEC_TOKENS" -gt 0 ]; then
+    spec_args=(--method dspark --num-speculative-tokens "$SPEC_TOKENS"
+        --spec-decode-acceptance-length "$ACCEPT_LENGTH")
+fi
 SERVER_LOG=/app/logs_claude/atom_server.log
 
 mkdir -p "$OUT_DIR" "$(dirname "$SERVER_LOG")"
@@ -72,7 +79,7 @@ subset_args=(--out "$OUT_DIR/traces" --seed "$SEED" --max-context "$MAX_CONTEXT"
 python3 "$HERE/trace_subset.py" "${subset_args[@]}"
 NUM_TRACES=$(find "$OUT_DIR/traces" -maxdepth 1 -name '*.json' | wc -l)
 
-# --- 2. server: the recipe's fast configuration, DSpark k=7, forced AL ---
+# --- 2. server: the recipe's fast configuration, DSpark (SPEC_TOKENS), forced AL ---
 export AITER_LOG_LEVEL=WARNING
 export AITER_CUSTOM_AR_DISABLE_LAMPORT=1
 default_variants='{"kernels": true, "attn": "aiter", "topk": "fused"}'
@@ -95,9 +102,7 @@ bash "$REPO/scripts/start_atom_server.sh" "$MODEL" "$TP" "$PORT" \
     --index-cache-dtype fp8 \
     --level 0 \
     --online_quant_config '{"layer_quant_config": {"*.experts": "mxfp4"}}' \
-    --method dspark \
-    --num-speculative-tokens 7 \
-    --spec-decode-acceptance-length "$ACCEPT_LENGTH"     "${server_extra[@]}"
+    "${spec_args[@]}" "${server_extra[@]}"
 # start_atom_server.sh stops waiting after two minutes; loading Pro takes longer.
 bash "$REPO/scripts/wait_server_ready.sh" "$PORT" 60 30 "$SERVER_LOG"
 

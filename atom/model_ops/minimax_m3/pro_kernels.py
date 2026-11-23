@@ -1206,6 +1206,7 @@ def _attn_kernel(
     ws_m_ptr,
     ws_l_ptr,
     ws_acc_ptr,
+    lse_ptr,
     scale,
     n_entries,
     H,
@@ -1218,6 +1219,7 @@ def _attn_kernel(
     KV_FP8: tl.constexpr,
     VALID_FIRST: tl.constexpr = False,
     EP2: tl.constexpr = 1,
+    WRITE_LSE: tl.constexpr = False,
 ):
     t = tl.program_id(0)
     sp = tl.program_id(1)
@@ -1315,7 +1317,14 @@ def _attn_kernel(
         m_i = m_new
 
     if SPLITS == 1:
-        inv = 1.0 / l_i
+        if WRITE_LSE:  # a token with no visible key here: output 0, lse -inf
+            inv = tl.where(l_i > 0, 1.0 / l_i, 0.0)
+            tl.store(
+                lse_ptr + t.to(tl.int64) * H + hbase + ar_h,
+                tl.where(l_i > 0, m_i + tl.log(l_i), float("-inf")),
+            )
+        else:
+            inv = 1.0 / l_i
         ob = out_ptr + t.to(tl.int64) * stride_out_t + (hbase + ar_h)[:, None] * 192
         tl.store(ob + ar_c[None, :], (acc1 * inv[:, None]).to(out_ptr.dtype.element_ty))
         tl.store(
@@ -1341,9 +1350,11 @@ def _combine_kernel(
     ws_acc_ptr,
     out_ptr,
     stride_out_t,
+    lse_ptr,
     H,
     SPLITS: tl.constexpr,
     SP2: tl.constexpr,
+    WRITE_LSE: tl.constexpr = False,
 ):
     t = tl.program_id(0)
     h = tl.program_id(1)
@@ -1353,6 +1364,8 @@ def _combine_kernel(
     m = tl.load(ws_m_ptr + wb, mask=ok, other=float("-inf"))
     l = tl.load(ws_l_ptr + wb, mask=ok, other=0.0)
     mx = tl.max(m, axis=0)
+    if WRITE_LSE:  # every split may be empty on this rank
+        mx = tl.where(mx == float("-inf"), 0.0, mx)
     w = tl.exp(m - mx)
     ltot = tl.sum(l * w, axis=0)
     a192 = tl.arange(0, 256)
@@ -1363,6 +1376,12 @@ def _combine_kernel(
         other=0.0,
     )
     o = tl.sum(acc * w[:, None], axis=0) / ltot
+    if WRITE_LSE:
+        o = tl.where(ltot > 0, o, 0.0)
+        tl.store(
+            lse_ptr + t.to(tl.int64) * H + h,
+            tl.where(ltot > 0, mx + tl.log(ltot), float("-inf")),
+        )
     tl.store(
         out_ptr + t.to(tl.int64) * stride_out_t + h * 192 + a192,
         o.to(out_ptr.dtype.element_ty),
@@ -1384,6 +1403,7 @@ def attention(
     n_blocks=None,
     k_scale=None,
     valid_first=False,
+    lse=None,
 ):
     """Attention of every token's local heads over its selected blocks.
 
@@ -1392,7 +1412,9 @@ def attention(
     ``out`` ``[T, H * 192]``. ``splits`` cuts the blocks over that many programs per token
     (for few tokens), ``nblk`` blocks are processed per step. An fp8 ``kc4`` takes its
     per-token scales ``k_scale`` ``[N, 1, page]``. ``valid_first``: ``sel``'s valid blocks
-    lead each row (``select_logical``), and the splits divide those.
+    lead each row (``select_logical``), and the splits divide those. ``lse`` ``[T, H]``
+    fp32: also write each head's log-sum-exp (natural base), -inf with output 0 where the
+    token sees no key, for a log-sum-exp merge of partial outputs.
     """
     t, h, _ = q.shape
     assert h % 16 == 0 and kc4.stride(-1) == 1 and q.stride(-1) == 1
@@ -1431,6 +1453,7 @@ def attention(
         ws_m,
         ws_l,
         ws_acc,
+        out if lse is None else lse,
         scale,
         n_entries,
         h,
@@ -1443,6 +1466,7 @@ def attention(
         KV_FP8=fp8,
         VALID_FIRST=valid_first and not dense,
         EP2=triton.next_power_of_2(n_entries),
+        WRITE_LSE=lse is not None,
     )
     if splits > 1:
         _combine_kernel[(t, h)](
@@ -1451,9 +1475,11 @@ def attention(
             ws_acc,
             out,
             out.stride(0),
+            out if lse is None else lse,
             h,
             SPLITS=splits,
             SP2=triton.next_power_of_2(splits),
+            WRITE_LSE=lse is not None,
         )
     return out
 
@@ -2124,3 +2150,75 @@ def attention_day0(q, kc4, block_tables, seq_id, positions, sel, out, scale):
         out.view(t, IDX_HEADS, VALUE_DIM),
     )
     return out
+
+
+# ------------------------------------------------------ decode context parallel --
+# Under DCP the KV and index caches are interleaved a whole 16-token block at a time:
+# global block j of a sequence lives on rank j % W as that rank's local block j // W, at
+# block-table entry j // W (one entry covers W * 16 tokens, 16 of them on each rank).
+# The kernels above then run unchanged on a rank's own blocks, fed the positions below.
+
+
+def dcp_local_positions(positions, rank, world):
+    """Each token's position in ``rank``'s local block sequence, for the scores and the
+    attention over that rank's blocks: local block ``(qb - rank) // world`` (``qb`` the
+    token's own block), its offset there the token's own if ``rank`` holds that block,
+    else 15 (a whole earlier block); -16 when ``rank`` holds none of the causal blocks.
+    """
+    qb = positions // PAGE
+    own = qb % world == rank
+    tail = torch.where(own, positions % PAGE, PAGE - 1)
+    local = torch.div(qb - rank, world, rounding_mode="floor") * PAGE + tail
+    return torch.where(qb >= rank, local, -PAGE)
+
+
+def dcp_pin(score, positions, rank, world, init, local):
+    """``scores``' pins on a rank's local columns, in place: the forced init blocks
+    above every score, the local window below them, by global block index."""
+    j = torch.arange(score.shape[1], device=score.device) * world + rank
+    qb = (positions // PAGE)[:, None]
+    score.masked_fill_(j < init, 1e30)
+    score.masked_fill_(j >= qb + 1 - local, 1e29)
+    return score
+
+
+def dcp_interleave(gathered, world):
+    """The ranks' local scores, all-gathered ``[world * T, NBl]`` (rank-major), as the
+    global ``[T, NBl * world]`` scores: column ``j`` from rank ``j % world``."""
+    return gathered.view(world, -1, gathered.shape[1]).permute(1, 2, 0).flatten(1)
+
+
+def dcp_local_selection(sel, rank, world):
+    """``select_logical``'s global ids ``[T, k]`` cut to those ``rank`` holds, as local
+    block ids, in selection order and leading each row, -1 after (``valid_first``)."""
+    k = sel.shape[1]
+    mine = (sel >= 0) & (sel % world == rank)
+    ar = torch.arange(k, device=sel.device)
+    order = torch.where(mine, ar, ar + k).argsort(dim=1)
+    local = torch.where(mine, torch.div(sel, world, rounding_mode="floor"), -1)
+    return local.gather(1, order).to(torch.int32)
+
+
+def dcp_prefill_plan(block_tables, context_lens, world):
+    """What gathering a prefill's sequences' blocks from every rank needs: ``rows`` the
+    local blocks (``[E]``, every entry of every sequence in order), and ``tables``
+    ``[S, world * max entries]`` int32, each sequence's global blocks in the gathered
+    caches (``dcp_gather_blocks``)."""
+    dev = block_tables.device
+    ne = [-(-int(c) // (PAGE * world)) for c in context_lens]
+    seq = torch.repeat_interleave(torch.arange(len(ne)), torch.tensor(ne))
+    ent = torch.cat([torch.arange(n) for n in ne])
+    rows = block_tables[seq.to(dev), ent.to(dev)].long()
+    tables = torch.zeros(len(ne), world * max(max(ne), 1), dtype=torch.int32)
+    off = 0
+    for s, n in enumerate(ne):
+        tables[s, : world * n] = torch.arange(world * off, world * (off + n))
+        off += n
+    return rows, tables.to(dev)
+
+
+def dcp_gather_blocks(cache, rows, gather, world):
+    """``cache[rows]`` of every rank (``gather`` the all-gather on dim 0) as one cache of
+    global blocks: local entry ``e`` of rank ``r`` becomes block ``world * e + r``."""
+    g = gather(cache[rows].contiguous())
+    return g.view(world, rows.shape[0], *cache.shape[1:]).transpose(0, 1).flatten(0, 1)

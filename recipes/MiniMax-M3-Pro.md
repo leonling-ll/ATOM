@@ -306,6 +306,43 @@ offload off. Stock GSM8K shares no prefix, so nothing is loaded back there; rest
 running the first 450 questions twice on one server, the second pass with 4.60M of its 4.66M prompt
 tokens loaded from CPU: 0.9667 cold, 0.9689 restored, 257 of 450 responses identical.
 
+## Decode context parallelism (DCP 8)
+
+Pro has one KV head, so at TP8 every rank holds the whole K and index caches. With
+`--decode-context-parallel-size 8` each rank holds every eighth 16-token block of them (the
+interleave is set to the block size), and a block-table entry covers 128 tokens. A decode step
+scores each rank's own blocks, all-gathers the scores and selects the same top-128 blocks on every
+rank as without DCP; each rank then attends all 128 query heads over the selected blocks it holds,
+and the partial outputs are merged by log-sum-exp. A prefill all-gathers its sequences' blocks and
+runs as without DCP. It needs the kernel path and runs the Triton attention.
+
+Add to the server's arguments `--decode-context-parallel-size 8`, and to its environment
+`AITER_REUSE_IDENTICAL_COMM_GROUPS=1`: without it aiter builds the DCP group a communicator of its
+own over the TP group's GPUs, and the KV pool loses it. The DSpark draft does not run under DCP
+yet (#78), so the server has no `--method dspark`.
+
+Measured on the 15-minute agentic proxy (`SPEC_TOKENS=0 scripts/m31pro/proxy_bench.sh 32`) with the K-only
+cache, CPU KV offload on and `AITER_REUSE_IDENTICAL_COMM_GROUPS=1`, both arms on one tree, without
+DSpark:
+
+| c32 | tok/s/GPU | p90 E2E-normalized interactivity | failed | KV pool (tokens) | decode batch mean |
+|---|---:|---:|---:|---:|---:|
+| DCP 1 | 3761.7 | 3.52 | 0/506 | 651,056 (40,691 blocks of 16) | 9.96 |
+| DCP 8 | 4863.0 | 12.11 | 0/623 | 5,208,448 (40,691 blocks of 128) | 17.05 |
+
+Real request rows per decode forward (`atom:decode_batch_size`), share of forwards:
+
+| batch | 3-4 | 5-8 | 9-12 | 13-16 | 17-24 | 25-32 | forwards |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| DCP 1 | 1.4% | 12.8% | 82.2% | 3.5% | 0 | 0 | 30,870 |
+| DCP 8 | 0.5% | 9.6% | 24.2% | 7.5% | 47.0% | 11.2% | 19,566 |
+
+Both arms had 16.00 GB for KV per GPU, so DCP 8 holds 8x the tokens. At DCP 1 about 10 requests
+wait on average and the pool runs 87% full; at DCP 8 none wait, the pool runs 20% full and every
+prefix hit is served from HBM. Accuracy at DCP 8
+(the GSM8K section's lm-eval command, max-model-len 16384, offload on, no DSpark): 0.9393 +- 0.0066
+flexible-extract; the 14k key-value retrieval is 12/12.
+
 ## Speculative decoding (DSpark)
 
 `--method dspark --num-speculative-tokens 7` drafts with the checkpoint's own 5-layer DSpark model
