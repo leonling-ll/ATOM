@@ -53,7 +53,11 @@ def _nbytes(t: torch.Tensor) -> int:
 
 def _mxfp8(linear, rows: int, cols: int, name: str):
     """(weight, scale) of a native MXFP8 1x32 linear: the checkpoint's bytes,
-    the weight (16, 16)-preshuffled, the scale row-major [rows, cols / 32]."""
+    the weight (16, 16)-preshuffled, the scale row-major [rows, cols / 32].
+
+    Row-major because aiter's ``shuffle_mxfp8_bpreshuffle_scale`` returns its
+    input unchanged on every arch but gfx1250 (``aiter/ops/shuffle.py``); this
+    is safe only because ``common_refusals`` refuses any arch but gfx950."""
     _need(linear is not None, f"{name}: missing")
     _need(
         getattr(linear, "native_a8_group_rows", None) == 1,

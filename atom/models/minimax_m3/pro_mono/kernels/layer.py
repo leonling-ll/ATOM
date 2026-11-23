@@ -4,8 +4,8 @@
 the first all-reduce and the post-attention Gemma RMSNorm with its MXFP8 output,
 plus the lookahead norm of layer L + 2 (stages: ``layout``'s docstring).
 
-Numerics are production's at <= 16 rows under the combo config (Lamport
-all-reduce, then aiter ``add_rmsnorm_mxfp8(..., gemma=True)``)::
+The numerics follow production's recipe at <= 16 rows under the combo config
+(Lamport all-reduce, then aiter ``add_rmsnorm_mxfp8(..., gemma=True)``)::
 
     a    = bf16(fp32 sum of the 8 bf16 partials, rank order 0 .. 7)
     v    = f32(a) + f32(res)                    (unrounded)
@@ -25,10 +25,18 @@ bf16 core rows), so the GEMM reads production's operand bytes; its sum order
 over K differs from aiter's tuned GEMM, so a partial can differ in its last bf16
 bit (design section 12).
 
+The recipe, not every bit: the sums of squares here are a per-task wave sum
+then a fixed butterfly over the 56 tasks (not aiter's order), and ``/ 7168`` is
+not shown to be the true divide aiter uses, so x, x8 and la8 may differ from
+production by an ulp or one MXFP8 code. h_mid is bit-exact when the partials
+are (the spike showed it); x / x8 / la8 are held to design section 12's
+tolerances until T12 compares the stage bit for bit.
+
 The AR + norm stages are the gate #3 spike's ``rsag_sq`` mode
 (``pro_opt/mono/spike_ar/arnorm_kernel.py``), which matched the reference on 8
-MI355X (h_mid bit-exact) before this port; the o_proj stage is MiniMax-M3's
-MXFP8 o stage (``minimax_m3/mono/kernels/stages/attention.py``) at Pro's K.
+MI355X (h_mid bit-exact, x within a tolerance) before this port; the o_proj
+stage is MiniMax-M3's MXFP8 o stage (``minimax_m3/mono/kernels/stages/attention.py``)
+at Pro's K.
 """
 
 import functools

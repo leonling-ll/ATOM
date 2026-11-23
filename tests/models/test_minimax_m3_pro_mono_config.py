@@ -232,7 +232,8 @@ def test_variants_take_the_row_limit():
     """``ATOM_M3PRO_VARIANTS`` names the field (unknown keys raise, so an older
     build rejects it rather than ignoring it); off by default."""
     pro_attn = pytest.importorskip(
-        "atom.model_ops.minimax_m3.pro_attn", reason="pro_attn imports aiter"
+        "atom.model_ops.minimax_m3.pro_attn",
+        reason="pro_attn needs aiter, including aiter.ops.triton.fused_kv_cache",
     )
     assert pro_attn.ProVariants().mono_ffn_rows == 0
     assert pro_attn._parse_variants({"mono_ffn_rows": 8}).mono_ffn_rows == 8

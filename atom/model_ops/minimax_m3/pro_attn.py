@@ -200,9 +200,12 @@ class ProVariants:
     prefill_attn: str = "triton"
     # Mono decode phase 1 (``models/minimax_m3/pro_mono``): the most graph rows a decode /
     # verify forward may have for its MoE layers' o_proj .. FFN segment to run as one
-    # persistent kernel; 0 (default) off, at most ``pro_mono.config.MAX_ROWS``. Latched
-    # once when the runner is created and agreed over the TP group: a later re-read of
-    # the variants does not change it.
+    # persistent kernel; 0 (default) off, at most ``pro_mono.config.MAX_ROWS``. To be
+    # latched once (``pro_mono.config.latch_rows``, agreed over the TP group) by the
+    # runner, which does not exist yet: nothing reads this field until then. Off by
+    # default until the design's acceptance gates pass with it on (accuracy: the
+    # exposure and official GSM8K 3-run means, AIME26 avg@16 >= 0.95 twice,
+    # retrieval 40/40; speed: a faster measured layer and >= 10% proxy TPOT at c1/c4).
     mono_ffn_rows: int = 0
 
 
