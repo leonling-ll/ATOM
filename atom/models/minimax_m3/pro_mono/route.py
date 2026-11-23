@@ -74,6 +74,8 @@ class ProMonoRoute:
         self._read, self._group = read, group
         self._mono = LazyRunner(create, WHAT)
         self.rows = 0
+        # the routed experts' activations the runner builds with (latched)
+        self.routed_act = "fp8"
         self.check = False
         self._latched = False
         if refusal is not None:
@@ -90,18 +92,23 @@ class ProMonoRoute:
         v, mx_norm = self._read()
         why = variants_refusal(v, mx_norm)
         # a refused variant set latches 0 here, which turns every rank off
-        self.rows, why = latch_rows(0 if why else v.mono_ffn_rows, self._group())
+        act = v.mono_routed_act
+        self.rows, why = latch_rows(
+            0 if why else v.mono_ffn_rows, self._group(), act=act
+        )
         if not self.rows:
             if v.mono_ffn_rows:
                 logger.warning("%s off: %s", WHAT, why)
             self._mono.enabled = False
             return
+        self.routed_act = act
         # ATOM_MONO_CHECK is the process's environment, the same on every rank
         self.check = envs.ATOM_MONO_CHECK
         logger.info(
-            "%s: forwards of 1 .. %d rows%s",
+            "%s: forwards of 1 .. %d rows, routed experts %s%s",
             WHAT,
             self.rows,
+            "W4A8" if act == "fp8" else "W4A4",
             ", checked against production" if self.check else "",
         )
 

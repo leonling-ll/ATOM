@@ -3,9 +3,10 @@
 """The phase-1 layer kernel's ``upto = "ffn"`` build on 8 GPUs: the norm
 stages against the torch reference as ``test_minimax_m3_pro_mono_layer_gpu``
 holds them, then the router and every rank's FFN partial against
-``ffn_reference`` (routed experts in the W4A4 recipe, aiter a4w4 numerics --
-production runs a16w4 -- and the MXFP8 shared expert) run on the kernel's own
-x, x8, picks and weights.
+``ffn_reference`` (routed experts in the W4A8 recipe -- the norm's MXFP8 x8
+and MXFP8 mids, the default build -- at every width, and in the W4A4 one,
+aiter a4w4 numerics, at 1 and 16 rows; production runs a16w4 -- and the MXFP8
+shared expert) run on the kernel's own x, x8, picks and weights.
 
 Every rank holds its own random routed planes (384 experts, MXFP4, the
 intermediate 640 zero padded to 768, shuffled as the loader leaves them) and
@@ -72,17 +73,21 @@ from test_minimax_m3_pro_mono_layer_gpu import (
 
 EXPERTS = 384
 INTER_V, INTER_R, INTER_S = 640, 768, 640
-# rows: one, the decode widths 2 / 4, a partial wave, an 8-row verify, two
-# passes, the widest
+# (rows, lookahead, routed_act). W4A8: one row, the decode widths 2 / 4, a
+# partial wave, an 8-row verify, two passes, the widest; W4A4 (the v1 build,
+# 26/26 on GPU at c467bcf9) at one row and the widest, so both stay covered
 CASES = (
-    (1, True), (2, True), (3, True), (4, True), (8, True), (9, True), (16, True),
-    (16, False),
+    (1, True, "fp8"), (2, True, "fp8"), (3, True, "fp8"), (4, True, "fp8"),
+    (8, True, "fp8"), (9, True, "fp8"), (16, True, "fp8"), (16, False, "fp8"),
+    (1, True, "fp4"), (16, True, "fp4"),
 )  # fmt: skip
 
 
 def _inputs(case):
     s = CASES[case][0]
-    return case_inputs(s, [_weight(r) for r in range(TP)], 3000 * (case + 1))
+    # a W4A4 case takes its W4A8 twin's inputs (the same rows at that width)
+    twin = next(i for i, c in enumerate(CASES) if c[:2] == CASES[case][:2])
+    return case_inputs(s, [_weight(r) for r in range(TP)], 3000 * (twin + 1))
 
 
 def _router():
@@ -163,12 +168,15 @@ def _worker(rank, port, queue, done, inputs):
         )
         group = dist.group.WORLD
         keys = [
-            L.P1Build(tokens=s, upto="ffn", lookahead=la, debug=True) for s, la in CASES
+            L.P1Build(tokens=s, upto="ffn", lookahead=la, debug=True, routed_act=act)
+            for s, la, act in CASES
         ]
         launches = compile_kernels([(build(k), ABI) for k in keys])
         peers = PeerBuffer(L.peer_bytes(), group, rank, TP, dev)
         scratch = uncached_bytes(L.scratch_bytes(keys[0]), dev)
-        plain = uncached_bytes(L.plain_bytes(keys[0]), dev)
+        # the widest plain layout of the two formats' (W4A8's mids are larger,
+        # W4A4 adds x4)
+        plain = uncached_bytes(max(L.plain_bytes(k) for k in keys), dev)
         mbx = StepMailboxes(peers, scratch, debug=True)
         diag = scratch[: L.scratch_layout(keys[0])["diag"][1]]
         route_at = L.scratch_layout(keys[0])["route"][0]
@@ -249,7 +257,7 @@ def _worker(rank, port, queue, done, inputs):
             )
             want = ffn_reference(
                 out["x"], x8, out["x8s"], picks, weights, routed_of,
-                shared["deq"],
+                shared["deq"], act=key.routed_act,
             )  # fmt: skip
             got = out["ffn_out"]
             norm = {k: v.cpu() for k, v in out.items() if k != "ffn_out"}
@@ -260,6 +268,7 @@ def _worker(rank, port, queue, done, inputs):
             results.append(
                 {
                     "rows": s, "lookahead": key.lookahead, "waits": waits,
+                    "act": key.routed_act,
                     "norm": norm, "picks": picks.cpu(), "weights": weights.cpu(),
                     "route_bad": route_bad,
                     "ffn_bad": ffn_failures(got.cpu(), want.cpu()),
@@ -315,7 +324,7 @@ def ranks():
 
 def test_no_wait_gave_up(ranks):
     stuck = [
-        (rank, r["rows"], r["lookahead"], r["waits"])
+        (rank, r["rows"], r["lookahead"], r["act"], r["waits"])
         for rank, results in ranks.items()
         for r in results
         if r["waits"]
@@ -357,7 +366,7 @@ def test_every_ranks_ffn_partial_matches_the_reference(ranks, case):
     for rank in range(TP):
         r = ranks[rank][case]
         print(
-            f"rows {r['rows']} rank {rank}: ffn rel {r['ffn_rel']:.3g},"
+            f"rows {r['rows']} {r['act']} rank {rank}: ffn rel {r['ffn_rel']:.3g},"
             f" |U| {r['union']}"
         )
-        assert not r["ffn_bad"], (rank, r["rows"], r["ffn_bad"])
+        assert not r["ffn_bad"], (rank, r["rows"], r["act"], r["ffn_bad"])

@@ -9,8 +9,8 @@ A mono layer's segment (``segment``), Option A::
     core (attention output, before o_proj) + residual
       -> layer kernel: o_proj, AR #1, + residual, Gemma norm (+ MXFP8), the
          lookahead norm of layer L + 2 (MXFP8), then (upto = "ffn") the router,
-         the routed experts (W4A4) and the shared expert (MXFP8) -> this rank's
-         FFN partial (``ffn_out``)
+         the routed experts (W4A8 or W4A4: ``routed_act``) and the shared
+         expert (MXFP8) -> this rank's FFN partial (``ffn_out``)
       -> (FFN partial, residual_mid): what production's segment returns, so
          the next layer's AR #2 + input norm runs unchanged (Option A)
 
@@ -22,7 +22,7 @@ The lookahead goes where ``ProLookaheadState.put`` would put it
 build hands its (x, x8) to production's MoE instead. Switching is this one
 constant. An "ffn" build reads each layer's FFN weights through ``moe_w``, a
 device table of their addresses (``layout.MOE_WEIGHTS`` order) made once at
-bind time, and stages x as MXFP4 and the routed mids in ``plain``.
+bind time, and stages the routed mids (and, W4A4, x as MXFP4) in ``plain``.
 
 Steps: ``begin_step`` (the mailboxes zeroed, the peer fence) once a forward, at
 its first MoE layer, on the current stream, so a decode graph records it.
@@ -127,9 +127,12 @@ class ProMonoRunner:
     builds. Construction is collective over the TP group (bind, agree, then
     the peer handshake)."""
 
-    def __init__(self, layers, state, check: bool) -> None:
+    def __init__(self, layers, state, check: bool, routed_act: str = "fp8") -> None:
         group = get_tp_group().cpu_group
         self.check = check
+        # the routed experts' activations (``layout.ROUTED_ACTS``), TP-uniform
+        # (``config.latch_rows``)
+        self.routed_act = routed_act
         self.debug = envs.ATOM_MONO_DEBUG
         bind_agreed(lambda: self._bind(layers, state), group)
         self._allocate(group)
@@ -173,7 +176,7 @@ class ProMonoRunner:
         self.kinds = sorted({lw.kind for lw in self.layers.values()})
 
     def _allocate(self, group) -> None:
-        key = P1Build(tokens=1, upto=UPTO, debug=self.debug)
+        key = P1Build(tokens=1, upto=UPTO, debug=self.debug, routed_act=self.routed_act)
         self.peers, self._finalizer = owned_peer_buffer(
             self, peer_bytes(), group, self.rank, DIMS.tp, self.dev
         )
@@ -196,6 +199,7 @@ class ProMonoRunner:
                 P1Build(
                     tokens=rows, upto=UPTO, lookahead=kind[0], eps=kind[1],
                     eps_ahead=kind[2], debug=self.debug,
+                    routed_act=self.routed_act,
                 )
             )
             for kind in self.kinds

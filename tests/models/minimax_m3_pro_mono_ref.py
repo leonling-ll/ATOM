@@ -218,11 +218,13 @@ def layer_failures(rep):
 
 
 # ================================================================= the FFN
-# ``upto = "ffn"``: this rank's FFN partial in the W4A4 recipe -- aiter a4w4
-# numerics (MXFP4 activations) over the MXFP4 routed planes, and production's
-# MXFP8 shared expert. Production's routed experts run a16w4 (bf16
-# activations), so this is the kernel's reference, not production's. The widths
-# come from the tensors, so a CPU test can run it narrow.
+# ``upto = "ffn"``: this rank's FFN partial with the routed experts in the
+# W4A4 recipe (``act = "fp4"``: aiter a4w4 numerics, MXFP4 activations) or the
+# W4A8 one (``"fp8"``: the norm's MXFP8 x8 and MXFP8 mids, ``quantize_fp8``'s
+# rule) over the MXFP4 routed planes, and production's MXFP8 shared expert.
+# Production's routed experts run a16w4 (bf16 activations), so this is the
+# kernel's reference, not production's. The widths come from the tensors, so a
+# CPU test can run it narrow.
 
 TOPK = 4
 ROUTE_SCALE = 2.0
@@ -326,19 +328,33 @@ def route_reference(x, w_gate, bias):
     return route_reference_of_logits(logits, bias)
 
 
-def ffn_reference(x, x8, x8s, picks, weights, routed, shared, swiglu=swiglu_oai):
+def qdq_mxfp8(x):
+    """MXFP8 1x32 of bf16 values [m, n], dequantized (``quantize_fp8``)."""
+    return dequant(*mxfp8(x.to(torch.bfloat16)))
+
+
+ROUTED_ACTS = ("fp4", "fp8")
+
+
+def ffn_reference(
+    x, x8, x8s, picks, weights, routed, shared, swiglu=swiglu_oai, act="fp8"
+):
     """This rank's FFN partial [S, H] bf16 from the norm's x (bf16) and x8
     (e4m3, codes), the route (picks, weights [S, 4]) and the weights:
     ``routed(e)`` -> (w13 [2 I, H], w2 [H, I]) dequantized, the gate rows then
     the up rows over the planes' padded I (the pad zero, as loaded);
-    ``shared`` = (gate_up [2 Is, H], down [H, Is]) dequantized.
+    ``shared`` = (gate_up [2 Is, H], down [H, Is]) dequantized. ``act``: the
+    routed activations, MXA = MXFP4 ("fp4", xa = MXFP4(x)) or MXFP8 ("fp8",
+    xa = x8).
 
-        routed = bf16(sum_k bf16(w_k (MXFP4(bf16(SwiGLU(MXFP4(x) w13^T))) w2^T)))
+        routed = bf16(sum_k bf16(w_k (MXA(bf16(SwiGLU(xa w13^T))) w2^T)))
         shared = bf16(MXFP8(bf16(SwiGLU(bf16(x8 w_sgu^T)))) w_sd^T)
         ffn    = bf16(routed + shared)
     """
+    assert act in ROUTED_ACTS, act
     s = x.shape[0]
-    xq = qdq_mxfp4(x)
+    xq = qdq_mxfp4(x) if act == "fp4" else dequant(x8, x8s)
+    qdq_mid = qdq_mxfp4 if act == "fp4" else qdq_mxfp8
     out = []
     for t in range(s):
         tot = None
@@ -347,7 +363,7 @@ def ffn_reference(x, x8, x8s, picks, weights, routed, shared, swiglu=swiglu_oai)
             gu = (w13.double() @ xq[t].double()).float()
             i = gu.shape[0] // 2
             mid = _bf(swiglu(gu[:i], gu[i:]))
-            acc = (w2.double() @ qdq_mxfp4(mid[None])[0].double()).float()
+            acc = (w2.double() @ qdq_mid(mid[None])[0].double()).float()
             slot = _bf(acc * weights[t, k].float())
             tot = slot if tot is None else tot + slot
         out.append(_bf(tot))
@@ -417,7 +433,7 @@ def ffn_failures(got, want):
     return [] if rel <= FFN_BOUND else [f"ffn rel {rel:.3g}"]
 
 
-def ffn_mutations(x, x8, x8s, picks, weights, routed, shared, n_experts):
+def ffn_mutations(x, x8, x8s, picks, weights, routed, shared, n_experts, act="fp8"):
     """The FFN partial with one bug injected each, by name: what the GPU
     test's ``ffn_failures`` must catch (``test_minimax_m3_pro_mono_ffn``)."""
     w_sgu, w_sd = shared
@@ -426,9 +442,17 @@ def ffn_mutations(x, x8, x8s, picks, weights, routed, shared, n_experts):
     def run(**kw):
         args = {
             "x": x, "x8": x8, "x8s": x8s, "picks": picks, "weights": weights,
-            "routed": routed, "shared": shared,
+            "routed": routed, "shared": shared, "act": act,
         }  # fmt: skip
         return ffn_reference(**(args | kw))
+
+    # a lost K block of the activations the routed experts read (x or x8)
+    block5 = torch.arange(x.shape[1]) // 32 != 5
+    lost_k = (
+        {"x": x * block5.to(x.dtype)}
+        if act == "fp4"
+        else {"x8": (x8.view(torch.uint8) * block5.to(torch.uint8)).view(x8.dtype)}
+    )
 
     def routed_with(f):
         return lambda e: f(*routed(e))
@@ -462,9 +486,7 @@ def ffn_mutations(x, x8, x8s, picks, weights, routed, shared, n_experts):
             * torch.clamp(u, -7, 7)
         ),
         "sigmoid alpha 1": run(swiglu=lambda g, u: swiglu_oai(g, u, alpha=1.0)),
-        "a K block of x lost": run(
-            x=x * (torch.arange(x.shape[1]) // 32 != 5).to(x.dtype)
-        ),
+        "a K block of x lost": run(**lost_k),
         "x8 scale code + 1": run(x8s=x8s + (torch.arange(x8s.shape[1]) == 3).byte()),
         "w2 rows shifted by 16": run(
             routed=routed_with(lambda w13, w2: (w13, w2.roll(16, 0)))
@@ -530,7 +552,8 @@ def ffn_case(s, h, i_valid, i_pad, e, i_sh, seed):
 
 
 def case_ffn(case, **kw):
-    """``ffn_reference`` of a ``ffn_case``."""
+    """``ffn_reference`` of a ``ffn_case`` (``act`` in ``kw``: the routed
+    activations, W4A8 by default)."""
     c = case
     return ffn_reference(
         c["x"], c["x8"], c["x8s"], c["picks"], c["weights"], c["routed"],

@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 """The FFN stages of the phase-1 layer kernel (``upto = "ffn"``): router band,
-route, expert union, routed W4A4 experts, MXFP8 shared expert and their
-combine into this rank's FFN partial (stages and placement: ``layout``).
+route, expert union, routed experts (W4A4 or W4A8, ``P1Build.routed_act``),
+MXFP8 shared expert and their combine into this rank's FFN partial (stages
+and placement: ``layout``).
 
 Ported from Kimi-K3's K2b MoE stage (``kimi_k3/mono/kernels/stages/moe.py``:
 the router band with its parts, ``stage_route``, ``load_route``'s union, the
@@ -10,16 +11,22 @@ ug / down tasks over the union) with MiniMax-M3's math
 (``minimax_m3/mono/kernels/stages``: SwiGLU-OAI, the a4w4 activation quant,
 the MXFP8 shared expert's operands) at Pro's TP8 widths.
 
-Numerics: the W4A4 recipe (aiter a4w4 numerics, MXFP4 activations, as
-M3.1-Flash mono's routed stage) and production's MXFP8 shared expert.
-Production's routed experts run a16w4 (bf16 activations) at these widths, so
-the routed stage is not production's bit for bit::
+Numerics: the routed experts in the W4A4 recipe (``routed_act = "fp4"``:
+aiter a4w4 numerics, MXFP4 activations, as M3.1-Flash mono's routed stage) or
+the W4A8 one (``"fp8"``: the norm's MXFP8 x8, which the shared expert also
+reads, and MXFP8 mids, ``quantize_fp8``'s rule; the gfx950 f8f6f4 MFMA with
+the MXFP4 weight as A, cbsz 4, and the MXFP8 activation as B, blgp 0), and
+production's MXFP8 shared expert. Production's routed experts run a16w4 (bf16
+activations) at these widths, so the routed stage is not production's bit for
+bit::
 
     logit  = bf16(x @ w_gate^T)                       (fp32 accumulate)
     s      = sigmoid(logit); picks = top-4 of s + bias (lower expert on a tie)
     w_k    = s_k / (s_0 + s_1 + s_2 + s_3) * 2.0      (rank order sum)
-    x4     = MXFP4(x)        (E8M0 RoundUp of amax * f32(1/6), RNE e2m1)
-    mid_k  = MXFP4(bf16(SwiGLU-OAI(x4 @ w13_e^T)))    (fp32 gate / up)
+    xa     = MXFP4(x)        (W4A4: E8M0 RoundUp of amax * f32(1/6), RNE e2m1)
+           | x8              (W4A8: the norm's MXFP8 x)
+    mid_k  = MXA(bf16(SwiGLU-OAI(xa @ w13_e^T)))      (fp32 gate / up; MXA:
+                                                       MXFP4 | MXFP8)
     routed = bf16(sum_k bf16(w_k (mid_k @ w2_e^T)))   (fp32 sum, top-k order)
     gu     = bf16(x8 @ w_sgu^T); smid = MXFP8(bf16(SwiGLU-OAI(gu)))
     shared = bf16(smid @ w_sd^T)
@@ -38,7 +45,7 @@ import math
 import flydsl.expr as fx
 from aiter.ops.flydsl.kernels import buffer_ops as bo
 from aiter.ops.flydsl.kernels.act import swiglu_mul_batch
-from flydsl.expr import gpu, range_constexpr
+from flydsl.expr import const_expr, gpu, range_constexpr
 from flydsl.expr.typing import T
 
 from atom.models.minimax_m3.pro_mono.config import (
@@ -56,7 +63,6 @@ from atom.models.minimax_m3.pro_mono.layout import (
     E_RANK,
     INTER_R,
     INTER_S,
-    INTER_WORDS,
     MOE_WEIGHTS,
     NT,
     R0,
@@ -78,7 +84,10 @@ from atom.models.minimax_m3.pro_mono.layout import (
     W13_HALF,
     X4_ROW,
     X4_WORDS,
+    X8_ROW,
+    X8_WORDS,
     XSC_WORDS,
+    inter_words,
     mxfp8_tile_dword,
     rlog_pair,
     route_pair,
@@ -441,6 +450,47 @@ def load_route(c):
     return uniform(tot)
 
 
+def fp8_routed(c) -> bool:
+    """Whether the build's routed experts are W4A8 (a build-time constant)."""
+    return c["routed_act"] == "fp8"
+
+
+@traced
+def load_xb(c):
+    """The routed experts' B operands, every token's row -> LDS (``xbl`` /
+    ``xsl``): the norm CTAs' MXFP4 x (W4A4: ``x4`` / ``x4s``, plain) or MXFP8
+    x8 (W4A8: ``x8`` / ``x8s``, the outputs), at device scope behind
+    ``xrdy``."""
+    if const_expr(fp8_routed(c)):
+        load_x8(c)
+    else:
+        load_x4(c)
+
+
+@traced
+def load_x8(c):
+    """The norm's MXFP8 x (``x8`` / ``x8s``: stored at device scope, as the
+    shared expert reads them) -> LDS rows of ``X8_ROW`` words, the codes
+    ``XSC_WORDS`` a token."""
+    s, tid = c["S"], c["tid"]
+    wait_x(c)
+    n = s * X8_WORDS // 4
+    for i in range_constexpr(passes(n)):
+        e = fx.min(tid + THREADS * i, n - 1)
+        t = e // (X8_WORDS // 4)
+        w = e % (X8_WORDS // 4) * 4
+        v = fx.Vector(ld_dev(c["x8"], t * X8_WORDS + w, 4))
+        if tid + THREADS * i < n:
+            fx.ptr_store(v, c["xbl"] + (t * X8_ROW + w))
+    m = s * XSC_WORDS
+    for i in range_constexpr(passes(m)):
+        e = fx.min(tid + THREADS * i, m - 1)
+        v = fx.Int32(ld_dev(c["x8s"], e))
+        if tid + THREADS * i < m:
+            fx.ptr_store(v, c["xsl"] + e)
+    gpu.barrier()
+
+
 @traced
 def load_x4(c):
     """The norm CTAs' MXFP4 x (``x4`` / ``x4s``, plain at device scope behind
@@ -454,13 +504,13 @@ def load_x4(c):
         w = e % (X4_WORDS // 4) * 4
         v = fx.Vector(ld_dev(c["plain"], c["pw"]["x4"] + t * X4_WORDS + w, 4))
         if tid + THREADS * i < n:
-            fx.ptr_store(v, c["x4l"] + (t * X4_ROW + w))
+            fx.ptr_store(v, c["xbl"] + (t * X4_ROW + w))
     m = s * XSC_WORDS
     for i in range_constexpr(passes(m)):
         e = fx.min(tid + THREADS * i, m - 1)
         v = fx.Int32(ld_dev(c["plain"], c["pw"]["x4s"] + e))
         if tid + THREADS * i < m:
-            fx.ptr_store(v, c["x4sl"] + e)
+            fx.ptr_store(v, c["xsl"] + e)
     gpu.barrier()
 
 
@@ -501,13 +551,24 @@ def ug_loads(c, task):
     return av + sw
 
 
+def x8_lds_operand(c, t, st, kb):
+    """Token t's MXFP8 x from LDS as the B operand of 128-k step ``st``: its
+    k 16 kb .. + 16 and 64 + 16 kb .. + 16 (the f8f6f4 MFMA's fp8 layout)."""
+    base = c["xbl"] + (t * X8_ROW + st * 32 + kb * 4)
+    hv = [fx.Vector(fx.ptr_load(base + 16 * h, result_type=_v4i())) for h in range(2)]
+    return fx.Vector.from_elements(
+        [hv[h][e] for h in range(2) for e in range(4)], fx.Int32
+    )
+
+
 @traced
 def ug_tile(c, task, ops, first, count):
     """Task ``task`` (``ops``: ``ug_loads``) against its slot's picks at
     first .. first + count (S <= 16: one tile), a pick an MFMA column, its
-    token's MXFP4 x row from LDS; then each pick's 32 mids -> bf16 ->
-    MXFP4 -> ``inter`` / ``isc``."""
+    token's x row (MXFP4 or MXFP8) from LDS; then each pick's 32 mids -> bf16
+    -> MXFP4 or MXFP8 -> ``inter`` / ``isc``."""
     tid, lane, wave, red, rt = c["tid"], c["lane"], c["wave"], c["red"], c["rt"]
+    fp8 = fp8_routed(c)
     g = task % UG_GROUPS
     rg = ug_row_group(task, wave)
     half = wave >> 2
@@ -518,14 +579,19 @@ def ug_tile(c, task, ops, first, count):
     acc = fx.Vector.filled(4, 0.0, fx.Float32)
     for i in range_constexpr(W13_HALF):
         st = half * W13_HALF + i
-        bw = fx.Vector(
-            fx.ptr_load(c["x4l"] + (t * X4_ROW + st * 16 + kb * 4), result_type=_v4i())
-        )
-        sb = (fx.ptr_load(c["x4sl"] + (t * XSC_WORDS + st)) >> (kb * 8)) & 0xFF
+        if const_expr(fp8):
+            bw = x8_lds_operand(c, t, st, kb)
+        else:
+            bw = fx.Vector(
+                fx.ptr_load(
+                    c["xbl"] + (t * X4_ROW + st * 16 + kb * 4), result_type=_v4i()
+                )
+            )
+        sb = (fx.ptr_load(c["xsl"] + (t * XSC_WORDS + st)) >> (kb * 8)) & 0xFF
         # byte (st % 2) 2 + rg % 2 of the word; st % 2 is i % 2 (half W13_HALF
         # is even)
         sa = (sw[i // 2] >> ((i % 2) * 16 + (rg % 2) * 8)) & 0xFF
-        acc = mfma_scaled(av[i], bw, acc, sa, sb, FP4, FP4)
+        acc = mfma_scaled(av[i], bw, acc, sa, sb, FP4, FP8 if fp8 else FP4)
     fx.ptr_store(acc, red + (wave * 64 + lane) * 4)
     gpu.barrier()
     # thread (pick column tt, mid column col of 32): g / u summed over the K
@@ -539,17 +605,27 @@ def ug_tile(c, task, ops, first, count):
     gv = lo.select(row_sum(red, r, tc, waves=(0, 4)), row_sum(red, r, tc, waves=(1, 5)))
     uv = lo.select(row_sum(red, r, tc, waves=(2, 6)), row_sum(red, r, tc, waves=(3, 7)))
     y = bf16_round(swiglu(gv, uv))
-    # MXFP4 of the 32 mids (32 lanes): an even column packs its pair's byte,
-    # 4 bytes (8 columns) a word
-    code, scale = fp4_scale(butterfly(fx.max(y, -y), (16, 8, 4, 2, 1), fx.max))
-    byte = fp4_pack2(fx.Int32(0), y, xshfl(y, 1), scale, 0) & 0xFF
-    mine = (col % 2 == 0).select(byte << (4 * (col % 8)), fx.Int32(0))
-    word = butterfly(mine, (1, 2, 4), _or)
+    am = butterfly(fx.max(y, -y), (16, 8, 4, 2, 1), fx.max)
     row = first + tt
-    if live & (col % 8 == 0):
-        st_dev(
-            word, c["plain"], c["pw"]["inter"] + row * INTER_WORDS + g * 4 + col // 8
-        )
+    iw = inter_words(c["routed_act"])
+    if const_expr(fp8):
+        # MXFP8 of the 32 mids (``quantize_fp8``'s rule, as the shared mid):
+        # column 4 m packs columns 4 m .. 4 m + 3, a word
+        code = mx8_code(am)
+        q = clamp_fp8(y * rcp_pow2(code))
+        qn = xshfl(q, 1)
+        word = fp8_pack4(q, qn, xshfl(q, 2), xshfl(qn, 2))
+        if live & (col % 4 == 0):
+            st_dev(word, c["plain"], c["pw"]["inter"] + row * iw + g * 8 + col // 4)
+    else:
+        # MXFP4 of the 32 mids (32 lanes): an even column packs its pair's
+        # byte, 4 bytes (8 columns) a word
+        code, scale = fp4_scale(am)
+        byte = fp4_pack2(fx.Int32(0), y, xshfl(y, 1), scale, 0) & 0xFF
+        mine = (col % 2 == 0).select(byte << (4 * (col % 8)), fx.Int32(0))
+        word = butterfly(mine, (1, 2, 4), _or)
+        if live & (col % 8 == 0):
+            st_dev(word, c["plain"], c["pw"]["inter"] + row * iw + g * 4 + col // 8)
     if live & (col == 0):
         st_dev(code, c["plain"], c["pw"]["isc"] + row * UG_GROUPS + g)
 
@@ -754,21 +830,26 @@ def down_loads(c, rgd, nu, b0):
 
 def inter_operands(c, row, live):
     """A lane's B operands of mid row ``row`` (its K steps' words at lane group
-    lane / 16, and their codes), device scope (the slot's ug flags polled
+    lane / 16 -- MXFP4: k 32 kb .. + 32; MXFP8: k 16 kb .. + 16 and 64 + 16 kb
+    .. + 16 -- and their codes), device scope (the slot's ug flags polled
     first); a dead column multiplies zero."""
     kb = c["lane"] // 16
+    iw = inter_words(c["routed_act"])
+    base = c["pw"]["inter"] + row * iw
     out = []
     for st in range_constexpr(W2_STEPS):
-        bw = fx.Vector(
-            ld_dev(
-                c["plain"], c["pw"]["inter"] + row * INTER_WORDS + st * 16 + kb * 4, 4
-            )
-        )
+        if const_expr(fp8_routed(c)):
+            at = base + st * 32 + kb * 4
+            hv = [fx.Vector(ld_dev(c["plain"], at + 16 * h, 4)) for h in range(2)]
+            words = [hv[h][e] for h in range(2) for e in range(4)]
+        else:
+            bw = fx.Vector(ld_dev(c["plain"], base + st * 16 + kb * 4, 4))
+            words = [bw[d] for d in range(4)]
         code = fx.Int32(
             ld_dev(c["plain"], c["pw"]["isc"] + row * UG_GROUPS + st * 4 + kb)
         )
         bw = fx.Vector.from_elements(
-            [live.select(bw[d], fx.Int32(0)) for d in range(4)], fx.Int32
+            [live.select(w, fx.Int32(0)) for w in words], fx.Int32
         )
         out.append((bw, live.select(code, fx.Int32(UNIT_SCALE))))
     return out
@@ -792,10 +873,11 @@ def down_tile(c, rgd, ops, j, first, count, bs):
     row, live = tile_row(c, first, count)
     words = ops[nbs + N_W2_WORDS * j : nbs + N_W2_WORDS * (j + 1)]
     acc = fx.Vector.filled(4, 0.0, fx.Float32)
+    b_fmt = FP8 if fp8_routed(c) else FP4
     for st in range_constexpr(W2_STEPS):
         acc = mfma_scaled(
             ops[j * W2_STEPS + st], bs[st][0], acc, w2_code(words, rgd, st),
-            bs[st][1], FP4, FP4,
+            bs[st][1], FP4, b_fmt,
         )  # fmt: skip
     if live:
         pid = fx.ptr_load(rt["order"] + row)
@@ -916,7 +998,7 @@ def run_ffn(c, bid):
     c["stamp"](6)
     enter_stage("union")
     nu = load_route(c)
-    load_x4(c)
+    load_xb(c)
     c["stamp"](7)
     enter_stage("ug")
     run_ug(c, bid, nu)

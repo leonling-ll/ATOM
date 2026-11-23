@@ -71,6 +71,7 @@ from atom.models.minimax_m3.pro_mono.layout import (
     TL_POINTS,
     TP,
     X4_ROW,
+    X8_ROW,
     XSC_WORDS,
     P1Build,
     ag_pair,
@@ -406,7 +407,7 @@ def ar_norm(c, ins, held, w_post, w_ahead):
         _st_words(_pack(y), c["x"], word, cm)
         yb = [bf16_round(ye) for ye in y]
         mx_store(c, c["x8"], c["x8s"], t, col, yb, cm)
-        if const_expr(ffn_on):
+        if const_expr(ffn_on and c["routed_act"] == "fp4"):
             ffn.mx4_store(c, t, col, yb)
         if const_expr(la):
             part2 = (lane < NT).select(_f32_of(got[k][1]), fx.Float32(0.0))
@@ -453,13 +454,16 @@ def build(key: P1Build):
     keyed = key_tuple(key, SOURCES)
     name = kernel_symbol("minimax_m3_pro_mono_layer", **symbol_params(key))
 
+    fp8 = ffn_on and key.routed_act == "fp8"
     # ``xs``: the o stage's MXFP8 core rows, then (FFN) the router's bf16 x
-    # slice and the shared mid's MXFP8 rows -- stages apart, past barriers
-    assert s * O_ROW >= s * (ffn.R_KLEN + 8) // 2 and s * O_ROW >= s * SM_ROW
+    # slice, a W4A8 build's MXFP8 x rows (the routed B operands: union to ug)
+    # and the shared mid's MXFP8 rows (down) -- stages apart, past barriers
+    xs_row = max(O_ROW, X8_ROW) if fp8 else O_ROW
+    assert xs_row >= (ffn.R_KLEN + 8) // 2 and xs_row >= SM_ROW
 
     @fx.struct
     class Smem:
-        xs: fx.Array[fx.Int32, s * O_ROW, 16]
+        xs: fx.Array[fx.Int32, s * xs_row, 16]
         osc: fx.Array[fx.Int32, s * OSC_ROW, 16]
         red: fx.Array[fx.Float32, WAVES * 64 * 4, 16]
         misc: fx.Array[fx.Float32, O_ROWS * s, 16]
@@ -471,8 +475,11 @@ def build(key: P1Build):
 
     @fx.struct
     class FfnLds:
-        x4l: fx.Array[fx.Int32, s * X4_ROW, 16]
-        x4sl: fx.Array[fx.Int32, s * XSC_WORDS, 16]
+        # the W4A4 build's MXFP4 x rows (a W4A8 build's x8 rows are in ``xs``;
+        # 16 B unused there)
+        x4l: fx.Array[fx.Int32, 4 if fp8 else s * X4_ROW, 16]
+        # the routed B operands' E8M0 codes, four a word (x4's or x8's)
+        xsl: fx.Array[fx.Int32, s * XSC_WORDS, 16]
         smsc: fx.Array[fx.Int32, s * SMSC_WORDS, 16]
         contrib: fx.Array[fx.Float32, s * TOPK * ffn.DOWN_ROWS, 16]
         route: fx.Array[fx.Int32, s * 2 * TOPK, 16]
@@ -529,7 +536,7 @@ def build(key: P1Build):
             "misc": lds.misc.ptr,
             "put": mb.put, "put_bf": mb.put_bf, "put_words": mb.put_words,
             "poll": mb.poll, "stamp": lambda k: stamp(tl_on, tls, tid, k),
-            "ffn_on": ffn_on,
+            "ffn_on": ffn_on, "routed_act": key.routed_act,
         }  # fmt: skip
         if const_expr(ffn_on):
             # the norm writes MXFP4 x to ``plain`` (one buffer resource over
@@ -562,7 +569,8 @@ def build(key: P1Build):
                 ],
                 "rlog_own": preg(c["own"], play["rlog"][0], "rlog"),
                 "xl": lds.xs.ptr, "sm8": lds.xs.ptr,
-                "x4l": fl.x4l.ptr, "x4sl": fl.x4sl.ptr, "smsc": fl.smsc.ptr,
+                "xbl": lds.xs.ptr if fp8 else fl.x4l.ptr, "xsl": fl.xsl.ptr,
+                "smsc": fl.smsc.ptr,
                 "contrib": fl.contrib.ptr, "cand": fl.cand.ptr,
                 "csig": fl.csig.ptr, "scan": fl.scan.ptr,
                 "rt": {

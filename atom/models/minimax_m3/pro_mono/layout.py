@@ -21,8 +21,8 @@ Stages, in program order (one launch a MoE layer and rank, ``BLOCKS`` CTAs of
 
 ``upto = "norm"`` ends there and writes x and x8 to HBM, where the
 production MoE reads them. ``upto = "ffn"`` goes on to the rank's FFN partial
-(the norm CTAs also write x as MXFP4 for the routed experts and flag their
-columns, ``xrdy``)::
+(the norm CTAs flag their columns, ``xrdy``; a W4A4 build's also write x as
+MXFP4 for the routed experts, a W4A8 build's routed experts read x8)::
 
     router  R_TASKS CTAs from R0: this rank's 48 router rows (3 row groups x
             R_PARTS K slices) against bf16 x; part 0 adds the parts in order,
@@ -32,10 +32,11 @@ columns, ``xrdy``)::
     route   S CTAs from RT0, token t: sigmoid, top-4 of sigmoid + bias, the
             4 unbiased sigmoids renormalized x 2.0 -> ``route``
     union   every CTA: ``route`` -> the union U of the step's experts and
-            their picks (LDS), x4 -> LDS
+            their picks (LDS), the routed B operand (x4, or x8) -> LDS
     ug      |U| x UG_GROUPS tasks round-robin: 32 gate + 32 up rows of an
-            expert (W4A4) against its picks -> SwiGLU-OAI -> bf16 -> MXFP4
-            mid rows (plain ``inter`` / ``isc``, a task's ``ugf`` flag)
+            expert (MXFP4) against its picks -> SwiGLU-OAI -> bf16 -> MXFP4
+            (W4A4) or MXFP8 (W4A8) mid rows (plain ``inter`` / ``isc``, a
+            task's ``ugf`` flag)
     down    DOWN_TASKS (16 hidden rows): w2 of every expert of U against its
             picks' mids -> bf16(w acc) a pick, summed in top-k order -> bf16;
             the shared down (MXFP8 of ``smid``) -> bf16; bf16(routed + shared)
@@ -58,6 +59,7 @@ from atom.models.minimax_m3.pro_mono.config import (
     MAX_ROWS,
     MAX_ROWS_LAYOUT,
     MX_GROUP,
+    ROUTED_ACTS,
     TOPK,
     ProDims,
 )
@@ -124,6 +126,22 @@ SD_STEPS = INTER_S // 128  # 5
 X4_WORDS = HIDDEN // 8
 X4_ROW = X4_WORDS + 4
 XSC_WORDS = HIDDEN // 128
+# W4A8: x as MXFP8 in LDS (the norm's x8 rows, padded alike; the codes as
+# x4's), and a pick's MXFP8 mid row in ``inter``
+X8_WORDS = HIDDEN // 4
+X8_ROW = X8_WORDS + 4
+INTER8_WORDS = INTER_V // 4
+# the routed experts' activation format (``config.ROUTED_ACTS``): "fp4" W4A4
+# (aiter a4w4 numerics), "fp8" W4A8 (MXFP8 x and mids, the f8f6f4 MFMA with an
+# fp4 A and an fp8 B)
+ROUTED_ACT_DEFAULT = "fp8"
+
+
+def inter_words(act: str) -> int:
+    """Words of a pick's mid row in ``inter`` (MXFP4 or MXFP8)."""
+    return INTER_WORDS if act == "fp4" else INTER8_WORDS
+
+
 # the shared mid as MXFP8 in LDS (the down's B operand): a token's row of e4m3
 # words (padded) and its codes four a word
 SM_WORDS = INTER_S // 4
@@ -216,12 +234,16 @@ class P1Build:
     eps_ahead: float = EPS
     debug: bool = field(default=False, metadata={"sym": "g"})
     timeline: bool = field(default=False, metadata={"sym": "t"})
+    # the routed experts' activations (``ROUTED_ACTS``; an FFN build's only)
+    routed_act: str = field(default=ROUTED_ACT_DEFAULT, metadata={"sym": "ra"})
 
     def __post_init__(self):
         if not 1 <= self.tokens <= MAX_ROWS:
             raise ValueError(f"tokens {self.tokens} outside 1 .. {MAX_ROWS}")
         if self.upto not in UPTO:
             raise ValueError(f"upto {self.upto!r} not in {UPTO}")
+        if self.routed_act not in ROUTED_ACTS:
+            raise ValueError(f"routed_act {self.routed_act!r} not in {ROUTED_ACTS}")
 
 
 # ------------------------------------------------------------- peer regions
@@ -327,18 +349,23 @@ def scratch_bytes(key: P1Build) -> int:
 
 def plain_layout(key: P1Build) -> dict:
     """Plain words at device scope, a FFN build's (``plain``; flagged by the
-    tagged pairs that announce them): x as MXFP4 (``x4``: a token's e2m1 words,
-    ``x4s``: its codes four a word, a norm CTA's chunk) and the routed mids
-    (``inter``: a pick's MXFP4 row in the union's pick order, ``isc``: its
-    codes, a word each). name -> (byte offset, bytes)."""
+    tagged pairs that announce them): a W4A4 build's x as MXFP4 (``x4``: a
+    token's e2m1 words, ``x4s``: its codes four a word, a norm CTA's chunk;
+    a W4A8 build reads the norm's x8 instead) and the routed mids (``inter``:
+    a pick's MXFP4 or MXFP8 row in the union's pick order, ``isc``: its codes,
+    a word each). name -> (byte offset, bytes)."""
     if key.upto != "ffn":
         return {}
     L = MAX_ROWS_LAYOUT
+    x4 = (
+        (("x4", L * X4_WORDS * 4), ("x4s", L * XSC_WORDS * 4))
+        if key.routed_act == "fp4"
+        else ()
+    )
     return byte_layout(
         (
-            ("x4", L * X4_WORDS * 4),
-            ("x4s", L * XSC_WORDS * 4),
-            ("inter", L * TOPK * INTER_WORDS * 4),
+            *x4,
+            ("inter", L * TOPK * inter_words(key.routed_act) * 4),
             ("isc", L * TOPK * UG_GROUPS * 4),
         )
     )

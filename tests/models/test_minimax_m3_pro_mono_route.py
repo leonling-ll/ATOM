@@ -29,6 +29,7 @@ def _variants(**over):
         "lookahead": True,
         "lookahead_src": "resid_in",
         "ar_lamport_rows": 16,
+        "mono_routed_act": "fp8",
     }
     fields.update(over)
     return SimpleNamespace(**fields)
@@ -206,13 +207,29 @@ def test_ranks_that_disagree_turn_it_off_on_every_rank(monkeypatch):
     import atom.distributed.group_agreement as ga
 
     def max_each(values, group):
-        rows = [tuple(values), (0, 0, 0)]
+        rows = [tuple(values), (0, 0, 0, 0, 0)]
         return tuple(max(col) for col in zip(*rows))
 
     monkeypatch.setattr(ga, "group_max_each", max_each)
     h = Harness(monkeypatch)
     assert h.take(1) is None
     assert h.created == 0
+
+
+@pytest.mark.parametrize("act", ["fp4", "fp8"])
+def test_the_routed_format_is_latched_with_the_rows(monkeypatch, act):
+    """The runner builds with the latched ``mono_routed_act`` (W4A8 by
+    default); a later edit is not seen, as for the rows."""
+    h = Harness(monkeypatch, mono_routed_act=act)
+    assert h.take(1) is h.runner and h.route.routed_act == act
+    h.v.mono_routed_act = "fp4" if act == "fp8" else "fp8"
+    assert h.take(1) is h.runner and h.route.routed_act == act
+
+
+def test_an_unknown_routed_format_latches_off(monkeypatch):
+    h = Harness(monkeypatch, mono_routed_act="bf16")
+    assert h.take(1) is None
+    assert h.created == 0 and h.route.rows == 0
 
 
 def test_check_mode_is_latched_from_the_environment(monkeypatch):

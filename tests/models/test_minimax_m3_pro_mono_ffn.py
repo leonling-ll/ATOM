@@ -5,7 +5,7 @@ stages' widths, regions and contract, and the torch reference the 8-GPU test
 (``test_minimax_m3_pro_mono_ffn_gpu``) holds the kernel to -- its MXFP4 rule,
 its router, and that the GPU test's bounds pass summation-order noise and
 catch every injected bug (on a narrow case: hidden 1024, intermediate 96 of
-128, 16 experts).
+128, 16 experts), for both routed formats (W4A4 and W4A8).
 
 At Pro's widths (hidden 7168, 640 of 768, 24 experts, the same generator and
 seeds; CPU, about 15 s) the noise model below gives at most 0.016 per row at
@@ -19,14 +19,18 @@ import torch
 from minimax_m3_pro_mono_ref import (
     FFN_BOUND,
     ROUTE_SCALE,
+    ROUTED_ACTS,
     TOPK,
     case_ffn,
+    dequant,
     dq_mxfp4,
     ffn_case,
     ffn_failures,
     ffn_mutations,
     mxfp4,
+    mxfp8,
     qdq_mxfp4,
+    qdq_mxfp8,
     route_failures,
     route_reference_of_logits,
     row_relnorm,
@@ -96,9 +100,10 @@ def _spans(lay):
     return sorted(lay.values())
 
 
+@pytest.mark.parametrize("act", ROUTED_ACTS)
 @pytest.mark.parametrize("debug", [False, True])
-def test_ffn_regions_are_disjoint_and_sized(debug):
-    key = L.P1Build(tokens=MAX_ROWS, upto="ffn", debug=debug)
+def test_ffn_regions_are_disjoint_and_sized(debug, act):
+    key = L.P1Build(tokens=MAX_ROWS, upto="ffn", debug=debug, routed_act=act)
     for lay in (L.scratch_layout(key), L.plain_layout(key)):
         spans = _spans(lay)
         for (o1, n1), (o2, _) in itertools.pairwise(spans):
@@ -112,8 +117,13 @@ def test_ffn_regions_are_disjoint_and_sized(debug):
     assert s["ugf"][1] == L.max_u(MAX_ROWS_LAYOUT) * L.UG_GROUPS * 8
     assert s["xrdy"][1] == L.NT * 8
     p = L.plain_layout(key)
-    assert p["x4"][1] == MAX_ROWS_LAYOUT * HIDDEN // 2
-    assert p["inter"][1] == MAX_ROWS_LAYOUT * L.TOPK * L.INTER_V // 2
+    if act == "fp4":
+        assert p["x4"][1] == MAX_ROWS_LAYOUT * HIDDEN // 2
+        assert p["inter"][1] == MAX_ROWS_LAYOUT * L.TOPK * L.INTER_V // 2
+    else:
+        # W4A8 reads the norm's x8: no MXFP4 copy of x; a mid is a byte a value
+        assert "x4" not in p and "x4s" not in p
+        assert p["inter"][1] == MAX_ROWS_LAYOUT * L.TOPK * L.INTER_V
     peer = L.peer_layout()
     assert (L.rlog_pair(L.TP - 1, t, L.E_RANK - 1) + 1) * 8 == peer["rlog"][1]
     # a norm build has none of them
@@ -126,6 +136,17 @@ def test_ffn_build_key_and_contract_table():
     assert key.upto == "ffn"
     with pytest.raises(ValueError):
         L.P1Build(tokens=1, upto="moe")
+    # W4A8 by default; the format names the kernel symbol (``sym`` "ra")
+    assert key.routed_act == L.ROUTED_ACT_DEFAULT == "fp8"
+    assert set(L.ROUTED_ACTS) == {"fp4", "fp8"}
+    with pytest.raises(ValueError):
+        L.P1Build(tokens=1, upto="ffn", routed_act="bf16")
+    from atom.mono.plan.build_key import symbol_params
+
+    assert symbol_params(key)["ra"] == "fp8"
+    assert symbol_params(L.P1Build(tokens=1, upto="ffn", routed_act="fp4"))["ra"] == (
+        "fp4"
+    )
     got = {d.name: (d.space, d.writers, d.exchange) for d in L.decls(key)}
     assert set(got) == set(L.REGIONS)
     assert got["rlog"] == (Space.PEER, ("router",), False)
@@ -144,17 +165,34 @@ def test_moe_weights_table_names_the_binders_fields():
     assert {"moe_w", "ffn_out", "plain"} <= set(L.ABI_NAMES)
 
 
-def test_ffn_lds_fits_at_the_widest_build():
+@pytest.mark.parametrize("act", ROUTED_ACTS)
+def test_ffn_lds_fits_at_the_widest_build(act):
     """The FFN build's LDS (``layer.build``'s structs, counted here) under the
-    CU's: the contract run checks the binary's."""
+    CU's: the contract run checks the binary's. W4A8 stages the x8 rows in
+    ``xs`` (grown to ``X8_ROW`` words a token), not beside it."""
     s = MAX_ROWS
+    xs_row = max(L.O_ROW, L.X8_ROW) if act == "fp8" else L.O_ROW
+    x4l = 4 if act == "fp8" else s * L.X4_ROW
     words = (
-        s * L.O_ROW + s * L.OSC_ROW + WAVES * 64 * 4 + L.O_ROWS * s + 2 * 11
-        + s * L.X4_ROW + s * L.XSC_WORDS + s * L.SMSC_WORDS
+        s * xs_row + s * L.OSC_ROW + WAVES * 64 * 4 + L.O_ROWS * s + 2 * 11
+        + x4l + s * L.XSC_WORDS + s * L.SMSC_WORDS
         + s * L.TOPK * L.DOWN_ROWS + s * 2 * L.TOPK + 2 * EXPERTS
         + 2 * L.max_u(s) + 1 + s * L.TOPK + 3 * (128 + 16) + WAVES
     )  # fmt: skip
     assert 4 * words <= LDS_BYTES
+
+
+def test_x8_rows_and_mids_hold_whole_mfma_steps():
+    """A W4A8 B operand (k 16 kb .. + 16, 64 + 16 kb .. + 16 of a 128-k step)
+    stays inside its token's x8 row and its pick's MXFP8 mid row."""
+    assert L.X8_WORDS * 4 == HIDDEN and L.X8_ROW > L.X8_WORDS
+    assert L.INTER8_WORDS * 4 == L.INTER_V
+    assert L.inter_words("fp8") == L.INTER8_WORDS
+    assert L.inter_words("fp4") == L.INTER_WORDS
+    # an ug task's 32 mid columns are 8 words of the MXFP8 row (4 of MXFP4)
+    assert L.UG_COLS // 4 == 8 and L.UG_GROUPS * 8 == L.INTER8_WORDS
+    last = (L.W2_STEPS - 1) * 32 + 3 * 4 + 16 + 4
+    assert last <= L.INTER8_WORDS
 
 
 # ------------------------------------------------------------ the reference
@@ -228,12 +266,48 @@ def test_route_checks_catch_a_wrong_router():
         assert route_failures(logits, p, ww, logits, c["bias"]), name
 
 
+def test_mxfp8_mid_rule():
+    """The W4A8 mid: ``quantize_fp8``'s MXFP8 of the bf16 mids (the shared
+    mid's rule), within half an e4m3 step."""
+    g = torch.Generator().manual_seed(4)
+    y = (torch.randn(8, 128, generator=g) * 3).to(torch.bfloat16)
+    q, code = mxfp8(y)
+    back = dequant(q, code)
+    assert torch.equal(back, qdq_mxfp8(y.float()))
+    scale = (code.to(torch.int32) << 23).view(torch.float32).repeat_interleave(32, 1)
+    # RNE: half an e4m3 step (2^-3 relative), or half the subnormal step
+    err = (back - y.float()).abs()
+    assert (err <= y.float().abs() * 2.0**-4 + scale * 2.0**-10).all()
+    # the block's max fits 448 x scale, half the scale would not
+    amax = y.float().view(8, 4, 32).abs().amax(-1).repeat_interleave(32, 1)
+    assert (amax <= 448 * scale).all() and (amax > 224 * scale).all()
+
+
+@pytest.mark.parametrize("act", ROUTED_ACTS)
+def test_the_routed_formats_differ_and_w4a8_reads_x8(act):
+    """W4A8's routed input is the x8 the shared expert reads (an x8 scale code
+    moves the routed output, x itself does not); W4A4's is MXFP4(x)."""
+    c = ffn_case(3, **NARROW, seed=7)
+    w_sgu, w_sd = c["shared"]
+    routed_only = dict(c, shared=(w_sgu * 0, w_sd * 0))
+    base = case_ffn(routed_only, act=act)
+    x_moved = case_ffn(dict(routed_only, x=c["x"] * 1.5), act=act)
+    x8s_moved = case_ffn(dict(routed_only, x8s=c["x8s"] + 1), act=act)
+    if act == "fp8":
+        assert torch.equal(x_moved, base) and not torch.equal(x8s_moved, base)
+    else:
+        assert not torch.equal(x_moved, base) and torch.equal(x8s_moved, base)
+    other = "fp4" if act == "fp8" else "fp8"
+    assert row_relnorm(case_ffn(routed_only, act=other), base) > 0
+
+
+@pytest.mark.parametrize("act", ROUTED_ACTS)
 @pytest.mark.parametrize("s", [1, 3, 16])
-def test_the_gpu_tests_ffn_bound_passes_sum_order_noise(s):
+def test_the_gpu_tests_ffn_bound_passes_sum_order_noise(s, act):
     """gate / up off by 2^-12 relative, at random (f32 sum order is ~2^-20):
     the bound holds. Off by 2^-20 nothing moves at all."""
     c = ffn_case(s, **NARROW, seed=11 + s)
-    want = case_ffn(c)
+    want = case_ffn(c, act=act)
     g = torch.Generator().manual_seed(s)
 
     def noisy(rel):
@@ -246,17 +320,18 @@ def test_the_gpu_tests_ffn_bound_passes_sum_order_noise(s):
 
         return f
 
-    assert torch.equal(case_ffn(c, swiglu=noisy(2.0**-20)), want)
-    assert not ffn_failures(case_ffn(c, swiglu=noisy(2.0**-12)), want)
+    assert torch.equal(case_ffn(c, swiglu=noisy(2.0**-20), act=act), want)
+    assert not ffn_failures(case_ffn(c, swiglu=noisy(2.0**-12), act=act), want)
 
 
+@pytest.mark.parametrize("act", ROUTED_ACTS)
 @pytest.mark.parametrize("s", [1, 3, 16])
-def test_the_gpu_tests_ffn_bound_catches_injected_bugs(s):
+def test_the_gpu_tests_ffn_bound_catches_injected_bugs(s, act):
     c = ffn_case(s, **NARROW, seed=11 + s)
-    want = case_ffn(c)
+    want = case_ffn(c, act=act)
     muts = ffn_mutations(
         c["x"], c["x8"], c["x8s"], c["picks"], c["weights"], c["routed"],
-        c["shared"], NARROW["e"],
+        c["shared"], NARROW["e"], act=act,
     )  # fmt: skip
     assert len(muts) >= 13
     missed = {
@@ -269,13 +344,15 @@ def test_the_gpu_tests_ffn_bound_catches_injected_bugs(s):
 
 def test_neither_the_routed_nor_the_shared_output_drowns():
     """The generator's code ranges keep the two outputs of one size, so a
-    lost or wrong one shows (``W2_CODES``, ``SHARED_CODES``)."""
+    lost or wrong one shows (``W2_CODES``, ``SHARED_CODES``), in either
+    routed format."""
     c = ffn_case(3, **NARROW, seed=2)
     w_sgu, w_sd = c["shared"]
-    routed = case_ffn(dict(c, shared=(w_sgu * 0, w_sd * 0))).float().norm(dim=-1)
-    shared = case_ffn(dict(c, weights=c["weights"] * 0)).float().norm(dim=-1)
-    ratio = routed / shared
-    assert ((ratio > 0.25) & (ratio < 4)).all(), ratio
+    for act in ROUTED_ACTS:
+        routed = case_ffn(dict(c, shared=(w_sgu * 0, w_sd * 0)), act=act)
+        shared = case_ffn(dict(c, weights=c["weights"] * 0), act=act)
+        ratio = routed.float().norm(dim=-1) / shared.float().norm(dim=-1)
+        assert ((ratio > 0.25) & (ratio < 4)).all(), (act, ratio)
 
 
 def test_the_routed_pad_is_exactly_zero():

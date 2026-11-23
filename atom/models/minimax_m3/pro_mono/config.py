@@ -309,24 +309,45 @@ def rows_refusal(rows: int) -> str | None:
     return None
 
 
-def latch_rows(rows, group) -> tuple[int, str | None]:
+# the routed experts' activation formats (``layout.ROUTED_ACTS``: plain
+# strings here, so the gate imports nothing of the kernels)
+ROUTED_ACTS = ("fp4", "fp8")
+
+
+def act_refusal(act) -> str | None:
+    """Why a ``mono_routed_act`` value cannot be latched, or None."""
+    if act not in ROUTED_ACTS:
+        return f"mono_routed_act {act!r} not in {ROUTED_ACTS}"
+    return None
+
+
+def latch_rows(rows, group, act="fp8") -> tuple[int, str | None]:
     """``(the row limit every rank serves, why it is 0 or None)``.
 
-    ``rows``: this rank's ``ProVariants.mono_ffn_rows`` at runner creation.
+    ``rows``: this rank's ``ProVariants.mono_ffn_rows`` at runner creation,
+    ``act`` its ``mono_routed_act`` (the runner builds with it).
     ``group``: the TP CPU (gloo) group, None for one rank. Collective: every
     rank must call it at the same point. A value one rank refuses, or ranks
     that read different values (a variants file edited between their reads),
     turn the phase off on every rank."""
     from atom.distributed.group_agreement import group_max_each
 
-    why = rows_refusal(rows)
+    why = rows_refusal(rows) or act_refusal(act)
     local = 0 if why is not None else rows
-    # bad flag, max, -min in one collective
-    bad, hi, neg_lo = group_max_each((int(why is not None), local, -local), group)
+    ai = 0 if why is not None else ROUTED_ACTS.index(act)
+    # bad flag, max, -min of the rows and of the format in one collective
+    bad, hi, neg_lo, ahi, neg_alo = group_max_each(
+        (int(why is not None), local, -local, ai, -ai), group
+    )
     if bad:
-        return 0, why or "another TP rank refused mono_ffn_rows"
+        return 0, why or "another TP rank refused mono_ffn_rows or mono_routed_act"
     if hi != -neg_lo:
         return 0, f"TP ranks read mono_ffn_rows {-neg_lo} .. {hi}"
+    if ahi != -neg_alo:
+        return 0, (
+            f"TP ranks read mono_routed_act {ROUTED_ACTS[-neg_alo]!r} and"
+            f" {ROUTED_ACTS[ahi]!r}"
+        )
     return hi, None if hi else "mono_ffn_rows 0"
 
 

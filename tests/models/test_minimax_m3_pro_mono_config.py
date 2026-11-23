@@ -19,9 +19,11 @@ from atom.models.minimax_m3.pro_mono.config import (
     MAX_ROWS,
     MAX_ROWS_LAYOUT,
     Q_HEADS,
+    ROUTED_ACTS,
     SUPPORTED_TP,
     TOPK,
     ProDims,
+    act_refusal,
     config_refusal,
     gate_rows,
     latch_rows,
@@ -202,8 +204,9 @@ def test_rows_out_of_range_turn_the_phase_off(rows):
 
 
 def test_ranks_that_read_different_rows_turn_it_off_on_every_rank(monkeypatch):
-    """The latch's collective (bad, max, -min): a rank that read 8 beside one
-    that read 16 serves neither, as does a rank that refused its value."""
+    """The latch's collective (bad, max, -min of the rows, max, -min of the
+    routed format): a rank that read 8 beside one that read 16 serves
+    neither, as does a rank that refused its value."""
     import atom.distributed.group_agreement as ga
 
     def peers(*others):
@@ -213,12 +216,33 @@ def test_ranks_that_read_different_rows_turn_it_off_on_every_rank(monkeypatch):
 
         return max_each
 
-    monkeypatch.setattr(ga, "group_max_each", peers((0, 16, -16)))
+    fp8 = ROUTED_ACTS.index("fp8")
+    monkeypatch.setattr(ga, "group_max_each", peers((0, 16, -16, fp8, -fp8)))
     assert latch_rows(8, "tp")[0] == 0
-    monkeypatch.setattr(ga, "group_max_each", peers((1, 0, 0)))
-    assert latch_rows(8, "tp") == (0, "another TP rank refused mono_ffn_rows")
-    monkeypatch.setattr(ga, "group_max_each", peers((0, 8, -8)))
+    monkeypatch.setattr(ga, "group_max_each", peers((1, 0, 0, 0, 0)))
+    assert latch_rows(8, "tp") == (
+        0,
+        "another TP rank refused mono_ffn_rows or mono_routed_act",
+    )
+    monkeypatch.setattr(ga, "group_max_each", peers((0, 8, -8, fp8, -fp8)))
     assert latch_rows(8, "tp") == (8, None)
+    # one rank read "fp4", another "fp8": the formats differ, neither serves
+    monkeypatch.setattr(ga, "group_max_each", peers((0, 8, -8, 0, 0)))
+    rows, why = latch_rows(8, "tp", act="fp8")
+    assert rows == 0 and "mono_routed_act" in why
+
+
+@pytest.mark.parametrize("act", ["fp4", "fp8"])
+def test_the_routed_formats_latch(act):
+    assert act_refusal(act) is None
+    assert latch_rows(16, None, act=act) == (16, None)
+
+
+@pytest.mark.parametrize("act", ["bf16", "FP8", "", None, 8])
+def test_an_unknown_routed_format_turns_the_phase_off(act):
+    assert act_refusal(act) is not None
+    rows, why = latch_rows(16, None, act=act)
+    assert rows == 0 and "mono_routed_act" in why
 
 
 def test_the_gate_takes_only_rows_inside_the_latched_limit():
@@ -238,6 +262,10 @@ def test_variants_take_the_row_limit():
     )
     assert pro_attn.ProVariants().mono_ffn_rows == 0
     assert pro_attn._parse_variants({"mono_ffn_rows": 8}).mono_ffn_rows == 8
+    # W4A8 unless the file names W4A4
+    assert pro_attn.ProVariants().mono_routed_act == "fp8"
+    v = pro_attn._parse_variants({"mono_routed_act": "fp4"})
+    assert v.mono_routed_act == "fp4"
 
 
 @pytest.mark.parametrize("level", [1, 2, 3])

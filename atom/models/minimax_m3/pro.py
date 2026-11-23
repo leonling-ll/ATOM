@@ -545,7 +545,7 @@ def _mono_route(atom_config: Config, state: ProLookaheadState, layers) -> ProMon
             from atom.models.minimax_m3.pro_mono.runner import ProMonoRunner
         except ImportError as error:
             raise MonoUnsupported(f"mono kernels unavailable: {error}") from error
-        return ProMonoRunner(layers(), state, route.check)
+        return ProMonoRunner(layers(), state, route.check, route.routed_act)
 
     route = ProMonoRoute(
         config_refusal(atom_config),

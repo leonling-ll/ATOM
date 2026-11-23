@@ -28,23 +28,33 @@ def arch():
         yield
 
 
-@pytest.mark.parametrize("upto", ["norm", "ffn"])
+# (upto, routed_act): the norm build, the FFN build in W4A8 (the default) and
+# in W4A4
+BUILDS = [("norm", "fp8"), ("ffn", "fp8"), ("ffn", "fp4")]
+
+
+@pytest.mark.parametrize("upto, act", BUILDS)
 @pytest.mark.parametrize("rows", ROWS)
 @pytest.mark.parametrize("lookahead", [True, False])
-def test_the_layer_kernel_holds(arch, rows, lookahead, upto):
-    contract.check_build(P1Build(tokens=rows, upto=upto, lookahead=lookahead))
+def test_the_layer_kernel_holds(arch, rows, lookahead, upto, act):
+    contract.check_build(
+        P1Build(tokens=rows, upto=upto, lookahead=lookahead, routed_act=act)
+    )
 
 
-@pytest.mark.parametrize("upto", ["norm", "ffn"])
-def test_the_debug_build_holds(arch, upto):
-    contract.check_build(P1Build(tokens=16, upto=upto, debug=True))
+@pytest.mark.parametrize("upto, act", BUILDS)
+def test_the_debug_build_holds(arch, upto, act):
+    contract.check_build(P1Build(tokens=16, upto=upto, debug=True, routed_act=act))
 
 
 # the FFN builds whose norm runs two passes with a partial one (an SGPR peak:
 # a value of the o stage held into the FFN spilled at 9 .. 13 rows)
+@pytest.mark.parametrize("act", ["fp8", "fp4"])
 @pytest.mark.parametrize("rows", [9, 13])
-def test_the_ffn_builds_past_one_pass_hold(arch, rows):
-    contract.check_build(P1Build(tokens=rows, upto="ffn", lookahead=True))
+def test_the_ffn_builds_past_one_pass_hold(arch, rows, act):
+    contract.check_build(
+        P1Build(tokens=rows, upto="ffn", lookahead=True, routed_act=act)
+    )
 
 
 @pytest.fixture(scope="module")
