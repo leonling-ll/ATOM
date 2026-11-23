@@ -6,9 +6,11 @@ Every binding is the production parameter itself or a view of it: no clone, no
 requantization, no re-shuffle, no re-padding (owner ruling: an optimization
 never changes the model's weights). The kernel reads exactly the bytes the
 production path reads -- o_proj's and the shared expert's native MXFP8 1x32
-(16x16-preshuffled weight, row-major E8M0 scale on gfx950), the bf16 router,
-and the routed experts' MXFP4 planes as ``FusedMoE`` left them after its
-NVFP4 -> MXFP4 prep (lane-shuffled, padded 640 -> 768 with zeros).
+(16x16-preshuffled weight, row-major E8M0 scale on gfx950), the bf16 router
+(the checkpoint's fp32 cast once at load) with its fp32 correction bias, and
+the routed experts' MXFP4 planes as ``FusedMoE`` left them after the recipe's
+online NVFP4 -> MXFP4 conversion (lane-shuffled, padded 640 -> 768 with
+zeros; ``_routed``).
 
 Each layout assumption is checked here once, so a model loaded any other way is
 refused (``MonoUnsupported``) instead of being misread. ``bind_layer`` runs
@@ -37,18 +39,13 @@ F32 = torch.float32
 FP8 = torch.float8_e4m3fn
 # an E8M0 scale plane is held as uint8 or as torch's e8m0 dtype
 E8M0 = (torch.uint8, getattr(torch, "float8_e8m0fnu", torch.uint8))
-# aiter's shuffle_scale pads an MXFP4 scale plane to these multiples
-SCALE_ROW_ALIGN = 256
-SCALE_GROUP_ALIGN = 8
+# packed MXFP4 (two E2M1 a byte) is held as torch's fp4x2 dtype or as uint8
+FP4 = (torch.uint8, getattr(torch, "float4_e2m1fn_x2", torch.uint8))
 
 
 def _need(ok: bool, what: str) -> None:
     if not ok:
         raise MonoUnsupported(what)
-
-
-def _nbytes(t: torch.Tensor) -> int:
-    return t.numel() * t.element_size()
 
 
 def _mxfp8(linear, rows: int, cols: int, name: str):
@@ -105,29 +102,42 @@ def _norm(norm, name: str) -> tuple[torch.Tensor, float]:
     return _bf16_vec(norm.weight, HIDDEN, name), float(eps)
 
 
-def _plane_bytes(t, want: int, name: str) -> torch.Tensor:
+def _plane(t, dtypes, shape, name: str) -> torch.Tensor:
+    """``t``'s bytes as a uint8 view (no copy), if it is ``shape`` of one of
+    ``dtypes`` and contiguous."""
     _need(t is not None, f"{name}: missing")
-    _need(t.is_contiguous(), f"{name}: not contiguous")
-    got = _nbytes(t)
-    _need(got == want, f"{name}: {got} B, expected {want}")
-    return t.data
-
-
-def _scale_plane_bytes(rows: int, groups: int) -> int:
-    pad_rows = -(-rows // SCALE_ROW_ALIGN) * SCALE_ROW_ALIGN
-    pad_groups = -(-groups // SCALE_GROUP_ALIGN) * SCALE_GROUP_ALIGN
-    return pad_rows * pad_groups
+    _need(
+        t.dtype in dtypes and tuple(t.shape) == shape and t.is_contiguous(),
+        f"{name}: {t.dtype} {tuple(t.shape)}, expected {shape} contiguous",
+    )
+    return t.data.view(torch.uint8)
 
 
 def _routed(moe, dims: ProDims, name: str):
-    """``FusedMoE``'s four MXFP4 planes where it left them: (w13, w13 scale,
-    w2, w2 scale), the routed intermediate padded to ``dims.inter_r`` with
-    zeros (rows of w13, K of w2), which production computes too
-    (``intermediate_pad = 0``)."""
+    """``FusedMoE``'s four MXFP4 planes where production left them, as uint8
+    views: (w13, w13 scale, w2, w2 scale).
+
+    The recipe's ``{"*.experts": "mxfp4"}`` converts the NVFP4 checkpoint at
+    load (``FusedMoE._online_quant``): ``Mxfp4MoEMethod.create_weights`` sizes
+    the planes with the rank's intermediate 640 padded to ``dims.inter_r``
+    (``pad_align`` 256) and zero-fills them; the conversion writes gate rows
+    [0, 640), up rows [768, 1408) and w2 K bytes [0, 320) (scale groups
+    [0, 20)), so the pad is zero values with E8M0 code 0. ``MiniMaxM3MoE`` pins
+    ``intermediate_pad = 0``, so production computes the padded 768 too. The
+    lane-shuffled prep (``_process_weight_layout_after_loading`` branch C,
+    gfx950) then applies aiter's ``shuffle_weight`` (16, 16) to w13 / w2 and
+    ``shuffle_scale`` to each scale flattened to [experts x rows, groups]:
+    no row or group padding at these widths (rows a multiple of 256, groups of
+    8), so each plane is exactly its logical size."""
     experts = getattr(moe, "experts", None)
     _need(experts is not None, f"{name}: no routed experts")
     method = experts.quant_method
     _need(getattr(experts, "top_k", None) == TOPK, f"{name}: top-{experts.top_k}")
+    _need(
+        not getattr(experts, "source_is_nvfp4", False),
+        f"{name}: still the checkpoint's NVFP4, not converted to MXFP4"
+        ' (no --online_quant_config {"*.experts": "mxfp4"})',
+    )
     _need(
         not getattr(experts, "num_fused_shared_experts", 0),
         f"{name}: the shared expert is fused into the routed tables",
@@ -139,6 +149,10 @@ def _routed(moe, dims: ProDims, name: str):
     _need(
         not getattr(method, "fp8_activations", False),
         f"{name}: FP8-activation MXFP4 prep (another weight layout)",
+    )
+    _need(
+        getattr(method, "hidden_pad", None) == 0,
+        f"{name}: hidden_pad {getattr(method, 'hidden_pad', None)}",
     )
     _need(
         getattr(method, "intermediate_pad", None) == 0,
@@ -161,16 +175,18 @@ def _routed(moe, dims: ProDims, name: str):
         f"{name}: expert planes are not preshuffled",
     )
     return (
-        _plane_bytes(w13, EXPERTS * dims.w13_bytes, f"{name} w13"),
-        _plane_bytes(
+        _plane(w13, FP4, (EXPERTS, dims.w13_rows, HIDDEN // 2), f"{name} w13"),
+        _plane(
             experts.w13_weight_scale,
-            _scale_plane_bytes(EXPERTS * dims.w13_rows, dims.w13_scale_cols),
+            E8M0,
+            (EXPERTS * dims.w13_rows, dims.w13_scale_cols),
             f"{name} w13 scale",
         ),
-        _plane_bytes(w2, EXPERTS * dims.w2_bytes, f"{name} w2"),
-        _plane_bytes(
+        _plane(w2, FP4, (EXPERTS, HIDDEN, dims.inter_r // 2), f"{name} w2"),
+        _plane(
             experts.w2_weight_scale,
-            _scale_plane_bytes(EXPERTS * HIDDEN, dims.w2_scale_cols),
+            E8M0,
+            (EXPERTS * HIDDEN, dims.w2_scale_cols),
             f"{name} w2 scale",
         ),
     )
@@ -220,7 +236,14 @@ class ProMoeLayer:
     # the router: this rank's 48 rows of the bf16 [384, 7168] gate, fp32 bias
     w_gate: torch.Tensor
     bias: torch.Tensor
-    # the routed MXFP4 planes
+    # The routed MXFP4 planes, uint8 views of FusedMoE's (``_routed``). Per
+    # expert e, logical rows: w13 [1536, 7168 / 2] gate [0, 640), zero
+    # [640, 768), up [768, 1408), zero [1408, 1536); w2 [7168, 768 / 2], K
+    # [640, 768) zero. Two E2M1 a byte, the even k in the low nibble.
+    # w13 / w2: aiter ``shuffle_weight`` (16, 16): 16-row x 16-byte tiles,
+    # row-major inside, tiles K-fastest (``mono.device.mx.fp4_tile_load``).
+    # s13 [384 x 1536, 224] / s2 [384 x 7168, 24]: E8M0, aiter ``shuffle_scale``
+    # over the flattened rows (``mono.device.mx.scale_index``); pad code 0.
     w13: torch.Tensor
     s13: torch.Tensor
     w2: torch.Tensor

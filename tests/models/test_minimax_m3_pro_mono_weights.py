@@ -7,14 +7,22 @@ owner ruling is that an optimization never changes weights), the router band is
 this rank's 48 experts, and each layout the kernel cannot read is refused by
 name rather than misread. The routed planes are 3 GB at full size, so they
 live on the meta device: the binder reads only their sizes and attributes.
+
+The routed planes are also built by production itself (aiter needed, CPU
+only): ``FusedMoE._online_quant`` converting an NVFP4 source into the real
+``Mxfp4MoEMethod``'s planes, then its gfx950 weight prep. The binder must take
+what that leaves, and the kernel's addressing (``mono.device.mx``) and the
+shared unshuffles must read back what the conversion wrote, pad included.
 """
 
+import importlib
 from types import SimpleNamespace
 
 import pytest
 import torch
 from torch import nn
 
+from atom.models.minimax_m3.pro_mono import weights as weights_mod
 from atom.models.minimax_m3.pro_mono.config import EXPERTS, HIDDEN, ProDims
 from atom.models.minimax_m3.pro_mono.weights import bind_layer
 from atom.mono.runtime.consensus import MonoUnsupported
@@ -51,7 +59,10 @@ def _experts():
         top_k=4,
         num_fused_shared_experts=0,
         quant_method=SimpleNamespace(
-            is_guinterleave=False, fp8_activations=False, intermediate_pad=0
+            is_guinterleave=False,
+            fp8_activations=False,
+            hidden_pad=0,
+            intermediate_pad=0,
         ),
         w13_swizzle_layout=None,
         w13_weight=_param((EXPERTS, 1536, 3584), torch.uint8, meta, True),
@@ -112,7 +123,7 @@ def test_binds_production_storage_in_place(layer, rank):
         (b.w2, moe.experts.w2_weight),
         (b.s2, moe.experts.w2_weight_scale),
     ):
-        assert got.is_meta and got.shape == param.shape
+        assert got.is_meta and got.shape == param.shape and got.dtype == torch.uint8
     # the router band: 48 rows of the replicated gate, a view (no copy)
     w = moe.gate.weight
     assert b.w_gate.shape == (48, HIDDEN) and b.w_gate.is_contiguous()
@@ -169,6 +180,26 @@ def _breaks():
             "intermediate_pad 128",
         ),
         (lambda m: setattr(ex(m), "w13_swizzle_layout", object()), "Triton MXFP4"),
+        (lambda m: setattr(ex(m), "source_is_nvfp4", True), "still the checkpoint"),
+        (lambda m: setattr(ex(m).quant_method, "hidden_pad", 256), "hidden_pad 256"),
+        (
+            # an online "mxfp8" target: FP8 experts of the same rows
+            lambda m: setattr(
+                ex(m),
+                "w13_weight",
+                _param((EXPERTS, 1536, 7168), torch.float8_e4m3fn, "meta", True),
+            ),
+            "w13: torch.float8_e4m3fn",
+        ),
+        (
+            # a scale plane kept 3-D (not the flattened shuffle_scale plane)
+            lambda m: setattr(
+                ex(m),
+                "w2_weight_scale",
+                _param((EXPERTS, HIDDEN, 24), torch.uint8, "meta"),
+            ),
+            "w2 scale:",
+        ),
         (
             lambda m: setattr(ex(m), "num_fused_shared_experts", 1),
             "fused into the routed",
@@ -204,3 +235,293 @@ def test_refuses_what_the_kernel_cannot_read(brk, why):
     brk(layer)
     with pytest.raises(MonoUnsupported, match=why):
         bind_layer(layer, DIMS, 0)
+
+
+# ------------------------------------------- the planes as production makes them
+
+ROUTED_ENV = (
+    "ATOM_USE_TRITON_MOE",
+    "ATOM_USE_TRITON_GEMM",
+    "ATOM_USE_TRITON_MOE_DECODE",
+    "ATOM_USE_TRITON_MOE_A4W4",
+    "ATOM_MOE_GU_ITLV",
+)
+
+
+def _production(monkeypatch):
+    """atom's MoE module with the recipe's gfx950 setting (no MoE env set)."""
+    pytest.importorskip("aiter")
+    moe_mod = importlib.import_module("atom.model_ops.moe")
+    shuffle_mod = importlib.import_module("aiter.ops.shuffle")
+    for env in ROUTED_ENV:
+        monkeypatch.delenv(env, raising=False)
+    monkeypatch.setattr(moe_mod, "get_gfx", lambda: "gfx950")
+    monkeypatch.setattr(shuffle_mod, "get_gfx", lambda: "gfx950")
+    monkeypatch.setattr(
+        moe_mod,
+        "get_current_atom_config",
+        lambda: SimpleNamespace(eplb_enable=False, moe_backend="standard"),
+    )
+    return moe_mod
+
+
+def _specs():
+    from aiter import QuantType, dtypes
+
+    from atom.quant_spec import NVFP4_DTYPE, LayerQuantConfig
+
+    source = LayerQuantConfig(
+        quant_type=QuantType.per_1x32,
+        quant_dtype=NVFP4_DTYPE,
+        is_dynamic=True,
+        quant_method="compressed-tensors",
+    )
+    target = LayerQuantConfig(
+        quant_type=QuantType.per_1x32,
+        quant_dtype=dtypes.fp4x2,
+        is_dynamic=True,
+        quant_method="quark",
+    )
+    return source, target
+
+
+class _Experts(nn.Module):
+    """The FusedMoE state ``_online_quant``, ``Mxfp4MoEMethod`` and the binder
+    read, at Pro's TP8 widths (intermediate 640 a rank) over ``count``
+    experts, holding the checkpoint's NVFP4 planes (``Nvfp4MoEMethod``'s
+    shapes) until ``_online_quant`` runs."""
+
+    def __init__(self, moe_mod, count, source, target, seed=0):
+        super().__init__()
+        from atom.quant_spec import NVFP4_DTYPE
+
+        inter = DIMS.inter_valid
+        g = torch.Generator().manual_seed(seed)
+        u8 = lambda *s: torch.randint(0, 256, s, dtype=torch.uint8, generator=g)
+        # positive E4M3 block scales, 0.25 .. 4
+        e4 = lambda *s: (torch.rand(*s, generator=g) * 3.75 + 0.25).to(
+            torch.float8_e4m3fn
+        )
+        p = lambda t: nn.Parameter(t, requires_grad=False)
+        self.w13_weight = p(u8(count, 2 * inter, HIDDEN // 2))
+        self.w13_weight_scale = p(e4(count, 2 * inter, HIDDEN // 16))
+        self.w13_weight_scale_2 = p(torch.rand(count, 2, generator=g) + 0.5)
+        self.w2_weight = p(u8(count, HIDDEN, inter // 2))
+        self.w2_weight_scale = p(e4(count, HIDDEN, inter // 16))
+        self.w2_weight_scale_2 = p(torch.rand(count, generator=g) + 0.5)
+        self.register_parameter("w13_bias", None)
+        self.register_parameter("w2_bias", None)
+        self.top_k = 4
+        self.num_fused_shared_experts = 0
+        self.hidden_size = HIDDEN
+        self.intermediate_size_per_partition = inter
+        self.has_bias = False
+        self.online_quant = True
+        self.quant_config = SimpleNamespace(
+            get_layer_quant_config=lambda *_a, use_online_quant=False, **_k: (
+                target if use_online_quant else source
+            )
+        )
+        self.layer_name = "model.layers.10.block_sparse_moe.experts"
+        self.layer_quant_config = source
+        self.source_is_nvfp4 = True
+        self.params_dtype = NVFP4_DTYPE
+        # the source method, with the pad MiniMaxM3MoE pins for the MX target
+        self.quant_method = SimpleNamespace(
+            hidden_pad=0, intermediate_pad=0, need_normalize_e4m3fn_to_e4m3fnuz=False
+        )
+        self.moe_config = SimpleNamespace(
+            a_quant_dtype=None,
+            mxfp4_fp8_activations=False,
+            use_ep=False,
+            in_dtype=torch.bfloat16,
+            hidden_dim=HIDDEN,
+        )
+        self.moe_quant_params = {
+            "num_experts": count,
+            "hidden_size": HIDDEN,
+            "intermediate_size_per_partition": inter,
+            "params_dtype": NVFP4_DTYPE,
+            "weight_loader": lambda *_a, **_k: None,
+        }
+        self.pad_align_override = None
+        self._stream_online_quant = False
+        self.local_num_experts = self.num_local_base_experts = count
+        self.expert_layout = SimpleNamespace(routed_physical_per_rank=count)
+        self.use_ep = False
+        self.tp_size, self.tp_rank = 8, 3
+        self._copy_quant_storage = moe_mod.FusedMoE._copy_quant_storage
+
+
+def _quantize(weight, **_kwargs):
+    """MXFP4 of a dequantized weight, in ``quant_weight_online``'s dtypes (the
+    aiter HIP quantizer it calls needs a GPU; only the bytes' places matter)."""
+    from aiter import dtypes
+
+    from atom.mono.weights.formats import quantize_mxfp4
+
+    q, s = quantize_mxfp4(weight)
+    return q.view(dtypes.fp4x2), s.view(dtypes.fp8_e8m0)
+
+
+def _expected(src, e):
+    """Expert e's logical planes as production must hold them: (w13 bytes
+    [1536, 3584], w13 codes [1536, 224], w2 bytes [7168, 384], w2 codes
+    [7168, 24]), the pad zero bytes and code 0."""
+    from atom.quantization.quark.utils import dequantize_nvfp4
+
+    inter, pad = DIMS.inter_valid, DIMS.inter_r
+
+    def mx(w, s, s2):
+        q, c = _quantize(dequantize_nvfp4(w.contiguous(), s.contiguous(), s2))
+        return q.view(torch.uint8), c.view(torch.uint8)
+
+    w13 = torch.zeros(2 * pad, HIDDEN // 2, dtype=torch.uint8)
+    c13 = torch.zeros(2 * pad, HIDDEN // 32, dtype=torch.uint8)
+    for half in range(2):
+        rows = slice(half * inter, (half + 1) * inter)
+        q, c = mx(src["w13"][e, rows], src["s13"][e, rows], src["s13_2"][e, half])
+        w13[half * pad : half * pad + inter] = q
+        c13[half * pad : half * pad + inter] = c
+    w2 = torch.zeros(HIDDEN, pad // 2, dtype=torch.uint8)
+    c2 = torch.zeros(HIDDEN, pad // 32, dtype=torch.uint8)
+    q, c = mx(src["w2"][e], src["s2"][e], src["s2_2"][e])
+    w2[:, : inter // 2], c2[:, : inter // 32] = q, c
+    return w13, c13, w2, c2
+
+
+@pytest.fixture(scope="module")
+def produced():
+    """Two experts converted and laid out by production: (the experts module,
+    its NVFP4 source)."""
+    with pytest.MonkeyPatch.context() as mp:
+        moe_mod = _production(mp)
+        mp.setattr(moe_mod, "quant_weight_online", _quantize)
+        source, target = _specs()
+        experts = _Experts(moe_mod, 2, source, target)
+        src = {
+            "w13": experts.w13_weight.data.clone(),
+            "s13": experts.w13_weight_scale.data.clone(),
+            "s13_2": experts.w13_weight_scale_2.data.clone(),
+            "w2": experts.w2_weight.data.clone(),
+            "s2": experts.w2_weight_scale.data.clone(),
+            "s2_2": experts.w2_weight_scale_2.data.clone(),
+        }
+        moe_mod.FusedMoE._online_quant(experts)
+        assert type(experts.quant_method) is moe_mod.Mxfp4MoEMethod
+        experts.quant_method.process_weights_after_loading(experts)
+        yield experts, src
+
+
+def _bind_routed(experts, monkeypatch, count):
+    monkeypatch.setattr(weights_mod, "EXPERTS", count)
+    return weights_mod._routed(SimpleNamespace(experts=experts), DIMS, "experts")
+
+
+def test_binds_the_planes_production_converts(produced, monkeypatch):
+    """The four planes FusedMoE's NVFP4 -> MXFP4 conversion and gfx950 prep
+    leave, bound in place, read back (shared unshuffles) as the conversion
+    wrote them: gate / up at rows 0 / 768, w2's K 640 .. 768 zero bytes and
+    zero codes."""
+    from atom.mono.weights.layer import (
+        _unshuffle_linear_scale,
+        _unshuffle_linear_weight,
+    )
+
+    experts, src = produced
+    method = experts.quant_method
+    assert (method.intermediate_size, method.intermediate_pad) == (DIMS.inter_r, 0)
+    w13, s13, w2, s2 = _bind_routed(experts, monkeypatch, 2)
+    for got, param in (
+        (w13, experts.w13_weight),
+        (s13, experts.w13_weight_scale),
+        (w2, experts.w2_weight),
+        (s2, experts.w2_weight_scale),
+    ):
+        assert got.data_ptr() == param.data_ptr() and got.dtype == torch.uint8
+    w13, w2 = w13.view(torch.uint8), w2.view(torch.uint8)
+    w13.is_shuffled = w2.is_shuffled = True
+    got13 = _unshuffle_linear_weight(w13)
+    got2 = _unshuffle_linear_weight(w2)
+    gotc13 = _unshuffle_linear_scale(
+        s13, experts=2, rows=DIMS.w13_rows, groups=DIMS.w13_scale_cols
+    )
+    gotc2 = _unshuffle_linear_scale(
+        s2, experts=2, rows=HIDDEN, groups=DIMS.w2_scale_cols
+    )
+    for e in range(2):
+        want13, wantc13, want2, wantc2 = _expected(src, e)
+        assert torch.equal(got13[e], want13)
+        assert torch.equal(gotc13[e], wantc13)
+        assert torch.equal(got2[e], want2)
+        assert torch.equal(gotc2[e], wantc2)
+
+
+def test_the_kernels_addressing_reads_the_production_planes(produced, monkeypatch):
+    """``mono.device.mx``'s ``fp4_tile_load`` dword arithmetic (lane l: row
+    l % 16 of a 16-row group, 32 k from 32 (l // 16) of a 128-k step) and
+    ``scale_index`` on the bound planes give the conversion's bytes, for gate,
+    up and down rows and the pad."""
+    pytest.importorskip("flydsl")
+    from atom.mono.device.mx import scale_index
+
+    experts, src = produced
+    w13, s13, w2, s2 = _bind_routed(experts, monkeypatch, 2)
+    pad = DIMS.inter_r
+    planes = (
+        # (plane, scale, rows, K, expected bytes, expected codes)
+        (w13, s13, 2 * pad, HIDDEN, 0, 1),
+        (w2, s2, HIDDEN, pad, 2, 3),
+    )
+    e = 1
+    want = _expected(src, e)
+    for w, s, rows, k, wi, ci in planes:
+        flat = w.reshape(-1)
+        base = e * rows * k // 2
+        for rg in (0, 39, 40, 47, 48, 87, rows // 16 - 1):
+            for st in (0, k // 128 - 1):
+                for lane in (0, 5, 16, 63):
+                    dw = rg * (2 * k) + st * 256 + lane * 4
+                    got = flat[base + dw * 4 : base + dw * 4 + 16]
+                    col = (st * 128 + (lane // 16) * 32) // 2
+                    exp = want[wi][16 * rg + lane % 16, col : col + 16]
+                    assert torch.equal(got, exp), (rows, rg, st, lane)
+        groups = k // 32
+        for r in (0, 17, 639, 640, 767, 768, 1407, 1408, rows - 1):
+            if r >= rows:
+                continue
+            for c in (0, 5, groups - 4, groups - 1):
+                si = scale_index(e * rows + r, c, groups)
+                assert s.reshape(-1)[si] == want[ci][r, c], (rows, r, c)
+
+
+def test_binds_the_full_layer_production_lays_out(monkeypatch):
+    """At Pro's full 384 experts (on the meta device: 3 GB otherwise), the
+    real ``Mxfp4MoEMethod`` sizes and lays out exactly the planes
+    ``bind_layer`` takes."""
+    moe_mod = _production(monkeypatch)
+    from aiter import dtypes
+
+    _, target = _specs()
+    layer = _layer()
+    experts = _Experts(moe_mod, 1, *_specs())
+    method = moe_mod.Mxfp4MoEMethod(target, experts.moe_config)
+    with torch.device("meta"):
+        method.create_weights(
+            experts,
+            **{
+                **experts.moe_quant_params,
+                "num_experts": EXPERTS,
+                "params_dtype": dtypes.fp4x2,
+            },
+        )
+    method.intermediate_pad = 0  # as MiniMaxM3MoE pins it
+    experts.quant_method = method
+    experts.source_is_nvfp4 = False
+    method.process_weights_after_loading(experts)
+    layer.block_sparse_moe.experts = experts
+    b = bind_layer(layer, DIMS, 5)
+    assert b.w13.shape == (EXPERTS, DIMS.w13_rows, HIDDEN // 2)
+    assert b.s13.shape == (EXPERTS * DIMS.w13_rows, DIMS.w13_scale_cols)
+    assert b.w2.shape == (EXPERTS, HIDDEN, DIMS.inter_r // 2)
+    assert b.s2.shape == (EXPERTS * HIDDEN, DIMS.w2_scale_cols)
