@@ -59,6 +59,7 @@ from atom.kv_transfer.disaggregation import (
     KVConnectorOutput,
     kv_config_has_producer,
 )
+from atom.metrics.dispatch import ForwardDispatchMetrics
 from atom.metrics.gpu import GPUForwardMetrics, record_gpu_forward
 from atom.model_engine.dynamic_chunking_worker import DynamicChunkingWorker
 from atom.model_engine.kv_block import STATE_SLOT_CLASS
@@ -1074,6 +1075,20 @@ class ModelRunner:
                     else "default"
                 ),
             )
+
+        # Graph-or-eager per real forward, counted on TP rank 0 only.
+        self.dispatch_metrics = (
+            ForwardDispatchMetrics(
+                dp_rank=config.parallel_config.data_parallel_rank,
+                engine_role=(
+                    ("decode" if config.disagg_is_decode else "prefill")
+                    if config.enable_rapidserve
+                    else "default"
+                ),
+            )
+            if self.rank == 0
+            else None
+        )
 
     def poll_forward_metrics(self):
         if self.gpu_forward_metrics is not None:
@@ -3155,6 +3170,17 @@ class ModelRunner:
             dp_rank=dp_rank,
         )
 
+        # Read like `gpu_forward_metrics`: set after the initialization
+        # warmup, and absent on a runner built without `__init__`.
+        dispatch_metrics = getattr(self, "dispatch_metrics", None)
+        if (
+            dispatch_metrics is not None
+            and batch is not None
+            and not batch.is_dummy_run
+            and bs > 0
+        ):
+            dispatch_metrics.record("target", is_prefill, forward_mode.use_cudagraph)
+
         # PCP+TBO prefill: per-group round-robin stripe before UBatchWrapper (see
         # _apply_pcp_balanced_stripe). _pcp_tbo_balanced also gates the per-group
         # output restore further below.
@@ -4007,6 +4033,19 @@ class ModelRunner:
 
         last_token_indices = self._commit_target_step(batch, anchors)
 
+        dispatch_metrics = getattr(self, "dispatch_metrics", None)
+        if (
+            dispatch_metrics is not None
+            and not align_only
+            and not batch.is_dummy_run
+            and batch.req_ids
+        ):
+            # Read before `propose`, which retargets the context to the block.
+            dispatch_metrics.record(
+                "draft",
+                forward_context.context.is_prefill,
+                self.drafter.draft_replays(forward_context.context.running_bs),
+            )
         draft_token = self.drafter.propose(
             target_token_ids=input_ids,
             target_positions=positions,

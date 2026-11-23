@@ -363,6 +363,14 @@ class Drafter(abc.ABC):
             for pass_ in self._declare_draft_graphs()
         )
 
+    def draft_replays(self, running_bs: int) -> bool:
+        """Whether a draft at the agreed batch `running_bs` replays every
+        declared pass from its recording. False for a flavor that declares
+        none: its passes all run eagerly."""
+        return bool(self.draft_graphs) and all(
+            g.is_captured(running_bs) for g in self.draft_graphs
+        )
+
     def warmup_draft_graphs(self, build_context, end_trace=None) -> None:
         """Warm the draft passes: clear the lossless draft's destinations,
         then the flavor's `_warmup_draft_graphs`. A template, so no flavor that

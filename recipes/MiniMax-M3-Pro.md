@@ -314,6 +314,20 @@ accepts 43% of the drafted tokens on GSM8K (4.0 tokens per target forward), the 
 caching on, where the draft's context for cached blocks comes from the cache too: copying lines out of
 an 8k-token list, it accepts 40% cold and 42-43% with the list cached.
 
+### Decode graphs at large batch
+
+A decode step replays a captured graph when its batch fits the capture ladder
+(`--cudagraph-capture-sizes`, default `[1..8, 16, 32, 48, 64, 128, 256, 512]`),
+cut at startup to what the scheduler can form: `min(max-num-seqs,
+max-num-batched-tokens // (k + 1))`. A DSpark verify graph holds `k + 1` rows a
+sequence, and the draft's block pass is captured at the same batch sizes. At the
+agentic proxy's c32 point (`--max-num-seqs 64`, 16384 tokens, k=7) that is
+`[1..8, 16, 32, 48, 64]`, so every decode batch replays.
+
+`atom:forward_steps_total` on `/metrics` counts forwards by `model` (target,
+draft), `phase` and `cudagraph`; eager decode steps are
+`atom:forward_steps_total{model="target",phase="decode",cudagraph="false"}`.
+
 ## What is verified, and what is not
 
 Settled by running them (`ATOM_M3PRO_VARIANTS`, a JSON string or file re-read between requests):
