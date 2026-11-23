@@ -775,6 +775,7 @@ class Scheduler:
         # Latency of the last prompt step
         self.last_prompt_latency = 0.0
         self.delay_factor = config.scheduler_delay_factor
+        self._cache_aware_admission = envs.ATOM_CACHE_AWARE_ADMISSION
 
         # Speculative decoding. A P/D producer is excluded for the same reason
         # `PrefillScheduler` is: it prefills, samples T0 and hands the request
@@ -2264,6 +2265,8 @@ class Scheduler:
         # Reclaim aborted heads even when decode protection vetoes Phase 2.
         while self.waiting and self.waiting[0].status == SequenceStatus.ABORTED:
             self._finish_rejected_waiting(self.waiting.popleft())
+        if self._cache_aware_admission:
+            self._cache_aware_reorder()
         if self.enable_dynamic_chunking:
             self._record_prefill_supply()
         if self.kv_connector is not None and self.waiting:
@@ -5623,6 +5626,41 @@ class Scheduler:
         if self._update_waiting_for_remote_kv(seq):
             seq.status = SequenceStatus.WAITING
             self._mark_offload_load_ready(seq)
+
+    _CACHE_AWARE_SCAN = 128
+
+    def _cache_aware_reorder(self) -> None:
+        """`ATOM_CACHE_AWARE_ADMISSION`: order the plain waiting requests among
+        the first `_CACHE_AWARE_SCAN` by HBM-resident prefix, most first.
+
+        Under queueing (AgentX: ~70 waiting, prefill-bound) FIFO admits a
+        session's next turn only after other prefills have evicted its prefix.
+        A request waiting longer than `ATOM_CACHE_AWARE_MAX_WAIT_S` goes first,
+        oldest first, which bounds a cold request's extra wait. Loads, resumes
+        and remote-KV waiters keep their slots; only plain entries swap.
+        """
+        early = self._early_load.entries
+        slots = [
+            i
+            for i, seq in enumerate(
+                itertools.islice(self.waiting, 0, self._CACHE_AWARE_SCAN)
+            )
+            if seq.status == SequenceStatus.WAITING
+            and seq.id not in early
+            and not self._is_offload_prefill_resume(seq)
+        ]
+        if len(slots) < 2:
+            return
+        aged_before = time.time() - envs.ATOM_CACHE_AWARE_MAX_WAIT_S
+
+        def rank(seq: Sequence) -> tuple:
+            if seq.arrive_time < aged_before:
+                return (0, seq.arrive_time, 0)
+            return (1, -self.block_manager.resident_prefix_blocks(seq), seq.arrive_time)
+
+        ordered = sorted((self.waiting[i] for i in slots), key=rank)
+        for i, seq in zip(slots, ordered):
+            self.waiting[i] = seq
 
     def _prioritize_ready_remote_kv_requests(self) -> None:
         """Prioritize completed remote requests before sizing prefill work.

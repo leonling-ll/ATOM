@@ -1527,6 +1527,12 @@ class BlockManager:
         walk_of = self._memoised_walk if self.walk_memo else self._walk_prefix
         return self._evaluate(seq, walk_of, False, None)
 
+    def resident_prefix_blocks(self, seq: Sequence) -> int:
+        """Prompt blocks of `seq` resident in the HBM prefix index, counted from
+        the first block: the raw walk, before gates and the fit. Read-only."""
+        walk_of = self._memoised_walk if self.walk_memo else self._walk_prefix
+        return len(walk_of(seq).hashes)
+
     def _memoised_walk(self, seq: Sequence) -> _PrefixWalk:
         memo = self._cached_walks.get(seq)
         if memo is not None and self._walk_still_valid(seq, memo):
