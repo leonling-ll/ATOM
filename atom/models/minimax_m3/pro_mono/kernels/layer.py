@@ -109,7 +109,7 @@ from atom.mono.device.ops import (
     wave_sum,
     xshfl,
 )
-from atom.mono.device.ranks import peer_bases, sum_partials
+from atom.mono.device.ranks import peer_bases
 from atom.mono.device.stamps import stamp, stamp_begin, stamp_flush
 from atom.mono.device.sync import Mailbox, preg, publish, sreg
 from atom.mono.plan.build_key import key_tuple, symbol_params
@@ -309,24 +309,39 @@ def stage_o(c):
 
 @traced
 def ar_reduce(c, ins):
-    """Stages reduce / gather, a pass a token: -> the f32 v = bf16(sum) + res of
-    this lane's two columns. The owner of the columns sums the ranks' partials,
-    sends the bf16 sum and the task's sums of squares to every rank."""
+    """Stages reduce / gather, the wave's tokens (one or two passes) at once:
+    -> the f32 v = bf16(sum) + res of this lane's two columns, a token each.
+    The owner of the columns polls every token's partials of the 8 ranks in
+    one batch, sums each token's in rank order and sends its bf16 sum and the
+    task's sums of squares to every rank; every other rank polls every
+    token's sum in one batch. (A poll a token cost a second round trip at 9
+    .. 16 rows, the owner's before its second sum went out.)"""
     lane, la = c["lane"], c["lookahead"]
-    held = []
-    for k in range_constexpr(len(ins)):
-        t, col, rr = ins[k][0], ins[k][1], ins[k][2]
-        # bound before the traced ifs: names their branches bind are not seen
-        # past them otherwise
-        v0, v1 = fx.Float32(0.0), fx.Float32(0.0)
-        enter_stage("reduce")
-        if c["is_owner"]:
-            lo, hi = sum_partials(
-                c["poll"],
-                preg(c["own"], c["off"]["rs"], "rs"),
-                lambda src, t=t, col=col: rs_pair(src, t, col - c["obeg"]),
-                TP,
-            )
+    n = len(ins)
+    # bound before the traced ifs: names their branches bind are not seen
+    # past them otherwise (a second pass's, unused at <= 8 rows)
+    a0, a1 = fx.Float32(0.0), fx.Float32(0.0)
+    b0, b1 = fx.Float32(0.0), fx.Float32(0.0)
+    enter_stage("reduce")
+    if c["is_owner"]:
+        own_rs = preg(c["own"], c["off"]["rs"], "rs")
+        ws = c["poll"](
+            [
+                (own_rs, rs_pair(src, ins[k][0], ins[k][1] - c["obeg"]), 1)
+                for k in range(n)
+                for src in range(TP)
+            ],
+            batch=n * TP,
+        )
+        held_o = []
+        for k in range_constexpr(n):
+            t, col, rr = ins[k][0], ins[k][1], ins[k][2]
+            # rank order 0 .. TP - 1 (``ranks.sum_partials``'): every rank agrees
+            lo, hi = bf2_f32(ws[k * TP][0])
+            for src in range_constexpr(1, TP):
+                plo, phi = bf2_f32(ws[k * TP + src][0])
+                lo = lo + plo
+                hi = hi + phi
             lo, hi = bf16_round(lo), bf16_round(hi)
             for p in range_constexpr(TP):
                 c["put_bf"](
@@ -338,8 +353,8 @@ def ar_reduce(c, ins):
             v1 = hi + rr[1]
             words = [wave_sum(v0 * v0 + v1 * v1).bitcast(fx.Int32)]
             if const_expr(la):
-                b0, b1 = bf16_round(v0), bf16_round(v1)
-                words.append(wave_sum(b0 * b0 + b1 * b1).bitcast(fx.Int32))
+                q0, q1 = bf16_round(v0), bf16_round(v1)
+                words.append(wave_sum(q0 * q0 + q1 * q1).bitcast(fx.Int32))
             if lane == 0:
                 for p in range_constexpr(TP):
                     c["put_words"](
@@ -347,14 +362,26 @@ def ar_reduce(c, ins):
                         agsq_pair(c["j"], t),
                         words,
                     )
-        enter_stage("gather")
-        if c["not_owner"]:
-            w = c["poll"]([(preg(c["own"], c["off"]["ag"], "ag"), ag_pair(t, col), 1)])
-            g0, g1 = bf2_f32(w[0][0])
-            v0 = g0 + rr[0]
-            v1 = g1 + rr[1]
-        held.append([v0, v1])
-    return held
+            held_o.append((v0, v1))
+        a0, a1 = held_o[0]
+        if const_expr(n == 2):
+            b0, b1 = held_o[1]
+    enter_stage("gather")
+    if c["not_owner"]:
+        w = c["poll"](
+            [
+                (preg(c["own"], c["off"]["ag"], "ag"), ag_pair(ins[k][0], ins[k][1]), 1)
+                for k in range(n)
+            ]
+        )
+        g0, g1 = bf2_f32(w[0][0])
+        a0 = g0 + ins[0][2][0]
+        a1 = g1 + ins[0][2][1]
+        if const_expr(n == 2):
+            h0, h1 = bf2_f32(w[1][0])
+            b0 = h0 + ins[1][2][0]
+            b1 = h1 + ins[1][2][1]
+    return [[a0, a1], [b0, b1]][:n]
 
 
 @traced
