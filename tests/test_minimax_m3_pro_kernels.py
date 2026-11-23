@@ -1290,6 +1290,92 @@ class TestImplGlue:
         for r in range(tp):
             assert torch.equal(run((2 * r, 2 * r + 2)), want), r
 
+    @pytest.mark.parametrize("attn", ["aiter", "triton"])
+    @pytest.mark.parametrize("tq_causal", [False, True])
+    @pytest.mark.parametrize("dsplit", [False, True])
+    def test_verify_rows_select_as_single_row_decodes(
+        self, attn, tq_causal, dsplit, monkeypatch
+    ):
+        # a DSpark verify (k = 7: 8 rows a sequence, score_tq 8 in the graph) must select,
+        # row by row, the blocks a plain decode of that one row would: its own causal
+        # top-k with the sink and local blocks of its own position. Two of the sequences'
+        # 8 rows straddle a block boundary. The attention is replaced by a recorder of
+        # what it is given (aiter: the page tables and lengths; Triton: the block ids).
+        k1, init, local = 8, 1, 9
+        c = Case([403, 512, 330], topk=16, seed=11, init=init, local=local)
+        base = {"attn": attn, "topk": "split", "score_tq": 8}
+        self._run(c, {}, base, monkeypatch)  # fills the K, V and index caches
+        seen = []
+
+        def rec_aiter(q, kc, vc, rows, ctx, out, *a, **kw):
+            seen.append(torch.cat([rows, ctx[:, None]], dim=1).clone())
+            return out
+
+        def rec_triton(q, kc4, bt, seq, pos, sel, out, *a, **kw):
+            seen.append(sel.clone())
+            return out
+
+        monkeypatch.setattr(K, "attention_aiter", rec_aiter)
+        monkeypatch.setattr(K, "attention", rec_triton)
+        wide = torch.cat([c.bt, torch.zeros_like(c.bt).repeat(1, 4)], dim=1)
+        ends = [sum(c.lens[: s + 1]) for s in range(c.S)]
+        tok = torch.cat([torch.arange(e - k1, e) for e in ends]).to(DEV)
+        v = ProVariants(
+            **base,
+            init_blocks=init,
+            local_blocks=local,
+            score_tq_causal=tq_causal,
+            index_split_decode=8 if dsplit else 0,
+        )
+
+        def run(rows, table, seq, ds=None):
+            seen.clear()
+            c.impl._kernel_attention(
+                c.qkv[rows],
+                c.pos[rows],
+                seq,
+                c.slot[rows],
+                table,
+                c.layer,
+                c.ic,
+                table.shape[1],
+                v,
+                torch.zeros(len(rows), H * VD, dtype=DT, device=DEV),
+                static=True,
+                dsplit=ds,
+            )
+            assert len(seen) == 1
+            return seen[0]
+
+        seq = torch.arange(c.S, device=DEV).repeat_interleave(k1)
+        if dsplit and attn == "aiter":
+            # 3 ranks, a sequence each, through a fake all-gather of their shares
+            comm = SimpleNamespace(tensor_model_parallel_all_gather=None)
+            monkeypatch.setitem(sys.modules, "aiter.dist.communication_op", comm)
+            shares = []
+            monkeypatch.setattr(
+                comm,
+                "tensor_model_parallel_all_gather",
+                lambda x, dim: (shares.append(x.clone()), x.repeat(c.S, 1))[1],
+            )
+            for r in range(c.S):
+                run(tok, wide, seq, (k1 * r, k1 * r + k1))
+            mine = list(shares)
+            monkeypatch.setattr(
+                comm, "tensor_model_parallel_all_gather", lambda x, dim: torch.cat(mine)
+            )
+            verify = run(tok, wide, seq, (0, k1))
+        else:
+            verify = run(tok, wide, seq)
+        for i, t in enumerate(tok.tolist()):
+            s = i // k1
+            alone = run(
+                torch.tensor([t], device=DEV),
+                wide[s : s + 1],
+                torch.zeros(1, dtype=torch.long, device=DEV),
+            )
+            assert torch.equal(verify[i], alone[0]), (i, int(c.pos[t]))
+
     def test_decode_split_plan(self, monkeypatch):
         ps = SimpleNamespace(
             get_tensor_model_parallel_world_size=lambda: 8,
