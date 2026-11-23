@@ -26,3 +26,5 @@ GPU: one 8xMI355X node per person. Unit tests and microbenchmarks may split GPUs
 Never push to ROCm upstream repositories before the model is public.
 
 Gate: `gate_task` runs `scripts/m31pro/gate.sh` in a Linux Python 3.12 environment set up as the "Install dependencies" step of the `unit-tests` job in `.github/workflows/pre-checks.yaml` does, plus `black` and `ruff==0.16.0` (for example a `python:3.12` container on the GPU node). The tree must be a git checkout: ruff checks the files changed against the merge base, and one test calls `git rev-parse HEAD`.
+
+Performance PRs: every PR that can change model output or serving performance shows, at its head and at its base, GSM8K 64-shot with the recipe's GSM8K command, passing the accuracy gate of #7 section 5 and a 15-minute agentic proxy run (`scripts/m31pro/proxy_bench.sh` at the concurrency its task targets; c32 for the c32 tasks), and states the change in tok/s/GPU and p90 E2E-normalized interactivity in the PR body.
