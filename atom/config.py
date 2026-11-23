@@ -2386,6 +2386,9 @@ class Config:
     # Its workers form AITER's PCP process group; see `pcp_group_size`.
     sequence_parallel_size: int = 1
     enforce_eager: bool = False
+    # Serve a multimodal checkpoint as text only: its vision tower and projector
+    # are neither built nor loaded, and requests with images are refused.
+    text_only: bool = False
     # Number of vocabulary positions that carry a real token. A checkpoint
     # whose embedding matrix is padded up to a friendlier width -- Qwen3 rounds
     # 151665 up to 151936 -- leaves the tail rows holding whatever the padding

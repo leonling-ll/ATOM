@@ -134,6 +134,7 @@ class EngineArgs:
     data_parallel_master_port: int = 29500
     data_parallel_base_port: int | None = None
     enforce_eager: bool = False
+    text_only: bool = False
     enable_prefix_caching: bool = True
     port: int = 8006
     kv_cache_dtype: str = "bf16"
@@ -331,6 +332,14 @@ class EngineArgs:
             "--enforce-eager",
             action="store_true",
             help="Enforce eager mode execution.",
+        )
+        parser.add_argument(
+            "--text-only",
+            action="store_true",
+            help="MiniMax-M3: serve the multimodal checkpoint as text only: skip building and "
+            "loading its vision encoder (frees its weights for the KV cache) and "
+            "refuse image input. Like vLLM's --limit-mm-per-prompt "
+            "'{\"image\": 0}'.",
         )
         parser.add_argument(
             "--enable_prefix_caching",
