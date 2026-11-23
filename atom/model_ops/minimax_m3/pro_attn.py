@@ -198,6 +198,12 @@ class ProVariants:
     # FlyDSL fp8_sparse_prefill; needs k_plain_fp8, 16 local heads and the package, else
     # "triton").
     prefill_attn: str = "triton"
+    # Mono decode phase 1 (``models/minimax_m3/pro_mono``): the most graph rows a decode /
+    # verify forward may have for its MoE layers' o_proj .. FFN segment to run as one
+    # persistent kernel; 0 (default) off, at most ``pro_mono.config.MAX_ROWS``. Latched
+    # once when the runner is created and agreed over the TP group: a later re-read of
+    # the variants does not change it.
+    mono_ffn_rows: int = 0
 
 
 # Below it the all-gather costs more than the scoring it saves (moo's threshold).
