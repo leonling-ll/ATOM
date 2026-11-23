@@ -33,6 +33,8 @@ points of that. Every setting below is there to enlarge the cache or to keep it 
 | `--gpu-memory-utilization 0.95` | Possible once the two above are in; 0.87 was the old ceiling. |
 | `ATOM_CACHE_AWARE_ADMISSION=1` | Among the first 128 waiting requests, admits those whose prefix is still in HBM first; a request waiting longer than `ATOM_CACHE_AWARE_MAX_WAIT_S` (120 s) goes first regardless. |
 | LMCache, 184 GiB a rank | Keeps evicted prefixes in host memory (~7.5M tokens for the server). |
+| `--text-only` | Builds and loads no vision tower, projector or patch merger (1.8 GiB of weights a GPU); image requests get a 400. AgentX is text only. |
+| `AITER_REUSE_IDENTICAL_COMM_GROUPS=1` | At TP8 aiter's `ep` group has the same ranks as `tp`; this makes it reuse `tp`'s custom all-reduce instead of building a second one (~2.5 GiB a GPU). |
 
 ## Measured (CONC 64 proxy)
 
@@ -48,10 +50,16 @@ server's over the whole run, warmup included; with LMCache it counts GPU and CPU
 | + pad_align 128 | 67.4 GiB | 2.50M | 30.9% | 4.22 | 6654 | 621 |
 | + cache-aware admission | 67.4 GiB | 2.50M | 73.1% | 4.56 | 6862 | 638 |
 | + LMCache 184 GiB a rank | 67.4 GiB | 2.50M + CPU | 77.4% | **30.57** | **10915** | 995 |
+| pad_align 128 row + `--text-only` + comm-group reuse (no admission, no LMCache) | 74.8 GiB | 2.77M | 43.3% | 11.44 | 8585 | 778 |
 
-No request failed in any row. In the last row LMCache loaded 10.3M tokens back with no failed
-load, and nothing was preempted. GSM8K (64-shot, one run, real DSpark acceptance) with streaming
-quant and pad_align 128 is 0.9424.
+No request failed in any row. In the LMCache row LMCache loaded 10.3M tokens back with no failed
+load, and nothing was preempted. The last row branches off the pad_align 128 row; the launch
+below turns everything on at once, a combination not yet measured as a whole. GSM8K (64-shot,
+one run, real DSpark acceptance) with streaming quant and pad_align 128 is 0.9424.
+
+An LMCache smoke on this configuration (util 0.73 so the pool is small; an 18.6k-token prompt is
+pushed out of HBM by 14 fillers and asked again) gets the same answers both times, with 18432
+tokens loaded from the CPU tier and the re-ask's TTFT down from 2.85 s to 0.20 s.
 
 ## Validated configuration
 
@@ -83,6 +91,7 @@ export ATOM_M3PRO_VARIANTS='{"kernels": true, "attn": "aiter", "topk": "split", 
 export ATOM_WARMUP_TOKENS=auto
 export ATOM_ONLINE_QUANT_STREAMING=1
 export ATOM_CACHE_AWARE_ADMISSION=1
+export AITER_REUSE_IDENTICAL_COMM_GROUPS=1
 
 # LMCache CPU offload
 export ATOM_KV_OFFLOAD=lmcache
@@ -110,13 +119,15 @@ python3 -m atom.entrypoints.openai_server \
   --method dspark \
   --num-speculative-tokens 7 \
   --spec-decode-acceptance-length 4.0 \
+  --text-only \
   2>&1 | tee "server-m31pro-agentx-c${CONC}.log"
 ```
 
 Check the startup log:
 
-- `Memory budget: ... available_for_kv=67.43GB ... num_kvcache_blocks=156002`. A pool near 35 GB
-  means pad_align 128 is not in; near 11 GB, streaming quant is not on.
+- `Memory budget: ... available_for_kv=74.81GB ... num_kvcache_blocks=173069` (67.43 GB without
+  `--text-only` and the comm-group reuse). A pool near 35 GB means pad_align 128 is not in; near
+  11 GB, streaming quant is not on.
 - One `Creating LMCacheEngine` line per rank with `'max_local_cpu_size': 184.0`.
 
 ### Host memory for LMCache
@@ -213,7 +224,7 @@ is within noise.
 
 - Other concurrencies: only CONC 64 has been measured with these settings.
 - A 3600 s run; the table above is 600 s.
-- LMCache correctness on this configuration (answers served from the CPU tier compared with a
-  fresh prefill); the GSM8K above ran without offload.
+- GSM8K and a greedy identity check with `--text-only` (running); the GSM8K above ran without it
+  and without offload.
 - DCP=8, which shards the target's K and index K over the eight GPUs (about 4.9× the cached
   tokens with the DSpark draft unsharded), is being brought up and is not part of this recipe.
