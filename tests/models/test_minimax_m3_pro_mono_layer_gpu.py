@@ -4,14 +4,22 @@
 reference (``minimax_m3_pro_mono_ref``): one process a rank, each with its own
 core rows and o_proj weight, all with the same residual and norm weights.
 
+The inputs (``case_inputs``): one size a token over 6 decades, the same on
+every rank, and each residual row 1, 0.1 or 10 times its all-reduced row's norm,
+so no rank's partial and no residual is drowned by another row or input.
+
 What must hold:
 * every rank writes the same bytes (they read the same gathered sums and sums of
   squares) -- bit for bit;
-* residual_mid, x, x8 and the lookahead's la8 match the reference. Not bit for
-  bit: the kernel's o_proj sums K in another order than the fp64 reference, so
-  a partial can differ in its last bf16 bit; the bounds are relative norms a
-  misread weight, scale or column (errors of order 1) cannot meet, and the
-  MXFP8 scale codes within one code.
+* (x8, x8s) is MXFP8 of the stored x, bit for bit; la8 is the lookahead norm of
+  the stored h_mid within one e4m3 step;
+* residual_mid, x, x8 and la8 match the reference row by row (``BOUNDS``: the
+  largest per-row relative error norm), at least ``H_MID_EXACT_FLOOR`` of h_mid
+  bit for bit. Not all bit for bit: the kernel's o_proj sums K in another order
+  than the fp64 reference, so a partial can differ in its last bf16 bit. The
+  bounds pass every partial 1 ulp off, and the reference's CPU test
+  (``test_minimax_m3_pro_mono_layout``) shows they catch a dropped rank, token,
+  K block or scale column and a missing, shifted or wrong-token residual.
 
 The build is the debug one: a wait that never lands gives up after 10 s and is
 reported by name instead of hanging the GPUs.
@@ -32,12 +40,11 @@ if torch.cuda.device_count() < 8:
     pytest.skip("needs 8 GPUs", allow_module_level=True)
 
 from minimax_m3_pro_mono_ref import (
-    code_distance,
-    dequant,
+    case_inputs,
+    layer_failures,
     layer_reference,
+    layer_report,
     mxfp8,
-    o_partial,
-    rows,
 )
 
 TP = 8
@@ -48,10 +55,6 @@ EPS = 1e-6
 # (rows, lookahead): one pass, a partial wave, two passes, the widest build
 CASES = ((1, True), (3, True), (8, True), (9, True), (16, True), (16, False))
 TIMEOUT_S = 900
-
-
-def _core(rank, s):
-    return rows(s, O_K, 100 * s + rank)
 
 
 @functools.cache
@@ -65,14 +68,22 @@ def _weight(rank):
     return mxfp8(w.to(torch.bfloat16))
 
 
-def _shared(s):
+def _norm_weights():
     g = torch.Generator().manual_seed(17)
     w_post = (torch.randn(HIDDEN, generator=g) * 0.3).to(torch.bfloat16)
     w_ahead = (torch.randn(HIDDEN, generator=g) * 0.3).to(torch.bfloat16)
-    return rows(s, HIDDEN, 300 + s, scale=4.0), w_post, w_ahead
+    return w_post, w_ahead
 
 
-def _worker(rank, port, queue):
+@functools.cache
+def _inputs(case):
+    """Case ``case``'s (cores of every rank, o partials of every rank, residual)."""
+    s = CASES[case][0]
+    return case_inputs(s, [_weight(r) for r in range(TP)], 1000 * (case + 1))
+
+
+def _worker(rank, port, queue, inputs):
+    """``inputs``: per case, (this rank's core rows, the residual)."""
     import torch.distributed as dist
     from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
     from aiter.ops.shuffle import shuffle_mxfp8_bpreshuffle_scale, shuffle_weight
@@ -105,10 +116,10 @@ def _worker(rank, port, queue):
         w_o = shuffle_weight(wq.view(torch.uint8).to(dev), layout=(16, 16))
         s_o = shuffle_mxfp8_bpreshuffle_scale(ws.to(dev)).contiguous()
         results = []
-        for key, launch in zip(keys, launches):
+        w_post, w_ahead = (t.to(dev) for t in _norm_weights())
+        for key, launch, (core, res) in zip(keys, launches, inputs):
             s = key.tokens
-            res, w_post, w_ahead = (t.to(dev) for t in _shared(s))
-            core = _core(rank, s).to(dev)
+            core, res = core.to(dev), res.to(dev)
             out = {
                 "h_mid": torch.zeros(s, HIDDEN, dtype=torch.bfloat16, device=dev),
                 "x": torch.zeros(s, HIDDEN, dtype=torch.bfloat16, device=dev),
@@ -153,11 +164,6 @@ def _free_port():
         return s.getsockname()[1]
 
 
-def _relnorm(a, b):
-    a, b = a.float(), b.float()
-    return float((a - b).norm() / b.norm().clamp_min(1e-30))
-
-
 @pytest.fixture(scope="module")
 def ranks():
     """Every rank's outputs of every case: {rank: [(rows, lookahead, waits,
@@ -168,7 +174,14 @@ def ranks():
     ctx = mp.get_context("spawn")
     queue = ctx.Queue()
     port = _free_port()
-    procs = [ctx.Process(target=_worker, args=(r, port, queue)) for r in range(TP)]
+    ins = [_inputs(i) for i in range(len(CASES))]
+    procs = [
+        ctx.Process(
+            target=_worker,
+            args=(r, port, queue, [(cores[r], res) for cores, _, res in ins]),
+        )
+        for r in range(TP)
+    ]
     for p in procs:
         p.start()
     got, errors = {}, []
@@ -211,26 +224,10 @@ def test_every_rank_writes_the_same_bytes(ranks):
 @pytest.mark.parametrize("case", range(len(CASES)))
 def test_matches_the_reference(ranks, case):
     s, la, _, got = ranks[0][case]
-    res, w_post, w_ahead = _shared(s)
-    parts = [o_partial(_core(r, s), *_weight(r)) for r in range(TP)]
-    want = layer_reference(parts, res, w_post, w_ahead if la else None, EPS, EPS)
-    report = {
-        "h_mid_exact": float((got["h_mid"].view(torch.int16) == want["h_mid"].view(torch.int16)).float().mean()),
-        "h_mid": _relnorm(got["h_mid"], want["h_mid"]),
-        "x": _relnorm(got["x"], want["x"]),
-        "x8": _relnorm(dequant(got["x8"], got["x8s"]), want["x"]),
-        "x8s_far": int((code_distance(got["x8s"], want["x8s"]) > 1).sum()),
-    }  # fmt: skip
-    if la:
-        la_x = dequant(want["la8"], want["la8s"])
-        report["la8"] = _relnorm(dequant(got["la8"], got["la8s"]), la_x)
-        report["la8s_far"] = int((code_distance(got["la8s"], want["la8s"]) > 1).sum())
+    _, parts, res = _inputs(case)
+    w_post, w_ahead = _norm_weights()
+    w_ahead = w_ahead if la else None
+    want = layer_reference(parts, res, w_post, w_ahead, EPS, EPS)
+    report = layer_report(got, want, w_ahead, EPS)
     print(f"rows {s} lookahead {la}: {report}")
-    assert report["h_mid"] <= 2.0**-7, report
-    assert report["x"] <= 2.0**-6, report
-    # MXFP8's own error is 2^-4 of a block's max at worst
-    assert report["x8"] <= 2.0**-4, report
-    assert report["x8s_far"] == 0, report
-    if la:
-        assert report["la8"] <= 2.0**-4, report
-        assert report["la8s_far"] == 0, report
+    assert not layer_failures(report), (layer_failures(report), report)
