@@ -7,18 +7,22 @@ segment a mono MoE layer runs instead of production's post-attention one.
 A mono layer's segment (``segment``), Option A::
 
     core (attention output, before o_proj) + residual
-      -> layer kernel: o_proj, AR #1, + residual, Gemma norm (+ MXFP8), and the
-         lookahead norm of layer L + 2 (MXFP8)
-      -> (upto = "norm") production's MoE on the kernel's (x, x8)
+      -> layer kernel: o_proj, AR #1, + residual, Gemma norm (+ MXFP8), the
+         lookahead norm of layer L + 2 (MXFP8), then (upto = "ffn") the router,
+         the routed experts (W4A4) and the shared expert (MXFP8) -> this rank's
+         FFN partial (``ffn_out``)
       -> (FFN partial, residual_mid): what production's segment returns, so
-         the next layer's AR #2 + input norm runs unchanged
+         the next layer's AR #2 + input norm runs unchanged (Option A)
 
 The lookahead goes where ``ProLookaheadState.put`` would put it
 (``resid_in[L + 2]``, MXFP8), so layer L + 2's indexer reads it as before.
 
-``UPTO`` names the build: a build that also runs the router and experts
-("ffn") writes the FFN partial itself (``ffn`` in its ABI), and the segment
-then skips production's MoE. Switching is this one constant.
+``UPTO`` names the build: the "ffn" build writes the FFN partial itself
+(``ffn_out`` in its ABI) and the segment skips production's MoE; a "norm"
+build hands its (x, x8) to production's MoE instead. Switching is this one
+constant. An "ffn" build reads each layer's FFN weights through ``moe_w``, a
+device table of their addresses (``layout.MOE_WEIGHTS`` order) made once at
+bind time, and stages x as MXFP4 and the routed mids in ``plain``.
 
 Steps: ``begin_step`` (the mailboxes zeroed, the peer fence) once a forward, at
 its first MoE layer, on the current stream, so a decode graph records it.
@@ -51,9 +55,11 @@ from atom.models.minimax_m3.pro_mono.config import EPS, HIDDEN, MX_GROUP
 from atom.models.minimax_m3.pro_mono.kernels.layer import ABI, build
 from atom.models.minimax_m3.pro_mono.layout import (
     DIMS,
+    MOE_WEIGHTS,
     REGIONS,
     P1Build,
     peer_bytes,
+    plain_bytes,
     scratch_bytes,
     scratch_layout,
 )
@@ -82,7 +88,7 @@ logger = logging.getLogger("atom")
 
 WHAT = "MiniMax-M3.1-Pro mono FFN"
 # the build every mono layer runs (``layout.UPTO``)
-UPTO = "norm"
+UPTO = "ffn"
 
 BF16 = torch.bfloat16
 U8 = torch.uint8
@@ -95,7 +101,7 @@ OUTPUTS = {
     "x8s": (U8, HIDDEN // MX_GROUP),
     "la8": (fp8, HIDDEN),
     "la8s": (U8, HIDDEN // MX_GROUP),
-    "ffn": (BF16, HIDDEN),
+    "ffn_out": (BF16, HIDDEN),
 }
 LOOKAHEAD_OUTPUTS = ("la8", "la8s")
 
@@ -103,10 +109,12 @@ LOOKAHEAD_OUTPUTS = ("la8", "la8s")
 @dataclass(frozen=True)
 class MonoLayer:
     """A bound MoE layer: its operands, the layer whose indexer reads its
-    lookahead (None: no reader) and its build's kind."""
+    lookahead (None: no reader), the device table of its FFN operands'
+    addresses (``moe_w``) and its build's kind."""
 
     w: ProMoeLayer
     reader: int | None
+    moe_w: torch.Tensor
 
     @property
     def kind(self) -> tuple:
@@ -156,9 +164,8 @@ class ProMonoRunner:
                     f"layer {reader}'s indexer projection is not native MXFP8"
                 )
             ahead = state.norms[reader] if reader is not None else None
-            self.layers[lid] = MonoLayer(
-                bind_layer(layer, DIMS, self.rank, ahead), reader
-            )
+            w = bind_layer(layer, DIMS, self.rank, ahead)
+            self.layers[lid] = MonoLayer(w, reader, moe_table(w, self.dev))
         if not self.layers:
             raise MonoUnsupported("no MoE layer")
         self.first = min(self.layers)
@@ -171,6 +178,7 @@ class ProMonoRunner:
             self, peer_bytes(), group, self.rank, DIMS.tp, self.dev
         )
         self.scratch = uncached_bytes(scratch_bytes(key), self.dev)
+        self.plain = uncached_bytes(plain_bytes(key), self.dev)
         self.diag = (
             self.scratch[: scratch_layout(key)["diag"][1]] if self.debug else None
         )
@@ -228,7 +236,8 @@ class ProMonoRunner:
             "core": core.data_ptr(), "w_o": w.w_o.data_ptr(), "s_o": w.s_o.data_ptr(),
             "res": residual.data_ptr(), "g_post": w.g_post.data_ptr(),
             "g_ahead": 0 if w.g_ahead is None else w.g_ahead.data_ptr(),
-            **ptrs, "scratch": self.scratch.data_ptr(),
+            "moe_w": lw.moe_w.data_ptr(), **ptrs,
+            "scratch": self.scratch.data_ptr(), "plain": self.plain.data_ptr(),
             "peers": self.peers.addresses.data_ptr(), "rank": self.rank,
             "layer": layer_id, "tl": 0,
         }  # fmt: skip
@@ -256,7 +265,7 @@ class ProMonoRunner:
                 out["la8"],
                 out["la8s"].view(torch.float8_e8m0fnu),
             )
-        ffn = out.get("ffn")
+        ffn = out.get("ffn_out")
         if ffn is None:
             ffn = layer._ffn(out["x"], out["x8"], out["x8s"], fuse=True)
         if ref is not None:
@@ -302,6 +311,17 @@ class ProMonoRunner:
         assert self.diag.numel() == DIAG_BYTES
         waits = given_up_waits(self.diag, region_namer(REGIONS))
         raise_if_given_up(WHAT, self.rank, rows, waits, self.mailboxes)
+
+
+def moe_table(w: ProMoeLayer, dev: torch.device) -> torch.Tensor:
+    """The kernel's ``moe_w``: ``w``'s FFN operand addresses, i64 in
+    ``layout.MOE_WEIGHTS`` order (the tensors are the model's parameters, so
+    the addresses hold for the runner's life)."""
+    return torch.tensor(
+        [getattr(w, name).data_ptr() for name in MOE_WEIGHTS],
+        dtype=torch.int64,
+        device=dev,
+    )
 
 
 def _values(t: torch.Tensor) -> torch.Tensor:

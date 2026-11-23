@@ -7,6 +7,8 @@
   AR #1 + norm, the lookahead put, the MoE -- and returns their outputs;
 * a MoE layer the route takes: the attention stops before o_proj and the
   runner's segment returns the layer's (FFN partial, residual);
+* the launch (``ProMonoRunner.launch``, the compiled kernel faked): every
+  ABI argument by name, the layer's ``moe_w`` table in ``MOE_WEIGHTS`` order;
 * the segment (``ProMonoRunner.segment``, its launch faked): the lookahead in
   ``resid_in[L + 2]`` as MXFP8, production's MoE on the kernel's (x, x8) under
   ``upto = "norm"`` and none when the build writes the FFN; check mode runs
@@ -181,7 +183,7 @@ def test_a_taken_layer_stops_before_o_proj_and_returns_the_segment(rec):
 def _runner(rec, outputs, check=False, reader=6):
     r = runner_mod.ProMonoRunner.__new__(runner_mod.ProMonoRunner)
     r.check, r.debug, r.rank = check, False, 0
-    r.layers = {4: runner_mod.MonoLayer(w=None, reader=reader)}
+    r.layers = {4: runner_mod.MonoLayer(w=None, reader=reader, moe_w=None)}
     r.state = SimpleNamespace(resid_in={})
 
     def put(lid, x, h_mid):
@@ -204,7 +206,7 @@ def _outputs(ffn=False):
         "la8": _t(24), "la8s": torch.full((N, 1), 127, dtype=torch.uint8),
     }  # fmt: skip
     if ffn:
-        out["ffn"] = _t(25)
+        out["ffn_out"] = _t(25)
     return out
 
 
@@ -230,7 +232,7 @@ def test_a_build_that_writes_the_ffn_skips_the_production_moe(rec):
     out = _outputs(ffn=True)
     r = _runner(rec, out)
     ffn, _ = r.segment(_layer(rec), _t(3, OK), _t(4), None)
-    assert rec.calls == ["launch"] and ffn is out["ffn"]
+    assert rec.calls == ["launch"] and ffn is out["ffn_out"]
 
 
 def test_check_mode_runs_production_on_a_copy_then_goes_on_from_mono(
@@ -267,3 +269,63 @@ def test_check_mode_off_under_capture(rec, monkeypatch):
     r = _runner(rec, _outputs(), check=True)
     r.segment(_layer(rec), _t(3, OK), _t(4), lambda res: pytest.fail("ran"))
     assert rec.calls == ["launch", ("ffn", True, True)]
+
+
+# -------------------------------------------------------------- the launch
+
+
+def _bound():
+    """A ``ProMoeLayer`` stand-in: a distinct small tensor per operand."""
+    from atom.models.minimax_m3.pro_mono.weights import ProMoeLayer
+
+    names = [f.name for f in ProMoeLayer.__dataclass_fields__.values()]
+    vals = {n: torch.zeros(4 + i, dtype=torch.uint8) for i, n in enumerate(names)}
+    vals |= {"layer_id": 4, "eps": 1e-6, "eps_ahead": 1e-6}
+    return SimpleNamespace(**vals)
+
+
+def test_moe_table_holds_the_operands_in_the_kernels_order():
+    from atom.models.minimax_m3.pro_mono.layout import MOE_WEIGHTS
+
+    w = _bound()
+    table = runner_mod.moe_table(w, torch.device("cpu"))
+    assert table.dtype == torch.int64
+    assert table.tolist() == [getattr(w, n).data_ptr() for n in MOE_WEIGHTS]
+    assert len(set(table.tolist())) == len(MOE_WEIGHTS)
+
+
+@pytest.mark.parametrize("reader", [6, None])
+def test_launch_passes_every_abi_argument(monkeypatch, reader):
+    from atom.models.minimax_m3.pro_mono.layout import DIMS, HIDDEN
+
+    w = _bound()
+    r = runner_mod.ProMonoRunner.__new__(runner_mod.ProMonoRunner)
+    r.debug, r.rank, r.first, r.last = False, 3, 4, 4
+    table = runner_mod.moe_table(w, torch.device("cpu"))
+    r.layers = {4: runner_mod.MonoLayer(w=w, reader=reader, moe_w=table)}
+    r.scratch = torch.zeros(16, dtype=torch.uint8)
+    r.plain = torch.zeros(32, dtype=torch.uint8)
+    r.peers = SimpleNamespace(addresses=torch.zeros(8, dtype=torch.int64))
+    steps = []
+    r.mailboxes = SimpleNamespace(begin_step=lambda: steps.append(1))
+    kind = r.layers[4].kind
+    r.builds = {2: {kind: "launcher"}}
+    got = []
+    monkeypatch.setattr(runner_mod, "_run_compiled", lambda *a: got.append(a))
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda: "stream")
+    core = torch.zeros(2, DIMS.o_k, dtype=torch.bfloat16)
+    res = torch.zeros(2, HIDDEN, dtype=torch.bfloat16)
+    out = r.launch(4, core, res)
+    (call,) = got
+    assert call[0] == "launcher" and call[-1] == "stream" and steps == [1]
+    args = dict(zip(runner_mod.ABI.names, call[1:-1]))
+    assert args["moe_w"] == table.data_ptr()
+    assert args["plain"] == r.plain.data_ptr()
+    assert args["scratch"] == r.scratch.data_ptr() and args["rank"] == 3
+    assert args["ffn_out"] == out["ffn_out"].data_ptr()
+    assert out["ffn_out"].shape == (2, HIDDEN)
+    for name in ("la8", "la8s"):
+        if reader is None:
+            assert args[name] == 0 and name not in out
+        else:
+            assert args[name] == out[name].data_ptr()

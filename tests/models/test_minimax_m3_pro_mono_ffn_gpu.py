@@ -71,8 +71,12 @@ from test_minimax_m3_pro_mono_layer_gpu import (
 
 EXPERTS = 384
 INTER_V, INTER_R, INTER_S = 640, 768, 640
-# rows: one, a partial wave, an 8-row verify, two passes, the widest
-CASES = ((1, True), (3, True), (8, True), (9, True), (16, True), (16, False))
+# rows: one, the decode widths 2 / 4, a partial wave, an 8-row verify, two
+# passes, the widest
+CASES = (
+    (1, True), (2, True), (3, True), (4, True), (8, True), (9, True), (16, True),
+    (16, False),
+)  # fmt: skip
 
 
 def _inputs(case):
@@ -134,8 +138,10 @@ def _planes(rank, dev):
     return routed, shared
 
 
-def _worker(rank, port, queue, inputs):
-    """``inputs``: per case, (this rank's core rows, the residual)."""
+def _worker(rank, port, queue, done, inputs):
+    """``inputs``: per case, (this rank's core rows, the residual). The worker stays
+    alive until the parent has received every rank's results (``done``): torch hands
+    tensors over the queue as file descriptors that the sender must still hold."""
     import torch.distributed as dist
     from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
     from aiter.ops.shuffle import shuffle_mxfp8_bpreshuffle_scale, shuffle_weight
@@ -261,6 +267,7 @@ def _worker(rank, port, queue, inputs):
                 }
             )  # fmt: skip
         queue.put((rank, results, None))
+        done.wait(TIMEOUT_S)
     except Exception as e:  # noqa: BLE001 - reported to the parent by name
         import traceback
 
@@ -275,12 +282,13 @@ def ranks():
     os.environ.setdefault("ARCH", "gfx950")
     ctx = mp.get_context("spawn")
     queue = ctx.Queue()
+    done = ctx.Event()
     port = _free_port()
     ins = [_inputs(i) for i in range(len(CASES))]
     procs = [
         ctx.Process(
             target=_worker,
-            args=(r, port, queue, [(cores[r], res) for cores, _, res in ins]),
+            args=(r, port, queue, done, [(cores[r], res) for cores, _, res in ins]),
         )
         for r in range(TP)
     ]
@@ -295,6 +303,7 @@ def ranks():
             else:
                 got[rank] = results
     finally:
+        done.set()
         for p in procs:
             p.join(timeout=60)
             if p.is_alive():
