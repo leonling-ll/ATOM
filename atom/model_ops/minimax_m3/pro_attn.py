@@ -201,8 +201,9 @@ class ProVariants:
     # prep only (aiter's scales every row).
     k_plain_fp8: bool = False
     # The prefill attention of the K-only cache: "triton", or "day0" (amd-kernels-day0's
-    # FlyDSL fp8_sparse_prefill; needs k_plain_fp8, 16 local heads and the package, else
-    # "triton").
+    # FlyDSL fp8_sparse_prefill as ported into aiter, aiter.ops.flydsl's
+    # minimax_m3_fp8_sparse_prefill; needs k_plain_fp8, 16 local heads and an aiter that
+    # has it, else "triton").
     prefill_attn: str = "triton"
 
 
@@ -904,7 +905,7 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
             and v.topk in ("fused", "split")
             and self.num_heads == 16
             and self.topk == pro_kernels.TOPK
-            and pro_kernels.day0_prefill_available()
+            and pro_kernels.day0_prefill_available(kc4.shape[-2])
         )
 
         valid_first = False  # set where the selection is select_logical's

@@ -2159,26 +2159,34 @@ def attention_aiter(
     return out
 
 
-_day0_prefill = None  # amd-kernels-day0's fp8_sparse_prefill; False: not installed
+# aiter's minimax_m3_fp8_sparse_prefill and _supported; False: this aiter lacks them
+_day0_prefill = None
+_day0_supported = None
 
 
-def day0_prefill_available() -> bool:
-    """Whether amd-kernels-day0's FlyDSL sparse prefill (``attention_day0``) imports."""
-    global _day0_prefill
+def day0_prefill_available(page: int = PAGE) -> bool:
+    """Whether aiter's FlyDSL fp8 sparse prefill (``attention_day0``; the kernel is
+    amd-kernels-day0's, ported into aiter) imports and serves this GPU and a K cache of
+    ``page``-token pages (gfx950, 16 heads on one KV head, 256 / 192, top-128 of 16)."""
+    global _day0_prefill, _day0_supported
     if _day0_prefill is None:
         try:
-            from amd_kernels.attention.fp8_sparse_prefill_gqa16_d256_v192_b16_top128.host import (
-                fp8_sparse_prefill,
+            from aiter.ops.flydsl import (
+                minimax_m3_fp8_sparse_prefill,
+                minimax_m3_fp8_sparse_prefill_supported,
             )
         except ImportError:
             _day0_prefill = False
         else:
-            _day0_prefill = fp8_sparse_prefill
-    return bool(_day0_prefill)
+            _day0_prefill = minimax_m3_fp8_sparse_prefill
+            _day0_supported = minimax_m3_fp8_sparse_prefill_supported
+    return bool(_day0_prefill) and _day0_supported(
+        IDX_HEADS, 1, HEAD_DIM, VALUE_DIM, TOPK, PAGE, page
+    )
 
 
 def attention_day0(q, kc4, block_tables, seq_id, positions, sel, out, scale):
-    """``attention`` on amd-kernels-day0's FlyDSL fp8 sparse prefill, over the K-only cache
+    """``attention`` on aiter's FlyDSL fp8 sparse prefill, over the K-only cache
     as a plain fp8 cast (``kc4`` ``[N, 1, page, 256]``): ``q`` ``[T, 16, 256]`` is cast to
     fp8 as well. ``sel`` ``[T, 128]`` block ids, valid first and -1 after (``select_logical``),
     or None: every causal block (at most 128)."""

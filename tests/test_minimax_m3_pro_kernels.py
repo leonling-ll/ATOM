@@ -1343,7 +1343,7 @@ class TestImplGlue:
         self._impl_with_rope(c, ProVariants())
         monkeypatch.setattr(K, "TOPK", 8)
         monkeypatch.setattr(K, "aiter_value_rows_available", lambda: True)
-        monkeypatch.setattr(K, "day0_prefill_available", lambda: True)
+        monkeypatch.setattr(K, "day0_prefill_available", lambda page=K.PAGE: True)
         got = {}
 
         def fake_day0(q, kc4, bt, seq, pos, sel, out, scale):
@@ -1528,7 +1528,8 @@ class TestKOnly:
         ).all()
 
     @pytest.mark.skipif(
-        not (GPU and K.day0_prefill_available()), reason="amd-kernels-day0 on a GPU"
+        not (GPU and K.day0_prefill_available()),
+        reason="aiter's FlyDSL fp8 sparse prefill on a GPU",
     )
     @pytest.mark.parametrize("dense", [False, True])
     def test_day0_prefill_matches_the_triton_attention(self, dense):
@@ -1561,6 +1562,77 @@ class TestKOnly:
         got = torch.zeros_like(ref)
         K.attention_day0(q16, c.kc4, c.bt, c.seq, c.pos, sel, got, D**-0.5)
         assert _close(got, ref)
+
+
+def _fake_flydsl(monkeypatch, **exports):
+    """Stand in for ``aiter.ops.flydsl`` with ``exports`` and make ``amd_kernels``
+    unimportable, as in the run environment."""
+    import sys
+    import types
+
+    mod = types.ModuleType("aiter.ops.flydsl")
+    for name, fn in exports.items():
+        setattr(mod, name, fn)
+    monkeypatch.setitem(sys.modules, "aiter.ops.flydsl", mod)
+    monkeypatch.setitem(sys.modules, "amd_kernels", None)
+    monkeypatch.setattr(K, "_day0_prefill", None)
+
+
+def test_day0_prefill_is_aiters_flydsl_kernel(monkeypatch):
+    # prefill_attn="day0" runs aiter's minimax_m3_fp8_sparse_prefill: the fp8 q, the
+    # K-only cache's page plane, the dense causal picks, the token metadata as int32
+    calls = []
+    _fake_flydsl(
+        monkeypatch,
+        minimax_m3_fp8_sparse_prefill=lambda *a: calls.append(a),
+        minimax_m3_fp8_sparse_prefill_supported=lambda *a: True,
+    )
+    assert K.day0_prefill_available()
+    t, pg = 5, 64
+    q = torch.randn(t, 16, 256)
+    kc4 = torch.zeros(3, 1, pg, 256, dtype=FP8)
+    bt = torch.tensor([[2, 0]], dtype=torch.int32)
+    seq = torch.zeros(t, dtype=torch.int64)
+    pos = torch.tensor([0, 15, 16, 40, 70])
+    out = torch.empty(t, 16 * 192, dtype=torch.bfloat16)
+    assert K.attention_day0(q, kc4, bt, seq, pos, None, out, 0.0625) is out
+    (args,) = calls
+    qa, ka, sel, bta, seqa, posa, scale, outa = args
+    assert qa.dtype == FP8 and torch.equal(qa.float(), q.to(FP8).float())
+    assert ka.shape == (3, pg, 256) and ka.data_ptr() == kc4.data_ptr()
+    assert sel.dtype == torch.int32 and sel.shape == (t, K.TOPK)
+    want = torch.full((t, K.TOPK), -1, dtype=torch.int32)
+    for i, p in enumerate(pos.tolist()):
+        want[i, : p // K.PAGE + 1] = torch.arange(p // K.PAGE + 1)
+    assert torch.equal(sel, want)
+    assert bta is bt and seqa.dtype == posa.dtype == torch.int32
+    assert torch.equal(posa, pos.int()) and scale == 0.0625
+    assert outa.shape == (t, 16, 192) and outa.data_ptr() == out.data_ptr()
+
+
+def test_day0_prefill_needs_the_aiter_export(monkeypatch):
+    # an aiter without the port: "day0" falls back (Triton), never to amd_kernels
+    _fake_flydsl(monkeypatch)
+    assert not K.day0_prefill_available()
+
+
+def test_day0_prefill_asks_aiter_whether_it_serves(monkeypatch):
+    # aiter's supported() decides (gfx950, the layer's shape, the cache's page size):
+    # where it says no, "day0" falls back to Triton
+    asked = []
+
+    def supported(*a):
+        asked.append(a)
+        return a[-1] == 64
+
+    _fake_flydsl(
+        monkeypatch,
+        minimax_m3_fp8_sparse_prefill=lambda *a: None,
+        minimax_m3_fp8_sparse_prefill_supported=supported,
+    )
+    assert K.day0_prefill_available(64)
+    assert not K.day0_prefill_available(24)
+    assert asked == [(16, 1, 256, 192, K.TOPK, K.PAGE, p) for p in (64, 24)]
 
 
 def _nv_pages(rows):

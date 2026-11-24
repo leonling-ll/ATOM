@@ -59,13 +59,13 @@ quant and pad_align 128 is 0.9424.
 |---|---|
 | Hardware | 8×MI355X (`gfx950`) |
 | ATOM | `yuhua/m3.1-pro` (this recipe's commit) |
-| aiter | `yuhua/m3.1-pro` with the inter-640 MoE rows (`[Config] [Tuning] [gfx950] MiniMax-M3.1-Pro MXFP4 MoE rows at inter 640`) |
+| aiter | aiter-M3 `hatwu/m3.1-pro-infx` at `a26613a8a` (with the inter-640 MoE rows, `[Config] [Tuning] [gfx950] MiniMax-M3.1-Pro MXFP4 MoE rows at inter 640`, and the FlyDSL fp8 sparse prefill) |
 | Parallelism | TP8, DCP=1 |
 | KV cache | FP8, K only, `--block-size 16`; index cache FP8 |
 | Prefix cache | on |
 | CPU offload | LMCache, 184 GiB a rank, chunk 256 |
 | Speculative decoding | DSpark, 7 tokens, synthetic acceptance length 4.0 |
-| Prefill | 16384-token chunks; prefill attention from amd-kernels-day0 when its `amd_kernels` package imports, otherwise the Triton kernel |
+| Prefill | 16384-token chunks; prefill attention on aiter's FlyDSL `minimax_m3_fp8_sparse_prefill` (amd-kernels-day0's kernel, ported into aiter-M3 `hatwu/m3.1-pro-infx` at `a26613a8a`) when the aiter build has it, otherwise the Triton kernel. `amd_kernels` is never installed. |
 | `max-num-seqs` | 2 × CONC (128) |
 
 ## 1. Start the ATOM server
