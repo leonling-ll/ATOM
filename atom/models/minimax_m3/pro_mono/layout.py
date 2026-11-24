@@ -313,17 +313,41 @@ def first_ug(bid):
 # above holds for each of the three partners.
 
 
-def list_ctas(act: str, tokens: int = 1) -> int:
-    """The CTAs of a task list: BLOCKS / ``ug_split``."""
-    return BLOCKS // ug_split(act, tokens)
+# Quartered (``ug_per_cta``), the quarter-0 list does the merges: in a
+# 24-row timeline at 56 experts (t189b_check_419ea6cd_1124T2051) its CTAs
+# ended ug 7 .. 9 us after the other lists' (their ug 52 us a CTA, the others'
+# 45), so it takes more CTAs: QUARTER0_CTAS, the rest QUARTER_CTAS each
+QUARTER0_CTAS = 70
+QUARTER_CTAS = (BLOCKS - QUARTER0_CTAS) // 3
+assert QUARTER0_CTAS + 3 * QUARTER_CTAS == BLOCKS
 
 
-def task_list(bid, act: str, tokens: int = 1):
-    """CTA ``bid``'s (task list, placed entry): A16W4 (``first_ug`` %
-    ``ug_split``, its K slice; ``first_ug`` / ``ug_split``, its entry), else
-    (0, ``first_ug``); ints or traced values."""
+def _ternary(cond, a, b):
+    return a if cond else b
+
+
+def list_ctas(act: str, tokens: int = 1, lst=0, select=_ternary) -> int:
+    """The CTAs of task list ``lst`` (its first round's entries): BLOCKS /
+    ``ug_split``, quartered ``QUARTER0_CTAS`` for list 0 and
+    ``QUARTER_CTAS`` else. ``select(cond, a, b)``: a traced ``lst``'s."""
+    n = ug_split(act, tokens)
+    if n == UG_QUARTERS:
+        return select(lst == 0, QUARTER0_CTAS, QUARTER_CTAS)
+    return BLOCKS // n
+
+
+def task_list(bid, act: str, tokens: int = 1, select=_ternary):
+    """CTA ``bid``'s (task list, placed entry): A16W4 halves (``first_ug`` %
+    2, its K half; ``first_ug`` / 2, its entry); quartered the first
+    ``QUARTER0_CTAS`` of ``first_ug`` list 0's (the CTAs with no stage
+    before ug), the rest dealt to lists 1 .. 3 in turn; else (0,
+    ``first_ug``). Ints, or traced values with ``select``."""
     t = first_ug(bid)
     n = ug_split(act, tokens)
+    if n == UG_QUARTERS:
+        r = t - QUARTER0_CTAS
+        in0 = t < QUARTER0_CTAS
+        return select(in0, 0, 1 + r % 3), select(in0, t, r // 3)
     if n > 1:
         return t & (n - 1), t >> (n.bit_length() - 1)
     return 0, t

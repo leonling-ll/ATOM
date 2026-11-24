@@ -1088,7 +1088,18 @@ def put_claim(c, got):
 def read_claim(c):
     """The list index of the claim in LDS: the list's first round is placed
     (``list_ctas`` entries), the queue counts the entries past it."""
-    return list_ctas(c["routed_act"], c["S"]) + uniform(fx.ptr_load(c["claim"]))
+    if const_expr(quartered(c)):
+        # the list's size formed here from the opaque ``ug_slice``: a
+        # condition held across the loop spilled the debug build's SGPRs
+        base = uniform(list_ctas(c["routed_act"], c["S"], ug_slice(c), _sel))
+    else:
+        base = list_ctas(c["routed_act"], c["S"])
+    return base + uniform(fx.ptr_load(c["claim"]))
+
+
+def _sel(cond, a, b):
+    """``layout``'s select on traced values."""
+    return cond.select(fx.Int32(a), fx.Int32(b))
 
 
 def flag_due(c, prev):
@@ -1097,7 +1108,7 @@ def flag_due(c, prev):
     hands its partials over in ``ugp``, the half-0 task finishes the pair)."""
     due = prev >= 0
     if const_expr(bf16_routed(c)):
-        due = due & (c["ugh"] == 0)
+        due = due & (ug_slice(c) == 0)
     return due
 
 
@@ -1183,7 +1194,10 @@ def run_ug(c, bid, nu):
         # UG_GROUPS is even: an entry's two tasks are always both real
         total = total // cells_n
     last = total - 1
-    task = c["k0"]
+    # the placed entry, formed here from the block index (held from the
+    # route as a value of its own, the quartered list's selects spilled the
+    # 24-row debug build's SGPRs)
+    task = task_list(bid, act, s, _sel)[1] if quartered(c) else c["k0"]
     # the claim before the loads: its return waits behind none of them
     got = take_ahead(c) if q else fx.Int32(0)
     t0 = fx.min(task, last)
@@ -1524,7 +1538,7 @@ def load_mids(c):
     n = s * TOPK * INTERB_WORDS // 4
     r = rsrc(
         c["plain"] + fx.Int64(c["pw"]["inter"] * 4),
-        c["nv"] * (TOPK * INTERB_WORDS * 4),
+        down_rows(c) * (TOPK * INTERB_WORDS * 4),
     )
     batched_rounds(
         tid, n,
@@ -1782,7 +1796,7 @@ def stage_down(c, rgd, nu, ops0, sops, nrgd):
                         c["contrib"] + ((tt * TOPK + kk) * DOWN_ROWS + r)
                     )
                 # a padding row has no picks (its contribs were never written)
-                y = (tt < c["nv"]).select(y, fx.Float32(0.0))
+                y = (tt < down_rows(c)).select(y, fx.Float32(0.0))
                 sh = bf16_round(row_sum(red, r, tl, waves=range(SD_STEPS)))
                 out.append(bf16_round(y) + sh)
             bo.buffer_store(
@@ -1847,12 +1861,26 @@ def real_rows(c):
     return uniform(has.select(fx.max(fx.min(got, s), 1), fx.Int32(s)))
 
 
+def down_rows(c):
+    """The real rows in the down: ``c["nv"]``; quartered read back from LDS
+    (``run_ffn``), so the count is not held as an SGPR across the ug loop
+    (it spilled the 24-row debug build's)."""
+    if quartered(c):
+        return uniform(fx.ptr_load(c["claim"] + 1))
+    return c["nv"]
+
+
 @traced
 def run_ffn(c, bid):
     """Every FFN stage of this CTA, in program order (``layout``'s
     placement): router / shared / route tasks, the union, ug, down."""
     s = c["S"]
     c["nv"] = real_rows(c)
+    if const_expr(quartered(c)):  # noqa: SIM102
+        # for the down (``down_rows``); LDS ``claim``'s word 1, read past the
+        # union's barriers
+        if c["tid"] == 0:
+            fx.ptr_store(c["nv"], c["claim"] + 1)
     enter_stage("router")
     rt_task = bid - R0
     if bid >= R0:
@@ -1871,7 +1899,7 @@ def run_ffn(c, bid):
     enter_stage("union")
     # this CTA's task list (A16W4: its K half ``ugh``, the x half it stages)
     # and its placed entry there
-    lst, c["k0"] = task_list(bid, c["routed_act"], s)
+    lst, c["k0"] = task_list(bid, c["routed_act"], s, _sel)
     if const_expr(bf16_routed(c)):
         c["ugh"] = lst
     nu = load_route(c)

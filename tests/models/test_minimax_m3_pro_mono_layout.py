@@ -131,10 +131,19 @@ def test_a16w4_task_lists_hold_every_entry_and_down_task_once(s):
     assert n == (L.UG_QUARTERS if wide else L.UG_HALVES)
     assert L.ug_per_cta(act, s) == (2 if wide else 1)
     assert L.xk_row(act, s) == (L.XQ_ROW if wide else L.XH_ROW)
-    per = L.list_ctas(act, s)
-    assert per * n == BLOCKS
+    per = [L.list_ctas(act, s, lst) for lst in range(n)]
+    assert sum(per) == BLOCKS
+    if wide:
+        # the quarter-0 list (the merges) on more CTAs, the first after the
+        # shared expert's (no stage before ug)
+        assert per == [L.QUARTER0_CTAS] + [L.QUARTER_CTAS] * 3
+        assert L.QUARTER0_CTAS > L.QUARTER_CTAS
+        assert all(
+            L.task_list(L.UG_FIRST_CTA + k, act, s) == (0, k)
+            for k in range(L.QUARTER0_CTAS)
+        )
     placed = [L.task_list(b, act, s) for b in range(BLOCKS)]
-    assert sorted(placed) == [(lst, k) for lst in range(n) for k in range(per)]
+    assert sorted(placed) == [(lst, k) for lst in range(n) for k in range(per[lst])]
     for ug in (0, 7, 590):
         downs = [
             L.list_down(k, ug, lst, act, s)
