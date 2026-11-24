@@ -3212,7 +3212,7 @@ class ModelRunner:
             and not batch.is_dummy_run
             and bs > 0
         ):
-            dispatch_metrics.record("target", is_prefill, forward_mode.use_cudagraph)
+            dispatch_metrics.record("target", is_prefill, forward_mode.replays_graph)
 
         # PCP+TBO prefill: per-group round-robin stripe before UBatchWrapper (see
         # _apply_pcp_balanced_stripe). _pcp_tbo_balanced also gates the per-group
