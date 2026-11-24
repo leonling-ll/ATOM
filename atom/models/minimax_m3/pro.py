@@ -26,7 +26,10 @@ from functools import cache, partial
 from typing import ClassVar
 
 import torch
-from aiter.dist.parallel_state import get_tensor_model_parallel_world_size
+from aiter.dist.parallel_state import (
+    get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size,
+)
 from aiter.rotary_embedding import get_rope
 from torch import nn
 from transformers import PretrainedConfig
@@ -34,6 +37,7 @@ from transformers import PretrainedConfig
 from atom.config import Config, QuantizationConfig
 from atom.model_loader.weight_names import WeightsMapper
 from atom.model_ops.base_attention import Attention
+from atom.model_ops.eplb import enable_expert_count
 from atom.model_ops.layernorm import (
     GemmaRMSNorm,
     fused_allreduce_gemma_rms_norm,
@@ -45,7 +49,12 @@ from atom.model_ops.linear import (
     MinimaxM3QKVParallelLinearWithIndexer,
     RowParallelLinear,
 )
-from atom.model_ops.minimax_m3.pro_attn import ProSparseAttentionImpl, variants
+from atom.model_ops.minimax_m3.pro_attn import (
+    ProSparseAttentionImpl,
+    diag_path,
+    refresh_variants,
+    variants,
+)
 from atom.model_ops.utils import atom_parameter
 from atom.models.minimax_m3 import moe_route_glue
 from atom.models.minimax_m3.model import (
@@ -669,6 +678,16 @@ class MiniMaxM3ProForCausalLM(MiniMaxM3SparseForCausalLM):
             # the op's IPC buffers: collective, and before any decode graph is captured
             moe_route_glue.build(
                 text.hidden_size, text.num_local_experts, text.num_experts_per_tok
+            )
+        v = refresh_variants(force=True)
+        if v.expert_count and get_tensor_model_parallel_rank() == 0:
+            enable_expert_count(
+                [
+                    layer.block_sparse_moe.experts
+                    for layer in self.model.layers
+                    if getattr(layer, "is_moe_layer", False)
+                ],
+                diag_path(f"{v.diag_tag}_experts.jsonl"),
             )
 
 

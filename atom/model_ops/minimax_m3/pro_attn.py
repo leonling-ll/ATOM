@@ -29,6 +29,7 @@ import functools
 import json
 import logging
 import os
+import tempfile
 import time
 from dataclasses import dataclass, fields, replace
 
@@ -223,6 +224,12 @@ class ProVariants:
     # ... and its epilogue writes o_proj's MXFP8 input (E4M3 + E8M0 of the bf16-rounded rows,
     # quantize_fp8's bytes) where o_proj is a native group32 FP8 GEMM: no separate quant.
     day0_decode_mxfp8: bool = True
+    # Developer profile, not an attention switch (the attention path never reads it): count
+    # the distinct routed experts each MoE layer reads in every forward (TP rank 0) into
+    # ``<diag_tag>_experts.jsonl`` (``eplb.ExpertCountProfile``). A counting run, not a
+    # timing run. Read once, when the model is built: the count runs inside the captured
+    # decode graphs.
+    expert_count: bool = False
 
 
 # Below it the all-gather costs more than the scoring it saves (moo's threshold).
@@ -293,6 +300,16 @@ def refresh_variants(force: bool = False) -> ProVariants:
 
 def variants() -> ProVariants:
     return _variants
+
+
+def diag_path(name: str) -> str:
+    """``name`` in the developer diagnostics' directory (``$ATOM_M3PRO_DIAG_DIR``, else
+    ``m3pro_diag`` under the system temp directory), created if missing."""
+    d = os.environ.get(
+        "ATOM_M3PRO_DIAG_DIR", os.path.join(tempfile.gettempdir(), "m3pro_diag")
+    )
+    os.makedirs(d, exist_ok=True)
+    return os.path.join(d, name)
 
 
 @dataclass(frozen=True)
