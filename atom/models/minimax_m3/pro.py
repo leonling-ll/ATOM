@@ -119,6 +119,16 @@ class ProLookaheadState:
         # projection is native group32 FP8 is put as MXFP8 ``(x, x_scale)`` under fuse_mxfp8_quant
         self.index_linears: dict[int, tuple[nn.Module, ...]] = {}
         self.resid_in: dict[int, torch.Tensor | tuple[torch.Tensor, torch.Tensor]] = {}
+        # ``moe_tail_ar``: the shared-expert output a MoE layer left for the next layer's
+        # input all-reduce to add, taken (and cleared) by that layer. ``end_layer``: one
+        # past this pipeline stage's last layer, which adds its own (the model sets it;
+        # the layer count until then, and without it every layer adds its own)
+        self.end_layer = int(getattr(config, "num_hidden_layers", 0) or 0)
+        self.moe_tail: torch.Tensor | None = None
+
+    def take_moe_tail(self) -> torch.Tensor | None:
+        tail, self.moe_tail = self.moe_tail, None
+        return tail
 
     @staticmethod
     def _normed(norm: GemmaRMSNorm, x: torch.Tensor) -> torch.Tensor:
@@ -403,6 +413,8 @@ class MiniMaxM3ProDecoderLayer(MiniMaxM3DecoderLayer):
         attn = self.self_attn
         fuse_attn_in = mx_norm and _native_a8(attn.qk_proj, attn.index_qk_proj)
         hidden_states_scale = None
+        state = self._pro_state
+        moe_tail = state.take_moe_tail()
         if residual is None:
             residual = hidden_states
             if fuse_attn_in:
@@ -414,16 +426,20 @@ class MiniMaxM3ProDecoderLayer(MiniMaxM3DecoderLayer):
         elif fuse_attn_in:
             _, hidden_states, hidden_states_scale, residual = (
                 fused_allreduce_gemma_rms_norm_mxfp8(
-                    hidden_states, residual, self.input_layernorm, v.ar_lamport_rows
+                    hidden_states,
+                    residual,
+                    self.input_layernorm,
+                    v.ar_lamport_rows,
+                    v.ar_fused_rows,
+                    addend=moe_tail,
                 )
             )
         else:
             hidden_states, residual = fused_allreduce_gemma_rms_norm(
-                hidden_states, residual, self.input_layernorm
+                hidden_states, residual, self.input_layernorm, addend=moe_tail
             )
         aux_hidden_state = residual.clone() if capture_aux else None
 
-        state = self._pro_state
         hidden_states = attn(
             positions=positions,
             hidden_states=hidden_states,
@@ -451,6 +467,7 @@ class MiniMaxM3ProDecoderLayer(MiniMaxM3DecoderLayer):
                     residual,
                     self.post_attention_layernorm,
                     v.ar_lamport_rows,
+                    v.ar_fused_rows,
                 )
             )
         else:
@@ -461,11 +478,20 @@ class MiniMaxM3ProDecoderLayer(MiniMaxM3DecoderLayer):
         if not fuse:
             hidden_states = ffn(hidden_states)
         elif self.is_moe_layer:
+            # the next layer's input all-reduce adds the shared output
+            defer = (
+                v.moe_tail_ar
+                and ffn.shared_experts is not None
+                and self.layer_num + 1 < state.end_layer
+            )
             hidden_states = ffn(
                 hidden_states,
                 shared_input=(ffn_x, ffn_x_scale) if fuse_ffn_in else None,
                 quant_down=True,
+                defer_shared=defer,
             )
+            if defer:
+                hidden_states, state.moe_tail = hidden_states
         elif fuse_ffn_in:
             hidden_states = ffn(ffn_x, ffn_x_scale, quant_down=True)
         else:
@@ -503,11 +529,13 @@ class MiniMaxM3ProForCausalLM(MiniMaxM3SparseForCausalLM):
 
     def __init__(self, atom_config: Config, prefix: str = "") -> None:
         text = getattr(atom_config.hf_config, "text_config", atom_config.hf_config)
+        state = ProLookaheadState(text)
         super().__init__(
             atom_config,
             prefix=prefix,
-            layer_type=partial(MiniMaxM3ProDecoderLayer, state=ProLookaheadState(text)),
+            layer_type=partial(MiniMaxM3ProDecoderLayer, state=state),
         )
+        state.end_layer = self.model.end_layer
 
 
 class MiniMaxM3ProForConditionalGenerationTextOnly(

@@ -60,7 +60,7 @@ quant and pad_align 128 is 0.9424.
 |---|---|
 | Hardware | 8×MI355X (`gfx950`) |
 | ATOM | `yuhua/m3.1-pro` (this recipe's commit) |
-| aiter | aiter-M3 `hatwu/m3.1-pro-infx` at `a26613a8a` (with the inter-640 MoE rows, `[Config] [Tuning] [gfx950] MiniMax-M3.1-Pro MXFP4 MoE rows at inter 640`, and the FlyDSL fp8 sparse prefill) |
+| aiter | aiter-M3 `hatwu/m3.1-pro-infx` at `a26613a8a` (with the inter-640 MoE rows, `[Config] [Tuning] [gfx950] MiniMax-M3.1-Pro MXFP4 MoE rows at inter 640`, the FlyDSL fp8 sparse prefill, and from `b85ce1a27` the op the `ar_fused_rows` / `moe_tail_ar` variants need, off here) |
 | Parallelism | TP8, DCP=1 |
 | KV cache | FP8, K only, `--block-size 16`; index cache FP8 |
 | Prefix cache | on |

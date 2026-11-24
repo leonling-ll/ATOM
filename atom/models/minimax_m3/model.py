@@ -454,9 +454,12 @@ class MiniMaxM3MoE(nn.Module):
         hidden_states: torch.Tensor,
         shared_input: tuple[torch.Tensor, torch.Tensor] | None = None,
         quant_down: bool = False,
-    ) -> torch.Tensor:
+        defer_shared: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """``shared_input``: ``hidden_states`` already quantised (``(x, x_scale)``) for
-        the shared expert; ``quant_down``: see ``MiniMaxM3MLP.forward``."""
+        the shared expert; ``quant_down``: see ``MiniMaxM3MLP.forward``.
+        ``defer_shared``: return ``(routed, shared)`` unsummed (the caller adds them);
+        a layer without a shared expert returns the routed output alone."""
         orig_shape = hidden_states.shape
         hidden_states = hidden_states.view(-1, orig_shape[-1])
         router_logits = self.gate(hidden_states)
@@ -482,6 +485,8 @@ class MiniMaxM3MoE(nn.Module):
                     sx_scale.view(-1, sx_scale.shape[-1]),
                     quant_down=quant_down,
                 )
+            if defer_shared:
+                return routed_output.view(orig_shape), shared.view(orig_shape)
             routed_output = routed_output + shared
 
         return routed_output.view(orig_shape)

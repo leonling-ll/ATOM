@@ -187,10 +187,23 @@ class ProVariants:
     # aiter or GPU without it, keeps "triton".
     index: str = "triton"
     # Rows (tokens) at or below which those fused all-reduce + norm sites run as aiter's
-    # Lamport all-reduce + ``add_rmsnorm_mxfp8`` (two launches, same bytes) instead of
-    # the fused 1-stage kernel: 7.5 vs 9.6 us at 1 row, 9.7 vs 12.6 at 16 (TP8, 7168).
+    # Lamport all-reduce + ``add_rmsnorm_mxfp8`` (two launches) instead of the fused
+    # 1-stage kernel: 7.5 vs 9.6 us at 1 row, 9.7 vs 12.6 at 16 (TP8, 7168). The sum and
+    # the residual are the same bytes; the norm rounds on its own, so a bf16 output can
+    # move by one ulp (one element at 16 rows).
     # Needs the Lamport path on (AITER_CUSTOM_AR_DISABLE_LAMPORT unset); 0 turns it off.
     ar_lamport_rows: int = 0
+    # Rows (tokens) at or below which the same sites run aiter's one-launch Lamport
+    # two-shot all-reduce + residual add + RMSNorm + MXFP8 (the fused 1-stage kernel's
+    # bytes) instead; before ``ar_lamport_rows``. Needs the Lamport path on and an aiter
+    # with ``tensor_model_parallel_fused_allreduce_rmsnorm_lamport`` (else the sites keep
+    # their route); 0 turns it off.
+    ar_fused_rows: int = 0
+    # A MoE layer hands its routed and shared-expert outputs over unsummed, and the next
+    # layer's input all-reduce adds them (``routed + shared`` rounded to bf16, the bytes
+    # of the separate add): inside the ``ar_fused_rows`` kernel up to its rows, as a
+    # separate add before the all-reduce otherwise. Not on the last layer.
+    moe_tail_ar: bool = False
     # The K-only cache (``ProKOnlyLayout``): one 256-wide row a token, V read from its tail,
     # no V cache (776 -> 520 B a token and layer with an fp8 KV and a bf16 index cache).
     # The attention is then the Triton one. Read once, when the layers are built: the

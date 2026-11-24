@@ -1040,8 +1040,12 @@ def fused_allreduce_gemma_rms_norm(
     hidden_states: torch.Tensor,
     residual: torch.Tensor,
     norm: GemmaRMSNorm,
+    addend: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """MiniMax-M3 helper for delayed TP all-reduce followed by Gemma RMSNorm."""
+    """MiniMax-M3 helper for delayed TP all-reduce followed by Gemma RMSNorm, of
+    ``hidden_states + addend`` when ``addend`` is given."""
+    if addend is not None:
+        hidden_states = hidden_states + addend
     if get_tensor_model_parallel_world_size() > 1:
         return tensor_model_parallel_fused_allreduce_rmsnorm(
             hidden_states.contiguous(),
@@ -1158,21 +1162,64 @@ def _lamport_ar_rms_norm_mxfp8(
     return out, q, q_scale.view(torch.float8_e8m0fnu), residual_out
 
 
+def _lamport_fused_ar_rms_norm_mxfp8(
+    hidden_states: torch.Tensor,
+    residual: torch.Tensor,
+    norm: GemmaRMSNorm,
+    addend: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None:
+    """aiter's one-launch Lamport all-reduce (of ``hidden_states + addend``) + residual
+    add + Gemma RMSNorm + MXFP8: ``(out, q, q_scale, residual_out)``, or None (nothing
+    run) on an aiter without it or where it does not take the rows."""
+    from aiter.dist import communication_op
+
+    fused = getattr(
+        communication_op, "tensor_model_parallel_fused_allreduce_rmsnorm_lamport", None
+    )
+    if fused is None:
+        return None
+    outs = fused(
+        hidden_states.contiguous(),
+        residual,
+        norm.weight,
+        norm.variance_epsilon,
+        gemma_norm=True,
+        mxfp8=True,
+        addend=addend,
+    )
+    if outs is None:
+        return None
+    out, residual_out, q, q_scale = outs
+    return out, q, q_scale, residual_out
+
+
 def fused_allreduce_gemma_rms_norm_mxfp8(
     hidden_states: torch.Tensor,
     residual: torch.Tensor,
     norm: GemmaRMSNorm,
     lamport_rows: int = 0,
+    fused_rows: int = 0,
+    addend: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """``fused_allreduce_gemma_rms_norm`` with its output also as MXFP8 (the bytes of
-    ``quantize_fp8`` of it): ``(out, q, q_scale, residual_out)``. The quant rides on the
-    norm's kernel where there is a form of it that does (aiter's custom all-reduce
-    epilogue and add_rmsnorm at TP > 1, ``gemma_rms_norm_mxfp8`` at TP 1); every other
-    route runs the unfused pair. Up to ``lamport_rows`` rows, where aiter's Lamport
-    all-reduce is on, it runs that all-reduce + ``add_rmsnorm_mxfp8`` instead."""
+    """``fused_allreduce_gemma_rms_norm`` of ``hidden_states`` (``+ addend`` when given,
+    added in bf16 first) with its output also as MXFP8 (the bytes of ``quantize_fp8`` of
+    it): ``(out, q, q_scale, residual_out)``. The quant rides on the norm's kernel where
+    there is a form of it that does (aiter's custom all-reduce epilogue and add_rmsnorm
+    at TP > 1, ``gemma_rms_norm_mxfp8`` at TP 1); every other route runs the unfused
+    pair. Up to ``fused_rows`` rows aiter's one-launch Lamport all-reduce + norm + MXFP8
+    takes it, the addend included, where it can (the custom 1-stage kernel's bytes);
+    else up to ``lamport_rows`` rows, where aiter's Lamport all-reduce is on, that
+    all-reduce + ``add_rmsnorm_mxfp8``."""
     from atom.model_ops.blockscale import quantize_fp8
 
-    if get_tensor_model_parallel_world_size() > 1:
+    tp = get_tensor_model_parallel_world_size()
+    if tp > 1 and 0 < hidden_states.shape[0] <= fused_rows:
+        outs = _lamport_fused_ar_rms_norm_mxfp8(hidden_states, residual, norm, addend)
+        if outs is not None:
+            return outs
+    if addend is not None:
+        hidden_states = hidden_states + addend
+    if tp > 1:
         from aiter.dist import communication_op
 
         if 0 < hidden_states.shape[0] <= lamport_rows and _lamport_ar_on():
