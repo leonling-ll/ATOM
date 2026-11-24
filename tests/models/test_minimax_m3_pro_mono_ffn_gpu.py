@@ -201,6 +201,10 @@ def _worker(rank, port, queue, done, inputs):
     from atom.mono.runtime.peer_memory import PeerBuffer
     from atom.mono.runtime.uncached import uncached_bytes
 
+    # the results go to the parent by shared-memory file name, not as file
+    # descriptors: 17 cases' tensors x 8 ranks held at once passed the
+    # parent's descriptor limit ("received 0 items of ancdata")
+    torch.multiprocessing.set_sharing_strategy("file_system")
     try:
         torch.cuda.set_device(rank)
         dev = torch.device("cuda", rank)
