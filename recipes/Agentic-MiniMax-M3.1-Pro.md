@@ -73,7 +73,7 @@ same node and setup, 600 s:
 |---|---|---|---|---|---|
 | All of the above + bound 1040 | 78.7% | 21.51 | 9562 | 869 | 0.9393 |
 | + decode kernels: FlyDSL sparse decode with MXFP8 out, merged MXFP8 GEMM rows, MoE route glue, `index_split_decode` | 79.7% | **30.22** | **11254** | 1022 | 0.9424 |
-| + `index_compress` (compressed bf16 index cache, +17.7% KV blocks) | 83.2% | **34.43** | **11569** | 1055 | 0.9462 |
+| + `index_compress` (compressed bf16 index cache, +17.7% KV blocks) | 83.2% measured phase (batch 1: 82.5%) | **34.43** | **11569** | 1055 | 0.9462 |
 
 `index_split_decode` alone gives 29.10 / 10864; the decode kernels add the rest.
 
