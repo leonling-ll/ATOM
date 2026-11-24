@@ -24,6 +24,7 @@ import torch
 from minimax_m3_pro_mono_ref import (
     E2M1,
     FFN_BOUND,
+    FP8_MAX,
     ROUTE_SCALE,
     ROUTED_ACTS,
     TOPK,
@@ -35,6 +36,7 @@ from minimax_m3_pro_mono_ref import (
     ffn_mutations,
     mxfp4,
     mxfp8,
+    mxfp8_codes,
     qdq_mxfp4,
     qdq_mxfp8,
     route_failures,
@@ -599,6 +601,28 @@ def test_mxfp8_mid_rule():
     # the block's max fits 448 x scale, half the scale would not
     amax = y.float().view(8, 4, 32).abs().amax(-1).repeat_interleave(32, 1)
     assert (amax <= 448 * scale).all() and (amax > 224 * scale).all()
+
+
+def test_a_bf16_blocks_mxfp8_quotient_needs_no_clamp():
+    """The o stage stores e4m3 of x / 2^code for its bf16 core rows without
+    clamping to +-448 (``layer.load_core``): over every finite bf16 block max
+    the quotient is within 448, and reaches it, so the clamp the reference
+    applies never binds (a bf16 amax above 448 * 2^k is at least 450 * 2^k,
+    past 2^k after the f32(1 / 448) product's rounding)."""
+    amax = torch.arange(0x7F80, dtype=torch.int32).to(torch.int16).view(torch.bfloat16)
+    code = mxfp8_codes(amax.float())
+    quot = amax.float() * ((254 - code) << 23).view(torch.float32)
+    assert quot.max().item() == FP8_MAX
+    # and so the whole block's e4m3 is the clamped reference's, bit for bit
+    g = torch.Generator().manual_seed(5)
+    x = torch.randn(64, 1024, generator=g) * 10.0 ** (
+        torch.rand(64, 1, generator=g) * 60 - 30
+    )
+    x = x.to(torch.bfloat16)
+    q, c = mxfp8(x)
+    inv = ((254 - c.to(torch.int32)) << 23).view(torch.float32).repeat_interleave(32, 1)
+    raw = (x.float() * inv).to(torch.float8_e4m3fn)
+    assert torch.equal(raw.view(torch.uint8), q.view(torch.uint8))
 
 
 @pytest.mark.parametrize("act", ROUTED_ACTS)
