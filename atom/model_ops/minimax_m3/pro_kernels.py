@@ -1984,6 +1984,54 @@ def select_logical(score, positions, k, num_warps=8, split=False):
     return sel
 
 
+_fused_scorer = None  # aiter's FlyDSL decode scorer (tests swap it)
+
+
+def fused_scores_available() -> bool:
+    """Whether this aiter has the FlyDSL Pro decode scorer and this GPU runs it
+    (gfx950)."""
+    if _fused_scorer is not None:
+        return True
+    try:
+        from aiter.ops.flydsl.minimax_m3_pro_index import (
+            pro_index_decode_supported,
+        )
+    except ImportError:
+        return False
+    return pro_index_decode_supported()
+
+
+def scores_fused(
+    iq, ic, block_tables, seq_id, positions, nb, cq, init, local, sc, pool_temp, rows
+):
+    """``scores``' pool4 / max block scores (``block_mode=BLOCK_POOL4MAX``,
+    ``head_mode=HEAD_MAX``) by aiter's FlyDSL decode scorer: ``[T, nb]`` fp32 with each
+    row's causal blocks written and the rest left unset, which every selection but
+    ``torch.topk`` reads past. ``rows`` consecutive rows (1, 2, 4 or 8) share a sequence
+    and each tile of keys; the scores equal ``scores``' up to fp32 rounding."""
+    global _fused_scorer
+    if _fused_scorer is None:
+        from aiter.ops.flydsl.minimax_m3_pro_index import pro_index_decode_scores
+
+        _fused_scorer = pro_index_decode_scores
+    out = torch.empty(iq.shape[0], nb, dtype=torch.float32, device=iq.device)
+    _fused_scorer(
+        iq,
+        ic,
+        cq,
+        block_tables,
+        seq_id,
+        positions,
+        out,
+        init,
+        local,
+        sc,
+        pool_temp,
+        rows=rows,
+    )
+    return out
+
+
 _pa_decode = None  # aiter's paged-attention decode as ATOM wraps it (tests swap it)
 
 

@@ -560,6 +560,14 @@ It is the recommended setting. Measured on 8x MI355X, max-model-len 131072:
 - At a 1M context (65536 blocks) the sort alone is 0.7–0.8 ms per layer for `"fused"` and
   3–66 us for `"split"`.
 
+`"index": "fused"` scores decode and DSpark-verify rows (the decode graph's static path) with
+aiter-M3's FlyDSL scorer (`pro_index_decode_scores`, [zhuyuhua-v/aiter-M3#5](https://github.com/zhuyuhua-v/aiter-M3/pull/5)
+landed as `ffb4cedb0`) instead of Triton's: one launch, each key tile read once for up to 8 rows of a
+sequence, fp8 or NVFP4 index cache (on fp8 from 32 rows a step, below which Triton's is as fast). It takes pool4 / max scores and a `topk` other than `"torch"`;
+elsewhere, and on an aiter without the scorer, the Triton scores run (a warning says so). The
+selection is unchanged and picks the same blocks (the scores agree to fp32 rounding). The default
+stays `"triton"`; per-layer timings are on that aiter PR.
+
 The block scores run as a tiled kernel (4 or 8 blocks x 16 tokens per program, one `tl.dot`); the
 softmax-pool weights depend on the keys alone, so the pooled scores are the token dots weighted per
 group of 4, in the same tile. The module hands the four

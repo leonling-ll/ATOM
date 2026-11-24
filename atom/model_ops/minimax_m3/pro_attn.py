@@ -180,6 +180,12 @@ class ProVariants:
     # two; 0: one): the rows of a sequence read each tile of block keys once, one dot for
     # all their query heads. A plain decode (one row a sequence) keeps one.
     score_tq: int = 0
+    # The decode / verify block scorer of the kernel path: "triton" (``scores``) or
+    # "fused" (``scores_fused``: aiter's FlyDSL scorer, each tile of keys read once
+    # for up to 8 rows of a sequence). "fused" takes the static (graph) decode with
+    # pool4 / max scores and a selection other than "torch"; everything else, and an
+    # aiter or GPU without it, keeps "triton".
+    index: str = "triton"
     # Rows (tokens) at or below which those fused all-reduce + norm sites run as aiter's
     # Lamport all-reduce + ``add_rmsnorm_mxfp8`` (two launches, same bytes) instead of
     # the fused 1-stage kernel: 7.5 vs 9.6 us at 1 row, 9.7 vs 12.6 at 16 (TP8, 7168).
@@ -199,6 +205,11 @@ class ProVariants:
     # "triton").
     prefill_attn: str = "triton"
 
+
+# Below it, on an fp8 index cache, Triton's query-blocked scores are as fast or faster
+# than aiter's fused scorer (MI355X, 16 rows: 19.6 vs 27.3 us at 32k context, 32.9 vs
+# 28.2 at 128k; 64 rows: 33.3 vs 26.2 at 32k), so "index": "fused" keeps Triton there.
+_FUSED_MIN_ROWS_FP8 = 32
 
 # Below it the all-gather costs more than the scoring it saves (moo's threshold).
 _SPLIT_MIN_TOKENS = 1024
@@ -739,6 +750,43 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
             )
         )
 
+    def _fused_index(self, v: ProVariants, static: bool, split, ic, n: int) -> bool:
+        """Whether the decode scores take aiter's FlyDSL scorer (``"index":
+        "fused"``): graph-shaped decode rows of one rank, pool4 / max scores, a
+        selection that reads only each row's causal blocks, an fp8 or NVFP4 index
+        cache ``ic`` (it reads no bf16 one), and on fp8 at least _FUSED_MIN_ROWS_FP8 of
+        the ``n`` rows."""
+        if v.index != "fused":
+            return False
+        ok = (
+            static
+            and split is None
+            and (
+                ic.dtype == torch.uint8
+                or (ic.dtype == torch.float8_e4m3fn and n >= _FUSED_MIN_ROWS_FP8)
+            )
+            and self.dcp_world == 1
+            and v.block_score == "pool4"
+            and v.head_reduce == "max"
+            and v.topk != "torch"
+            and pro_kernels.fused_scores_available()
+        )
+        small_fp8 = ic.dtype == torch.float8_e4m3fn and n < _FUSED_MIN_ROWS_FP8
+        if (
+            static
+            and not ok
+            and not small_fp8
+            and not getattr(self, "_warned_index", False)
+        ):
+            self._warned_index = True
+            logger.warning(
+                "M3-Pro layer %d: index 'fused' needs pool4 / max scores, a topk "
+                "other than 'torch', an fp8 or NVFP4 index cache, no DCP and aiter's "
+                "FlyDSL Pro scorer on gfx950; decode scores stay Triton's",
+                self.layer_num,
+            )
+        return ok
+
     @staticmethod
     def _device_meta(md, n: int, device):
         """Per-forward device tensors shared by all layers: the sequence of every token
@@ -936,32 +984,51 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
             # every row scores alone, so this rank's rows come out as they would in full
             idx, seg, n_rows, tp = split
             rq, rseq, rpos = iq[idx], seq_id[idx], positions[idx]
-        score = pro_kernels.scores(
-            rq,
-            ic,
-            block_tables,
-            rseq,
-            rpos,
-            nb,
-            self.index_compress_query.data if pool else None,
-            init,
-            local,
-            sc,
-            block_mode=block_mode,
-            head_mode=head_mode,
-            pool_temp=v.pool_scale,
-            # torch.topk reads the whole width; the others only each token's causal blocks
-            causal=v.topk != "torch",
-            # decode: one row a sequence, nothing to share; a verify has k + 1 rows a
-            # sequence, so the tile is the largest power of two dividing them (at most
-            # score_tq): a tile never spans two sequences, which would score row by row
-            # (k = 3: 4 rows, not 8). Graph-safe: the shapes alone decide.
-            tq=(
-                v.score_tq
-                if not static
-                else min(v.score_tq, rps & -rps) if rps > 1 else 0
-            ),
-        )
+        if self._fused_index(v, static, split, ic, n):
+            # each group of `rows` rows is one sequence's: k + 1 a verify, so the
+            # largest power of two (at most 8) dividing them
+            rows = min(8, rps & -rps) if rps > 1 else 1
+            score = pro_kernels.scores_fused(
+                rq,
+                ic,
+                block_tables,
+                rseq,
+                rpos,
+                nb,
+                self.index_compress_query.data,
+                init,
+                local,
+                sc,
+                v.pool_scale,
+                rows,
+            )
+        else:
+            score = pro_kernels.scores(
+                rq,
+                ic,
+                block_tables,
+                rseq,
+                rpos,
+                nb,
+                self.index_compress_query.data if pool else None,
+                init,
+                local,
+                sc,
+                block_mode=block_mode,
+                head_mode=head_mode,
+                pool_temp=v.pool_scale,
+                # torch.topk reads the whole width; the others only each token's causal blocks
+                causal=v.topk != "torch",
+                # decode: one row a sequence, nothing to share; a verify has k + 1 rows a
+                # sequence, so the tile is the largest power of two dividing them (at most
+                # score_tq): a tile never spans two sequences, which would score row by row
+                # (k = 3: 4 rows, not 8). Graph-safe: the shapes alone decide.
+                tq=(
+                    v.score_tq
+                    if not static
+                    else min(v.score_tq, rps & -rps) if rps > 1 else 0
+                ),
+            )
         # select_rows_split matches select_rows bit for bit; its cost follows the context
         select = (
             pro_kernels.select_rows_split
