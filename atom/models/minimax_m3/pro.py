@@ -141,6 +141,12 @@ class ProLookaheadState:
         self.index_linears: dict[int, tuple[nn.Module, ...]] = {}
         self.resid_in: dict[int, torch.Tensor | tuple[torch.Tensor, torch.Tensor]] = {}
         self._ring: tuple[torch.Tensor, torch.Tensor] | None = None
+        # ``moe_tail_ar``: the shared-expert output a MoE layer left for the next layer's
+        # input all-reduce to add, taken (and cleared) by that layer. ``end_layer``: one
+        # past this pipeline stage's last layer, which adds its own (the model sets it;
+        # the layer count until then, and without it every layer adds its own)
+        self.end_layer = int(getattr(config, "num_hidden_layers", 0) or 0)
+        self.moe_tail: torch.Tensor | None = None
 
     def front_rows(
         self, reader: int, rows: int, like: torch.Tensor
@@ -199,6 +205,10 @@ class ProLookaheadState:
         if written_at(index_src, q[rows:], q_scale[rows:]):
             return front
         return None
+
+    def take_moe_tail(self) -> torch.Tensor | None:
+        tail, self.moe_tail = self.moe_tail, None
+        return tail
 
     @staticmethod
     def _normed(norm: GemmaRMSNorm, x: torch.Tensor) -> torch.Tensor:
@@ -539,6 +549,7 @@ class MiniMaxM3ProDecoderLayer(MiniMaxM3DecoderLayer):
         )
         x_out = (None, None) if front is None else (front[0][:rows], front[1][:rows])
         hidden_states_scale = None
+        moe_tail = state.take_moe_tail()
         if residual is None:
             residual = hidden_states
             if fuse_attn_in:
@@ -559,13 +570,15 @@ class MiniMaxM3ProDecoderLayer(MiniMaxM3DecoderLayer):
                     residual,
                     self.input_layernorm,
                     v.ar_lamport_rows,
+                    v.ar_fused_rows,
+                    addend=moe_tail,
                     q_out=x_out[0],
                     q_scale_out=x_out[1],
                 )
             )
         else:
             hidden_states, residual = fused_allreduce_gemma_rms_norm(
-                hidden_states, residual, self.input_layernorm
+                hidden_states, residual, self.input_layernorm, addend=moe_tail
             )
         aux_hidden_state = residual.clone() if capture_aux else None
 
@@ -617,6 +630,7 @@ class MiniMaxM3ProDecoderLayer(MiniMaxM3DecoderLayer):
                     residual,
                     self.post_attention_layernorm,
                     v.ar_lamport_rows,
+                    v.ar_fused_rows,
                 )
             )
         else:
@@ -627,11 +641,21 @@ class MiniMaxM3ProDecoderLayer(MiniMaxM3DecoderLayer):
         if not fuse:
             hidden_states = ffn(hidden_states)
         elif self.is_moe_layer:
+            # the next layer's input all-reduce adds the shared output
+            defer = (
+                v.moe_tail_ar
+                and ffn.shared_experts is not None
+                and self.layer_num + 1 < state.end_layer
+            )
             hidden_states = ffn(
                 hidden_states,
                 shared_input=(ffn_x, ffn_x_scale) if fuse_ffn_in else None,
                 quant_down=True,
+                defer_shared=defer,
+                two_streams=0 < hidden_states.shape[0] <= v.moe_two_stream_rows,
             )
+            if defer:
+                hidden_states, state.moe_tail = hidden_states
         elif fuse_ffn_in:
             hidden_states = ffn(ffn_x, ffn_x_scale, quant_down=True)
         else:
@@ -669,11 +693,13 @@ class MiniMaxM3ProForCausalLM(MiniMaxM3SparseForCausalLM):
 
     def __init__(self, atom_config: Config, prefix: str = "") -> None:
         text = getattr(atom_config.hf_config, "text_config", atom_config.hf_config)
+        state = ProLookaheadState(text)
         super().__init__(
             atom_config,
             prefix=prefix,
-            layer_type=partial(MiniMaxM3ProDecoderLayer, state=ProLookaheadState(text)),
+            layer_type=partial(MiniMaxM3ProDecoderLayer, state=state),
         )
+        state.end_layer = self.model.end_layer
         if variants().moe_route_glue:
             # the op's IPC buffers: collective, and before any decode graph is captured
             moe_route_glue.build(

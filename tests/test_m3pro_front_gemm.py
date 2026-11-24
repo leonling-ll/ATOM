@@ -270,12 +270,24 @@ class _Norms:
         assert residual is None  # the input norm of layer 0 and the lookahead norm
         return (x if write_bf16 else None), q_out, q_scale_out, None
 
-    def ar(self, h, residual, norm, lamport_rows=0, q_out=None, q_scale_out=None):
+    def ar(
+        self,
+        h,
+        residual,
+        norm,
+        lamport_rows=0,
+        fused_rows=0,
+        addend=None,
+        q_out=None,
+        q_scale_out=None,
+    ):
+        assert addend is None  # moe_tail_ar is off here
         _, q, s, _ = self.mx(h, None, norm, False, q_out, q_scale_out)
         return h + residual, q, s, h + residual
 
     @staticmethod
-    def ar_plain(h, residual, norm):
+    def ar_plain(h, residual, norm, addend=None):
+        assert addend is None
         return h + residual, h + residual
 
 

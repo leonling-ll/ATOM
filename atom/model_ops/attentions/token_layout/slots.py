@@ -68,3 +68,25 @@ def slot_mapping(
     blk += np.repeat(np.arange(len(seqlens_q), dtype=np.int64) * stride, seqlens_q)
     np.multiply(flat[blk], block_size, out=blk, dtype=np.int64)
     return np.add(blk, out, out=out)
+
+
+def dcp_slot_mapping(
+    positions: np.ndarray,
+    seqlens_q: np.ndarray,
+    block_tables: np.ndarray,
+    block_size: int,
+    dcp_size: int,
+    dcp_rank: int,
+    interleave: int = 1,
+) -> np.ndarray:
+    """`slot_mapping` under decode context parallelism: a block-table entry covers
+    `block_size * dcp_size` tokens, a token is written on the rank that owns it
+    (`dcp_layout.dcp_owner_rank`) at its local index (`dcp_layout.dcp_local_index`)
+    and nowhere else (`-1`).
+    The rule `dcp_prefill_slot_mapping` applies to a prefill, over a packed table."""
+    rows = np.repeat(np.arange(len(seqlens_q), dtype=np.int64), seqlens_q)
+    entry = positions // (block_size * dcp_size)
+    local = (positions // (interleave * dcp_size)) * interleave + positions % interleave
+    slots = block_tables[rows, entry].astype(np.int64) * block_size + local % block_size
+    slots[(positions // interleave) % dcp_size != dcp_rank] = -1
+    return slots
