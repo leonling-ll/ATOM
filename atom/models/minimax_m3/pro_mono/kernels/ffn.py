@@ -23,7 +23,7 @@ x8, which the shared expert also reads, and MXFP8 mids, ``quantize_fp8``'s
 rule; the gfx950 f8f6f4 MFMA with the MXFP4 weight as A, cbsz 4, and the
 MXFP8 activation as B, blgp 0), and production's MXFP8 shared expert::
 
-    logit  = bf16(x @ w_gate^T)                       (fp32 accumulate)
+    logit  = x @ w_gate^T                    (fp32 accumulate, kept fp32)
     s      = sigmoid(logit); picks = top-4 of s + bias (lower expert on a tie)
     w_k    = s_k / (s_0 + s_1 + s_2 + s_3) * 2.0      (rank order sum)
     xa     = x               (A16W4: the norm's bf16 x)
@@ -266,8 +266,10 @@ def router_loads(c, task):
 def stage_router(c, task, ops):
     """Router task (i, q) = (task / R_PARTS, task % R_PARTS): its rows against
     x's K slice q (bf16 MFMA, fp32). Parts q > 0 publish their fp32 partials;
-    part 0 adds them in part order, rounds to bf16 (the gate's output dtype)
-    and sends the logits to every rank's ``rlog``."""
+    part 0 adds them in part order and sends the fp32 logits to every rank's
+    ``rlog``, unrounded as production's ``moe_route_glue`` keeps them: a bf16
+    rounding here picks another 4th expert where the 4th and 5th scores are
+    closer than its error."""
     s, tid, lane, wave, red = c["S"], c["tid"], c["lane"], c["wave"], c["red"]
     i, q = task // R_PARTS, task % R_PARTS
     xrow = R_KLEN + gemv.LDS_PAD
@@ -290,7 +292,6 @@ def stage_router(c, task, ops):
             )
             for p in range_constexpr(R_PARTS - 1):
                 v = v + _f32_of(got[p][0])
-            v = bf16_round(v)
             for p in range_constexpr(TP):
                 c["put"](c["rlog"][p], rlog_pair(c["rank"], t, i * R_ROWS + r), v)
     gpu.barrier()

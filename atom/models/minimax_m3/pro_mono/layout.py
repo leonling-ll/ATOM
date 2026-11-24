@@ -27,7 +27,7 @@ build's the bf16 x)::
 
     router  R_TASKS CTAs from R0: this rank's 48 router rows (3 row groups x
             R_PARTS K slices) against bf16 x; part 0 adds the parts in order,
-            bf16 -> every rank's ``rlog`` (an all-gather of the 384 logits)
+            fp32 -> every rank's ``rlog`` (an all-gather of the 384 logits)
     shared  SH_TASKS CTAs from SH0: 8 gate + 8 up rows of the MXFP8 shared
             gate_up against x8 -> bf16 g, u -> SwiGLU-OAI -> bf16 -> ``smid``
     route   S CTAs from RT0, token t (a real row: t < ``nvalid``'s count):
@@ -384,8 +384,7 @@ class P1Build:
 #      this rank owns
 # ag   [token][column] bf16 pairs: the owners' sums
 # agsq [task][token] two words a cell (sum of squares over f32 v, over bf16 v)
-# rlog [src rank][token][its 48 experts] the router logits (f32 words holding
-#      bf16 values)
+# rlog [src rank][token][its 48 experts] the router logits (f32)
 
 
 def rs_pair(src, t, col_in_own):

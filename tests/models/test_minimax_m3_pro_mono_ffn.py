@@ -33,11 +33,14 @@ from minimax_m3_pro_mono_ref import (
     ffn_case,
     ffn_failures,
     ffn_mutations,
+    logit_bound,
     mxfp4,
     mxfp8,
+    near_tie_router,
     qdq_mxfp4,
     qdq_mxfp8,
     route_failures,
+    route_reference,
     route_reference_of_logits,
     row_relnorm,
     swiglu_oai,
@@ -510,13 +513,17 @@ def test_route_reference():
 def test_route_checks_catch_a_wrong_router():
     c = ffn_case(5, **NARROW, seed=3)
     logits, picks, w = c["logits"], c["picks"], c["weights"]
-    assert not route_failures(logits, picks, w, logits, c["bias"])
-    # logits one bf16 step off are sum order (the picks and weights then
-    # follow from them); two steps are not
-    for steps, want in ((1, []), (2, ["logits"])):
-        off = (logits.view(torch.int16) + steps).view(torch.bfloat16)
-        _, p, ww, _ = route_reference_of_logits(off, c["bias"])
-        assert route_failures(off, p, ww, logits, c["bias"]) == want
+    bound = logit_bound(c["x"], c["w_gate"])
+    assert not route_failures(logits, picks, w, logits, c["bias"], bound)
+    # fp32 logits summed in another order pass (the picks and weights then
+    # follow from them); bf16-rounded ones (a router that rounds as the bf16
+    # gate does) do not
+    for name, mine, want in (
+        ("fp32", c["x"].float() @ c["w_gate"].float().T, []),
+        ("bf16", logits.to(torch.bfloat16).float(), ["logits"]),
+    ):
+        _, p, ww, _ = route_reference_of_logits(mine, c["bias"])
+        assert route_failures(mine, p, ww, logits, c["bias"], bound) == want, name
     bad = {
         "unscaled": (picks, w / ROUTE_SCALE),
         "biased weights": (picks, w * 1.01),
@@ -529,7 +536,30 @@ def test_route_checks_catch_a_wrong_router():
         "no bias": (torch.topk(logits.float(), TOPK).indices, w),
     }
     for name, (p, ww) in bad.items():
-        assert route_failures(logits, p, ww, logits, c["bias"]), name
+        assert route_failures(logits, p, ww, logits, c["bias"], bound), name
+
+
+@pytest.mark.parametrize("seed", [1, 2, 3])
+def test_near_tie_router_splits_fp32_from_bf16_logits(seed):
+    """At Pro's widths (the GPU test's router generator): on the near-tie
+    router the fp32 logits pick B and the bf16-rounded ones A, and the logit
+    check flags the bf16-rounded logits."""
+    g = torch.Generator().manual_seed(seed)
+    x = (
+        torch.randn(HIDDEN, generator=g) * (1 + 0.3 * torch.randn(HIDDEN, generator=g))
+    ).to(torch.bfloat16)
+    w_gate = (torch.randn(EXPERTS, HIDDEN, generator=g) * 0.02).to(torch.bfloat16)
+    bias = torch.randn(EXPERTS, generator=g) * 0.02
+    w, b, want32, want16 = near_tie_router(x, w_gate, bias)
+    assert want32 != want16
+    logits, picks, ww, _ = route_reference(x[None], w, b)
+    assert sorted(picks[0].tolist()) == want32
+    rounded = logits.to(torch.bfloat16).float()
+    _, p16, w16, _ = route_reference_of_logits(rounded, b)
+    assert sorted(p16[0].tolist()) == want16
+    bound = logit_bound(x[None], w)
+    assert not route_failures(logits, picks, ww, logits, b, bound)
+    assert "logits" in route_failures(rounded, p16, w16, logits, b, bound)
 
 
 def test_mxfp8_mid_rule():
