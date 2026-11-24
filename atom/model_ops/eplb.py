@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+import time
 from contextlib import nullcontext
 from dataclasses import dataclass
 from functools import wraps
@@ -1023,8 +1025,8 @@ def _plan_single_layer_migration(
         rbase = r * num_local_physical_experts
         old_r = old_list[rbase : rbase + num_local_physical_experts]
         new_r = new_list[rbase : rbase + num_local_physical_experts]
-        old_set = set(x for x in old_r if x >= 0)
-        new_set = set(x for x in new_r if x >= 0)
+        old_set = {x for x in old_r if x >= 0}
+        new_set = {x for x in new_r if x >= 0}
         for logical in sorted(new_set):
             if logical not in old_set:
                 recv_ranks_by_logical.setdefault(logical, []).append(r)
@@ -1592,8 +1594,84 @@ class ExpertLoadMonitor:
         )
 
 
+class ExpertCountProfile(ExpertLoadMonitor):
+    """Decode-profile mode of the load monitor, without expert parallelism: how many
+    distinct routed experts each MoE layer reads in every real forward, decode
+    included, one JSON line a forward. A counting run, not a timing run: one count
+    launch per MoE layer and one host read per forward.
+
+    Each layer in ``layers`` (``FusedMoE``) gets its row of the per-pass buffer as
+    ``expert_count_slot``; its ``_run_experts`` records the ids ``apply`` receives
+    there, rows past the forward's real ones dropped. Ids at or past the routed count
+    (a fused shared expert's column) are not counted. Under tensor parallelism every
+    rank runs every expert's slice, so one rank's count is the step's."""
+
+    def __init__(self, layers: list, path: str):
+        super().__init__(enabled=True, window_size=1)
+        self.path = path
+        self.initialize(
+            num_layers=len(layers),
+            num_physical=layers[0].expert_layout.num_routed,
+            device=next(layers[0].parameters()).device,
+        )
+        for slot, layer in enumerate(layers):
+            layer.expert_count_slot = slot
+
+    def record_rows(
+        self, slot: int, topk_ids: torch.Tensor, real_rows: torch.Tensor | None
+    ) -> None:
+        """Count ``topk_ids`` into ``slot``; ``real_rows`` (device ``[1]``, or None:
+        all rows are real) leaves out the padded rows of a graph bucket. Capture-safe.
+        """
+        if real_rows is not None:
+            row = torch.arange(topk_ids.shape[0], device=topk_ids.device)
+            topk_ids = torch.where(row.unsqueeze(1) < real_rows, topk_ids, -1)
+        self.record(
+            layer_id=slot, topk_physical=topk_ids, num_physical=self._num_physical
+        )
+
+    def commit(self, batch: Any) -> None:
+        """Append the forward's record: its rows and sequences, decode or prefill, the
+        routed ids counted in the first layer (rows x top-k when only real rows were
+        counted) and the distinct experts of each layer."""
+        if getattr(batch, "is_dummy_run", False):
+            return
+        c = self._cur_pass_count
+        *distinct, ids = torch.cat([(c > 0).sum(dim=1), c[0].sum().view(1)]).tolist()
+        prefill = getattr(batch, "total_tokens_num_prefill", 0) > 0
+        rec = {
+            "t": round(time.time(), 3),
+            "phase": "prefill" if prefill else "decode",
+            "rows": int(batch.total_tokens_num),
+            "seqs": int(batch.total_seqs_num),
+            "ids": ids,
+            "distinct": distinct,
+        }
+        with open(self.path, "a") as f:
+            f.write(json.dumps(rec) + "\n")
+
+
 _MONITOR: ExpertLoadMonitor | None = None
 _MANAGER: EPLBManager | None = None
+_EXPERT_COUNT: ExpertCountProfile | None = None
+
+
+def enable_expert_count(layers: list, path: str) -> ExpertCountProfile:
+    """Start the decode-profile count over ``layers`` into the JSONL file ``path``.
+    Call it before the first forward: the forward monitor resolves it once, and the
+    count must be in the decode graphs when they are captured."""
+    global _EXPERT_COUNT
+    if not layers:
+        raise ValueError("expert count: the model has no MoE layers")
+    if getattr(get_current_atom_config(), "eplb_enable", False):
+        raise ValueError("expert count: EPLB owns the load monitor; turn one off")
+    _EXPERT_COUNT = ExpertCountProfile(layers, path)
+    logger.info("Expert count: %d MoE layers -> %s", len(layers), path)
+    return _EXPERT_COUNT
+
+
+def get_expert_count() -> ExpertCountProfile | None:
+    return _EXPERT_COUNT
 
 
 def get_expert_load_monitor(*, enabled: bool, window_size: int) -> ExpertLoadMonitor:
@@ -2455,13 +2533,19 @@ def with_eplb_forward_monitor(fn):
     # pay no overhead. _MANAGER and its live_metadata are set by
     # initialize_eplb_runtime() during model runner init, which always precedes
     # the first forward pass, so the hot path never re-binds the owner.
-    resolved_manager: list[EPLBManager | None] = []
+    # The expert count (`enable_expert_count`) is resolved the same way.
+    resolved_manager: list[tuple[EPLBManager | None, ExpertCountProfile | None]] = []
 
     @wraps(fn)
     def wrapper(self, batch, *args, **kwargs):
         if not resolved_manager:
-            resolved_manager.append(_MANAGER)
-        manager = resolved_manager[0]
+            resolved_manager.append((_MANAGER, _EXPERT_COUNT))
+        manager, count = resolved_manager[0]
+        if count is not None:
+            count.on_forward_start()
+            out = fn(self, batch, *args, **kwargs)
+            count.commit(batch)
+            return out
         # Pass through when EPLB is off, or defensively if init never bound
         # metadata (should not happen — init is fail-loud).
         if manager is None or manager.live_metadata is None:

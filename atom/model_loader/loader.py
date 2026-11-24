@@ -43,6 +43,29 @@ from atom.utils import envs
 
 logger = logging.getLogger("atom")
 
+# Cached-but-free bytes above which post-load processing hands them back to the driver.
+_RELEASE_SLACK_BYTES = 256 << 20
+
+
+def _release_freed_blocks() -> None:
+    """Return the caching allocator's free blocks to the driver.
+
+    Post-load processing allocates a weight's processed copy (online
+    quantization, shuffles) after the temporaries of an earlier step were
+    freed but are still cached. The allocator places the persistent copy in
+    the best-fitting free block, often a larger temporary's, and the rest of
+    that segment can never be released while the weight lives: on
+    MiniMax-M3.1-Pro that stranded about 40 GB per GPU, all of it missing from
+    the KV pool. Releasing between steps gives every persistent copy a
+    segment of its own size.
+    """
+    if (
+        torch.cuda.is_available()
+        and torch.cuda.memory_reserved() - torch.cuda.memory_allocated()
+        > _RELEASE_SLACK_BYTES
+    ):
+        torch.cuda.empty_cache()
+
 
 def _weight_identity(param: nn.Parameter) -> str:
     """Name the weight a loader was handed, for failures inside one.
@@ -399,12 +422,14 @@ def load_model(
             and id(module) not in streamed_done
         ):
             module.process_weights_after_loading()
+            _release_freed_blocks()
         quant_method = getattr(module, "quant_method", None)
 
         # when running plugin mode for sglang, don't do the post process here
         # since sglang will call this func automatically after finishing loading
         if isinstance(quant_method, QuantizeMethodBase) and not is_sglang():
             quant_method.process_weights_after_loading(module)
+            _release_freed_blocks()
         if isinstance(quant_method, FusedMoEMethodBase):
             quant_method.init_prepare_finalize(module)
 
