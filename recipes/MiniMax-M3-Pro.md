@@ -100,6 +100,57 @@ curl -s http://127.0.0.1:8300/v1/completions -H 'Content-Type: application/json'
 # " Paris. The city is located in the north of the country, on the banks of the Seine River. Paris is the"
 ```
 
+## Chat, tool calls and reasoning
+
+Pro's own `chat_template.jinja` renders the user turns only: no system or developer turn, no tools,
+no assistant or tool turns. A server on it finds no tool-call format and no reasoning tags (`No known
+tool-call format` and `Reasoning channel: </think> (no dialect named in the chat template)` in the
+log), so tool calls and the chain of thought both arrive as `content`. For chat, serve Pro with
+MiniMax-M3's template (`chat_template.jinja` of `amd/MiniMax-M3-MXFP4`) and thinking on; add to any
+launch above:
+
+```bash
+  --chat-template /path/to/MiniMax-M3-MXFP4/chat_template.jinja \
+  --default-chat-template-kwargs '{"thinking_mode": "enabled"}'
+```
+
+The log then reads `Tool-call format: minimax (from the chat template)` and `Reasoning channel:
+</mm:think>`: tool calls arrive as `tool_calls` and the thinking as `reasoning_content`. A request can
+still turn thinking off with `chat_template_kwargs: {"thinking_mode": "disabled"}`.
+
+The [MiniMax Provider Verifier](https://github.com/MiniMax-AI/MiniMax-Provider-Verifier) at
+`c899f95e` (InferenceX's `minimax_m3_full`: 102 requests, temperature 0, `max_tokens` 40960, 5
+concurrent) on the fast configuration with DSpark k=7 and `--max-model-len 196608` (its longest
+prompt is 128,984 tokens, so it needs at least 169,944):
+
+| Model and server | Delivery | Rows answered | `tool_calls_match_rate` | Tool calls made / expected | Schema-valid calls |
+|---|---|---:|---:|---:|---:|
+| Pro on ATOM | non-streaming | 102 / 102 | 0.95 | 83 / 84 | 83 |
+| Pro on ATOM | streaming | 102 / 102 | 0.95 | 83 / 84 | 83 |
+| M3.1-Flash on vLLM | non-streaming | 102 / 102 | 0.97 | 84 / 84 | 83 |
+| M3.1-Flash on vLLM | streaming | 102 / 102 | 0.99 | 84 / 84 | 84 |
+| M3.1-Flash on ATOM | non-streaming | 102 / 102 | 0.99 | 84 / 84 | 83 |
+| M3.1-Flash on ATOM | streaming | 102 / 102 | 0.99 | 84 / 84 | 83 |
+
+The Flash rows are `amd/MiniMax-M3.1-Flash-Quark-MXFP4` with its own chat template and the same
+`thinking_mode`, TP4, fp8 KV cache, no speculative decoding and `--max-model-len 196608`. On vLLM:
+`vllm/vllm-openai-rocm:minimax-m31-flash` (vLLM 0.32.0rc1.dev364) with `--tool-call-parser minimax_m3
+--reasoning-parser minimax_m3 --enable-auto-tool-choice`. On ATOM: the Quark MXFP4 launch of
+[MiniMax-M3.md](MiniMax-M3.md) without its DSpark flags, `--max-num-seqs 16`.
+
+Flash on ATOM matches Flash on vLLM, so the server's shared chat path (template, reasoning split,
+`minimax` parser) loses no requests on Flash; Pro's gap is Pro's own, from the model or from its
+serving path, which no other server runs to compare. Pro's misses are expected-stop
+requests that ran to the 40960-token cap (Flash on vLLM has two of those as well, Flash on ATOM none),
+one summary where a call was expected, and one call written inside the think block, which ATOM
+delivers as reasoning.
+
+`tool_calls_match_rate` counts the labelled requests whose finish reason (`tool_calls` or `stop`)
+matches the label; a schema-valid call's arguments pass the tool's JSON Schema. Nested arguments
+(objects, arrays) arrive as the template's XML elements and are decoded into JSON by ATOM's
+`minimax` parser. Greedy decoding is not bit-reproducible on this stack, so two runs of one server
+differ by a request or two.
+
 ## Accuracy (GSM8K, 64-shot)
 
 With 64 shots a prompt is about 10k tokens (9.0k-11.9k, median 10.4k), so the indexer picks 128 of
