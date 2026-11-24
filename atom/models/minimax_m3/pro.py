@@ -503,6 +503,10 @@ class MiniMaxM3ProAttention(nn.Module):
 class MiniMaxM3ProDecoderLayer(MiniMaxM3DecoderLayer):
     """A Flash decoder layer with Pro's attention and the lookahead hand-over."""
 
+    # mono phase 1's gate (``pro_mono.route``), shared by the model's layers; None (a
+    # layer built without one too) runs production's segment only
+    _mono: ProMonoRoute | None = None
+
     def __init__(
         self,
         *args,
@@ -512,7 +516,6 @@ class MiniMaxM3ProDecoderLayer(MiniMaxM3DecoderLayer):
     ) -> None:
         # plain attributes, set before `nn.Module.__init__` runs inside super()
         self._pro_state = state
-        # mono phase 1's gate (``pro_mono.route``), shared by the model's layers
         self._mono = mono
         super().__init__(*args, **kwargs)
         state.norms[self.layer_num] = self.input_layernorm
