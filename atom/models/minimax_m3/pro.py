@@ -483,14 +483,13 @@ class MiniMaxM3ProDecoderLayer(MiniMaxM3DecoderLayer):
             ),
         }
         if mono is not None:
+            # production's segment of this o_proj is check mode's reference
             core = attn.forward_core(**attn_in)
             hidden_states, residual = mono.segment(
                 self,
                 core,
                 residual,
-                lambda res: self._post_attention_norm(
-                    attn.o_proj(core), res, v, mx_norm
-                ),
+                lambda res: self._segment(attn.o_proj(core), res, v, mx_norm, fuse),
             )
         else:
             hidden_states, residual, *_ = self._segment(

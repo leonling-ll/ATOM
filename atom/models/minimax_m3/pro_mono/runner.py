@@ -35,10 +35,11 @@ as production's are, so a residual the next layer's fused add updates in
 place is never a buffer the kernel writes again.
 
 Check mode (``ATOM_MONO_CHECK=1``, eager steps; a captured step runs mono
-alone): each mono layer first runs production's AR #1 + norm (its own o_proj)
-on a copy of the residual, the lookahead put and the MoE, then the kernel, and
-rank 0 logs ``compare()`` of every output the two hand on; the forward goes
-on from mono's.
+alone): each mono layer first runs production's segment at that width (its
+own o_proj, then ``moe_route_glue``'s launch where it serves, else AR #1 +
+norm; the lookahead put and the MoE) on a copy of the residual, then the
+kernel, and rank 0 logs ``compare()`` of every output the two hand on; the
+forward goes on from mono's.
 """
 
 import logging
@@ -280,8 +281,10 @@ class ProMonoRunner:
     def segment(self, layer, core: torch.Tensor, residual: torch.Tensor, reference):
         """Decoder layer ``layer``'s post-attention segment on the kernel:
         ``(FFN partial, residual_mid)``. ``reference(residual)``: production's
-        AR #1 + norm of this layer's o_proj of ``core`` -> ``(x, x8, x8s,
-        residual_mid)`` (check mode only)."""
+        segment of this layer's o_proj of ``core`` at this width (the
+        ``moe_route_glue`` launch where it serves, else AR #1 + norm and the
+        MoE), its lookahead put included -> ``(FFN partial, residual_mid, x,
+        x8, x8s)`` (check mode only)."""
         lid = layer.layer_num
         ref = None
         if self.check and not capturing():
@@ -304,17 +307,16 @@ class ProMonoRunner:
 
     def _production(self, layer, residual, reference) -> dict:
         """Production's segment on a copy of ``residual`` (its fused add may
-        update the residual in place): what it hands on, by output name."""
-        x, x8, x8s, h_mid = reference(residual.clone())
-        ref = {"h_mid": h_mid, "x": x, "x8": x8, "x8s": x8s}
+        update the residual in place): what it hands on, by output name. The
+        lookahead it put is taken back out (the kernel's goes on)."""
+        ffn, h_mid, x, x8, x8s = reference(residual.clone())
+        ref = {"h_mid": h_mid, "x": x, "x8": x8, "x8s": x8s, "ffn": ffn}
         reader = self.layers[layer.layer_num].reader
         if reader is not None:
-            self.state.put(layer.layer_num, x, h_mid)
             # absent when the live variants left the latched ones
             put = self.state.resid_in.pop(reader, None)
             if isinstance(put, tuple):
                 ref["la8"], ref["la8s"] = put
-        ref["ffn"] = layer._ffn(x, x8, x8s, fuse=True)
         return ref
 
     def _log_check(self, lid: int, out: dict, ffn: torch.Tensor, ref: dict) -> None:

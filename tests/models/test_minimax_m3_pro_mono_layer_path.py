@@ -181,10 +181,13 @@ def test_a_taken_layer_stops_before_o_proj_and_returns_the_segment(rec):
     assert got_layer is layer
     assert torch.equal(core, (hidden + residual)[:, :OK] * 5)
     assert torch.equal(res_in, residual + 1)
-    # the check's reference: production's o_proj and AR #1 + norm of the core
-    _, _, _, h_mid = reference(res_in.clone())
-    assert rec.calls[-2:] == ["o_proj", ("ar_mx", 16)]
-    assert torch.equal(h_mid, _production(hidden, residual)[1])
+    # the check's reference: production's segment of the core's o_proj
+    ffn, h_mid, x, x8, x8s = reference(res_in.clone())
+    assert rec.calls[3:] == ["o_proj", ("ar_mx", 16), ("put", 4), ("ffn", True, True)]
+    want_ffn, want_h_mid = _production(hidden, residual)
+    assert torch.equal(h_mid, want_h_mid) and torch.equal(ffn, want_ffn)
+    assert torch.equal(x, h_mid * 2) and torch.equal(x8, h_mid * 3)
+    assert torch.equal(x8s, h_mid * 4)
 
 
 # ---------------------------------------------------- mono and the route glue
@@ -271,6 +274,22 @@ def test_with_mono_off_the_glue_serves_every_width(rec, glue, route, rows):
     assert torch.equal(out, want_out) and torch.equal(res, want_res)
 
 
+def test_check_modes_reference_is_the_glue_where_it_serves(rec, glue):
+    """Check mode compares a mono layer against what production runs at that
+    width: with the glue on, its launch and ``forward_glue``."""
+    runner = SegmentRunner(rec)
+    layer = _layer(rec, route=Route(runner, limit=16))
+    hidden, residual = _t(1, rows=16), _t(2, rows=16)
+    layer(None, hidden, residual)
+    del rec.calls[:]
+    ffn, h_mid, x, x8, x8s = runner.reference(residual + 1)
+    assert rec.calls == ["o_proj", "glue", ("put", 4), ("glue_ffn", True)]
+    want_ffn, want_h_mid = _glue_production(hidden, residual)
+    assert torch.equal(h_mid, want_h_mid) and torch.equal(ffn, want_ffn)
+    assert torch.equal(x, h_mid * 2) and torch.equal(x8, h_mid * 3)
+    assert torch.equal(x8s, h_mid * 4)
+
+
 def test_a_dense_layer_never_takes_the_glue(rec, glue):
     layer = _layer(rec, moe=False, route=Route(SegmentRunner(rec), limit=16))
     layer(None, _t(1), _t(2))
@@ -291,6 +310,7 @@ def _runner(rec, outputs, check=False, reader=6):
         r.state.resid_in[lid + 2] = (h_mid * 13, h_mid.to(torch.uint8))
 
     r.state.put = put
+    r.put = put
 
     def launch(lid, core, residual):
         rec.calls.append("launch")
@@ -345,15 +365,15 @@ def test_check_mode_runs_production_on_a_copy_then_goes_on_from_mono(
     seen = []
 
     def reference(res):
+        # production's segment: AR #1 + norm, its lookahead put, the MoE
         rec.calls.append("reference")
         seen.append(res)
-        return res * 2, res * 3, res * 4, res
+        r.put(4, res * 2, res)
+        return res * 5, res, res * 2, res * 3, res * 4
 
     with caplog.at_level("INFO", logger="atom"):
         ffn, h_mid = r.segment(_layer(rec), _t(3, OK), residual, reference)
-    assert rec.calls == [
-        "reference", ("put", 4), ("ffn", True, True), "launch", ("ffn", True, True),
-    ]  # fmt: skip
+    assert rec.calls == ["reference", ("put", 4), "launch", ("ffn", True, True)]
     assert seen[0] is not residual and torch.equal(seen[0], residual)
     # mono's outputs go on; production's lookahead was taken back out
     assert h_mid is out["h_mid"] and torch.equal(ffn, out["x"] * 11)
