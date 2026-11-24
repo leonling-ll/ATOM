@@ -148,6 +148,7 @@ from atom.mono.device.ops import (
     block_excl_scan,
     butterfly,
     fp8_pack4,
+    fresh,
     hw_exp2,
     hw_rcp,
     ld_dev,
@@ -589,17 +590,11 @@ def ug_row_group(task, wave):
     return (rgl >> 1) * (INTER_R // 16) + 2 * g + (rgl & 1)
 
 
-def ug_steps(c) -> int:
-    """A wave's 128-k steps of an ug task: W4A4 / W4A8 a K half
-    (``W13_HALF``), A16W4 a quarter (``W13_Q``: the task is one K half)."""
-    return W13_Q if bf16_routed(c) else W13_HALF
-
-
 def ug_kslice(c):
     """This wave's first 128-k step of an ug task: W4A4 / W4A8 the K half
     wave / 4; A16W4 the quarter wave / 4 of the CTA's K half ``ugh`` (wave w
     sums K 1792 (w / 4 + 2 ugh) .. + 1792, gemm1_a16w4's k_wave 4 slice).
-    Its steps: ``ug_steps``."""
+    Its steps: W13_HALF (A16W4: W13_Q, the task is one K half)."""
     q = uniform(c["wave"] >> 2)
     if const_expr(bf16_routed(c)):
         return c["ugh"] * W13_HALF + q * W13_Q
@@ -626,6 +621,12 @@ def ug_parts(c):
     """The build's parts (``UG_PARTS``): (first step in the K slice, steps)."""
     sizes = UG_PARTS[c["routed_act"]]
     return [(sum(sizes[:p]), n) for p, n in enumerate(sizes)]
+
+
+def ug_task_loads(c) -> int:
+    """The vector memory loads of one task's ``ug_loads`` (every part): a
+    tile a step and a scale word two steps (A16W4 21, W4A4 / W4A8 42)."""
+    return sum(n + n // 2 for _, n in ug_parts(c))
 
 
 def ug_loads(c, task, part, live):
@@ -725,28 +726,34 @@ def ug_mfmas(c, task, ops, part, t, acc):
     return acc
 
 
-@traced
-def ug_epilogue(c, task, first, count):
-    """Task ``task``'s gate / up sums (``red``, past a barrier) of its picks at
-    first .. first + count -> its mids (``ug_mx_mids``; A16W4 the K-half
-    hand-off, ``ug_bf16_mids``)."""
-    tid, red = c["tid"], c["red"]
-    g = task % UG_GROUPS
-    # thread (pick column tt, mid column col of 32): g / u summed over the K
-    # halves (A16W4: quarters) in wave order
+def ug_cell(c, first, count):
+    """This thread's cell of an ug task's picks at first .. first + count:
+    (pick row, mid column of 32, live), thread (pick column tt, column col)."""
+    tid = c["tid"]
     tt = tid // UG_COLS
+    return first + tt, tid % UG_COLS, tt < count
+
+
+def ug_sums(c, count):
+    """This thread's gate / up sums of the task in ``red`` (past a barrier):
+    the K halves (A16W4: this half's quarters) in wave order."""
+    tid, red = c["tid"], c["red"]
+    tc = fx.min(tid // UG_COLS, count - 1)
     col = tid % UG_COLS
-    live = tt < count
-    tc = fx.min(tt, count - 1)
     r = col % 16
     lo = col < 16
     gv = lo.select(row_sum(red, r, tc, waves=(0, 4)), row_sum(red, r, tc, waves=(1, 5)))
     uv = lo.select(row_sum(red, r, tc, waves=(2, 6)), row_sum(red, r, tc, waves=(3, 7)))
-    row = first + tt
-    if const_expr(bf16_routed(c)):
-        ug_bf16_mids(c, g, row, col, live, gv, uv)
-    else:
-        ug_mx_mids(c, g, row, col, live, gv, uv)
+    return gv, uv
+
+
+@traced
+def ug_epilogue(c, task, first, count):
+    """W4A4 / W4A8: task ``task``'s gate / up sums of its picks at first ..
+    first + count -> its mids (``ug_mx_mids``)."""
+    row, col, live = ug_cell(c, first, count)
+    gv, uv = ug_sums(c, count)
+    ug_mx_mids(c, task % UG_GROUPS, row, col, live, gv, uv)
 
 
 @traced
@@ -780,22 +787,69 @@ def ug_mx_mids(c, g, row, col, live, gv, uv):
         st_dev(code, c["plain"], c["pw"]["isc"] + row * UG_GROUPS + g)
 
 
+# A16W4's K-half hand-off. A half-1 task sends its gate / up sums at once
+# (``ug_put``); a half-0 task's are merged with its partner's one task late
+# (``ug_merge``): the partials' load (``ug_peek``) goes out in the next task,
+# with its first part's MFMAs (the scheduler may take it above them) and
+# before the task after's first loads, so the epilogue's wait for it
+# (``vmcnt`` in issue order) waits for no weight load of the task after. Merged in the task's own epilogue, the poll's
+# load followed every load of the next task (its 21) and took them all
+# (v1a16w4tuned_1124T0306_259: list 0's ug ended 3.6 / 4.2 us after list 1's
+# at 8 / 16 rows). Half 1 never waits, so a half-0 merge always ends: its
+# pair's half-1 task is in the other task list, whose CTAs wait for nothing
+# in ug (``layout.task_lists``).
+
+
+def half_task(c, task):
+    """Whether ``task`` (-1: none) is a half-0 task of this CTA's (A16W4)."""
+    return (task >= 0) & (c["ugh"] == 0)
+
+
 @traced
-def ug_bf16_mids(c, g, row, col, live, gv, uv):
-    """A16W4: this K half's gate / up of (pick row ``row``, mid column 32 g +
-    ``col``). Half 1 sends them (``ugp``, one 16 B put a cell); half 0 adds
-    them to its own -- (q0 + q1) + (q2 + q3) -- -> SwiGLU-OAI -> the bf16 mid
-    -> ``inter`` (an even column stores its pair's word; plain, announced by
-    ``ugf`` once drained)."""
-    h = c["ugh"]
-    at = ugp_pair(row, g, col)
-    # half 1 never waits, so a half-0 task's wait always ends: its pair's
-    # half-1 task is in the other task list, whose CTAs wait for nothing in
-    # ug (``layout.task_lists``)
-    if live & (h == 1):
+def ug_put(c, task, first, count):
+    """A16W4: this thread's cell's gate / up sums of ``task``; half 1 sends
+    them (``ugp``, one 16 B put a cell). Returns the sums."""
+    row, col, live = ug_cell(c, first, count)
+    gv, uv = ug_sums(c, count)
+    at = ugp_pair(row, task % UG_GROUPS, col)
+    if live & (c["ugh"] == 1):
         c["put_words"](c["ugp"], at, [gv.bitcast(fx.Int32), uv.bitcast(fx.Int32)])
-    if live & (h == 0):
-        got = c["poll"]([(c["ugp"], at, 2)])[0]
+    return gv, uv
+
+
+def ug_pending(c, task, first, count):
+    """A16W4 half 0: what ``ug_merge`` needs of ``task`` a task later --
+    the task, this thread's pick row (past the picks: the last pick's) and
+    whether its cell is live -- in VGPRs: held round the task loop as SGPRs
+    they spilled SGPRs at 7 rows (debug) and 10 .. 16 (timeline)."""
+    tt = c["tid"] // UG_COLS
+    live = (tt < count).select(fx.Int32(1), fx.Int32(0))
+    return fresh(task), first + fx.min(tt, count - 1), live
+
+
+def ug_peek(c, ptask, prow):
+    """A16W4 half 0: the load of the half-1 partials of this thread's cell of
+    the pending task (``ug_pending``; none: -1, or a half-1 CTA: zeros, no
+    traffic)."""
+    task = uniform(ptask)
+    g = fx.max(task, 0) % UG_GROUPS
+    at = ugp_pair(prow, g, c["tid"] % UG_COLS)
+    return c["peek"](c["ugp"], at, 2, half_task(c, task))
+
+
+@traced
+def ug_merge(c, ptask, prow, plive, gv, uv, raw):
+    """A16W4 half 0: the pending task's (``ug_pending``; -1: none) gate / up
+    sums ``gv`` / ``uv`` of this thread's cell plus its pair's half-1
+    partials (``raw``: ``ug_peek``'s words, polled on while stale; None:
+    polled here) -- (q0 + q1) + (q2 + q3) -- -> SwiGLU-OAI -> the bf16 mid ->
+    ``inter`` (an even column stores its pair's word; plain, announced by
+    ``ugf`` once drained)."""
+    task = uniform(ptask)
+    row, col = prow, c["tid"] % UG_COLS
+    g = fx.max(task, 0) % UG_GROUPS
+    if (plive != 0) & half_task(c, task):
+        got = c["poll"]([(c["ugp"], ugp_pair(row, g, col), 2)], first=raw)[0]
         y = bf16_round(swiglu(gv + _f32_of(got[0]), uv + _f32_of(got[1])))
         # both lanes of a pair are live (one pick row)
         word = bf16_pair(y, xshfl(y, 1)).bitcast(fx.Int32)
@@ -859,9 +913,11 @@ def run_ug(c, bid, nu):
     part p is used (``UG_PARTS``), so a CTA's loads never drain between
     tasks; the claim of the task after next is taken a whole task ahead. A
     task's ``ugf`` flag (A16W4: the half-0 task's, the pair's) is published in
-    the next task, once its mid stores have drained behind the next task's
-    loads (a flag at once would wait for those: ``vmcnt`` counts in issue
-    order), the CTA's last task's at the end.
+    the task after its mids are stored, once those stores have drained (a
+    ``vmcnt`` that leaves the next task's loads in flight: a flag at once
+    would wait for those, ``vmcnt`` counting in issue order), the CTA's last
+    at the end. An A16W4 half-0 task's mids are stored a task late
+    (``ug_merge``), so its flag goes out two tasks on.
 
     A build that is not ``queued`` (1 row) takes no claim: its next task is
     ``list_ctas`` on (the list round-robin, the first round as placed), the
@@ -885,7 +941,13 @@ def run_ug(c, bid, nu):
     if const_expr(q):
         # every thread has read it before the loop's first claim lands there
         gpu.barrier()
+    bf16 = bf16_routed(c)
+    # the task whose ugf flag is due (its mids stored); A16W4 half 0: the
+    # task whose merge is pending (``ug_pending``) and this thread's sums
     prev = fx.Int32(-1)
+    ptask, prow, plive = ug_pending(c, fx.Int32(-1), fx.Int32(0), fx.Int32(0))
+    pgv = fx.Float32(0.0)
+    puv = fx.Float32(0.0)
     while task < total:
         got = take_ahead(c) if q else fx.Int32(0)
         slot = task // UG_GROUPS
@@ -900,26 +962,45 @@ def run_ug(c, bid, nu):
             acc = ug_mfmas(c, task, ops[p], p, t, acc)
             if const_expr(p + 1 < len(parts)):
                 rocdl.sched_barrier(0)
+            if const_expr(bf16 and p == 0):
+                # with this task's first part, ahead of the next task's loads
+                raw = ug_peek(c, ptask, prow)
+                rocdl.sched_barrier(0)
             ops_n.append(ug_loads(c, nt, p, nlive))
         fx.ptr_store(acc, red + (wave * 64 + lane) * 4)
         # every vector memory op older than the next task's loads is done:
-        # the previous task's mid stores and the claim (at least the next
-        # task's ``ug_steps`` tile loads were issued after them)
-        rocdl.s_waitcnt(vmcnt=ug_steps(c))
+        # the mid stores of the task before, the claim and (A16W4) the
+        # partials' peek
+        rocdl.s_waitcnt(vmcnt=ug_task_loads(c))
         if const_expr(q):
             put_claim(c, got)
         gpu.barrier()
         if flag_due(c, prev) & (tid == 0):
             c["put"](c["ugf"], prev, fx.Int32(1))
         nxt_n = read_claim(c) if q else nxt + per
-        ug_epilogue(c, task, first, count)
+        if const_expr(bf16):
+            gv, uv = ug_put(c, task, first, count)
+            ug_merge(c, ptask, prow, plive, pgv, puv, raw)
+            prev = uniform(ptask)
+            ptask, prow, plive = ug_pending(c, task, first, count)
+            pgv = gv
+            puv = uv
+        else:
+            ug_epilogue(c, task, first, count)
+            prev = task
         # ``red`` and ``claim`` read by every thread before they are rewritten
         gpu.barrier()
-        prev = task
         task = nxt
         nxt = nxt_n
         ops = ops_n
-    if flag_due(c, prev):
+    if const_expr(bf16):
+        last_task = uniform(ptask)
+        if half_task(c, last_task):
+            ug_merge(c, ptask, prow, plive, pgv, puv, None)
+            publish(c["put"], c["ugf"], last_task, fx.Int32(1), tid == 0)
+            if flag_due(c, prev) & (tid == 0):
+                c["put"](c["ugf"], prev, fx.Int32(1))
+    elif flag_due(c, prev):
         publish(c["put"], c["ugf"], prev, fx.Int32(1), tid == 0)
     return task, nxt
 

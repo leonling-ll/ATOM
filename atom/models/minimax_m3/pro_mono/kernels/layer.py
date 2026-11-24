@@ -599,7 +599,7 @@ def build(key: P1Build):
             "xs": lds.xs.ptr, "osc": lds.osc.ptr, "red": lds.red.ptr,
             "misc": lds.misc.ptr,
             "put": mb.put, "put_bf": mb.put_bf, "put_words": mb.put_words,
-            "poll": mb.poll, "stamp": lambda k: stamp(tl_on, tls, tid, k),
+            "poll": mb.poll, "peek": mb.peek, "stamp": lambda k: stamp(tl_on, tls, tid, k),
             "ffn_on": ffn_on, "routed_act": key.routed_act,
         }  # fmt: skip
         if const_expr(ffn_on):
