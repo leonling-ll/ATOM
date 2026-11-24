@@ -463,7 +463,12 @@ class MiniMaxM3ProAttention(nn.Module):
         impl.bf16_out = True
         try:
             return self._attend(
-                positions, hidden_states, hidden_states_scale, index_src, diag_srcs, front
+                positions,
+                hidden_states,
+                hidden_states_scale,
+                index_src,
+                diag_srcs,
+                front,
             )
         finally:
             impl.bf16_out = False
