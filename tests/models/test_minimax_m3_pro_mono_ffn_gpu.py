@@ -40,6 +40,7 @@ otherwise.
 """
 
 import os
+import resource
 
 import pytest
 import torch
@@ -201,10 +202,6 @@ def _worker(rank, port, queue, done, inputs):
     from atom.mono.runtime.peer_memory import PeerBuffer
     from atom.mono.runtime.uncached import uncached_bytes
 
-    # the results go to the parent by shared-memory file name, not as file
-    # descriptors: 17 cases' tensors x 8 ranks held at once passed the
-    # parent's descriptor limit ("received 0 items of ancdata")
-    torch.multiprocessing.set_sharing_strategy("file_system")
     try:
         torch.cuda.set_device(rank)
         dev = torch.device("cuda", rank)
@@ -384,6 +381,11 @@ def ranks():
     import torch.multiprocessing as mp
 
     os.environ.setdefault("ARCH", "gfx950")
+    # every rank's result tensors come over the queue as file descriptors,
+    # all held here at once: 17 cases x 8 ranks pass a soft limit of 1024
+    # ("received 0 items of ancdata"); the hard limit is far above
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    resource.setrlimit(resource.RLIMIT_NOFILE, (max(soft, min(hard, 65536)), hard))
     ctx = mp.get_context("spawn")
     queue = ctx.Queue()
     done = ctx.Event()
