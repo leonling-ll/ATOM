@@ -77,6 +77,7 @@ from atom.models.minimax_m3.pro_mono.config import (
     LAYERS,
     MAX_ROWS,
     MAX_ROWS_LAYOUT,
+    MAX_ROWS_NORM,
     MX_GROUP,
     ROUTED_ACTS,
     TOPK,
@@ -105,12 +106,30 @@ O_SCALES_PW = O_K // MX_GROUP // 4  # 24
 O_ROW = O_K // 4 + 4
 OSC_ROW = O_K // MX_GROUP // 4
 UPTO = ("norm", "ffn")
+# tokens a 16x16 MFMA's B operand holds: a build of more rows runs each stage
+# whose B operand is the token rows once a tile (the o stage: ``stage_o``)
+TOKEN_TILE = 16
 # timeline points: 0 start, 1 core quantized, 2 o pushed, 3 reduced /
 # gathered, 4 sums of squares in, 5 stored; FFN: 6 router / shared / route
 # done, 7 union and x4 in, 8 ug done, 9 down done; 10 end
 TL_POINTS = 11
 
 assert O_TASKS <= 256 and OWN % O_ROWS == 0 and OWN % COLS == 0
+# the o stage's K-quarter sum takes a thread a (token, row) cell: a pass of
+# THREADS threads is one token tile's cells
+assert THREADS == O_ROWS * TOKEN_TILE
+
+
+def token_tiles(s: int) -> int:
+    """The 16-token MFMA B tiles of an ``s``-row build."""
+    return -(-s // TOKEN_TILE)
+
+
+def max_tokens(upto: str) -> int:
+    """The widest build of ``upto``: a norm build ``MAX_ROWS_NORM`` (two token
+    tiles), an FFN build ``MAX_ROWS`` (its stages hold one tile)."""
+    return MAX_ROWS_NORM if upto == "norm" else MAX_ROWS
+
 
 # ---------------------------------------------------------------- the FFN
 E_RANK = DIMS.e_rank  # 48 router rows a rank
@@ -377,10 +396,13 @@ class P1Build:
     inter_r: int = field(default=0, metadata={"sym": "ir"})
 
     def __post_init__(self):
-        if not 1 <= self.tokens <= MAX_ROWS:
-            raise ValueError(f"tokens {self.tokens} outside 1 .. {MAX_ROWS}")
         if self.upto not in UPTO:
             raise ValueError(f"upto {self.upto!r} not in {UPTO}")
+        top = max_tokens(self.upto)
+        if not 1 <= self.tokens <= top:
+            raise ValueError(
+                f"tokens {self.tokens} outside 1 .. {top} ({self.upto} build)"
+            )
         if self.routed_act not in ROUTED_ACTS:
             raise ValueError(f"routed_act {self.routed_act!r} not in {ROUTED_ACTS}")
         if self.upto == "ffn":

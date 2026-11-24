@@ -61,6 +61,15 @@ def test_the_debug_build_holds(arch, upto, act):
     )
 
 
+# the norm builds past one token tile: the o stage's second tile and AR #1's
+# third pass, at one wave's third token and at every wave's (the widest)
+@pytest.mark.parametrize("rows", [17, 24])
+@pytest.mark.parametrize("lookahead", [True, False])
+@pytest.mark.parametrize("debug", [False, True])
+def test_the_two_tile_norm_builds_hold(arch, rows, lookahead, debug):
+    contract.check_build(P1Build(tokens=rows, lookahead=lookahead, debug=debug))
+
+
 # the FFN builds whose norm runs two passes with a partial one (an SGPR peak:
 # a value of the o stage held into the FFN spilled at 9 .. 13 rows)
 @pytest.mark.parametrize("act", ["bf16", "fp8", "fp4"])

@@ -52,8 +52,13 @@ HIDDEN = 7168
 O_K = 3072
 LAYER = 4
 EPS = 1e-6
-# (rows, lookahead): one pass, a partial wave, two passes, the widest build
-CASES = ((1, True), (3, True), (8, True), (9, True), (16, True), (16, False))
+# (rows, lookahead): one pass, a partial wave, two passes, 16 rows; then the
+# second token tile and AR #1's third pass: one wave's third token (17), half
+# the waves' (20), the widest norm build (24)
+CASES = (
+    (1, True), (3, True), (8, True), (9, True), (16, True), (16, False),
+    (17, True), (20, True), (24, True), (24, False),
+)  # fmt: skip
 TIMEOUT_S = 900
 
 

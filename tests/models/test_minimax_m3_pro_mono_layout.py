@@ -28,7 +28,13 @@ from minimax_m3_pro_mono_ref import (
 )
 
 from atom.models.minimax_m3.pro_mono import layout as L
-from atom.models.minimax_m3.pro_mono.config import HIDDEN, MAX_ROWS, MAX_ROWS_LAYOUT
+from atom.models.minimax_m3.pro_mono.config import (
+    HIDDEN,
+    MAX_ROWS,
+    MAX_ROWS_LAYOUT,
+    MAX_ROWS_NORM,
+    ROUTED_ACTS,
+)
 
 
 def test_tp8_geometry():
@@ -78,11 +84,33 @@ def test_pair_indices_are_injective():
 
 def test_build_key():
     assert L.P1Build(tokens=MAX_ROWS).upto == "norm"
-    for bad in ({"tokens": 0}, {"tokens": MAX_ROWS + 1}, {"tokens": 1, "upto": "x"}):
+    for bad in (
+        {"tokens": 0},
+        {"tokens": MAX_ROWS_NORM + 1},
+        {"tokens": 1, "upto": "x"},
+    ):
         with pytest.raises(ValueError):
             L.P1Build(**bad)
     names = [d.name for d in L.decls(L.P1Build(tokens=1))]
     assert names == list(L.NORM_REGIONS)
+
+
+def test_a_norm_build_takes_24_rows_an_ffn_build_16():
+    """Past 16 rows only the norm build exists (two token tiles in the o stage,
+    AR #1 in three passes); no FFN format builds there yet, so no forward of
+    17 .. 24 rows can reach a stage that holds one tile."""
+    assert MAX_ROWS < MAX_ROWS_NORM == 24 <= MAX_ROWS_LAYOUT
+    assert L.max_tokens("norm") == MAX_ROWS_NORM and L.max_tokens("ffn") == MAX_ROWS
+    assert L.P1Build(tokens=MAX_ROWS_NORM).tokens == 24
+    with pytest.raises(ValueError, match="norm build"):
+        L.P1Build(tokens=MAX_ROWS_NORM + 1)
+    for act in ROUTED_ACTS:
+        L.P1Build(tokens=MAX_ROWS, upto="ffn", routed_act=act, inter_r=640)
+        with pytest.raises(ValueError, match="ffn build"):
+            L.P1Build(tokens=MAX_ROWS + 1, upto="ffn", routed_act=act, inter_r=640)
+    # the o stage: a tile a 16 tokens, its K-quarter sum a pass a tile
+    assert [L.token_tiles(s) for s in (1, 16, 17, 24)] == [1, 1, 2, 2]
+    assert L.O_ROWS * L.TOKEN_TILE == 512
 
 
 def test_debug_scratch_holds_the_wait_records():

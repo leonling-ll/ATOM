@@ -69,6 +69,10 @@ COLS = 128
 # MFMA B operand holds them in one tile; 32 rows need two token groups a
 # weight tile.
 MAX_ROWS = 16
+# Rows a norm build (``upto = "norm"``: o_proj, AR #1 and the norms) takes at
+# most: two 16-token MFMA B tiles in the o stage, AR #1 in up to 3 passes. No
+# forward is served past ``MAX_ROWS`` until the FFN stages build that wide.
+MAX_ROWS_NORM = 24
 # Rows the kernel ABI, the peer regions and the scratch are sized for from day
 # one, so a later 32-row build changes no layout (``begin_step`` zeroes the
 # whole buffers either way).
