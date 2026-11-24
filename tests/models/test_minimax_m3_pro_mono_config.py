@@ -36,7 +36,7 @@ from atom.mono.runtime import deployment
 
 
 def test_tp8_widths():
-    """The widths the design's stage table and byte budget are written for."""
+    """The widths the kernel's stages and byte budget are written for."""
     d = ProDims(8)
     assert (d.heads, d.o_k) == (16, 3072)
     assert (d.e_rank, d.inter_valid, d.inter_r, d.inter_s) == (48, 640, 768, 640)

@@ -67,7 +67,8 @@ MX_GROUP = 32
 COLS = 128
 
 # Rows a forward serves at most: the widths P1 builds and gates on. A 16-row
-# MFMA B operand holds them in one tile; 32 needs token groups (design T16).
+# MFMA B operand holds them in one tile; 32 rows need two token groups a
+# weight tile.
 MAX_ROWS = 16
 # Rows the kernel ABI, the peer regions and the scratch are sized for from day
 # one, so a later 32-row build changes no layout (``begin_step`` zeroes the

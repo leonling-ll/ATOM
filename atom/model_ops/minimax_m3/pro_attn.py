@@ -229,8 +229,8 @@ class ProVariants:
     # forwards keep production's segment (``moe_route_glue`` where it is on), and a
     # ``day0_decode_rows`` at or below the limit turns mono off. Latched once, at the
     # first forward (``pro_mono.route``, agreed over the TP group): a later edit of the
-    # file does not change it. Off by default until the design's acceptance gates pass
-    # with it on (accuracy: the
+    # file does not change it. Off by default until its acceptance gates pass with it
+    # on (accuracy: the
     # exposure and official GSM8K 3-run means, AIME26 avg@16 >= 0.95 twice,
     # retrieval 40/40; speed: a faster measured layer and >= 10% proxy TPOT at c1/c4).
     mono_ffn_rows: int = 0

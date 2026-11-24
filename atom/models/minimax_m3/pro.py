@@ -62,8 +62,8 @@ from atom.models.minimax_m3.model import (
 )
 from atom.models.minimax_m3.pro_mono.config import config_refusal
 from atom.models.minimax_m3.pro_mono.route import ProMonoRoute
+from atom.models.minimax_m3.pro_mono.runner import ProMonoRunner
 from atom.models.minimax_m3.vl import MiniMaxM3SparseForConditionalGenerationVL
-from atom.mono.runtime.consensus import MonoUnsupported
 
 logger = logging.getLogger("atom")
 
@@ -571,11 +571,6 @@ def _mono_route(atom_config: Config, state: ProLookaheadState, layers) -> ProMon
     runner binds them on its first step)."""
 
     def create():
-        # FlyDSL is not a dependency: an absent one refuses on every rank alike
-        try:
-            from atom.models.minimax_m3.pro_mono.runner import ProMonoRunner
-        except ImportError as error:
-            raise MonoUnsupported(f"mono kernels unavailable: {error}") from error
         return ProMonoRunner(layers(), state, route.check, route.routed_act)
 
     route = ProMonoRoute(
