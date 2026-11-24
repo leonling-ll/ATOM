@@ -46,7 +46,7 @@ import functools
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from aiter.ops.flydsl.kernels import buffer_ops as bo
-from flydsl.expr import const_expr, gpu, range_constexpr
+from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import Int32, Int64, T
 
 from atom.models.minimax_m3.pro_mono.config import COLS, EXPERTS, HIDDEN, TOPK
@@ -184,23 +184,45 @@ def _or(a, b):
 # ------------------------------------------------------------------ o_proj
 
 
-@traced
-def load_core(c):
-    """The core rows (bf16 [S, 3072], plain loads: the attention wrote them)
-    -> MXFP8 1x32 in LDS: e4m3 words at ``xs`` (token t's at t O_ROW), their
-    E8M0 codes four a word at ``osc``. A thread takes 8 values, 4 threads a
-    block; S * 384 items is a multiple of 16, so a 16-lane group is either all
-    live or all past the end (clamped, nothing stored)."""
+def core_loads(c):
+    """The core rows' loads (bf16 [S, 3072], plain: the attention wrote them),
+    every round of ``load_core``'s strided loop, issued before anything else
+    of the o stage: a round's stores are conditional, so a load in a later
+    round went out only after the earlier round's use, which waited (``vmcnt``
+    in issue order) for every w_o load issued before it -- 5 serial L2 round
+    trips at 8 rows, 11 at 16."""
     s, tid = c["S"], c["tid"]
     n = s * CORE_ITEMS
     r_core = rsrc(c["core"])
+    out = []
     for i in range_constexpr(-(-n // THREADS)):
         e = fx.min(tid + THREADS * i, n - 1)
         t = e // CORE_ITEMS
         q = e % CORE_ITEMS
-        v = fx.Vector(
-            bo.buffer_load(r_core, (t * O_K + 8 * q) // 2, vec_width=4, dtype=T.i32)
+        out.append(
+            fx.Vector(
+                bo.buffer_load(r_core, (t * O_K + 8 * q) // 2, vec_width=4, dtype=T.i32)
+            )
         )
+    # issued here, ahead of w_o's: the scheduler would sink them past it
+    rocdl.sched_barrier(0)
+    return out
+
+
+@traced
+def load_core(c, loads):
+    """The core rows (``core_loads``) -> MXFP8 1x32 in LDS: e4m3 words at
+    ``xs`` (token t's at t O_ROW), their E8M0 codes four a word at ``osc``. A
+    thread takes 8 values, 4 threads a block; S * 384 items is a multiple of
+    16, so a 16-lane group is either all live or all past the end (clamped,
+    nothing stored)."""
+    s, tid = c["S"], c["tid"]
+    n = s * CORE_ITEMS
+    for i in range_constexpr(len(loads)):
+        e = fx.min(tid + THREADS * i, n - 1)
+        t = e // CORE_ITEMS
+        q = e % CORE_ITEMS
+        v = loads[i]
         vals = _unpack([fx.Int32(v[d]) for d in range(4)])
         code = _code(butterfly(_absmax(vals), (1, 2), fx.max))
         inv = rcp_pow2(code)
@@ -221,7 +243,8 @@ def stage_o(c):
     """CTA t < O_TASKS: o_proj rows 32 t .. + 32 (two 16-row groups, a group's
     4 waves each a quarter of K) -> bf16 partial rows -> the owner rank's
     ``rs`` (this rank's slot). The weight and its scales are in flight while
-    the core rows are quantized."""
+    the core rows are quantized, the core rows' loads issued first (their
+    quantization then waits for them alone)."""
     s, tid, lane, wave, bid = c["S"], c["tid"], c["lane"], c["wave"], c["bid"]
     g4 = lane // 16
     l16 = lane % 16
@@ -230,6 +253,7 @@ def stage_o(c):
     if bid < O_TASKS:
         t = bid
         rg = t * 2 + wave // 4
+        core = core_loads(c)
         r_wo = rsrc(c["w_o"])
         wts = [
             fx.Vector(
@@ -250,7 +274,7 @@ def stage_o(c):
         s_lo = fx.Vector(bo.buffer_load(r_so, sw, vec_width=4, dtype=T.i32))
         s_hi = fx.Vector(bo.buffer_load(r_so, sw + 4, vec_width=2, dtype=T.i32))
         ws = [s_lo[d] for d in range(4)] + [s_hi[d] for d in range(2)]
-        load_core(c)
+        load_core(c, core)
         gpu.barrier()
         c["stamp"](1)
         # B column l16 is token l16 (the last token past S: its column is
