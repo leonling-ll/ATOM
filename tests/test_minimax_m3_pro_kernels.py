@@ -1981,6 +1981,96 @@ def test_day0_prefill_asks_aiter_whether_it_serves(monkeypatch):
     assert asked == [(16, 1, 256, 192, K.TOPK, K.PAGE, p) for p in (64, 24)]
 
 
+def _fake_flydsl_decode(monkeypatch, **exports):
+    """``_fake_flydsl`` with the decode's loader and warm-up record reset."""
+    _fake_flydsl(monkeypatch, **exports)
+    monkeypatch.setattr(K, "_day0_decode", None)
+    monkeypatch.setattr(K, "_day0_decode_warmed", set(), raising=False)
+
+
+def _decode_exports(calls, warms, supported=lambda *a: True):
+    return {
+        "minimax_m3_fp8_sparse_decode": lambda *a: calls.append(a),
+        "minimax_m3_fp8_sparse_decode_warm_up": lambda *a: warms.append(a),
+        "minimax_m3_fp8_sparse_prefill_supported": supported,
+    }
+
+
+def test_day0_decode_is_aiters_flydsl_kernel(monkeypatch):
+    # day0_decode_rows runs aiter's minimax_m3_fp8_sparse_decode: the fp8 q, the K-only
+    # cache's page plane, the picks, each request's length, qlen and the MXFP8 output
+    calls = []
+    _fake_flydsl_decode(monkeypatch, **_decode_exports(calls, []))
+    assert K.day0_decode_available()
+    qlen, reqs, pg = 2, 3, 32
+    t = qlen * reqs
+    q = torch.randn(t, 16, 256)
+    kc4 = torch.zeros(4, 1, pg, 256, dtype=FP8)
+    bt = torch.tensor([[1, 3], [0, 2], [0, 0]], dtype=torch.int32)
+    pos = torch.tensor([40, 41, 7, 8, 0, 1])
+    slots = torch.tensor([5, 6, 7, 8, -1, -1])  # request 2: a graph's padding request
+    sel = torch.full((t, K.TOPK), -1, dtype=torch.int32)
+    out = torch.empty(t, 16 * 192, dtype=FP8)
+    scale = torch.empty(t, 16 * 192 // 32, dtype=torch.uint8)
+    got = K.attention_day0_decode(
+        q, kc4, bt, pos, slots, sel, out, 0.0625, qlen, out_scale=scale
+    )
+    assert got is out
+    (args,) = calls
+    qa, ka, sela, bta, seq_lens, qla, sc, outa, sca = args
+    assert qa.dtype == FP8 and torch.equal(qa.float(), q.to(FP8).float())
+    assert ka.shape == (4, pg, 256) and ka.data_ptr() == kc4.data_ptr()
+    assert sela is sel and bta is bt and qla == qlen and sc == 0.0625
+    assert seq_lens.dtype == torch.int32 and seq_lens.tolist() == [42, 9, 0]
+    assert outa.shape == (t, 16, 192) and outa.data_ptr() == out.data_ptr()
+    assert sca is scale
+
+
+def test_day0_decode_needs_the_aiter_export(monkeypatch):
+    # an aiter with the prefill port only, or none: the decode keeps the other attention,
+    # never amd_kernels, and the forward's warm-up does nothing
+    for exports in (
+        {"minimax_m3_fp8_sparse_prefill_supported": lambda *a: True},
+        {},
+    ):
+        _fake_flydsl_decode(monkeypatch, **exports)
+        assert not K.day0_decode_available()
+        K.day0_decode_warm_up("cuda:0", K.PAGE, True)
+        assert K._day0_decode_warmed == set()
+
+
+def test_day0_decode_asks_aiter_whether_it_serves(monkeypatch):
+    # aiter's check decides (gfx950, the layer's shape): where it says no, the decode
+    # keeps the other attention
+    asked = []
+
+    def supported(*a):
+        asked.append(a)
+        return False
+
+    _fake_flydsl_decode(monkeypatch, **_decode_exports([], [], supported))
+    assert not K.day0_decode_available()
+    assert asked == [(16, 1, 256, 192, K.TOPK, K.PAGE, K.PAGE)]
+
+
+def test_day0_decode_warms_up_once_outside_a_capture(monkeypatch):
+    # aiter's warm-up compiles each (device, page, output) once, never inside a graph
+    # capture and never for a CPU tensor
+    warms = []
+    _fake_flydsl_decode(monkeypatch, **_decode_exports([], warms))
+    capturing = [False]
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: capturing[0])
+    dev = torch.device("cuda", 0)
+    K.day0_decode_warm_up(dev, 16, True)
+    K.day0_decode_warm_up(dev, 16, True)
+    K.day0_decode_warm_up("cpu", 16, False)
+    capturing[0] = True
+    K.day0_decode_warm_up(dev, 16, False)
+    capturing[0] = False
+    K.day0_decode_warm_up(dev, 16, False)
+    assert warms == [(dev, 16, True), (dev, 16, False)]
+
+
 def _nv_pages(rows):
     """``[N, PG, 72]`` NVFP4 rows -> the ``[N, PG * 72]`` pages ``prep`` writes: all the
     tokens' 64 data bytes, then all their 8 scale bytes."""
@@ -2214,3 +2304,51 @@ class TestDay0Decode:
         su = scale.view(torch.uint8)
         assert (su[:n] == 127).all() and (su[n:] == 0).all()
         assert m.take_mx_scale() is None  # taken once
+
+    @pytest.mark.parametrize("day0", [True, False])
+    def test_forward_warms_the_decode_up_before_it_runs(self, monkeypatch, day0):
+        # the batch the day0 decode takes first compiles its kernel (page and output of
+        # this cache and o_proj), ahead of the attention; other batches warm nothing
+        n = 24
+        m = self._impl(True)
+        v = ProVariants(kernels=True, k_only=True, k_plain_fp8=True, topk="split")
+        monkeypatch.setattr(pro_attn, "variants", lambda: v)
+        monkeypatch.setattr(m, "_use_kernels", lambda v: True, raising=False)
+        monkeypatch.setattr(
+            m, "_day0_decode", lambda v, n, reqs, fp8: day0, raising=False
+        )
+        monkeypatch.setattr(K, "day0_decode_available", lambda: day0)
+        events = []
+        monkeypatch.setattr(
+            K, "day0_decode_warm_up", lambda *a: events.append(("warm", *a))
+        )
+        md = SimpleNamespace(
+            slot_mapping=torch.zeros(n, dtype=torch.long),
+            block_tables=torch.zeros(6, 16, dtype=torch.int32),
+            cu_seqlens_q=torch.arange(0, 25, 4, dtype=torch.int32),
+        )
+        layer = SimpleNamespace(k_cache=torch.zeros(1, 1, 1, 32, D, dtype=FP8))
+        fwd = SimpleNamespace(
+            context=SimpleNamespace(is_dummy_run=False, is_prefill=False),
+            attn_metadata=md,
+            kv_cache_data={"layer_1": layer},
+        )
+        monkeypatch.setattr(pro_attn, "get_forward_context", lambda: fwd)
+        monkeypatch.setattr(
+            m,
+            "_kernel_attention",
+            lambda *a, **kw: events.append(("attend", kw["day0_lens"])),
+            raising=False,
+        )
+        q = torch.zeros(n, H * D)
+        pos = torch.arange(n) + 100
+        m.forward(q, q, q, position=pos, qkv=q)
+        m.forward(q, q, q, position=pos, qkv=q)  # the next layer, same forward
+        if not day0:
+            assert events == [("attend", None)] * 2
+            return
+        w, a1, _, a2 = events
+        assert w == ("warm", q.device, 32, True)
+        # 6 requests of 4 rows: each request's last position + 1, once for both layers
+        assert a1[1].tolist() == [104 + 4 * r for r in range(6)] and a2[1] is a1[1]
+        assert a1[1].dtype == torch.int32

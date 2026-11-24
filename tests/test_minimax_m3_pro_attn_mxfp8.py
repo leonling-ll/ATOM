@@ -441,3 +441,77 @@ def test_triton_mx_attention_matches_unfused_values(b, qlen, ctx):
     deq = xq.float().view(c.t, -1, 32) * torch.exp2(xs.float() - 127)[..., None]
     err = (deq.view(c.t, -1) - ref.float()).abs()
     assert (err <= ref.float().abs() * 2**-3 + 2**-9 * deq.abs().max()).all()
+
+
+needs_day0_decode = pytest.mark.skipif(
+    not K.day0_decode_available(),
+    reason="this aiter has no minimax_m3_fp8_sparse_decode",
+)
+
+# (sequences, query rows each, context): from the day0 decode's 24 rows, the CONC 32 k=3
+# verify (8 to 22 requests of 4 rows at 55k to 64k), decode and wider verify rows
+DAY0_SHAPES = [
+    (24, 1, 1024),
+    (64, 1, 70000),
+    (8, 4, 56000),
+    (22, 4, 64000),
+    (16, 4, 8192),
+    (1, 4, 300),
+    (4, 8, 3000),
+]
+
+
+@needs_day0_decode
+class TestDay0Decode:
+    """aiter's FlyDSL sparse decode (``day0_decode_rows``): its bf16 output against the
+    Triton attention on the same picks and the fp8-cast q, its MXFP8 epilogue against
+    ``quantize_fp8`` of its own bf16 output, and the impl's dispatch against the batch
+    with it off. No ``amd_kernels`` anywhere."""
+
+    @staticmethod
+    def _run(c, qlen, out, out_scale=None, slots=None):
+        if slots is None:
+            slots = torch.zeros(c.t, dtype=torch.long, device=DEV)
+        return K.attention_day0_decode(
+            c.q, c.kr[:, 0], c.bt, c.pos, slots, c.sel, out, SC, qlen, out_scale
+        )
+
+    @pytest.mark.parametrize("b,qlen,ctx", DAY0_SHAPES)
+    def test_matches_the_triton_attention(self, b, qlen, ctx):
+        c = _case(b, qlen, ctx, seed=b * 3 + qlen)
+        ref = torch.empty(c.t, H * DV, dtype=torch.bfloat16, device=DEV)
+        kw = {"nblk": 4, "k_scale": c.ks, "valid_first": True}
+        q8 = c.q.to(FP8).to(torch.bfloat16)  # the day0 decode reads q as fp8
+        K.attention(q8, c.kr[:, 0], c.bt, c.seq, c.pos, c.sel, ref, SC, 4, **kw)
+        got = torch.full_like(ref, float("nan"))
+        self._run(c, qlen, got)
+        assert torch.allclose(got.float(), ref.float(), atol=3e-2, rtol=1e-2)
+
+    @pytest.mark.parametrize("b,qlen,ctx", DAY0_SHAPES)
+    def test_mxfp8_epilogue_is_quantize_fp8_of_its_bf16(self, b, qlen, ctx):
+        c = _case(b, qlen, ctx, seed=b * 3 + qlen)
+        ref = torch.empty(c.t, H * DV, dtype=torch.bfloat16, device=DEV)
+        self._run(c, qlen, ref)
+        xq, xs = _mx_out(c.t)
+        self._run(c, qlen, xq, xs)
+        _assert_quantized(ref, xq, xs)
+
+    def test_padding_requests_write_zeros(self):
+        c = _case(6, 4, 8192)
+        slots = torch.zeros(c.t, dtype=torch.long, device=DEV)
+        slots[-8:] = -1  # the last two requests: a graph's padding
+        got = torch.full((c.t, H * DV), float("nan"), dtype=torch.bfloat16, device=DEV)
+        self._run(c, 4, got, slots=slots)
+        assert torch.isfinite(got[:-8].float()).all() and (got[-8:] == 0).all()
+
+    @pytest.mark.parametrize("n_seqs", [24, 40])
+    def test_impl_matches_the_attention_below_it(self, n_seqs):
+        # the impl's static decode: the day0 decode at day0_decode_rows, against the same
+        # batch with it off (aiter's K rows where this aiter reads them, else Triton)
+        c, v, m, _, args, nb = TestImpl._decode_case(n_seqs, True)
+        assert m._day0_decode(v, c.S, c.S, True)
+        got = torch.zeros(c.S, H * DV, dtype=torch.bfloat16, device=DEV)
+        m._kernel_attention(*args, nb, v, got, static=True)
+        ref = torch.zeros_like(got)
+        m._kernel_attention(*args, nb, replace(v, day0_decode_rows=0), ref, static=True)
+        assert torch.allclose(got.float(), ref.float(), atol=3e-2, rtol=1e-2)

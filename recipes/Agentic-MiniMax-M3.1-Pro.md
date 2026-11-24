@@ -106,7 +106,7 @@ tokens loaded from the CPU tier and the re-ask's TTFT down from 2.85 s to 0.20 s
 | CPU offload | LMCache, 184 GiB a rank, chunk 256 |
 | Speculative decoding | DSpark, 7 tokens, synthetic acceptance length 2.94 (golden AL, thinking enabled; the CONC 64 table ran at 4.0) |
 | Prefill | 16384-token chunks; prefill attention on aiter's FlyDSL `minimax_m3_fp8_sparse_prefill` (amd-kernels-day0's kernel, ported into aiter-M3 `hatwu/m3.1-pro-infx` at `a26613a8a`) when the aiter build has it, otherwise the Triton kernel. `amd_kernels` is never installed. |
-| Decode attention | from 24 rows, amd-kernels-day0's FlyDSL sparse decode with an MXFP8 output for `o_proj`, when its `amd_kernels` package imports; otherwise aiter |
+| Decode attention | from 24 rows, aiter's FlyDSL `minimax_m3_fp8_sparse_decode` (amd-kernels-day0's kernel, ported into aiter-M3 `hatwu/m3.1-pro-infx` at `3c55cbcc2`) with an MXFP8 output for `o_proj`, when the aiter build has it; otherwise aiter's paged attention |
 | Decode front | up to 16 rows (`ar_lamport_rows`), a layer's q, k, index q and index k come from one MXFP8 GEMM over `[x; lookahead input]`; above it, two GEMMs |
 | `max-num-seqs` | 2 × CONC (128) |
 
@@ -335,7 +335,7 @@ export AITER_LOG_LEVEL=WARNING
 export AITER_QUICK_REDUCE_QUANTIZATION=NONE    # quick all-reduce is forbidden
 unset AITER_CUSTOM_AR_DISABLE_LAMPORT          # ar_lamport_rows and ar_fused_rows need the Lamport path
 export AITER_REUSE_IDENTICAL_COMM_GROUPS=1
-export ATOM_M3PRO_VARIANTS='{"kernels": true, "attn": "aiter", "topk": "split", "prep": "aiter", "index_split": true, "score_tq": 8, "ar_lamport_rows": 16, "k_only": true, "k_plain_fp8": true, "prefill_attn": "day0", "index_split_decode": 64, "moe_route_glue": true, "index": "fused", "ar_fused_rows": 128, "index_compress": true}'
+export ATOM_M3PRO_VARIANTS='{"kernels": true, "attn": "aiter", "topk": "split", "prep": "aiter", "index_split": true, "score_tq": 8, "ar_lamport_rows": 16, "k_only": true, "k_plain_fp8": true, "prefill_attn": "day0", "index_split_decode": 64, "moe_route_glue": true, "index": "fused", "ar_fused_rows": 128, "index_compress": true, "day0_decode_rows": 48}'
 export ATOM_WARMUP_TOKENS=auto
 export ATOM_ONLINE_QUANT_STREAMING=1
 export ATOM_CACHE_AWARE_ADMISSION=1
@@ -385,7 +385,7 @@ with and `scripts/m31pro/aime_gate.sh` uses; the 237eada file is not on `/shared
 export RECIPE=agentic SPEC_TOKENS=3
 export MODEL="${MODEL_PATH}"
 export CHAT_TEMPLATE=/shared_nfs/huggingface_models/amd/MiniMax-M3-MXFP4/chat_template.jinja
-export ATOM_M3PRO_VARIANTS='{"index": "fused", "ar_fused_rows": 128}'
+export ATOM_M3PRO_VARIANTS='{"index": "fused", "ar_fused_rows": 128, "day0_decode_rows": 48}'
 flock /tmp/m31pro-gpu.lock bash scripts/m31pro/proxy_bench.sh 32 "${OUT_DIR}"
 ```
 
@@ -393,8 +393,11 @@ flock /tmp/m31pro-gpu.lock bash scripts/m31pro/proxy_bench.sh 32 "${OUT_DIR}"
   `proxy_bench.sh` takes it from its golden AL curve for `SPEC_TOKENS=3`. The server logs
   `Forced speculative acceptance ON: mean acceptance length 2.5300 over 3 draft positions`, and
   the run measures 2.530 (`atom:mtp_average_tokens_per_forward`). Output text is `synthetic`.
-- No `amd_kernels`: day0's prefill kernel runs from aiter-M3. `day0_decode_rows` (default 24)
-  needs the `amd_kernels` package, so decode keeps aiter's attention.
+- No `amd_kernels`: day0's prefill and decode kernels run from aiter-M3. The day0 decode
+  needs an aiter-M3 at `3c55cbcc2` or later; an older build keeps aiter's paged attention.
+  `"day0_decode_rows": 48` (the default is 24): at 24 to 40 decode rows, most CONC 32 k=3
+  steps, aiter's value_rows attention is faster; from 48 rows the FlyDSL decode is
+  ([#208](https://github.com/zhuyuhua-v/ATOM-M3/pull/208), #207).
 - `"prep": "aiter"` runs Triton's prep here: aiter's prep declines `k_plain_fp8` and
   `index_compress` (the server logs `triton prep`).
 - `"index": "fused"` is inert with `index_compress` on: the FlyDSL scorer declines the bf16

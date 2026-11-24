@@ -247,9 +247,10 @@ class ProVariants:
     # has it, else "triton").
     prefill_attn: str = "triton"
     # Decode / verify batches of at least this many rows attend with amd-kernels-day0's FlyDSL
-    # sparse decode (day0#4, one workgroup a row: ahead of the paged attention from ~24 rows)
-    # on the K-only plain fp8 cache, the picks select_logical's; 0: off. Without the package
-    # (or day0#4 in it) the batch keeps the other attention.
+    # sparse decode as ported into aiter, aiter.ops.flydsl's minimax_m3_fp8_sparse_decode
+    # (one workgroup a row: ahead of the paged attention from ~24 rows), on the K-only plain
+    # fp8 cache, the picks select_logical's; 0: off. With an aiter that lacks it the batch
+    # keeps the other attention.
     day0_decode_rows: int = 24
     # ... and its epilogue writes o_proj's MXFP8 input (E4M3 + E8M0 of the bf16-rounded rows,
     # quantize_fp8's bytes) where o_proj is a native group32 FP8 GEMM: no separate quant.
@@ -817,9 +818,10 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
         )
 
     def _day0_decode(self, v: ProVariants, n: int, reqs: int, fp8: bool) -> bool:
-        """amd-kernels-day0's FlyDSL sparse decode for a decode / verify batch of ``n`` rows
-        over ``reqs`` requests: from ``day0_decode_rows`` rows, on the K-only plain fp8 cache,
-        rows request-major (``n`` a multiple of ``reqs``). The shapes alone decide (graph-safe).
+        """aiter's FlyDSL sparse decode for a decode / verify batch of ``n`` rows over
+        ``reqs`` requests: from ``day0_decode_rows`` rows, on the K-only plain fp8 cache of
+        whole 16-token blocks a page, rows request-major (``n`` a multiple of ``reqs``). The
+        shapes alone decide (graph-safe).
         """
         return (
             0 < v.day0_decode_rows <= n
@@ -830,6 +832,7 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
             and v.topk in ("fused", "split")
             and self.num_heads == 16
             and self.topk == pro_kernels.TOPK
+            and self.page % pro_kernels.PAGE == 0
             and reqs > 0
             and n % reqs == 0
             and pro_kernels.day0_decode_available()
@@ -962,6 +965,23 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
             md._m3pro_dev = cached = (capturing, seq)
         return cached[1]
 
+    @staticmethod
+    def _day0_lens(md, n: int, positions):
+        """The day0 decode's request lengths (``day0_decode_seq_lens``) of a decode / verify
+        batch of ``n`` rows, once a forward for all layers, cached per capture state as
+        ``_device_meta`` is."""
+        capturing = (
+            torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
+        )
+        reqs = md.block_tables.shape[0]
+        cached = getattr(md, "_m3pro_day0_lens", None)
+        if cached is None or cached[0] != capturing or cached[1].shape[0] != reqs:
+            lens = pro_kernels.day0_decode_seq_lens(
+                positions[:n], md.slot_mapping[:n], n // reqs
+            )
+            md._m3pro_day0_lens = cached = (capturing, lens)
+        return cached[1]
+
     def _kernel_attention(
         self,
         qkv,
@@ -979,6 +999,7 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
         mx_scale=None,
         dsplit=None,
         ring=None,
+        day0_lens=None,
     ):
         """The whole layer in four launches (``prep`` / ``scores`` + top-k / ``attention``).
 
@@ -994,6 +1015,8 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
         a decode's ``(first, end)`` rows this rank selects (``decode_split``). ``ring``:
         ``(each batch row's first ring row, the ring rows)`` of the compressed index cache
         (``index_compress``; ``ic`` is then its ``[pages, 4, 128]`` centroids).
+        ``day0_lens``: the day0 decode's request lengths (``_day0_lens``), else computed
+        in the call.
         """
         kc4 = layer.k_cache[:, 0]
         vc4 = None if self.k_only else layer.v_cache[:, 0]
@@ -1119,6 +1142,8 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
                     scale,
                     n // block_tables.shape[0],
                     out_scale=mx_scale,
+                    # the forward's lengths where it gave them (else the call's own)
+                    **({} if day0_lens is None else {"seq_lens": day0_lens}),
                 )
             if day0:
                 assert (
@@ -1604,13 +1629,15 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
                 nb = (max(ctx) + self.page - 1) // self.page
             # the decode attention writes o_proj's MXFP8 input where o_proj takes it (mx_out,
             # set by the model): E4M3 rows here, their E8M0 scales through take_mx_scale
-            mx = static and self._mxfp8_out(
-                v,
-                n,
-                self._day0_decode(
-                    v, n, md.block_tables.shape[0], layer.k_cache.element_size() == 1
-                ),
+            day0_dec = static and self._day0_decode(
+                v, n, md.block_tables.shape[0], layer.k_cache.element_size() == 1
             )
+            mx = static and self._mxfp8_out(v, n, day0_dec)
+            if day0_dec:
+                # compiled here, in the eager forward a capture runs first, not in the capture
+                pro_kernels.day0_decode_warm_up(
+                    query.device, layer.k_cache.shape[-2], mx
+                )
             # the kernels write every row they compute in full: zero only the others
             width = h * self.value_head_dim
             out = query.new_empty(
@@ -1647,6 +1674,7 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
                     getattr(md, "pro_ring_base", None),
                     getattr(md, "pro_ring_rows", 0),
                 ),
+                day0_lens=self._day0_lens(md, n, position) if day0_dec else None,
             )
             if mx:
                 self._mx_scale = mx_scale.view(torch.float8_e8m0fnu)
