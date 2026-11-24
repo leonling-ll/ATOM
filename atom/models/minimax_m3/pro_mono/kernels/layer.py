@@ -214,7 +214,7 @@ def core_loads(c):
 
 
 @traced
-def load_core(c, loads):
+def load_core(c, loads, issue):
     """The core rows (``core_loads``) -> MXFP8 1x32 in LDS: e4m3 words at
     ``xs`` (token t's at t O_ROW), their E8M0 codes four a word at ``osc``. A
     thread takes 8 values, 4 threads a block; S * 384 items is a multiple of
@@ -224,10 +224,19 @@ def load_core(c, loads):
     Straight-line code: every lane of a 16-lane group stores the group's codes
     word (the same word to the same address), and only a round with lanes
     past the end branches, so the scheduler interleaves the rounds' chains.
-    No clamp to +-448: a bf16 block's quotient is within it (``_code``)."""
+    No clamp to +-448: a bf16 block's quotient is within it (``_code``).
+
+    ``issue``: the o stage's weight loads (callables), issued a share before
+    each round: a wave's buffer loads issue in order behind the CU's earlier
+    ones, so issuing them all ahead held the wave's quantization back until
+    the last went out (about 2 us at 8 rows). Returns their values."""
     s, tid = c["S"], c["tid"]
     n = s * CORE_ITEMS
+    per = -(-len(issue) // len(loads))
+    got = []
     for i in range_constexpr(len(loads)):
+        got += [f() for f in issue[per * i : per * (i + 1)]]
+        rocdl.sched_barrier(0)
         e = fx.min(tid + THREADS * i, n - 1)
         t = e // CORE_ITEMS
         q = e % CORE_ITEMS
@@ -245,12 +254,20 @@ def load_core(c, loads):
         else:
             if tid + THREADS * i < n:
                 _core_store(c, t, q, w0, w1, codes)
+        rocdl.sched_barrier(0)
+    return got
 
 
 def _core_store(c, t, q, w0, w1, codes):
     fx.ptr_store(w0, c["xs"] + (t * O_ROW + 2 * q))
     fx.ptr_store(w1, c["xs"] + (t * O_ROW + 2 * q + 1))
     fx.ptr_store(codes, c["osc"] + (t * OSC_ROW + q // 16))
+
+
+def _ld4(r, word, cm=0, width=4):
+    return fx.Vector(
+        bo.buffer_load(r, word, vec_width=width, dtype=T.i32, cache_modifier=cm)
+    )
 
 
 @traced
@@ -269,27 +286,21 @@ def stage_o(c):
         t = bid
         rg = t * 2 + wave // 4
         core = core_loads(c)
-        r_wo = rsrc(c["w_o"])
-        wts = [
-            fx.Vector(
-                bo.buffer_load(
-                    r_wo,
-                    ((rg * (O_K // 32) + (q4 * O_CPW + cc) * 2) * 512 + lane * 16) // 4,
-                    vec_width=4,
-                    dtype=T.i32,
-                    cache_modifier=CM_NT,
-                )
-            )
-            for cc in range(O_CPW)
-        ]
+        r_wo, r_so = rsrc(c["w_o"]), rsrc(c["s_o"])
         # lane (row l16, block g4): the E8M0 bytes of this wave's 24 blocks,
         # row-major [7168, 96]; MFMA p takes block g4 of dword p
         sw = (rg * 16 + l16) * (O_K // 32 // 4) + q4 * (O_SCALES_PW // 4)
-        r_so = rsrc(c["s_o"])
-        s_lo = fx.Vector(bo.buffer_load(r_so, sw, vec_width=4, dtype=T.i32))
-        s_hi = fx.Vector(bo.buffer_load(r_so, sw + 4, vec_width=2, dtype=T.i32))
+        wo = ((rg * (O_K // 32) + q4 * O_CPW * 2) * 512 + lane * 16) // 4
+        issue = [
+            functools.partial(_ld4, r_wo, wo + cc * 256, CM_NT) for cc in range(O_CPW)
+        ]
+        issue += [
+            functools.partial(_ld4, r_so, sw),
+            functools.partial(_ld4, r_so, sw + 4, 0, 2),
+        ]
+        got = load_core(c, core, issue)
+        wts, s_lo, s_hi = got[:O_CPW], got[O_CPW], got[O_CPW + 1]
         ws = [s_lo[d] for d in range(4)] + [s_hi[d] for d in range(2)]
-        load_core(c, core)
         gpu.barrier()
         c["stamp"](1)
         # B column l16 is token l16 (the last token past S: its column is
