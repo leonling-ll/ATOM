@@ -11,6 +11,7 @@ implementation of it.
 
 from __future__ import annotations
 
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -378,3 +379,96 @@ class TestCacheIO:
     def test_pre_v_experiment_leaves_the_v_cache_alone(self):
         _, layer, *_ = self._write(torch.float32, 4, ProVariants(v_src="pre"))
         assert not layer.v_cache.any()
+
+
+def _op_scaled(*args, kv_fp8_max=None, index_fp8_max=None, **kw):
+    """A stand-in with the signature of an aiter op without ``kv_unit_scale``."""
+    _op_scaled.calls.append(kw)
+    return None, None
+
+
+def _op_unit(*args, kv_fp8_max=None, index_fp8_max=None, kv_unit_scale=False, **kw):
+    """A stand-in with the signature of an aiter op that takes ``kv_unit_scale``."""
+    _op_unit.calls.append(dict(kw, kv_unit_scale=kv_unit_scale))
+    return None, None
+
+
+class TestPrepRouting:
+    """Which prep the kernel path runs (``_aiter_prep``) and what ``prep_aiter`` passes to
+    aiter's op; the resolved op is a stand-in, so nothing launches."""
+
+    # the prep-relevant part of the small-concurrency variants (K-only plain fp8 cache, aiter
+    # prep, no index_compress): the configuration the plain fp8 K switch takes effect on
+    SMALL_CONC = ProVariants(
+        kernels=True, prep="aiter", attn="aiter", k_only=True, k_plain_fp8=True
+    )
+
+    @pytest.fixture
+    def K(self, monkeypatch):
+        if pro_attn.pro_kernels is None:
+            pytest.skip("pro_kernels needs Triton")
+        K = pro_attn.pro_kernels
+        _op_scaled.calls, _op_unit.calls = [], []
+        monkeypatch.setattr(K, "_fused_prep", _op_unit)
+        return K
+
+    def _route(self, v, index_dtype=torch.float8_e4m3fn):
+        m = _impl()
+        m.__dict__["index_cache"] = torch.zeros(4, dtype=index_dtype)
+        return m._aiter_prep(v)
+
+    def test_plain_fp8_k_runs_on_an_op_with_kv_unit_scale(self, K):
+        assert self._route(self.SMALL_CONC)
+
+    def test_plain_fp8_k_stays_on_triton_without_kv_unit_scale(self, K, monkeypatch):
+        monkeypatch.setattr(K, "_fused_prep", _op_scaled)
+        assert not self._route(self.SMALL_CONC)
+        assert self._route(replace(self.SMALL_CONC, k_plain_fp8=False))
+
+    def test_no_aiter_op_is_triton(self, K, monkeypatch):
+        monkeypatch.setattr(K, "_fused_prep", False)
+        assert not self._route(self.SMALL_CONC)
+
+    def test_nvfp4_index_and_index_compress_stay_on_triton(self, K):
+        assert not self._route(self.SMALL_CONC, index_dtype=torch.uint8)
+        assert not self._route(replace(self.SMALL_CONC, index_compress=True))
+        assert not self._route(replace(self.SMALL_CONC, prep="triton"))
+
+    def _prep_aiter(self, K, **kw):
+        t, h = 2, 16
+        dt = torch.bfloat16
+        qkv = torch.zeros(t, h * 256 + 256 + 16 * 128 + 128, dtype=dt)
+        z = lambda n: torch.zeros(n, dtype=dt)
+        kc4 = torch.zeros(4, 1, 16, 256, dtype=torch.float8_e4m3fn)
+        ic = torch.zeros(4, 16, 128, dtype=torch.float8_e4m3fn)
+        ks = torch.zeros(4, 1, 16)
+        pos = torch.zeros(t, dtype=torch.int64)
+        cs = torch.zeros(8, 32, dtype=dt)
+        K.prep_aiter(
+            qkv,
+            pos,
+            pos,
+            cs,
+            cs,
+            1.0,
+            z(256),
+            z(256),
+            z(128),
+            z(128),
+            1e-6,
+            kc4,
+            ic,
+            h,
+            k_scale=ks,
+            **kw,
+        )
+
+    def test_prep_aiter_passes_k_unit_as_kv_unit_scale(self, K):
+        self._prep_aiter(K, k_unit=True)
+        assert _op_unit.calls[-1]["kv_unit_scale"] is True
+
+    def test_prep_aiter_leaves_kv_unit_scale_out_by_default(self, K, monkeypatch):
+        # an aiter without the argument still serves the scaled cache
+        monkeypatch.setattr(K, "_fused_prep", _op_scaled)
+        self._prep_aiter(K)
+        assert "kv_unit_scale" not in _op_scaled.calls[-1]

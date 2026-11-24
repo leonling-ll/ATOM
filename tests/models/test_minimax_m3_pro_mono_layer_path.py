@@ -77,14 +77,14 @@ def _layer(rec, moe=True, route=None):
     state = SimpleNamespace(
         source_for=lambda *a: None,
         put=lambda lid, x, res: rec.calls.append(("put", lid)),
+        front_input=pro.ProLookaheadState.front_input,
         resid_in={},
     )
     layer._pro_state = state
     layer._mono = route
 
     class Attn:
-        qk_proj = PLAIN
-        index_qk_proj = PLAIN
+        qkv_proj = PLAIN
 
         def __call__(self, **kw):
             rec.calls.append("attn")
