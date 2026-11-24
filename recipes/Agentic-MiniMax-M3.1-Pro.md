@@ -37,7 +37,7 @@ points of that. Every setting below is there to enlarge the cache or to keep it 
 | `--text-only` | Builds and loads no vision tower, projector or patch merger (1.8 GiB of weights a GPU); image requests get a 400. AgentX is text only. |
 | `AITER_REUSE_IDENTICAL_COMM_GROUPS=1` | At TP8 aiter's `ep` group has the same ranks as `tp`; this makes it reuse `tp`'s custom all-reduce instead of building a second one (~2.5 GiB a GPU). |
 | `GPTOSS_SWIGLU_MXFP4_BF16_BOUND=1040` | Keeps the routed MoE's activations in bf16 (a16w4) for steps below 1040 rows. aiter's default of 256 switches DSpark verify steps (sequences × 8 rows) to MXFP4 activations, which costs about 0.01 GSM8K (see Accuracy). Prefill chunks stay a4w4. |
-| `ATOM_TOKEN_GRAPH_SIZES=256,512,1024,2048` | Pro's prefills of up to 2048 tokens pad to the smallest bucket and replay a recorded token graph instead of issuing ~2170 launches from the host (attention stays eager). Measured on the #33 launch and variants (no `moe_route_glue` / `index_compress`, util 0.87, no LMCache), not yet on this recipe's variants: a warm turn on a cached 55k / 94k prefix at c1, paired medians of 8: 16-128 new tokens TTFT 160-191 ms -> 83-125 ms (prefill forward 104 ms -> 24-39 ms); ~1050 new tokens (padded to 2048) -18 to -29 ms; ~2820 new tokens padded to the default's 3072 bucket +5 ms, so 3072 is left out. |
+| `ATOM_TOKEN_GRAPH_SIZES=256,512,1024,2048` | Pro's prefills of up to 2048 tokens pad to the smallest bucket and replay a recorded token graph instead of issuing ~2170 launches from the host (attention stays eager). Measured on the #33 launch and variants (no `moe_route_glue` / `index_compress`, util 0.87, no LMCache), not yet on this recipe's variants: a warm turn on a cached 55k / 94k prefix at c1, paired medians of 8: 16-128 new tokens TTFT 160-191 ms -> 83-125 ms (prefill forward 104 ms -> 24-39 ms); ~1050 new tokens (padded to 2048) -18 to -29 ms; ~2820 new tokens padded to the default's 3072 bucket +5 ms, so 3072 is left out. The CONC 32 launch adds 3072 and 4096 ([Token graphs at CONC 32](#token-graphs-at-conc-32)). |
 | `"index_compress": true` | Stores the index cache as one bf16 centroid per 4 tokens (vLLM's compressed index): +17.7% KV blocks, indexer scoring ~4× faster, GSM8K 0.9462; c64 P90 30.22 → 34.43, 11,254 → 11,569 tok/s/GPU. Every switch that changes numerics, with its measured accuracy, is in [`MiniMax-M3.1-Pro-Accuracy-Switches.md`](MiniMax-M3.1-Pro-Accuracy-Switches.md). |
 | `ATOM_CUSTOM_AR_POOL_BYTES=134217728` | Sizes aiter's custom all-reduce pool to 128 MiB (routing unchanged: twice the 64 MiB AR cutoff), and token-id broadcasts and post-KV barriers no longer make torch build its own RCCL communicator (~2.4 GiB, one of them after KV sizing). Non-torch memory 9.44 -> 5.31 GB, +7.3% KV blocks. |
 
@@ -341,6 +341,7 @@ export ATOM_ONLINE_QUANT_STREAMING=1
 export ATOM_CACHE_AWARE_ADMISSION=1
 export ATOM_CUSTOM_AR_POOL_BYTES=134217728
 export GPTOSS_SWIGLU_MXFP4_BF16_BOUND=1040
+export ATOM_TOKEN_GRAPH_SIZES=256,512,1024,2048,3072,4096  # prefills of up to 4096 tokens replay token graphs
 
 # LMCache CPU offload
 export ATOM_KV_OFFLOAD=lmcache
@@ -376,7 +377,8 @@ python3 -m atom.entrypoints.openai_server \
 ```
 
 The proxy run starts the same server. `RECIPE=agentic` sets the section 1 env and flags itself and
-merges `ATOM_M3PRO_VARIANTS` onto the section 1 variants, so only the c32 keys go there. It refuses
+merges `ATOM_M3PRO_VARIANTS` onto the section 1 variants, so only the c32 keys go there.
+`ATOM_TOKEN_GRAPH_SIZES` replaces section 1's buckets when set (empty runs every prefill eagerly). It refuses
 a checkpoint whose `chat_template.jinja` is the stub unless `CHAT_TEMPLATE` is set. The template
 named here is the full one with the `thinking_mode` switch that `recipes/MiniMax-M3-Pro.md` serves
 with and `scripts/m31pro/aime_gate.sh` uses; the 237eada file is not on `/shared_nfs`.
@@ -386,6 +388,7 @@ export RECIPE=agentic SPEC_TOKENS=3
 export MODEL="${MODEL_PATH}"
 export CHAT_TEMPLATE=/shared_nfs/huggingface_models/amd/MiniMax-M3-MXFP4/chat_template.jinja
 export ATOM_M3PRO_VARIANTS='{"index": "fused", "ar_fused_rows": 128, "day0_decode_rows": 48}'
+export ATOM_TOKEN_GRAPH_SIZES=256,512,1024,2048,3072,4096
 flock /tmp/m31pro-gpu.lock bash scripts/m31pro/proxy_bench.sh 32 "${OUT_DIR}"
 ```
 
@@ -450,6 +453,25 @@ on the full template. The launch above, as `proxy_bench.sh` now starts it, has n
 With `index_compress` on, KV blocks go from 179,728 to 211,452 and LMCache reloads 0.48M tokens
 instead of 1.56M. From the second batch on, the draft length is 3, so those rows are not
 like-for-like with the k=7 rows above them.
+
+### Token graphs at CONC 32
+
+`ATOM_TOKEN_GRAPH_SIZES` picked by three 15-minute c32 proxies on one node (m31pro-256), the full
+chat template, DSpark k=5 at its golden AL 2.89 (measured 2.89), aiter-M3 `b7f589913`, ATOM
+`29b7ed93` (`ATOM_TOKEN_GRAPH_SIZES=""` needs #205's `proxy_bench.sh`). KV blocks are 218,276 in
+every arm: the 3072 and 4096 recordings come out of the margin, not the pool.
+
+| `ATOM_TOKEN_GRAPH_SIZES` | tok/s/GPU (output) | P90 E2E-norm interactivity | Prefill forwards replayed / eager | Failed |
+|---|---:|---:|---|---|
+| `""` (eager) | 8322.8 (84.63) | 48.83 | 0 / 977 | 0/956 |
+| `256,512,1024,2048` | 8483.6 (86.05) | 53.29 | 637 / 375 | 0/971 |
+| `256,512,1024,2048,3072,4096` (this launch) | **8534.1 (86.44)** | **55.21** | 754 / 232 | 0/974 |
+
+Prefill forward on TP rank 0 (device events around `ModelRunner.run_model`, median ms), eager
+against this launch: up to 256 rows 90 -> 37; 257-512 90 -> 53; 513-1024 106 -> 78; 1025-2048
+124 -> 106; 2049-3072 135 -> 136 and 3073-4096 158 -> 169, but their means drop 194 -> 146 and
+228 -> 183 (the eager forwards of that size have a long host-bound tail). Prefill device time over
+the window: 203 s eager, 163 s here.
 
 ### Accuracy at CONC 32
 

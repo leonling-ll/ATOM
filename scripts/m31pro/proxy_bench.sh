@@ -168,7 +168,8 @@ print(json.dumps({**json.loads(sys.argv[1]), **json.loads(sys.argv[2] or "{}")})
     export LMCACHE_MAX_LOCAL_CPU_SIZE=184
     export LMCACHE_CHUNK_SIZE=256
     export PYTHONHASHSEED=0
-    export ATOM_TOKEN_GRAPH_SIZES="${ATOM_TOKEN_GRAPH_SIZES:-256,512,1024,2048}"
+    # Set but empty records no bucket: every prefill runs eagerly.
+    export ATOM_TOKEN_GRAPH_SIZES="${ATOM_TOKEN_GRAPH_SIZES-256,512,1024,2048}"
     # Graphs between 8, 16 and 32 sequences: a step replays the smallest graph
     # that holds its sequences, and padded rows cost index score time.
     recipe_args=(--cudagraph-capture-sizes

@@ -128,6 +128,25 @@ def test_agentic_recipe_launch(tmp_path):
     assert values["ATOM_CUSTOM_AR_POOL_BYTES"] == "134217728"
 
 
+@pytest.mark.parametrize(
+    "sizes, served",
+    [
+        (None, "256,512,1024,2048"),
+        ("", ""),
+        ("256,512,1024,2048,3072,4096", "256,512,1024,2048,3072,4096"),
+    ],
+)
+def test_agentic_token_graph_sizes_keep_the_callers_value(tmp_path, sizes, served):
+    """Unset takes the recipe's buckets; set, even to empty (every prefill
+    eager), is served as given."""
+    env = {"RECIPE": "agentic"}
+    if sizes is not None:
+        env["ATOM_TOKEN_GRAPH_SIZES"] = sizes
+    done, values, _ = _dry_run(tmp_path, **env)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert values["ATOM_TOKEN_GRAPH_SIZES"] == served
+
+
 def test_pro_recipe_launch(tmp_path):
     done, values, _ = _dry_run(tmp_path)
     assert done.returncode == 0, done.stdout + done.stderr
