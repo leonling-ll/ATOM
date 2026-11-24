@@ -224,6 +224,12 @@ class ProVariants:
     # minimax_m3_fp8_sparse_prefill; needs k_plain_fp8, 16 local heads and an aiter that
     # has it, else "triton").
     prefill_attn: str = "triton"
+    # The routed experts of a MoE call of at most 64 rows: "aiter" (``fused_moe``) or
+    # "day0": aiter's ``minimax_m3_moe_experts_decode`` (amd-kernels-day0's one-launch
+    # sort, the a16w4 GEMMs at its decode tiles, the 4 slots summed in fp32 in slot order;
+    # ``fused_moe/pro_experts_decode.py``), "aiter" where this aiter lacks it. Read once,
+    # when the layers are built: a captured graph keeps the kernels it recorded.
+    moe_decode: str = "aiter"
 
 
 # Below it, on an fp8 index cache, Triton's query-blocked scores are as fast or faster

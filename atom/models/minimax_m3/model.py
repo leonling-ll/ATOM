@@ -451,6 +451,11 @@ class MiniMaxM3MoE(nn.Module):
             and self.experts.routed_scaling_factor == self.routed_scaling_factor
         )
 
+        if is_minimax_m3_pro_config(config):
+            from atom.model_ops.fused_moe.pro_experts_decode import ProDecodeExperts
+
+            self.experts.pro_decode_experts = ProDecodeExperts.from_variants()
+
         self.shared_experts: MiniMaxM3MLP | None = None
         if getattr(config, "n_shared_experts", 0) and not self.fuse_shared_experts:
             self.shared_experts = MiniMaxM3MLP(
