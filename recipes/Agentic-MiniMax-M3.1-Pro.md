@@ -1,7 +1,7 @@
 # MiniMax-M3.1-Pro AgentX Recipe on MI355X
 
 This recipe runs the SemiAnalysis/Weka AgentX replay workload against MiniMax-M3.1-Pro
-with ATOM on 8×AMD MI355X GPUs. It is tuned for **CONC 64**, the point measured so far.
+with ATOM on 8×AMD MI355X GPUs. It is tuned for **CONC 64**; the current best **CONC 32** launch is in [CONC 32](#conc-32).
 The configuration uses:
 
 - MiniMax-M3.1-Pro (MXFP8 attention/dense, NVFP4 routed experts converted to MXFP4 at load)
@@ -299,6 +299,152 @@ The server's `/metrics` has what explains a run: `atom:prefix_cache_hit_ratio`,
 `atom:lmcache_loaded_tokens_total`, `atom:requests_running` / `atom:requests_waiting` and
 `atom:kv_cache_usage_ratio`.
 
+## CONC 32
+
+The current best CONC 32 configuration, as `scripts/m31pro/proxy_bench.sh` launches it with
+`RECIPE=agentic`. It differs from the CONC 64 launch above: DSpark runs 3 draft tokens, the
+variants add the c32 kernels, and it leaves out what the c32 runs did not set
+(`ATOM_CUSTOM_AR_POOL_BYTES`, `GPTOSS_SWIGLU_MXFP4_BF16_BOUND`, `--timeout-keep-alive`,
+`--chat-template`).
+
+### aiter-M3 for CONC 32
+
+aiter-M3 `hatwu/m3.1-pro-infx` at `5bc8d81ec`, built as in section 0. That commit has
+aiter-M3#12 (FlyDSL decode indexer scorer, LDS ring), #13 (`minimax_m3_moe_experts_decode`),
+#15 (a16w4 MoE stage-1 rows at 32 and 64 tokens), #16 (fp8 sparse prefill refreshed to
+amd-kernels-day0 a9cd9a21), #18 (deep B pipeline for the a16w4 MoE kernels) and the sync
+aiter-M3#17, which brings `yuhua/m3.1-pro`'s fused all-reduce + RMSNorm + router + top-k + sort.
+`moe_route_glue` needs aiter-M3#17: on an older aiter the server logs
+`M3-Pro moe_route_glue unavailable` and keeps the separate launches.
+
+The numbers below ran on aiter-M3 `3c55cbcc2` with the route-glue files of `yuhua/m3.1-pro`
+`6e7523d6e` copied in, not on `5bc8d81ec`; #12, #13, #15, #16 and #18 are not in them.
+
+### Launch for CONC 32
+
+```bash
+export MODEL_PATH="${MODEL_PATH:-/data/models/m3-pro}"
+export PORT="${PORT:-8000}"
+export CONC=32
+
+export AITER_LOG_LEVEL=WARNING
+export AITER_QUICK_REDUCE_QUANTIZATION=NONE    # quick all-reduce is forbidden
+unset AITER_CUSTOM_AR_DISABLE_LAMPORT          # ar_lamport_rows and ar_fused_rows need the Lamport path
+export AITER_REUSE_IDENTICAL_COMM_GROUPS=1
+export ATOM_M3PRO_VARIANTS='{"kernels": true, "attn": "aiter", "topk": "split", "prep": "aiter", "index_split": true, "score_tq": 8, "ar_lamport_rows": 16, "k_only": true, "k_plain_fp8": true, "prefill_attn": "day0", "index_split_decode": 64, "moe_route_glue": true, "index": "fused", "ar_fused_rows": 128, "index_compress": true}'
+export ATOM_WARMUP_TOKENS=auto
+export ATOM_ONLINE_QUANT_STREAMING=1
+export ATOM_CACHE_AWARE_ADMISSION=1
+
+# LMCache CPU offload
+export ATOM_KV_OFFLOAD=lmcache
+export LMCACHE_LOCAL_CPU=True
+export LMCACHE_MAX_LOCAL_CPU_SIZE=184
+export LMCACHE_CHUNK_SIZE=256
+export PYTHONHASHSEED=0
+
+rm -rf ~/.cache/atom/*
+
+python3 -m atom.entrypoints.openai_server \
+  --model "${MODEL_PATH}" \
+  --trust-remote-code \
+  --tensor-parallel-size 8 \
+  --server-port "${PORT}" \
+  --kv_cache_dtype fp8 \
+  --index-cache-dtype fp8 \
+  --block-size 16 \
+  --level 0 \
+  --max-model-len 132096 \
+  --max-num-seqs $((2 * CONC)) \
+  --max-num-batched-tokens 16384 \
+  --cudagraph-capture-sizes "[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,18,20,22,24,26,28,30,32,48,64,128,256,512]" \
+  --gpu-memory-utilization 0.95 \
+  --online_quant_config '{"layer_quant_config": {"*.experts": "mxfp4"}}' \
+  --method dspark \
+  --num-speculative-tokens 3 \
+  --spec-decode-acceptance-length 2.53 \
+  --text-only \
+  2>&1 | tee "server-m31pro-agentx-c${CONC}.log"
+```
+
+The proxy run starts the same server; `proxy_bench.sh` sets the quick all-reduce, Lamport,
+LMCache and capture-ladder settings itself:
+
+```bash
+export RECIPE=agentic SPEC_TOKENS=3 SERVER_EXTRA=--text-only AITER_REUSE_IDENTICAL_COMM_GROUPS=1
+export MODEL="${MODEL_PATH}"
+export ATOM_M3PRO_VARIANTS='...'               # the variants above
+flock /tmp/m31pro-gpu.lock bash scripts/m31pro/proxy_bench.sh 32 "${OUT_DIR}"
+```
+
+- **AL is forced.** k=3 at Pro's golden AL 2.53 (thinking on), per the owner's k=3 ruling;
+  `proxy_bench.sh` takes it from its golden AL curve for `SPEC_TOKENS=3`. The server logs
+  `Forced speculative acceptance ON: mean acceptance length 2.5300 over 3 draft positions`, and
+  the run measures 2.530 (`atom:mtp_average_tokens_per_forward`). Output text is `synthetic`.
+- No `amd_kernels`: day0's prefill kernel runs from aiter-M3. `day0_decode_rows` (default 24)
+  needs the `amd_kernels` package, so decode keeps aiter's attention.
+- `"prep": "aiter"` runs Triton's prep here: aiter's prep declines `k_plain_fp8` and
+  `index_compress` (the server logs `triton prep`).
+- `"index": "fused"` is inert with `index_compress` on: the FlyDSL scorer declines the bf16
+  centroid cache and every decode score is Triton's BLOCK_CENTROID (one
+  `decode scores stay Triton's` line a layer and rank). It takes over when `index_compress` is off.
+- The capture ladder is #99's. At `--max-num-seqs 64` and k=3 the startup cut keeps 26 graphs,
+  1 to 64.
+- With k=3 a verify step at CONC 32 is at most 128 rows, under aiter's default 256-row MXFP4
+  activation bound, so the c32 runs leave `GPTOSS_SWIGLU_MXFP4_BF16_BOUND` unset.
+
+Startup log: `available_for_kv=77.69GB ... num_kvcache_blocks=211452`, one
+`M3-Pro moe_route_glue: fused all-reduce + norm + router + top-k + sort` line a rank, and one
+`Creating LMCacheEngine` line a rank with `'max_local_cpu_size': 184.0`.
+
+### What each landed change does at CONC 32
+
+| Change | In this launch |
+|---|---|
+| #108 / #122 | `"index": "fused"`: decode and verify scores on aiter-M3's FlyDSL scorer. Inert with `index_compress` on (above). |
+| #119 / #124 | `"prefill_attn": "day0"`: aiter-M3's FlyDSL `minimax_m3_fp8_sparse_prefill`, no `amd_kernels` import. |
+| #110 / #127 | `"ar_fused_rows": 128`: up to 128 rows, the all-reduce + residual + RMSNorm + MXFP8 sites run as one Lamport launch. `moe_tail_ar` stays off. |
+| #99 / #155 | The capture ladder between 8, 16 and 32 sequences (Decode graph sizes, above). |
+| #97 / #163 | `"moe_decode": "day0"` runs MoE calls of at most 64 rows on aiter-M3#13's `minimax_m3_moe_experts_decode`. Off (`"aiter"`, the default); not yet measured at c32. |
+| #42 / #161 | `moe_two_stream_rows`: the shared expert on a side stream. Off (0, the default). |
+| #101 / #120 | `proxy_bench.sh` gets the golden AL curve and the `RECIPE=agentic` launch; `accuracy_gate.sh` the recipe's utilization. |
+| #152 / #156 | `accuracy_gate.sh` takes `GATE_VARIANTS` and `GATE_DISABLE_LAMPORT`, so GSM8K runs with these variants and Lamport on. |
+| #173 / #174 | `scripts/m31pro/aime_gate.sh`: AIME 2025 through the chat endpoint, thinking on, provisional bar 0.90. |
+| #128 (`yuhua/m3.1-pro`, via #176) | `moe_route_glue`, `index_split_decode` 64, the MXFP8 GEMM rows, the day0 decode guard. |
+| #137 (`yuhua/m3.1-pro`, via #176) | `index_compress`: the bf16 centroid index cache. |
+
+### Measured (CONC 32 proxy)
+
+`proxy_bench.sh`, 900 s, the seed-42 subset of 64 sessions capped at a 128k context, one run per
+row. Run details are in #7.
+
+**These rows ran with the stub chat template.** The checkpoint's 1,165-byte `chat_template.jinja`
+renders only the user messages, so every AgentX prompt is about 21% short (see the chat template
+note in section 1). The rows compare with each other, not with the CONC 64 tables or with a run
+on the full 237eada template. #182 makes `proxy_bench.sh` launch the recipe's full template.
+
+| Run | ATOM | aiter | k | AL | tok/s/GPU | P90 E2E-norm interactivity | Failed |
+|---|---|---|---|---|---:|---:|---|
+| #99 baseline | `e7f85047` | image aiter `572232d23` | 7 | 2.94 | 5000.0 | 8.01 | 0/642 |
+| First batch (#108, #119) | `e7f85047` + #122, #124 (PR heads) | aiter-M3 `c6a7d6d8` | 7 | 2.94 | 7149.3 | 42.59 | 0/917 |
+| Second batch (+ #110, #112) | `03309580` (`843a79cb` + `--text-only`) | aiter-M3 `3c55cbcc2` | 3 | 2.53 | 7321.7 | 45.45 | 0/936 |
+| + `yuhua/m3.1-pro`, `index_compress` off | `28356f19` (`78c55bcf` + `yuhua/m3.1-pro` `a22ad7cb`) | `3c55cbcc2` + route glue | 3 | 2.53 | 7482.2 | 44.59 | 0/952 |
+| + `index_compress` on (this launch) | `28356f19` | `3c55cbcc2` + route glue | 3 | 2.53 | 7628.2 | 49.99 | 0/969 |
+
+With `index_compress` on, KV blocks go from 179,728 to 211,452 and LMCache reloads 0.48M tokens
+instead of 1.56M. From the second batch on, the draft length is 3, so those rows are not
+like-for-like with the k=7 rows above them.
+
+### Accuracy at CONC 32
+
+- GSM8K 64-shot, second batch (ATOM `03309580`, aiter-M3 `3c55cbcc2`, DSpark k=3 at real
+  acceptance, fused index, day0 prefill, `ar_fused_rows` 128 with Lamport on, `index_compress`
+  off): flexible-extract 0.9325 + 0.0069 = 0.9394, short of the bar in #7 by 0.0006. Accepted
+  without a rerun by the owner's ruling
+  ([#7, 2026-11-24](https://github.com/zhuyuhua-v/ATOM-M3/issues/7#issuecomment-7134786667)).
+- No GSM8K run yet with `moe_route_glue` and `index_compress` together at k=3.
+- AIME 2025 has not run yet; its gate is `scripts/m31pro/aime_gate.sh` (#174).
+
 ## Accuracy
 
 Start the same server **without** `--spec-decode-acceptance-length` (keep `--method dspark`), then
@@ -346,7 +492,9 @@ verify steps are 129-256 rows, where tuned a16w4 is within 3-5% of a4w4 per MoE 
 
 ## Not covered yet
 
-- Other concurrencies: only CONC 64 has been measured with these settings.
+- Other concurrencies: only CONC 64 has been measured with these settings, and CONC 32 with
+  its own (CONC 32, above).
+- CONC 32 with the full 237eada chat template (#182), and at aiter-M3 `5bc8d81ec`.
 - A 3600 s run with `GPTOSS_SWIGLU_MXFP4_BF16_BOUND=1040`; the 3600 s row above is without it.
 - The intermittent LMCache start hang (see Host memory for LMCache) is not fixed in the launcher.
 - DCP=8, which shards the target's K and index K over the eight GPUs (about 4.9× the cached
