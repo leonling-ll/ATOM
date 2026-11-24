@@ -31,6 +31,7 @@ import triton
 import triton.language as tl
 
 from atom.model_ops.layernorm import GemmaRMSNorm
+from atom.model_ops.minimax_m3 import pro_attn
 from atom.model_ops.minimax_m3 import pro_kernels as K
 from atom.model_ops.minimax_m3.pro_attn import (
     ProKOnlyLayout,
@@ -1650,3 +1651,149 @@ class TestValidFirst:
             c.q, c.kc4, c.bt, c.seq, c.pos, sel, ref, D**-0.5, 1, nblk=2, k_scale=c.ks
         )
         assert _close(out, ref)
+
+
+class TestDay0Decode:
+    """amd-kernels-day0's FlyDSL sparse decode (``day0_decode_rows``): decode / verify batches
+    from 24 rows on the K-only fp8 cache, select_logical's block ids, and its MXFP8 epilogue
+    handed to o_proj (dispatch only: the kernel itself is the package's, tested there).
+    """
+
+    def test_wrapper_lengths_and_arguments(self, monkeypatch):
+        got = {}
+
+        def fake(q, k_cache, topk, bt, seq_lens, qlen, scale, out, out_scale):
+            got.update(
+                q=q, k=k_cache, seq_lens=seq_lens, qlen=qlen, out=out, s=out_scale
+            )
+
+        monkeypatch.setattr(K, "_day0_decode", fake)
+        qlen, reqs = 4, 3
+        t = qlen * reqs
+        pos = torch.cat([torch.arange(10, 14), torch.arange(50, 54), torch.arange(4)])
+        slots = torch.arange(t)
+        slots[8:] = -1  # request 2: a graph's padding request
+        kc4 = torch.zeros(5, 1, PG, D, dtype=FP8)
+        out = torch.empty(t, H * VD, dtype=FP8)
+        scale = torch.empty(t, H * VD // 32, dtype=torch.uint8)
+        q = torch.randn(t, H, D)
+        K.attention_day0_decode(
+            q, kc4, None, pos, slots, None, out, 0.1, qlen, out_scale=scale
+        )
+        assert got["seq_lens"].tolist() == [14, 54, 0]
+        assert got["seq_lens"].dtype == torch.int32 and got["qlen"] == qlen
+        assert got["q"].dtype == FP8 and got["k"].shape == (5, PG, D)
+        assert got["out"].shape == (t, H, VD) and got["s"] is scale
+
+    def _verify_case(self):
+        lens = [150, 97, 60, 80, 120, 70]
+        c = Case(lens, topk=8, seed=3, kv_dtype=FP8, k_only=True)
+        c.impl.k_only = True
+        TestImplGlue()._impl_with_rope(c, ProVariants())
+        qlen = 4  # a verify of k + 1 = 4 rows a request
+        tok = torch.cat(
+            [
+                torch.arange(c.seq_slice(s)[1] - qlen, c.seq_slice(s)[1])
+                for s in range(c.S)
+            ]
+        ).to(DEV)
+        seq = torch.arange(c.S, device=DEV).repeat_interleave(qlen)
+        return c, tok, seq, qlen
+
+    @pytest.mark.parametrize("rows_min,day0", [(24, True), (25, False)])
+    def test_verify_batch_dispatch(self, monkeypatch, rows_min, day0):
+        c, tok, seq, qlen = self._verify_case()
+        monkeypatch.setattr(K, "TOPK", 8)
+        monkeypatch.setattr(K, "aiter_value_rows_available", lambda: True)
+        monkeypatch.setattr(K, "day0_decode_available", lambda: True)
+        got = {}
+
+        def fake_day0(q, kc4, bt, pos, slots, sel, out, scale, ql, out_scale=None):
+            got.update(sel=sel, qlen=ql, out_scale=out_scale)
+            return out
+
+        def fake_aiter(*a, **k):
+            got["aiter"] = True
+            return a[5]
+
+        monkeypatch.setattr(K, "attention_day0_decode", fake_day0)
+        monkeypatch.setattr(K, "attention_aiter", fake_aiter)
+        kw = {"topk": "split", "attn": "aiter", "k_only": True, "k_plain_fp8": True}
+        v = ProVariants(**kw, day0_decode_rows=rows_min)
+        n = tok.numel()
+        wide = torch.cat([c.bt, torch.zeros_like(c.bt).repeat(1, 3)], dim=1)
+        mx = (
+            torch.empty(n, H * VD // 32, dtype=torch.uint8, device=DEV)
+            if day0
+            else None
+        )
+        out = torch.zeros(n, H * VD, dtype=FP8 if day0 else DT, device=DEV)
+        c.impl._kernel_attention(
+            c.qkv[tok], c.pos[tok], seq, c.slot[tok], wide, c.layer, c.ic,
+            wide.shape[1], v, out, static=True, mx_scale=mx,
+        )  # fmt: skip
+        assert ("sel" in got) == day0 and ("aiter" in got) != day0
+        if day0:
+            sel, pos = got["sel"], c.pos[tok]
+            assert got["qlen"] == qlen and got["out_scale"] is mx
+            assert tuple(sel.shape) == (n, 8) and sel.dtype == torch.int32
+            valid = sel >= 0
+            qb = (pos // PG).unsqueeze(1).expand_as(sel)
+            assert (sel[valid] <= qb[valid]).all()
+            assert torch.equal(valid.sum(1), torch.clamp(pos // PG + 1, max=8))
+            # valid first, -1 after
+            assert (valid.int().diff(dim=1) <= 0).all()
+
+    def _impl(self, mx_out):
+        m = object.__new__(ProSparseAttentionImpl)
+        m.num_heads, m.head_dim, m.value_head_dim, m.layer_num = H, D, VD, 1
+        m.k_only, m.mx_out, m.index_cache = True, mx_out, None
+        return m
+
+    @pytest.mark.parametrize("mx_out", [True, False])
+    def test_forward_returns_mxfp8_for_o_proj(self, monkeypatch, mx_out):
+        n_tok, n = 32, 24  # 8 padding rows past the batch
+        m = self._impl(mx_out)
+        v = ProVariants(kernels=True, k_only=True, k_plain_fp8=True, topk="split")
+        monkeypatch.setattr(pro_attn, "variants", lambda: v)
+        monkeypatch.setattr(m, "_use_kernels", lambda v: True, raising=False)
+        monkeypatch.setattr(
+            m, "_day0_decode", lambda v, n, reqs, fp8: True, raising=False
+        )
+        monkeypatch.setattr(K, "day0_decode_available", lambda: True)
+        md = SimpleNamespace(
+            slot_mapping=torch.zeros(n, dtype=torch.long),
+            block_tables=torch.zeros(6, 16, dtype=torch.int32),
+            cu_seqlens_q=torch.arange(0, 25, 4, dtype=torch.int32),
+        )
+        layer = SimpleNamespace(k_cache=torch.zeros(1, 1, 1, PG, D, dtype=FP8))
+        fwd = SimpleNamespace(
+            context=SimpleNamespace(is_dummy_run=False, is_prefill=False),
+            attn_metadata=md,
+            kv_cache_data={"layer_1": layer},
+        )
+        monkeypatch.setattr(pro_attn, "get_forward_context", lambda: fwd)
+
+        def fake_kernel(parts, pos, seq, slots, bt, layer, ic, nb, v, out, **kw):
+            assert out.shape[0] == n
+            out.view(torch.uint8).fill_(0x38)  # 1.0 in e4m3 (bf16 bytes otherwise)
+            if kw["mx_scale"] is not None:
+                kw["mx_scale"].fill_(127)
+
+        monkeypatch.setattr(m, "_kernel_attention", fake_kernel, raising=False)
+        q = torch.zeros(n_tok, H * D)
+        out = m.forward(q, q, q, position=torch.zeros(n_tok, dtype=torch.long), qkv=q)
+        assert out.shape == (n_tok, H * VD)
+        if not mx_out:
+            assert out.dtype == q.dtype and m.take_mx_scale() is None
+            return
+        assert out.dtype == FP8
+        assert (out[:n].float() == 1.0).all() and (out[n:].view(torch.uint8) == 0).all()
+        scale = m.take_mx_scale()
+        assert scale.dtype == torch.float8_e8m0fnu and scale.shape == (
+            n_tok,
+            H * VD // 32,
+        )
+        su = scale.view(torch.uint8)
+        assert (su[:n] == 127).all() and (su[n:] == 0).all()
+        assert m.take_mx_scale() is None  # taken once

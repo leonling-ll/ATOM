@@ -311,6 +311,9 @@ class MiniMaxM3ProAttention(nn.Module):
             local_blocks=sparse_cfg.get("sparse_local_block", 0),
             block_size=sparse_cfg["sparse_block_size"],
         )
+        # o_proj takes MXFP8 rows (a group32 FP8 GEMM, not its BF16 fallback): the attention
+        # may write them itself (day0 decode)
+        self.attn.impl.mx_out = _native_a8(self.o_proj) and not self.o_proj.runs_bf16
 
     def forward(
         self,
@@ -349,6 +352,9 @@ class MiniMaxM3ProAttention(nn.Module):
         # the impl reads the four projections where they are (column slices of the two
         # GEMM outputs): index k rides in ``qkv``
         out = self.attn(q, k, iq, positions, qkv=ik)
+        if out.dtype == torch.float8_e4m3fn:
+            # the day0 decode's epilogue wrote o_proj's MXFP8 input (impl.mx_out)
+            return self.o_proj(out, x_scale=self.attn.impl.take_mx_scale())
         return self.o_proj(out)
 
     def _index_qk(self, x, x_scale=None) -> tuple[torch.Tensor, torch.Tensor]:

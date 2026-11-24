@@ -2124,3 +2124,53 @@ def attention_day0(q, kc4, block_tables, seq_id, positions, sel, out, scale):
         out.view(t, IDX_HEADS, VALUE_DIM),
     )
     return out
+
+
+_day0_decode = (
+    None  # amd-kernels-day0's fp8_sparse_decode (day0#4); False: not installed
+)
+
+
+def day0_decode_available() -> bool:
+    """Whether amd-kernels-day0's FlyDSL sparse decode (``attention_day0_decode``) imports."""
+    global _day0_decode
+    if _day0_decode is None:
+        try:
+            from amd_kernels.attention.fp8_sparse_prefill_gqa16_d256_v192_b16_top128.host import (
+                fp8_sparse_decode,
+            )
+        except ImportError:
+            _day0_decode = False
+        else:
+            _day0_decode = fp8_sparse_decode
+    return bool(_day0_decode)
+
+
+def attention_day0_decode(
+    q, kc4, block_tables, positions, slots, sel, out, scale, qlen, out_scale=None
+):
+    """``attention`` of a decode / verify batch on amd-kernels-day0's FlyDSL sparse decode (one
+    workgroup a row) over the K-only cache as a plain fp8 cast (``kc4`` as ``attention_day0``
+    takes it): ``q`` ``[T, 16, 256]`` (cast to fp8), ``T`` = requests x ``qlen`` rows, request
+    major; ``sel`` ``[T, 128]`` block ids, valid first and -1 after (``select_logical``).
+    A request's length is its last row's position + 1, 0 where that row's slot is -1 (a
+    graph's padding request: its rows come out 0). ``out`` ``[T, 16 x 192]``: bf16, or with
+    ``out_scale`` ``[T, 96]`` uint8 the E4M3 codes and E8M0 scales of the bf16-rounded rows
+    (``quantize_fp8``'s bytes), o_proj's MXFP8 input."""
+    t = q.shape[0]
+    reqs = t // qlen
+    last = positions.view(reqs, qlen)[:, -1]
+    live = slots.view(reqs, qlen)[:, -1] >= 0
+    seq_lens = torch.where(live, last + 1, 0).to(torch.int32)
+    _day0_decode(
+        q.to(torch.float8_e4m3fn),
+        kc4[:, 0],
+        sel,
+        block_tables,
+        seq_lens,
+        qlen,
+        scale,
+        out.view(t, IDX_HEADS, VALUE_DIM),
+        out_scale,
+    )
+    return out

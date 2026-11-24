@@ -198,6 +198,14 @@ class ProVariants:
     # FlyDSL fp8_sparse_prefill; needs k_plain_fp8, 16 local heads and the package, else
     # "triton").
     prefill_attn: str = "triton"
+    # Decode / verify batches of at least this many rows attend with amd-kernels-day0's FlyDSL
+    # sparse decode (day0#4, one workgroup a row: ahead of the paged attention from ~24 rows)
+    # on the K-only plain fp8 cache, the picks select_logical's; 0: off. Without the package
+    # (or day0#4 in it) the batch keeps the other attention.
+    day0_decode_rows: int = 24
+    # ... and its epilogue writes o_proj's MXFP8 input (E4M3 + E8M0 of the bf16-rounded rows,
+    # quantize_fp8's bytes) where o_proj is a native group32 FP8 GEMM: no separate quant.
+    day0_decode_mxfp8: bool = True
 
 
 # Below it the all-gather costs more than the scoring it saves (moo's threshold).
@@ -344,6 +352,11 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
     ``value`` / ``qkv`` carry the module's raw q, k, index q and index k projections (the
     module owns the projections, the lookahead choice of the indexer input, and ``o_proj``).
     """
+
+    # whether o_proj takes MXFP8 rows (the model sets it), and the scales of this forward's
+    # MXFP8 output (take_mx_scale)
+    mx_out = False
+    _mx_scale = None
 
     is_indexed_sparse_attention = True
     k_only = False  # the pool is ``ProKOnlyLayout`` (no V cache)
@@ -699,6 +712,31 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
             or (n >= _K_ROWS_AITER_MIN and pro_kernels.aiter_value_rows_available())
         )
 
+    def _day0_decode(self, v: ProVariants, n: int, reqs: int, fp8: bool) -> bool:
+        """amd-kernels-day0's FlyDSL sparse decode for a decode / verify batch of ``n`` rows
+        over ``reqs`` requests: from ``day0_decode_rows`` rows, on the K-only plain fp8 cache,
+        rows request-major (``n`` a multiple of ``reqs``). The shapes alone decide (graph-safe).
+        """
+        return (
+            0 < v.day0_decode_rows <= n
+            and not v.dense_only
+            and self.k_only
+            and fp8
+            and v.k_plain_fp8
+            and v.topk in ("fused", "split")
+            and self.num_heads == 16
+            and self.topk == pro_kernels.TOPK
+            and reqs > 0
+            and n % reqs == 0
+            and pro_kernels.day0_decode_available()
+        )
+
+    def take_mx_scale(self) -> torch.Tensor:
+        """The E8M0 scales ``[T, H x 192 / 32]`` of the MXFP8 output this forward returned (the
+        model hands them to o_proj with it), dropped here."""
+        scale, self._mx_scale = self._mx_scale, None
+        return scale
+
     def _use_kernels(self, v: ProVariants) -> bool:
         """Whether the Triton kernels cover this layer and these variants."""
         return (
@@ -763,6 +801,7 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
         out,
         static: bool = False,
         split=None,
+        mx_scale=None,
     ):
         """The whole layer in four launches (``prep`` / ``scores`` + top-k / ``attention``).
 
@@ -772,7 +811,8 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
         holds, ``out`` ``[n, H * 192]``. ``static``: ``nb`` is only a bound (the block
         table's width), so the selection runs even where every block would fit.
         ``split``: this forward's ``index_split`` plan; the indexer scores this rank's
-        rows only (the other rows' index q may be unset).
+        rows only (the other rows' index q may be unset). ``mx_scale`` ``[n, H x 192 / 32]``
+        uint8 (with ``out`` E4M3): the day0 decode writes o_proj's MXFP8 input.
         """
         kc4 = layer.k_cache[:, 0]
         vc4 = None if self.k_only else layer.v_cache[:, 0]
@@ -846,9 +886,27 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
             and pro_kernels.day0_prefill_available()
         )
 
+        # decode / verify: FlyDSL sparse decode from day0_decode_rows rows
+        day0_dec = static and self._day0_decode(v, n, block_tables.shape[0], fp8)
+        assert mx_scale is None or day0_dec, "an MXFP8 output needs the day0 decode"
+
         valid_first = False  # set where the selection is select_logical's
 
         def attend(sel, rows=None):
+            if day0_dec:
+                assert rows is None, "the day0 decode takes block ids (select_logical)"
+                return pro_kernels.attention_day0_decode(
+                    q,
+                    kc4,
+                    block_tables,
+                    positions,
+                    slots,
+                    sel,
+                    out,
+                    scale,
+                    n // block_tables.shape[0],
+                    out_scale=mx_scale,
+                )
             if day0:
                 assert (
                     rows is None
@@ -950,7 +1008,8 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
             if v.topk == "split"
             else pro_kernels.select_rows
         )
-        logical = day0 or not aiter_attn  # day0 and Triton take block ids, aiter pages
+        # day0 (prefill and decode) and Triton take block ids, aiter pages
+        logical = day0 or day0_dec or not aiter_attn
         if split is not None:
             from aiter.dist.communication_op import tensor_model_parallel_all_gather
 
@@ -1068,6 +1127,16 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
                 if self._aiter_attn(v)
                 else "triton"
             )
+            if (
+                v.day0_decode_rows
+                and self.k_only
+                and pro_kernels.day0_decode_available()
+            ):
+                attn_impl += f"; day0 decode from {v.day0_decode_rows} rows" + (
+                    " (MXFP8 out)"
+                    if v.day0_decode_mxfp8 and getattr(self, "mx_out", False)
+                    else ""
+                )
             logged = (attn_impl, prep_impl)
             if self.layer_num == 0 and getattr(self, "_logged_kernels", None) != logged:
                 self._logged_kernels = logged
@@ -1079,8 +1148,6 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
                     layer.k_cache.dtype,
                     v,
                 )
-            # the kernels write every row they compute in full: zero only the others
-            out = query.new_empty(n_tok, h * self.value_head_dim)
             static = not fwd.context.is_prefill
             if static:
                 # decode reads nothing back from the host (a graph can hold it): every
@@ -1091,10 +1158,30 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
                 cu, ctx = self._cpu_lengths(md)
                 n = min(n_tok, int(cu[-1]))
                 if n == 0:
-                    return out.zero_()
+                    return query.new_zeros(n_tok, h * self.value_head_dim)
                 nb = (max(ctx) + self.page - 1) // self.page
+            # the day0 decode writes o_proj's MXFP8 input where o_proj takes it (mx_out, set
+            # by the model): E4M3 rows here, their E8M0 scales through take_mx_scale
+            mx = (
+                static
+                and v.day0_decode_mxfp8
+                and getattr(self, "mx_out", False)
+                and self._day0_decode(
+                    v, n, md.block_tables.shape[0], layer.k_cache.element_size() == 1
+                )
+            )
+            # the kernels write every row they compute in full: zero only the others
+            width = h * self.value_head_dim
+            out = query.new_empty(
+                n_tok, width, dtype=torch.float8_e4m3fn if mx else query.dtype
+            )
+            mx_scale = (
+                query.new_empty(n_tok, width // 32, dtype=torch.uint8) if mx else None
+            )
             if n < n_tok:
-                out[n:].zero_()
+                out.view(torch.uint8)[n:].zero_()  # fp8 or bf16: all-zero bytes are 0
+                if mx:
+                    mx_scale[n:].zero_()
             seq_id = self._device_meta(md, n, query.device)
             self._kernel_attention(
                 tuple(p[:n] for p in parts),
@@ -1109,7 +1196,10 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
                 out[:n],
                 static=static,
                 split=None if static else self.index_split(n_tok),
+                mx_scale=None if mx_scale is None else mx_scale[:n],
             )
+            if mx:
+                self._mx_scale = mx_scale.view(torch.float8_e8m0fnu)
             return out
 
         if self._index_nvfp4():
