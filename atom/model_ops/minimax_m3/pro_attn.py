@@ -266,6 +266,12 @@ class ProVariants:
     # timing run. Read once, when the model is built: the count runs inside the captured
     # decode graphs.
     expert_count: bool = False
+    # qk_proj and index_qk_proj in one launch, each on its own input (the indexer's may be
+    # the lookahead): aiter's ``gemm_a8w8_blockscale_bpreshuffle_pair``, which runs both
+    # GEMMs' column blocks in one grid where aiter's small-M MXFP8 kernel has a row for
+    # the pair at the step's rows, and the two GEMMs in turn elsewhere. Native MXFP8
+    # (1x32, preshuffled) weights only; an aiter without it keeps the two GEMMs.
+    qk_pair: bool = False
 
 
 # Below it, on an fp8 index cache, Triton's query-blocked scores are as fast or faster

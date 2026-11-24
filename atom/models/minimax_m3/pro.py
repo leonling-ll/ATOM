@@ -91,6 +91,55 @@ def _native_a8(*linears) -> bool:
     return all(getattr(m, "native_a8_group_rows", None) is not None for m in linears)
 
 
+def _pair_operand(linear, x, x_scale) -> bool:
+    """Whether ``linear(x, x_scale)`` is a plain native MXFP8 GEMM on a preshuffled
+    weight: what ``gemm_a8w8_blockscale_bpreshuffle_pair`` computes for it."""
+    return (
+        x_scale is not None
+        and x.dim() == 2
+        and getattr(linear, "native_a8_group_rows", None) == 1
+        and getattr(linear.weight, "is_shuffled", False)
+        and linear.bias is None
+        and not linear.is_output_padded
+        and not (linear.tp_dim == 1 and linear.tp_size > 1 and linear.reduce_results)
+    )
+
+
+def _qk_pair(qk_proj, x, x_scale, index_qk_proj, ix, ix_scale):
+    """(qk, index qk) from one ``gemm_a8w8_blockscale_bpreshuffle_pair`` call when
+    ``qk_pair`` is on and both GEMMs qualify, else None."""
+    if not variants().qk_pair:
+        return None
+    import aiter
+
+    pair_gemm = getattr(aiter, "gemm_a8w8_blockscale_bpreshuffle_pair", None)
+    if not (
+        pair_gemm is not None
+        and x.shape[0] == ix.shape[0]
+        and _pair_operand(qk_proj, x, x_scale)
+        and _pair_operand(index_qk_proj, ix, ix_scale)
+    ):
+        return None
+    m = x.shape[0]
+    qk = torch.empty(m, qk_proj.weight.shape[0], dtype=torch.bfloat16, device=x.device)
+    iqk = torch.empty(
+        m, index_qk_proj.weight.shape[0], dtype=torch.bfloat16, device=x.device
+    )
+    pair_gemm(
+        x,
+        qk_proj.weight,
+        x_scale,
+        qk_proj.weight_scale,
+        ix,
+        index_qk_proj.weight,
+        ix_scale,
+        index_qk_proj.weight_scale,
+        qk,
+        iqk,
+    )
+    return qk, iqk
+
+
 @cache
 def _aiter_mx_norm() -> bool:
     """Whether this aiter's norm kernels can write MXFP8 (``add_rmsnorm_mxfp8`` and the
@@ -452,16 +501,22 @@ class MiniMaxM3ProAttention(nn.Module):
             if index_src is None:
                 own.append(self.index_qk_proj)
             x, xs = _quantized_once(hidden_states, hidden_states_scale, own)
-            q, k = self.qk_proj(x, x_scale=xs).split(self.qk_sizes, dim=-1)
             if index_src is None:
-                iq, ik = self._index_qk(x, xs)
+                ix, ixs = x, xs
             else:
                 ix, ixs = (
                     index_src
                     if isinstance(index_src, tuple)
                     else _quantized_once(index_src, None, [self.index_qk_proj])
                 )
-                iq, ik = self._index_qk(ix, ixs)
+            pair = _qk_pair(self.qk_proj, x, xs, self.index_qk_proj, ix, ixs)
+            if pair is None:
+                qk = self.qk_proj(x, x_scale=xs)
+                iqk = self.index_qk_proj(ix, x_scale=ixs)
+            else:
+                qk, iqk = pair
+            q, k = qk.split(self.qk_sizes, dim=-1)
+            iq, ik = iqk.split(self.index_qk_sizes, dim=-1)
         if diag_srcs is not None:
             # raw indexer projections of every candidate input, for `pro_diag`
             own = (
