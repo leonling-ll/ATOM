@@ -220,6 +220,21 @@ class ProVariants:
     # ... and its epilogue writes o_proj's MXFP8 input (E4M3 + E8M0 of the bf16-rounded rows,
     # quantize_fp8's bytes) where o_proj is a native group32 FP8 GEMM: no separate quant.
     day0_decode_mxfp8: bool = True
+    # Mono decode phase 1 (``models/minimax_m3/pro_mono``): the most graph rows a decode /
+    # verify forward may have for its MoE layers' o_proj .. FFN segment to run as one
+    # persistent kernel; 0 (default) off, at most ``pro_mono.config.MAX_ROWS``. Latched
+    # once, at the first forward (``pro_mono.route``, agreed over the TP group): a later
+    # edit of the file does not change it. Off by
+    # default until the design's acceptance gates pass with it on (accuracy: the
+    # exposure and official GSM8K 3-run means, AIME26 avg@16 >= 0.95 twice,
+    # retrieval 40/40; speed: a faster measured layer and >= 10% proxy TPOT at c1/c4).
+    mono_ffn_rows: int = 0
+    # The mono FFN's routed experts' activations: "bf16" (A16W4: bf16 x and mids against
+    # the MXFP4 experts dequantized in the kernel, production's a16w4 numerics at these
+    # widths), "fp8" (W4A8: the norm's MXFP8 x and MXFP8 mids, gfx950's f8f6f4 MFMA) or
+    # "fp4" (W4A4, aiter a4w4 numerics); the last two quantize the activations, a
+    # numerics change. Latched with ``mono_ffn_rows`` and agreed over the TP group.
+    mono_routed_act: str = "bf16"
 
 
 # Below it the all-gather costs more than the scoring it saves (moo's threshold).
