@@ -32,6 +32,9 @@ runner_mod = pytest.importorskip("atom.models.minimax_m3.pro_mono.runner")
 from atom.model_ops.minimax_m3 import pro_attn
 from atom.model_ops.minimax_m3.pro_attn import ProVariants
 
+# the routed planes' width (Pro's pad_align 128)
+INTER_R = 640
+
 N, H, OK = 3, 8, 6  # rows, hidden, o_proj's K (small stand-ins)
 NATIVE = SimpleNamespace(native_a8_group_rows=1)
 PLAIN = SimpleNamespace(native_a8_group_rows=None)
@@ -439,7 +442,7 @@ def test_launch_passes_every_abi_argument(monkeypatch, reader):
     w = _bound()
     r = runner_mod.ProMonoRunner.__new__(runner_mod.ProMonoRunner)
     r.debug, r.rank, r.first, r.last = False, 3, 4, 4
-    r.scratch_key = P1Build(tokens=1, upto="ffn")
+    r.scratch_key = P1Build(tokens=1, upto="ffn", inter_r=INTER_R)
     r.scratch = torch.zeros(16, dtype=torch.uint8)
     queue = r.scratch.data_ptr() + queue_word_offset(r.scratch_key, 4)
     table = runner_mod.moe_table(w, torch.device("cpu"), queue)

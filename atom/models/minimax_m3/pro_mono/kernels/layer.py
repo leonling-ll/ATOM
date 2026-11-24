@@ -25,20 +25,19 @@ residual)::
 o_proj's input is quantized as ``quantize_fp8`` does it (the same recipe, on the
 bf16 core rows), so the GEMM reads production's operand bytes; its sum order
 over K differs from aiter's tuned GEMM, so a partial can differ in its last bf16
-bit (design section 12).
+bit.
 
 The recipe, not every bit: the sums of squares here are a per-task wave sum
 then a fixed butterfly over the 56 tasks (not aiter's order), and ``/ 7168`` is
 not shown to be the true divide aiter uses, so x, x8 and la8 may differ from
 production by an ulp or one MXFP8 code. h_mid is bit-exact when the partials
-are (the spike showed it); x / x8 / la8 are held to design section 12's
-tolerances until T12 compares the stage bit for bit.
+are, because the AR sums the ranks' partials in the Lamport all-reduce's order;
+x / x8 / la8 are held to a relative error norm that passes every partial one
+bf16 ulp off, with their E8M0 scales at most one step from the reference's
+(``tests/models/minimax_m3_pro_mono_ref.py``).
 
-The AR + norm stages are the gate #3 spike's ``rsag_sq`` mode
-(``pro_opt/mono/spike_ar/arnorm_kernel.py``), which matched the reference on 8
-MI355X (h_mid bit-exact, x within a tolerance) before this port; the o_proj
-stage is MiniMax-M3's MXFP8 o stage (``minimax_m3/mono/kernels/stages/attention.py``)
-at Pro's K.
+The o_proj stage is MiniMax-M3's MXFP8 o stage
+(``minimax_m3/mono/kernels/stages/attention.py``) at Pro's K.
 """
 
 import functools
@@ -606,6 +605,7 @@ def build(key: P1Build):
             "put": mb.put, "put_bf": mb.put_bf, "put_words": mb.put_words,
             "poll": mb.poll, "peek": mb.peek, "stamp": lambda k: stamp(tl_on, tls, tid, k),
             "ffn_on": ffn_on, "routed_act": key.routed_act,
+            "planes": key.planes if ffn_on else None,
         }  # fmt: skip
         if const_expr(ffn_on):
             # the norm writes MXFP4 x to ``plain`` (one buffer resource over

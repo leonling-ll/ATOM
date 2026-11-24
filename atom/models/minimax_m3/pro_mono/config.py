@@ -12,7 +12,10 @@ the indexer, the dense layers, AR #2 and prefill stay on the production path.
 Every width a kernel loops over, places tasks by or lays a region out with is a
 build-time constant of ``ProDims(8)``: the kernels place o_proj, the column
 owners of the all-reduce and the router's expert band by the TP8 split, so any
-other TP size is refused by name (``ShardError``) before anything loads.
+other TP size is refused by name (``ShardError``) before anything loads. The
+one width read off the loaded model is the routed planes' padded intermediate
+(``RoutedPlanes``: the loader's ``pad_align`` decides it), which an FFN build
+bakes as ``P1Build.inter_r``.
 
 The phase is off unless ``ProVariants.mono_ffn_rows`` is set. Its value is
 latched once, at the first MoE layer of the first forward (``route``), and
@@ -44,10 +47,6 @@ TOPK = 4
 # the routed experts' and the shared expert's intermediate width (one shared)
 INTER_FULL = 5120
 SHARED_EXPERTS = 1
-# FusedMoE's MXFP4 weight prep pads a rank's routed intermediate to this
-# (``moe.py`` ``pad_align``), and ``intermediate_pad = 0`` makes production
-# compute the zero pad too, so a kernel over the padded width is exact
-ROUTED_PAD_ALIGN = 256
 EPS = 1e-6
 ROUTE_SCALE = 2.0
 SWIGLU_ALPHA = 1.702
@@ -67,7 +66,8 @@ MX_GROUP = 32
 COLS = 128
 
 # Rows a forward serves at most: the widths P1 builds and gates on. A 16-row
-# MFMA B operand holds them in one tile; 32 needs token groups (design T16).
+# MFMA B operand holds them in one tile; 32 rows need two token groups a
+# weight tile.
 MAX_ROWS = 16
 # Rows the kernel ABI, the peer regions and the scratch are sized for from day
 # one, so a later 32-row build changes no layout (``begin_step`` zeroes the
@@ -129,12 +129,6 @@ class ProDims:
         return INTER_FULL // self.tp
 
     @property
-    def inter_r(self) -> int:
-        """A routed expert's intermediate as loaded: padded with zeros to
-        ``ROUTED_PAD_ALIGN``."""
-        return padded(self.inter_valid, ROUTED_PAD_ALIGN)
-
-    @property
     def own_cols(self) -> int:
         """The hidden columns whose all-reduce this rank owns."""
         return HIDDEN // self.tp
@@ -148,11 +142,46 @@ class ProDims:
         """AR + norm column tasks over the whole hidden."""
         return HIDDEN // COLS
 
-    # ---- the routed planes (MXFP4, two values a byte) as FusedMoE leaves them
+    # ---- the shared expert (native MXFP8 1x32)
+
+    @property
+    def sh_gate_up(self) -> tuple[int, int]:
+        """gate_up's (rows, K): [gate | up] over the hidden."""
+        return 2 * self.inter_s, HIDDEN
+
+    @property
+    def sh_down(self) -> tuple[int, int]:
+        return HIDDEN, self.inter_s
+
+
+# aiter ``shuffle_scale`` (non-interleaved) lays E8M0 codes out in tiles of 8
+# K groups and pads a row's groups up to a whole tile (code 0x7F, 1.0)
+SCALE_TILE_GROUPS = 8
+
+
+@dataclass(frozen=True)
+class RoutedPlanes:
+    """A rank's routed MXFP4 planes as ``FusedMoE`` loaded them (two values a
+    byte), sized by ``inter_r``: the routed intermediate the loader padded the
+    rank's ``inter_valid`` columns to (``Mxfp4MoEMethod.intermediate_size``;
+    ``MiniMaxM3MoE``'s ``pad_align`` 128 leaves 640 at TP8, the default 256
+    padded it to 768). The binder reads it off the loaded method
+    (``weights._routed``) and the build bakes it (``P1Build.inter_r``): the
+    one value the planes' offsets derive from. The kernel computes the valid
+    columns only; the pad (zero bytes, so zero products) only moves the up
+    block and w2's K stride."""
+
+    inter_r: int
+
+    def __post_init__(self):
+        why = routed_width_refusal(self.inter_r)
+        if why is not None:
+            raise ValueError(why)
 
     @property
     def w13_rows(self) -> int:
-        """One expert's gate_up rows: the gate block, then the up block."""
+        """One expert's gate_up rows: the gate block, then the up block (at
+        row ``inter_r``)."""
         return 2 * self.inter_r
 
     @property
@@ -161,7 +190,7 @@ class ProDims:
 
     @property
     def w13_scale_cols(self) -> int:
-        return HIDDEN // MX_GROUP
+        return padded(HIDDEN // MX_GROUP, SCALE_TILE_GROUPS)
 
     @property
     def w13_scale_bytes(self) -> int:
@@ -173,22 +202,29 @@ class ProDims:
 
     @property
     def w2_scale_cols(self) -> int:
-        return self.inter_r // MX_GROUP
+        """w2's E8M0 columns as shuffled: ``inter_r / 32`` groups padded to a
+        whole tile (640: 20 -> 24)."""
+        return padded(self.inter_r // MX_GROUP, SCALE_TILE_GROUPS)
 
     @property
     def w2_scale_bytes(self) -> int:
         return HIDDEN * self.w2_scale_cols
 
-    # ---- the shared expert (native MXFP8 1x32)
 
-    @property
-    def sh_gate_up(self) -> tuple[int, int]:
-        """gate_up's (rows, K): [gate | up] over the hidden."""
-        return 2 * self.inter_s, HIDDEN
-
-    @property
-    def sh_down(self) -> tuple[int, int]:
-        return HIDDEN, self.inter_s
+def routed_width_refusal(inter_r, dims: "ProDims | None" = None) -> str | None:
+    """Why routed planes loaded at intermediate ``inter_r`` cannot be read, or
+    None. The kernel takes whole 128-k steps of the valid columns, a 32-row
+    scale group the up block starts on and w2 K bytes in whole 16-byte tiles:
+    ``inter_r`` >= ``inter_valid`` and a multiple of 32."""
+    dims = dims or ProDims(SUPPORTED_TP[0])
+    if not isinstance(inter_r, int) or isinstance(inter_r, bool):
+        return f"routed intermediate {inter_r!r} is not an integer"
+    if inter_r < dims.inter_valid or inter_r % MX_GROUP:
+        return (
+            f"routed intermediate {inter_r}: needs a multiple of {MX_GROUP}"
+            f" >= {dims.inter_valid}"
+        )
+    return None
 
 
 def _hf(atom_config):

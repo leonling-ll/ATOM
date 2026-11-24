@@ -81,6 +81,7 @@ from atom.models.minimax_m3.pro_mono.config import (
     ROUTED_ACTS,
     TOPK,
     ProDims,
+    RoutedPlanes,
 )
 from atom.mono.plan.check import RegionDecl
 from atom.mono.plan.execution import BLOCKS, THREADS
@@ -118,12 +119,13 @@ R_GROUPS = E_RANK // R_ROWS  # 3
 R_PARTS = 7  # K slices: 1024 columns, one 128-column chunk a wave
 R_KLEN = HIDDEN // R_PARTS
 R_TASKS = R_GROUPS * R_PARTS  # 21
-# a routed expert's intermediate on this rank: the valid 640 and the 768 the
-# planes are laid out (and zero padded) to. The pad's gate / up rows and w2
-# columns are zero, so its mid is exactly zero, a whole MXFP4 block of its own
-# (640 = 20 x 32): the kernel skips it and the sums are production's.
+# a routed expert's valid intermediate on this rank. The planes are laid out
+# at the loader's padded width (``P1Build.inter_r``: 640 at Pro's pad_align
+# 128, so no pad; 768 at the default 256), whose pad gate / up rows and w2
+# columns are zero, so its mids are exactly zero, whole MXFP4 blocks of their
+# own: the kernel computes the valid columns only and the sums are
+# production's.
 INTER_V = DIMS.inter_valid  # 640
-INTER_R = DIMS.inter_r  # 768
 UG_COLS = 32  # mid columns an ug task: one MXFP4 block of gate and of up
 UG_GROUPS = INTER_V // UG_COLS  # 20
 W13_STEPS = HIDDEN // 128  # 56 K steps of the f8f6f4 MFMA
@@ -288,23 +290,29 @@ def fp4_tile_dword(rg, k, st, lane):
     return rg * (2 * k) + st * 256 + lane * 4
 
 
-def w13_scale_word(e, rg, st, lane):
-    """The dword of w13's E8M0 codes (aiter ``shuffle_scale`` over [E 1536,
-    224], ``mx.scale_index``) holding row e 1536 + 16 rg + lane % 16, K block
-    4 st + lane / 16; the code is its byte (st % 2) 2 + rg % 2."""
-    r32 = e * (DIMS.w13_rows // 32) + rg // 2
-    cols = DIMS.w13_scale_cols
+def w13_scale_word(planes: RoutedPlanes, e, rg, st, lane):
+    """The dword of w13's E8M0 codes (aiter ``shuffle_scale`` over [E
+    ``w13_rows``, 224], ``mx.scale_index``) holding row e ``w13_rows`` + 16 rg
+    + lane % 16, K block 4 st + lane / 16; the code is its byte (st % 2) 2 +
+    rg % 2."""
+    r32 = e * (planes.w13_rows // 32) + rg // 2
+    cols = planes.w13_scale_cols
     return ((r32 * (cols // 8) + st // 2) * 4 + lane // 16) * 16 + lane % 16
 
 
-def w2_scale_word(e, rgd_half, m, lane):
-    """The dword of w2's E8M0 codes (``shuffle_scale`` over [E 7168, 24])
-    holding row e 7168 + 16 rgd + lane % 16 (``rgd_half`` = rgd / 2), K
-    blocks 4 st + lane / 16 of steps st = 2 m, 2 m + 1: byte (st % 2) 2 +
-    rgd % 2."""
+def w2_scale_word(planes: RoutedPlanes, e, rgd_half, m, lane):
+    """The dword of w2's E8M0 codes (``shuffle_scale`` over [E 7168,
+    ``w2_scale_cols``]: 640's 20 groups padded to 24) holding row e 7168 + 16
+    rgd + lane % 16 (``rgd_half`` = rgd / 2), K blocks 4 st + lane / 16 of
+    steps st = 2 m, 2 m + 1: byte (st % 2) 2 + rgd % 2."""
     r32 = e * (HIDDEN // 32) + rgd_half
-    cols = DIMS.w2_scale_cols
+    cols = planes.w2_scale_cols
     return ((r32 * (cols // 8) + m) * 4 + lane // 16) * 16 + lane % 16
+
+
+def w13_up_group(planes: RoutedPlanes) -> int:
+    """The first 16-row group of w13's up block (row ``inter_r``)."""
+    return planes.inter_r // 16
 
 
 def mxfp8_tile_dword(row, cols, kc, g):
@@ -364,6 +372,9 @@ class P1Build:
     timeline: bool = field(default=False, metadata={"sym": "t"})
     # the routed experts' activations (``ROUTED_ACTS``; an FFN build's only)
     routed_act: str = field(default=ROUTED_ACT_DEFAULT, metadata={"sym": "ra"})
+    # the routed planes' loaded intermediate (``RoutedPlanes``, read off the
+    # bound weights): an FFN build's, 0 for a norm build
+    inter_r: int = field(default=0, metadata={"sym": "ir"})
 
     def __post_init__(self):
         if not 1 <= self.tokens <= MAX_ROWS:
@@ -372,6 +383,15 @@ class P1Build:
             raise ValueError(f"upto {self.upto!r} not in {UPTO}")
         if self.routed_act not in ROUTED_ACTS:
             raise ValueError(f"routed_act {self.routed_act!r} not in {ROUTED_ACTS}")
+        if self.upto == "ffn":
+            RoutedPlanes(self.inter_r)
+        elif self.inter_r:
+            raise ValueError(f"inter_r {self.inter_r} on a norm build")
+
+    @property
+    def planes(self) -> RoutedPlanes:
+        """An FFN build's routed planes."""
+        return RoutedPlanes(self.inter_r)
 
 
 # ------------------------------------------------------------- peer regions

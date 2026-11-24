@@ -9,8 +9,8 @@ production path reads -- o_proj's and the shared expert's native MXFP8 1x32
 (16x16-preshuffled weight, row-major E8M0 scale on gfx950), the bf16 router
 (the checkpoint's fp32 cast once at load) with its fp32 correction bias, and
 the routed experts' MXFP4 planes as ``FusedMoE`` left them after the recipe's
-online NVFP4 -> MXFP4 conversion (lane-shuffled, padded 640 -> 768 with
-zeros; ``_routed``).
+online NVFP4 -> MXFP4 conversion (lane-shuffled, at the loader's padded
+routed width, 640 at Pro's ``pad_align`` 128; ``_routed``).
 
 Each layout assumption is checked here once, so a model loaded any other way is
 refused (``MonoUnsupported``) instead of being misread. ``bind_layer`` runs
@@ -31,6 +31,8 @@ from atom.models.minimax_m3.pro_mono.config import (
     MX_GROUP,
     TOPK,
     ProDims,
+    RoutedPlanes,
+    routed_width_refusal,
 )
 from atom.mono.runtime.consensus import MonoUnsupported
 
@@ -115,20 +117,21 @@ def _plane(t, dtypes, shape, name: str) -> torch.Tensor:
 
 def _routed(moe, dims: ProDims, name: str):
     """``FusedMoE``'s four MXFP4 planes where production left them, as uint8
-    views: (w13, w13 scale, w2, w2 scale).
+    views, and their layout: (w13, w13 scale, w2, w2 scale, ``RoutedPlanes``).
 
     The recipe's ``{"*.experts": "mxfp4"}`` converts the NVFP4 checkpoint at
     load (``FusedMoE._online_quant``): ``Mxfp4MoEMethod.create_weights`` sizes
-    the planes with the rank's intermediate 640 padded to ``dims.inter_r``
-    (``pad_align`` 256) and zero-fills them; the conversion writes gate rows
-    [0, 640), up rows [768, 1408) and w2 K bytes [0, 320) (scale groups
-    [0, 20)), so the pad is zero values with E8M0 code 0. ``MiniMaxM3MoE`` pins
-    ``intermediate_pad = 0``, so production computes the padded 768 too. The
-    lane-shuffled prep (``_process_weight_layout_after_loading`` branch C,
-    gfx950) then applies aiter's ``shuffle_weight`` (16, 16) to w13 / w2 and
-    ``shuffle_scale`` to each scale flattened to [experts x rows, groups]:
-    no row or group padding at these widths (rows a multiple of 256, groups of
-    8), so each plane is exactly its logical size."""
+    the planes with the rank's intermediate 640 padded to its
+    ``intermediate_size`` (``MiniMaxM3MoE``'s ``pad_align`` 128 for Pro: 640,
+    no pad; the default 256 gave 768) and zero-fills them; the conversion
+    writes gate rows [0, 640), up rows [inter_r, inter_r + 640) and w2 K bytes
+    [0, 320) (scale groups [0, 20)), so any pad is zero values with E8M0 code
+    0. ``MiniMaxM3MoE`` pins ``intermediate_pad = 0``. The lane-shuffled prep
+    (``_process_weight_layout_after_loading`` branch C, gfx950) then applies
+    aiter's ``shuffle_weight`` (16, 16) to w13 / w2 and ``shuffle_scale`` to
+    each scale flattened to [experts x rows, groups], which pads the groups to
+    a multiple of 8 (w2 at 640: 20 -> 24, code 0x7F; ``RoutedPlanes``). The
+    loaded ``intermediate_size`` is the one source of the planes' sizes."""
     experts = getattr(moe, "experts", None)
     _need(experts is not None, f"{name}: no routed experts")
     method = experts.quant_method
@@ -174,21 +177,26 @@ def _routed(moe, dims: ProDims, name: str):
         getattr(w13, "is_shuffled", False) and getattr(w2, "is_shuffled", False),
         f"{name}: expert planes are not preshuffled",
     )
+    inter_r = getattr(method, "intermediate_size", None)
+    why = routed_width_refusal(inter_r, dims)
+    _need(why is None, f"{name}: {why}")
+    planes = RoutedPlanes(inter_r)
     return (
-        _plane(w13, FP4, (EXPERTS, dims.w13_rows, HIDDEN // 2), f"{name} w13"),
+        _plane(w13, FP4, (EXPERTS, planes.w13_rows, HIDDEN // 2), f"{name} w13"),
         _plane(
             experts.w13_weight_scale,
             E8M0,
-            (EXPERTS * dims.w13_rows, dims.w13_scale_cols),
+            (EXPERTS * planes.w13_rows, planes.w13_scale_cols),
             f"{name} w13 scale",
         ),
-        _plane(w2, FP4, (EXPERTS, HIDDEN, dims.inter_r // 2), f"{name} w2"),
+        _plane(w2, FP4, (EXPERTS, HIDDEN, inter_r // 2), f"{name} w2"),
         _plane(
             experts.w2_weight_scale,
             E8M0,
-            (EXPERTS * HIDDEN, dims.w2_scale_cols),
+            (EXPERTS * HIDDEN, planes.w2_scale_cols),
             f"{name} w2 scale",
         ),
+        planes,
     )
 
 
@@ -252,18 +260,21 @@ class ProMoeLayer:
     # the router: this rank's 48 rows of the bf16 [384, 7168] gate, fp32 bias
     w_gate: torch.Tensor
     bias: torch.Tensor
-    # The routed MXFP4 planes, uint8 views of FusedMoE's (``_routed``). Per
-    # expert e, logical rows: w13 [1536, 7168 / 2] gate [0, 640), zero
-    # [640, 768), up [768, 1408), zero [1408, 1536); w2 [7168, 768 / 2], K
-    # [640, 768) zero. Two E2M1 a byte, the even k in the low nibble.
+    # The routed MXFP4 planes, uint8 views of FusedMoE's (``_routed``), at
+    # the loaded width ``planes.inter_r`` (640 at Pro's pad_align 128). Per
+    # expert e, logical rows: w13 [2 inter_r, 7168 / 2] gate [0, 640), up
+    # [inter_r, inter_r + 640), any pad rows zero; w2 [7168, inter_r / 2], K
+    # past 640 zero. Two E2M1 a byte, the even k in the low nibble.
     # w13 / w2: aiter ``shuffle_weight`` (16, 16): 16-row x 16-byte tiles,
     # row-major inside, tiles K-fastest (``mono.device.mx.fp4_tile_load``).
-    # s13 [384 x 1536, 224] / s2 [384 x 7168, 24]: E8M0, aiter ``shuffle_scale``
-    # over the flattened rows (``mono.device.mx.scale_index``); pad code 0.
+    # s13 [384 x 2 inter_r, 224] / s2 [384 x 7168, w2_scale_cols]: E8M0,
+    # aiter ``shuffle_scale`` over the flattened rows, groups padded to 8
+    # (``mono.device.mx.scale_index``).
     w13: torch.Tensor
     s13: torch.Tensor
     w2: torch.Tensor
     s2: torch.Tensor
+    planes: RoutedPlanes
     # the shared expert: gate_up e4m3 [1280, 7168] + [1280, 224], down
     # e4m3 [7168, 640] + [7168, 20]
     w_sgu: torch.Tensor
@@ -289,7 +300,7 @@ def bind_layer(layer, dims: ProDims, rank: int, ahead_norm=None) -> ProMoeLayer:
         g_ahead, eps_ahead = _norm(ahead_norm, f"{name} lookahead norm")
     moe = layer.block_sparse_moe
     w_gate, bias = _router(moe, dims, rank, name)
-    w13, s13, w2, s2 = _routed(moe, dims, f"{name} experts")
+    w13, s13, w2, s2, planes = _routed(moe, dims, f"{name} experts")
     sh = getattr(moe, "shared_experts", None)
     _need(sh is not None, f"{name}: no shared expert of its own")
     w_sgu, s_sgu = _mxfp8(sh.gate_up_proj, *dims.sh_gate_up, f"{name} shared gate_up")
@@ -308,6 +319,7 @@ def bind_layer(layer, dims: ProDims, rank: int, ahead_norm=None) -> ProMoeLayer:
         s13=s13,
         w2=w2,
         s2=s2,
+        planes=planes,
         w_sgu=w_sgu,
         s_sgu=s_sgu,
         w_sd=w_sd,

@@ -10,7 +10,8 @@ and mids) and the W4A4 one (aiter a4w4 numerics) at 1 and 16 rows; and the
 MXFP8 shared expert) run on the kernel's own x, x8, picks and weights.
 
 Every rank holds its own random routed planes (384 experts, MXFP4, the
-intermediate 640 zero padded to 768, shuffled as the loader leaves them) and
+intermediate 640 unpadded as Pro's ``pad_align`` 128 loads it, shuffled as the
+loader leaves them: w2's 20 scale groups padded to 24) and
 shared expert (MXFP8), and the same router; the code ranges keep the gate /
 up past the SwiGLU limit now and then and the routed and shared outputs of
 one size (``minimax_m3_pro_mono_ref``).
@@ -77,7 +78,8 @@ from test_minimax_m3_pro_mono_layer_gpu import (
 )
 
 EXPERTS = 384
-INTER_V, INTER_R, INTER_S = 640, 768, 640
+# the routed planes at Pro's pad_align 128 (MiniMaxM3MoE): 640, no pad
+INTER_V, INTER_R, INTER_S = 640, 640, 640
 # (rows, lookahead, routed_act). A16W4: one row, the decode widths 2 / 4, a
 # partial wave, an 8-row verify, two passes, the widest (+ the widest without
 # the lookahead); W4A8 (32/32 on GPU at 05a6fc80) and W4A4 (26/26 at
@@ -185,7 +187,14 @@ def _worker(rank, port, queue, done, inputs):
         )
         group = dist.group.WORLD
         keys = [
-            L.P1Build(tokens=s, upto="ffn", lookahead=la, debug=True, routed_act=act)
+            L.P1Build(
+                tokens=s,
+                upto="ffn",
+                inter_r=INTER_R,
+                lookahead=la,
+                debug=True,
+                routed_act=act,
+            )
             for s, la, act in CASES
         ]
         launches = compile_kernels([(build(k), ABI) for k in keys])
