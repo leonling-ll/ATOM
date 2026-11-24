@@ -45,11 +45,20 @@ VALUE_DIM = 192
 IDX_HEADS = 16
 IDX_DIM = 128
 TOPK = 128
+# The compressed index cache (``index_compress``, vLLM's): a bf16 centroid of every GROUP
+# consecutive index keys, a page of PAGE / GROUP rows; each request's latest raw keys wait
+# in a ring of RING_ROWS rows (position p at row p % RING_ROWS) until their group closes.
+GROUP = 4
+RING_ROWS = 16
 
 BLOCK_TOKMAX = 0
 BLOCK_POOL4MAX = 1
 BLOCK_POOL4MEAN = 2
 BLOCK_TOKLSE = 3
+# vLLM's compressed index cache: a block's score is the max over its 4 centroid rows (every 4
+# index keys softmax-pooled into one bf16 row when written, ``ic_c [pages, 4, 128]``)
+BLOCK_CENTROID = 4
+CENTROID_ROWS = 4
 HEAD_SUM = 0
 HEAD_MAX = 1
 HEAD_LSE = 2
@@ -232,6 +241,7 @@ def _prep_kernel(
     ic_ptr,
     ic_sb,
     ic_so,
+    ik_out_ptr,
     ratio,
     eps,
     fp8_max,
@@ -246,6 +256,7 @@ def _prep_kernel(
     IC_FP8: tl.constexpr,
     K_UNIT: tl.constexpr,
     IC_NV: tl.constexpr,
+    IK_OUT: tl.constexpr = False,
 ):
     t = tl.program_id(0)
     OUT_DT = q_out_ptr.dtype.element_ty
@@ -380,7 +391,12 @@ def _prep_kernel(
     lo, hi, r0, z1 = _norm_rope_rows(
         lo, hi, r0, z1, wl, wh, w0, tl.zeros([32], tl.float32), c, s, eps, D_IDX, OUT_DT
     )
-    if IC_NV:  # [page x 64 B e2m1 | page x 8 B e4m3 scales] a block
+    if IK_OUT:  # the compressed cache: the step's keys, pooled by compress_insert
+        ko = ik_out_ptr + t64 * D_IDX
+        tl.store(ko + a32[None, :], lo)
+        tl.store(ko + 32 + a32[None, :], hi)
+        tl.store(ko + 64 + a64[None, :], r0)
+    elif IC_NV:  # [page x 64 B e2m1 | page x 8 B e4m3 scales] a block
         if slot >= 0:
             nd = ic_ptr + blk * ic_sb + off * 64
             ns = ic_ptr + blk * ic_sb + PG * 64 + off * 8
@@ -432,6 +448,7 @@ def prep(
     k_scale=None,
     v_scale=None,
     k_unit=False,
+    ik_out=None,
 ):
     """Norm + rope the raw projections and write K / V / index-K to the caches.
 
@@ -442,7 +459,9 @@ def prep(
     ``[N, page/x, 256, x]``, ``ic`` the index cache ``[N, page, 128]``. An fp8 ``kc4``
     takes the per-token dequant scales ``k_scale`` / ``v_scale`` ``[N, 1, page]``; an fp8
     ``ic`` holds the keys cast (clamped to the fp8 range), unscaled. ``k_unit``: an fp8 K /
-    V cache a plain cast too, its scales written 1.0.
+    V cache a plain cast too, its scales written 1.0. ``ik_out`` ``[T, 128]`` (activation
+    dtype): the compressed cache's mode, the index keys go there instead of into ``ic``
+    (`compress_insert` pools them).
     """
     qkv = _split_rows(qkv, heads)
     q, k, iq, ik = qkv
@@ -457,8 +476,10 @@ def prep(
     assert q.shape[-1] >= heads * HEAD_DIM and k.shape[-1] >= HEAD_DIM
     assert iq.shape[-1] >= IDX_HEADS * IDX_DIM and ik.shape[-1] >= IDX_DIM
     fp8 = kc4.element_size() == 1
-    ic_nv = ic.dtype == torch.uint8  # NVFP4 rows, [N, page * 72]
-    ic_fp8 = ic.element_size() == 1 and not ic_nv
+    ic_nv = ic.dtype == torch.uint8 and ik_out is None  # NVFP4 rows, [N, page * 72]
+    ic_fp8 = ic.element_size() == 1 and not ic_nv and ik_out is None
+    if ik_out is not None:
+        assert ik_out.shape == (t, IDX_DIM) and ik_out.is_contiguous()
     write_v = vc4 is not None
     if write_v:
         assert vc4.dtype == kc4.dtype and vc4.stride(-1) == 1
@@ -503,6 +524,7 @@ def prep(
         ic,
         ic.stride(0),
         ic.stride(1),
+        ik_out if ik_out is not None else ic,
         ratio,
         eps,
         torch.finfo(kc4.dtype).max if fp8 else 1.0,
@@ -517,8 +539,150 @@ def prep(
         IC_FP8=ic_fp8,
         K_UNIT=k_unit,
         IC_NV=ic_nv,
+        IK_OUT=ik_out is not None,
     )
     return q_out, iq_out
+
+
+@triton.jit
+def _compress_pool_kernel(
+    ik_ptr,
+    pos_ptr,
+    seq_ptr,
+    slot_ptr,
+    base_ptr,
+    ring_ptr,
+    ring_pos_ptr,
+    cq_ptr,
+    out_ptr,
+    out_sb,
+    out_sr,
+    pool_scale,
+    PG: tl.constexpr,
+    G: tl.constexpr,
+    RR: tl.constexpr,
+):
+    """One closing token (position % G == G - 1): softmax-pool its group's G keys with the
+    compress query into the group's bf16 row. A key of this step is read from ``ik``, an
+    earlier one from the request's ring, where it must carry its own position; a key
+    found in neither (no ring slot, or one taken by another request) is left out."""
+    t = tl.program_id(0)
+    p = tl.load(pos_ptr + t)
+    slot = tl.load(slot_ptr + t)
+    if (slot >= 0) & (p % G == G - 1):
+        s = tl.load(seq_ptr + t)
+        base = tl.load(base_ptr + s)
+        g = tl.arange(0, G)
+        q = p - (G - 1) + g  # the group's positions
+        tt = t - (G - 1) + g  # where they sit if this step wrote them
+        ttc = tl.maximum(tt, 0)
+        mine = (
+            (tt >= 0)
+            & (tl.load(seq_ptr + ttc) == s)
+            & (tl.load(pos_ptr + ttc).to(tl.int64) == q.to(tl.int64))
+        )
+        row = base + q % RR
+        rowc = tl.where(base >= 0, row, 0)
+        has_ring = (base >= 0).to(tl.int32)
+        kept = (has_ring * (tl.load(ring_pos_ptr + rowc) == q).to(tl.int32)) != 0
+        from_ring = (kept.to(tl.int32) * (1 - mine.to(tl.int32))) != 0
+        here = mine | kept
+        d = tl.arange(0, D_IDX)
+        k_step = tl.load(
+            ik_ptr + ttc.to(tl.int64)[:, None] * D_IDX + d[None, :],
+            mask=mine[:, None],
+            other=0.0,
+        ).to(tl.float32)
+        k_ring = tl.load(
+            ring_ptr + rowc.to(tl.int64)[:, None] * D_IDX + d[None, :],
+            mask=from_ring[:, None],
+            other=0.0,
+        ).to(tl.float32)
+        k = k_step + k_ring  # [G, D]: each key from the one place it was read
+        cq = tl.load(cq_ptr + d).to(tl.float32)
+        logit = tl.sum(k * cq[None, :], axis=1) * pool_scale
+        logit = tl.where(here, logit, float("-inf"))
+        w = tl.exp(logit - tl.max(logit, axis=0))
+        w = w / tl.sum(w, axis=0)
+        c = tl.sum(w[:, None] * k, axis=0)
+        blk = (slot // PG).to(tl.int64)
+        r = (slot % PG) // G
+        tl.store(
+            out_ptr + blk * out_sb + r * out_sr + d, c.to(out_ptr.dtype.element_ty)
+        )
+
+
+@triton.jit
+def _ring_store_kernel(
+    ik_ptr,
+    pos_ptr,
+    seq_ptr,
+    slot_ptr,
+    base_ptr,
+    ring_ptr,
+    ring_pos_ptr,
+    T,
+    RR: tl.constexpr,
+):
+    """Keep a request's last RR keys of the step in its ring (row position % RR, tagged
+    with the position): a later step's groups read the ones before it from there."""
+    t = tl.program_id(0)
+    slot = tl.load(slot_ptr + t)
+    s = tl.where(
+        slot >= 0, tl.load(seq_ptr + t), 0
+    )  # a pad row's batch row is no index
+    base = tl.load(base_ptr + s)
+    nxt = tl.minimum(t + RR, T - 1)
+    last = (t + RR >= T) | (tl.load(seq_ptr + nxt) != s)
+    if (slot >= 0) & (base >= 0) & last:
+        p = tl.load(pos_ptr + t)
+        row = (base + p % RR).to(tl.int64)
+        d = tl.arange(0, D_IDX)
+        tl.store(
+            ring_ptr + row * D_IDX + d, tl.load(ik_ptr + t.to(tl.int64) * D_IDX + d)
+        )
+        tl.store(ring_pos_ptr + row, p)
+
+
+def compress_insert(
+    ik, positions, seq_id, slots, ring_base, ring, ring_pos, cq, pool_scale, ic_c
+):
+    """Pool the groups this step closes into the compressed index cache, then keep each
+    request's trailing keys in its ring.
+
+    ``ik`` ``[T, 128]`` the step's normed, RoPE'd index keys (`prep`'s ``ik_out``),
+    ``positions`` / ``seq_id`` (batch row) / ``slots`` (KV slot, -1 for a pad row) ``[T]``,
+    a sequence's rows contiguous and in position order. ``ring_base`` ``[B]`` each batch
+    row's first ring row (-1: none), ``ring`` ``[R, 128]`` and ``ring_pos`` ``[R]`` int32 the
+    rings and their rows' positions (-1: empty), ``cq`` ``[128]`` the layer's compress query,
+    ``ic_c`` ``[pages, PAGE / GROUP, 128]`` bf16. Two launches: the pooling reads the rings
+    before this step's keys overwrite them.
+    """
+    t = ik.shape[0]
+    if t == 0:
+        return
+    assert ik.is_contiguous() and ring.is_contiguous() and ic_c.stride(-1) == 1
+    assert ic_c.shape[1:] == (PAGE // GROUP, IDX_DIM) and ring.shape[1] == IDX_DIM
+    _compress_pool_kernel[(t,)](
+        ik,
+        positions,
+        seq_id,
+        slots,
+        ring_base,
+        ring,
+        ring_pos,
+        cq,
+        ic_c,
+        ic_c.stride(0),
+        ic_c.stride(1),
+        pool_scale,
+        PG=PAGE,
+        G=GROUP,
+        RR=RING_ROWS,
+    )
+    _ring_store_kernel[(t,)](
+        ik, positions, seq_id, slots, ring_base, ring, ring_pos, t, RR=RING_ROWS
+    )
 
 
 _fused_prep = (
@@ -773,6 +937,44 @@ def _score_tile_kernel(
                 tl.store(
                     obase + jb, tl.full([BB], float("-inf"), tl.float32), mask=jb < NB
                 )
+        elif BLOCK_MODE == 4:  # the compressed index cache: 4 centroid rows a block
+            one = tl.arange(0, 1)
+            ik, live = _load_block_keys(
+                ic_ptr,
+                ic_sb,
+                ic_so,
+                bt_ptr,
+                stride_bt,
+                tl.load(seq_ptr + t),
+                j0,
+                qb,
+                NB,
+                BB,
+                DI,
+                4,
+            )
+            score = _row_tile_scores(
+                iq_ptr,
+                t + one,
+                one == 0,
+                qpos + one,
+                ik,
+                live,
+                j0,
+                cq_ptr,
+                sc,
+                pool_temp,
+                init_blocks,
+                local_blocks,
+                1,
+                BB,
+                NI,
+                DI,
+                PG,
+                BLOCK_MODE,
+                HEAD_MODE,
+            )
+            tl.store(obase + jb, tl.reshape(score, (BB,)), mask=jb < NB)
         else:
             seq = tl.load(seq_ptr + t)
             r = tl.arange(0, BB * PG)
@@ -874,7 +1076,8 @@ def _row_tile_scores(
 ):
     """_score_tile_kernel's scores ``[R, BB]`` of the ``R`` rows ``t`` (``rmask`` the real
     ones, ``qpos`` their positions) over one tile of keys ``ik`` ``[BB*PG, DI]`` of blocks
-    ``j0..`` (``live`` the loaded keys): one dot for all ``R * NI`` query heads."""
+    ``j0..`` (``live`` the loaded keys): one dot for all ``R * NI`` query heads.
+    ``BLOCK_CENTROID``: ``ik`` is ``[BB*4, DI]``, the blocks' compressed rows."""
     ar_d = tl.arange(0, DI)
     ar_i = tl.arange(0, NI)
     qrow = tl.reshape(
@@ -894,6 +1097,9 @@ def _row_tile_scores(
         bs = tl.max(dm, axis=3)  # [R, NI, BB]
         if BLOCK_MODE == 3:
             bs = tl.log(tl.sum(tl.exp(dm - bs[:, :, :, None]), axis=3)) + bs
+    elif BLOCK_MODE == 4:
+        # ``ik`` holds the blocks' centroid rows (``[BB*4, DI]``): the max of q . c over them
+        bs = tl.max(tl.reshape(dots, (R, NI, BB, 4)), axis=3)  # [R, NI, BB]
     else:
         cq = tl.load(cq_ptr + ar_d).to(tl.float32)
         lg = tl.sum(ik.to(tl.float32) * cq[None, :], axis=1) * pool_temp  # [BB*PG]
@@ -976,6 +1182,7 @@ def _score_qtile_kernel(
     BLOCK_MODE: tl.constexpr,
     HEAD_MODE: tl.constexpr,
     CAUSAL: tl.constexpr = False,
+    RPB: tl.constexpr = 16,  # key rows a block: PG, or CENTROID_ROWS (BLOCK_CENTROID)
 ):
     """_score_tile_kernel's scores for ``TQ`` rows at once: rows of one sequence share each
     tile of block keys (loaded once, one dot for the ``TQ * NI`` query heads); a tile whose
@@ -1007,7 +1214,7 @@ def _score_qtile_kernel(
             NB,
             BB,
             DI,
-            PG,
+            RPB,
         )
         score = _row_tile_scores(
             iq_ptr,
@@ -1048,7 +1255,7 @@ def _score_qtile_kernel(
                 NB,
                 BB,
                 DI,
-                PG,
+                RPB,
             )
             score = _row_tile_scores(
                 iq_ptr,
@@ -1112,10 +1319,14 @@ def scores(
     out = torch.empty(t, nb, dtype=torch.float32, device=iq.device)
     assert ic.stride(-1) == 1 and (tiled or not causal)
     nv = ic.dtype == torch.uint8
+    if block_mode == BLOCK_CENTROID:  # ic is the compressed cache, ic_c [pages, 4, DI]
+        assert tiled and not nv and ic.shape[1:] == (CENTROID_ROWS, IDX_DIM), ic.shape
     assert tiled or not nv, "NVFP4 index pages: the tiled scorer only"
     assert not (tq and nv), "NVFP4 index pages: score_tq unsupported"
     if bb is None:
-        bb = 4 if tiled and t <= 16 else 8
+        # 4 rows a centroid block: 16 blocks a 64-row tile, 1.4-1.5x over 8 on MI355X decode
+        # verify (the same scores bit for bit; opt/topk.md round7)
+        bb = 16 if block_mode == BLOCK_CENTROID else 4 if tiled and t <= 16 else 8
     if tq:
         assert tq & (tq - 1) == 0, tq
         _score_qtile_kernel[(triton.cdiv(t, tq), triton.cdiv(nb, bb))](
@@ -1144,6 +1355,7 @@ def scores(
             BLOCK_MODE=block_mode,
             HEAD_MODE=head_mode,
             CAUSAL=causal,
+            RPB=CENTROID_ROWS if block_mode == BLOCK_CENTROID else PAGE,
         )
         return out
     tiles = triton.cdiv(nb, bb)

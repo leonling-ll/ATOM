@@ -190,6 +190,9 @@ class ProVariants:
     # rows unwritten instead of -inf, as the selections that read only causal blocks allow
     # (fused / split / aiter): its cost follows the context, not the block table's width.
     score_tq_causal: bool = False
+    # vLLM's compressed index cache: every 4 index keys softmax-pooled into one bf16 row
+    # (ic_c [pages, 4, 128]), written after prep; the scorer reads those rows only.
+    index_compress: bool = False
     # Prefill and speculative-verify scores take ``score_tq`` rows per program (a power of
     # two; 0: one): the rows of a sequence read each tile of block keys once, one dot for
     # all their query heads. A plain decode (one row a sequence) keeps one.
@@ -722,10 +725,12 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
 
     # ------------------------------------------------------------ kernel path --
     def _aiter_prep(self, v: ProVariants) -> bool:
-        """aiter's prep: it scales an fp8 K and writes no NVFP4 index rows."""
+        """aiter's prep: it scales an fp8 K and writes no NVFP4 index rows, nor the keys the
+        compressed index cache pools."""
         return (
             v.prep == "aiter"
             and not v.k_plain_fp8
+            and not v.index_compress
             and not self._index_nvfp4()
             and pro_kernels.aiter_prep_available()
         )
@@ -734,6 +739,18 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
         """``--index-cache-dtype nvfp4``: uint8 pages the Triton kernels alone read."""
         ic = self.index_cache
         return ic is not None and ic.dtype == torch.uint8
+
+    def _ring_buffers(self, rows: int, device, dtype):
+        """This layer's rings of raw index keys and their rows' positions (-1: empty) for
+        the compressed index cache, allocated on first use (the warmup forward, before
+        the KV budget is measured and any graph is captured)."""
+        ring = getattr(self, "_ring", None)
+        if ring is None or ring.shape[0] != rows:
+            self._ring = torch.zeros(
+                rows, pro_kernels.IDX_DIM, dtype=dtype, device=device
+            )
+            self._ring_pos = torch.full((rows,), -1, dtype=torch.int32, device=device)
+        return self._ring, self._ring_pos
 
     def _aiter_attn(self, v: ProVariants, n: int = _K_ROWS_AITER_MIN) -> bool:
         """aiter's paged attention for ``n`` rows: on the K-only cache only where it reads V
@@ -834,6 +851,7 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
         split=None,
         mx_scale=None,
         dsplit=None,
+        ring=None,
     ):
         """The whole layer in four launches (``prep`` / ``scores`` + top-k / ``attention``).
 
@@ -845,7 +863,9 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
         ``split``: this forward's ``index_split`` plan; the indexer scores this rank's
         rows only (the other rows' index q may be unset). ``mx_scale`` ``[n, H x 192 / 32]``
         uint8 (with ``out`` E4M3): the day0 decode writes o_proj's MXFP8 input. ``dsplit``:
-        a decode's ``(first, end)`` rows this rank selects (``decode_split``).
+        a decode's ``(first, end)`` rows this rank selects (``decode_split``). ``ring``:
+        ``(each batch row's first ring row, the ring rows)`` of the compressed index cache
+        (``index_compress``; ``ic`` is then its ``[pages, 4, 128]`` centroids).
         """
         kc4 = layer.k_cache[:, 0]
         vc4 = None if self.k_only else layer.v_cache[:, 0]
@@ -873,6 +893,13 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
                     "M3-Pro layer %d: unaligned projection rows, Triton prep",
                     self.layer_num,
                 )
+        compress = v.index_compress
+        if compress:
+            dt = qkv[0].dtype if isinstance(qkv, tuple) else qkv.dtype
+            prep = functools.partial(
+                prep,
+                ik_out=torch.empty(n, pro_kernels.IDX_DIM, dtype=dt, device=ic.device),
+            )
         q, iq = prep(
             qkv,
             positions,
@@ -892,6 +919,27 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
             k_scale=ks,
             v_scale=vs,
         )
+        if compress:
+            # the groups this step closes, before any score reads them (a prefill chunk's
+            # later rows read its earlier, older-than-local blocks)
+            base, rows = ring if ring is not None else (None, 0)
+            if base is None:
+                base = torch.full(
+                    (block_tables.shape[0],), -1, dtype=torch.int32, device=ic.device
+                )
+            rbuf, rpos = self._ring_buffers(max(rows, 1), ic.device, q.dtype)
+            pro_kernels.compress_insert(
+                prep.keywords["ik_out"],
+                positions,
+                seq_id,
+                slots,
+                base,
+                rbuf,
+                rpos,
+                self.index_compress_query.data,
+                v.pool_scale,
+                ic,
+            )
         scale = self.scale * v.scale_mult
         nblk = v.attn_nblk
         # MI355X, decode over top-128 (opt/kv/bench_decode_attn.py, valid_first, nblk 4):
@@ -993,6 +1041,11 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
             "pool4": pro_kernels.BLOCK_POOL4MAX,
             "lse": pro_kernels.BLOCK_TOKLSE,
         }[v.block_score]
+        if v.index_compress:
+            # ``ic`` is the compressed cache: its rows are the blocks' pool4 centroids,
+            # so the block score is their max (pool4 / max on precomputed centroids)
+            assert v.block_score == "pool4", "index_compress replaces the pool4 scores"
+            block_mode, pool = pro_kernels.BLOCK_CENTROID, False
         head_mode = {
             "sum": pro_kernels.HEAD_SUM,
             "mean": pro_kernels.HEAD_SUM,
@@ -1055,7 +1108,9 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
                 mine = pro_kernels.select_logical(
                     score, rpos, k, split=v.topk == "split"
                 )
-                return attend(tensor_model_parallel_all_gather(mine, dim=0).contiguous())
+                return attend(
+                    tensor_model_parallel_all_gather(mine, dim=0).contiguous()
+                )
             # this rank's [page table | ctx] rows, written in place by the selection
             mine = torch.empty(r1 - r0, k + 1, dtype=torch.int32, device=iq.device)
             if select is pro_kernels.select_rows_split:
@@ -1292,14 +1347,18 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
                     if static
                     else None
                 ),
+                ring=(
+                    getattr(md, "pro_ring_base", None),
+                    getattr(md, "pro_ring_rows", 0),
+                ),
             )
             if mx:
                 self._mx_scale = mx_scale.view(torch.float8_e8m0fnu)
             return out
 
-        if self._index_nvfp4():
+        if self._index_nvfp4() or v.index_compress:
             raise NotImplementedError(
-                'an NVFP4 index cache needs the kernel path ({"kernels": true})'
+                'an NVFP4 or compressed index cache needs the kernel path ({"kernels": true})'
             )
         if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
             raise RuntimeError(
