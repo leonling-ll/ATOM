@@ -6,14 +6,15 @@ Against M3.1-Flash, only the attention differs (the MoE / dense MLP / norms / lo
 are the Flash modules, with Pro's sizes read from the config):
 
 * q_proj (128 heads x 256, TP-sharded), k_proj (1 head x 256, replicated): no v_proj
-  -- V is K with the 64 rope dims dropped, so ``o_proj`` takes 128 x 192; the two run
-  as one GEMM (``qk_proj``);
-* a 16-head x 128 indexer (``index_q_proj`` / ``index_k_proj``, replicated, one GEMM
-  ``index_qk_proj``) whose
+  -- V is K with the 64 rope dims dropped, so ``o_proj`` takes 128 x 192;
+* a 16-head x 128 indexer (``index_q_proj`` / ``index_k_proj``, replicated) whose
   inputs, from layer 2 on, are the state of the layer two back
   (``sparse_indexer_lookahead_*``, source ``pre_ffn_norm``: its residual before the FFN
   norm, here put through the reading layer's input norm), and which scores 16-token
   blocks;
+* the four projections stored as one weight ``[q; k; index q; index k]`` (``qkv_proj``):
+  up to ``FRONT_ROWS`` rows one GEMM computes them from ``[x; indexer input]``, above it
+  ``qk_proj`` / ``index_qk_proj`` (row views of it) run on their own inputs;
 * ``index_compress_query`` per layer (softmax-pool compression of the index keys).
 
 The attention math is ``model_ops.minimax_m3.pro_attn`` (torch, correctness first).
@@ -37,11 +38,11 @@ from atom.model_ops.layernorm import (
     GemmaRMSNorm,
     fused_allreduce_gemma_rms_norm,
     fused_allreduce_gemma_rms_norm_mxfp8,
+    fused_allreduce_gemma_rms_norm_mxfp8_writes_out,
     gemma_rms_norm_mxfp8,
 )
 from atom.model_ops.linear import (
-    MergedReplicatedLinear,
-    QKVParallelLinear,
+    MinimaxM3QKVParallelLinearWithIndexer,
     RowParallelLinear,
 )
 from atom.model_ops.minimax_m3.pro_attn import ProSparseAttentionImpl, variants
@@ -56,6 +57,10 @@ from atom.models.minimax_m3.model import (
 from atom.models.minimax_m3.vl import MiniMaxM3SparseForConditionalGenerationVL
 
 logger = logging.getLogger("atom")
+
+# Rows up to which a layer's q, k, index q and index k come from one GEMM over
+# ``[x; indexer input]`` (2 x rows): at 8 rows one 16-row MFMA tile holds both halves.
+FRONT_ROWS = 16
 
 
 def _quantized_once(x: torch.Tensor, x_scale: torch.Tensor | None, linears) -> tuple:
@@ -104,6 +109,12 @@ class ProLookaheadState:
     ``ProVariants.lookahead_src`` for which one); one forward's layers run in order, so a
     dict of the last ``ahead`` layers is the whole state (no cross-forward lifetime: a
     layer's entry is written before it is read).
+
+    Up to ``FRONT_ROWS`` rows the MXFP8 indexer inputs and attention inputs live in a
+    ring of ``ahead + 1`` slots (``front_rows``), slot ``reader % (ahead + 1)``: the
+    lookahead norm writes rows ``[T, 2T)`` of its reader's slot, the reader's input norm
+    rows ``[0, T)``, and the reader's front GEMM reads the slot's ``2T`` rows as one A.
+    Fixed buffers, so a CUDA graph reads and writes the same addresses every replay.
     """
 
     def __init__(self, config: PretrainedConfig):
@@ -120,6 +131,65 @@ class ProLookaheadState:
         # projection is native group32 FP8 is put as MXFP8 ``(x, x_scale)`` under fuse_mxfp8_quant
         self.index_linears: dict[int, tuple[nn.Module, ...]] = {}
         self.resid_in: dict[int, torch.Tensor | tuple[torch.Tensor, torch.Tensor]] = {}
+        self._ring: tuple[torch.Tensor, torch.Tensor] | None = None
+
+    def front_rows(
+        self, reader: int, rows: int, like: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        """``reader``'s ring slot as ``2 * rows`` MXFP8 rows ``(q, q_scale)`` (rows
+        ``[0, rows)`` its input, ``[rows, 2 * rows)`` its indexer input), or None past
+        ``FRONT_ROWS``. ``like``: an activation of the layer (hidden size, device)."""
+        if not 0 < rows <= FRONT_ROWS:
+            return None
+        hidden = like.shape[-1]
+        if (
+            self._ring is None
+            or self._ring[0].shape[-1] != hidden
+            or self._ring[0].device != like.device
+        ):
+            # allocated once, by the first eager forward of at most FRONT_ROWS rows
+            # (a capture is preceded by an eager forward of its size)
+            shape = (self.ahead + 1, 2 * FRONT_ROWS, hidden)
+            self._ring = (
+                torch.empty(shape, dtype=torch.float8_e4m3fn, device=like.device),
+                torch.empty(
+                    (*shape[:2], hidden // 32),
+                    dtype=torch.float8_e8m0fnu,
+                    device=like.device,
+                ),
+            )
+        slot = reader % (self.ahead + 1)
+        return self._ring[0][slot, : 2 * rows], self._ring[1][slot, : 2 * rows]
+
+    @staticmethod
+    def front_input(
+        front: tuple[torch.Tensor, torch.Tensor] | None,
+        rows: int,
+        x: tuple[torch.Tensor, torch.Tensor | None],
+        index_src: torch.Tensor | tuple[torch.Tensor, torch.Tensor] | None,
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        """The A of a layer's one front GEMM, read where the norms wrote it: None (two
+        GEMMs) unless ``x``, the input norm's MXFP8 ``(q, q_scale)``, is rows ``[0, rows)``
+        of ``front`` (``front_rows``); then those rows when the indexer reads ``x`` too
+        (``index_src`` None), all ``2 * rows`` when ``index_src`` is the slot's rows
+        ``[rows, 2 * rows)``, None for any other ``index_src``."""
+
+        def written_at(t, q, q_scale) -> bool:
+            return (
+                isinstance(t, tuple)
+                and t[1] is not None
+                and t[0].data_ptr() == q.data_ptr()
+                and t[1].data_ptr() == q_scale.data_ptr()
+            )
+
+        if front is None or not written_at(x, *front):
+            return None
+        q, q_scale = front
+        if index_src is None:
+            return q[:rows], q_scale[:rows]
+        if written_at(index_src, q[rows:], q_scale[rows:]):
+            return front
+        return None
 
     @staticmethod
     def _normed(norm: GemmaRMSNorm, x: torch.Tensor) -> torch.Tensor:
@@ -183,8 +253,15 @@ class ProLookaheadState:
                     and _native_a8(*linears)
                     and _aiter_mx_norm()
                 ):
+                    rows = resid.shape[0]
+                    front = self.front_rows(reader, rows, resid)
                     _, q, q_scale, _ = gemma_rms_norm_mxfp8(
-                        resid, None, norm, write_bf16=False
+                        resid,
+                        None,
+                        norm,
+                        write_bf16=False,
+                        q_out=None if front is None else front[0][rows:],
+                        q_scale_out=None if front is None else front[1][rows:],
                     )
                     self.resid_in[reader] = (q, q_scale)
                 else:
@@ -240,30 +317,27 @@ class MiniMaxM3ProAttention(nn.Module):
         self.scaling = self.head_dim**-0.5
 
         # q (TP-sharded) + the one K head (replicated, as QKV replicates a KV head
-        # below the TP size) in one GEMM; no V
-        self.qk_proj = QKVParallelLinear(
+        # below the TP size), no V, then index q + index k (every index head on every
+        # rank): one weight, [q; k; index q; index k]
+        self.qkv_proj = MinimaxM3QKVParallelLinearWithIndexer(
             self.hidden_size,
             self.head_dim,
             self.total_num_heads,
             1,
+            self.num_idx_heads,
+            self.idx_head_dim,
             bias=False,
             quant_config=quant_config,
-            prefix=f"{prefix}.qk_proj",
+            prefix=f"{prefix}.qkv_proj",
             v_head_size=0,
+            replicate_index_heads=True,
         )
         self.qk_sizes = [self.num_heads * self.head_dim, self.head_dim]
-        # index q + index k: both replicated, and both read the indexer input
         self.index_qk_sizes = [
             self.num_idx_heads * self.idx_head_dim,
             self.idx_head_dim,
         ]
-        self.index_qk_proj = MergedReplicatedLinear(
-            self.hidden_size,
-            self.index_qk_sizes,
-            bias=False,
-            quant_config=quant_config,
-            prefix=f"{prefix}.index_qk_proj",
-        )
+        self._views = None
         self.o_proj = RowParallelLinear(
             self.total_num_heads * self.value_dim,
             self.hidden_size,
@@ -316,6 +390,27 @@ class MiniMaxM3ProAttention(nn.Module):
         # may write them itself (day0 decode)
         self.attn.impl.mx_out = _native_a8(self.o_proj) and not self.o_proj.runs_bf16
 
+    @property
+    def qk_proj(self) -> nn.Module:
+        """q + k: rows ``[0, sum(qk_sizes))`` of ``qkv_proj``."""
+        return self._row_views()[0]
+
+    @property
+    def index_qk_proj(self) -> nn.Module:
+        """index q + index k: the rest of ``qkv_proj``."""
+        return self._row_views()[1]
+
+    def _row_views(self) -> tuple[nn.Module, nn.Module]:
+        # Built at the first forward, once the loader has shuffled the weight and its
+        # scale (it does so after this module's own hooks); a tuple, so not submodules.
+        if self._views is None:
+            n = sum(self.qk_sizes)
+            self._views = (
+                self.qkv_proj.make_row_view(0, n),
+                self.qkv_proj.make_row_view(n, sum(self.index_qk_sizes)),
+            )
+        return self._views
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -323,21 +418,31 @@ class MiniMaxM3ProAttention(nn.Module):
         hidden_states_scale: torch.Tensor | None = None,
         index_src: torch.Tensor | tuple[torch.Tensor, torch.Tensor] | None = None,
         diag_srcs: dict[str, torch.Tensor | None] | None = None,
+        front: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
-        own = [self.qk_proj]
-        if index_src is None:
-            own.append(self.index_qk_proj)
-        x, xs = _quantized_once(hidden_states, hidden_states_scale, own)
-        q, k = self.qk_proj(x, x_scale=xs).split(self.qk_sizes, dim=-1)
-        if index_src is None:
-            iq, ik = self._index_qk(x, xs)
+        """``front``: MXFP8 ``[x; indexer input]`` rows (``ProLookaheadState.front_input``;
+        ``x`` alone when the indexer reads it) for one ``qkv_proj`` GEMM: q, k from the
+        first ``n`` rows, index q, index k from the last ``n``."""
+        if front is not None:
+            n = hidden_states.shape[0]
+            y = self.qkv_proj(*front)
+            q, k = y[:n, : sum(self.qk_sizes)].split(self.qk_sizes, dim=-1)
+            iq, ik = y[-n:, sum(self.qk_sizes) :].split(self.index_qk_sizes, dim=-1)
         else:
-            ix, ixs = (
-                index_src
-                if isinstance(index_src, tuple)
-                else _quantized_once(index_src, None, [self.index_qk_proj])
-            )
-            iq, ik = self._index_qk(ix, ixs)
+            own = [self.qk_proj]
+            if index_src is None:
+                own.append(self.index_qk_proj)
+            x, xs = _quantized_once(hidden_states, hidden_states_scale, own)
+            q, k = self.qk_proj(x, x_scale=xs).split(self.qk_sizes, dim=-1)
+            if index_src is None:
+                iq, ik = self._index_qk(x, xs)
+            else:
+                ix, ixs = (
+                    index_src
+                    if isinstance(index_src, tuple)
+                    else _quantized_once(index_src, None, [self.index_qk_proj])
+                )
+                iq, ik = self._index_qk(ix, ixs)
         if diag_srcs is not None:
             # raw indexer projections of every candidate input, for `pro_diag`
             own = (
@@ -372,7 +477,7 @@ class MiniMaxM3ProDecoderLayer(MiniMaxM3DecoderLayer):
         self._pro_state = state
         super().__init__(*args, **kwargs)
         state.norms[self.layer_num] = self.input_layernorm
-        state.index_linears[self.layer_num] = (self.self_attn.index_qk_proj,)
+        state.index_linears[self.layer_num] = (self.self_attn.qkv_proj,)
 
     def _make_attention(
         self,
@@ -408,20 +513,45 @@ class MiniMaxM3ProDecoderLayer(MiniMaxM3DecoderLayer):
         fuse = v.fuse_mxfp8_quant and not v.diag
         mx_norm = fuse and _aiter_mx_norm()
         attn = self.self_attn
-        fuse_attn_in = mx_norm and _native_a8(attn.qk_proj, attn.index_qk_proj)
+        state = self._pro_state
+        fuse_attn_in = mx_norm and _native_a8(attn.qkv_proj)
+        rows = hidden_states.shape[0]
+        # up to FRONT_ROWS rows the input norm writes its MXFP8 rows into the ring slot
+        # the lookahead norm filled two layers back, for one front GEMM over both
+        front = (
+            state.front_rows(self.layer_num, rows, hidden_states)
+            if fuse_attn_in
+            and not attn.qkv_proj.runs_bf16
+            and v.lookahead_src == "resid_in"
+            and fused_allreduce_gemma_rms_norm_mxfp8_writes_out(
+                rows, self.input_layernorm, v.ar_lamport_rows
+            )
+            else None
+        )
+        x_out = (None, None) if front is None else (front[0][:rows], front[1][:rows])
         hidden_states_scale = None
         if residual is None:
             residual = hidden_states
             if fuse_attn_in:
                 _, hidden_states, hidden_states_scale, _ = gemma_rms_norm_mxfp8(
-                    hidden_states, None, self.input_layernorm, write_bf16=False
+                    hidden_states,
+                    None,
+                    self.input_layernorm,
+                    write_bf16=False,
+                    q_out=x_out[0],
+                    q_scale_out=x_out[1],
                 )
             else:
                 hidden_states = self.input_layernorm(hidden_states)
         elif fuse_attn_in:
             _, hidden_states, hidden_states_scale, residual = (
                 fused_allreduce_gemma_rms_norm_mxfp8(
-                    hidden_states, residual, self.input_layernorm, v.ar_lamport_rows
+                    hidden_states,
+                    residual,
+                    self.input_layernorm,
+                    v.ar_lamport_rows,
+                    q_out=x_out[0],
+                    q_scale_out=x_out[1],
                 )
             )
         else:
@@ -430,16 +560,19 @@ class MiniMaxM3ProDecoderLayer(MiniMaxM3DecoderLayer):
             )
         aux_hidden_state = residual.clone() if capture_aux else None
 
-        state = self._pro_state
+        index_src = state.source_for(self.layer_num, self.input_layernorm)
         hidden_states = attn(
             positions=positions,
             hidden_states=hidden_states,
             hidden_states_scale=hidden_states_scale,
-            index_src=state.source_for(self.layer_num, self.input_layernorm),
+            index_src=index_src,
             diag_srcs=(
                 state.diag_sources(self.layer_num, self.input_layernorm)
                 if v.diag
                 else None
+            ),
+            front=state.front_input(
+                front, rows, (hidden_states, hidden_states_scale), index_src
             ),
         )
         ffn = self.block_sparse_moe if self.is_moe_layer else self.mlp
@@ -513,13 +646,13 @@ class _TextQKNames(WeightsMapper):
 class MiniMaxM3ProForCausalLM(MiniMaxM3SparseForCausalLM):
     """The text model: Flash's ``MiniMaxM3Model`` over Pro's decoder layers."""
 
-    # q / k into ``qk_proj`` under the names ``weights_mapper`` gives the text layers'
-    # (the vision tower's q/k/v_proj keep theirs); index q / k into ``index_qk_proj``.
+    # q / k into ``qkv_proj`` under the names ``weights_mapper`` gives the text layers'
+    # (the vision tower's q/k/v_proj keep theirs); index q / k after them.
     packed_modules_mapping: ClassVar[dict[str, tuple[str, str | int]]] = {
-        ".index_q_proj": (".index_qk_proj", 0),
-        ".index_k_proj": (".index_qk_proj", 1),
-        ".attn_q_proj": (".qk_proj", "q"),
-        ".attn_k_proj": (".qk_proj", "k"),
+        ".index_q_proj": (".qkv_proj", "index_q"),
+        ".index_k_proj": (".qkv_proj", "index_k"),
+        ".attn_q_proj": (".qkv_proj", "q"),
+        ".attn_k_proj": (".qkv_proj", "k"),
         ".gate_proj": (".gate_up_proj", 0),
         ".up_proj": (".gate_up_proj", 1),
     }
