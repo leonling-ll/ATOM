@@ -29,6 +29,7 @@ import torch
 from aiter.dist.parallel_state import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
+    get_tp_group,
 )
 from aiter.rotary_embedding import get_rope
 from torch import nn
@@ -63,6 +64,9 @@ from atom.models.minimax_m3.model import (
     MiniMaxM3SparseForConditionalGenerationTextOnly,
     _rope_theta,
 )
+from atom.models.minimax_m3.pro_mono.config import config_refusal
+from atom.models.minimax_m3.pro_mono.route import ProMonoRoute
+from atom.models.minimax_m3.pro_mono.runner import ProMonoRunner
 from atom.models.minimax_m3.vl import MiniMaxM3SparseForConditionalGenerationVL
 
 logger = logging.getLogger("atom")
@@ -432,6 +436,48 @@ class MiniMaxM3ProAttention(nn.Module):
         """``front``: MXFP8 ``[x; indexer input]`` rows (``ProLookaheadState.front_input``;
         ``x`` alone when the indexer reads it) for one ``qkv_proj`` GEMM: q, k from the
         first ``n`` rows, index q, index k from the last ``n``."""
+        out = self._attend(
+            positions, hidden_states, hidden_states_scale, index_src, diag_srcs, front
+        )
+        if out.dtype == torch.float8_e4m3fn:
+            # the decode attention wrote o_proj's MXFP8 input (impl.mx_out)
+            return self.o_proj(out, x_scale=self.attn.impl.take_mx_scale())
+        return self.o_proj(out)
+
+    def forward_core(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        hidden_states_scale: torch.Tensor | None = None,
+        index_src: torch.Tensor | tuple[torch.Tensor, torch.Tensor] | None = None,
+        diag_srcs: dict[str, torch.Tensor | None] | None = None,
+        front: tuple[torch.Tensor, torch.Tensor] | None = None,
+    ) -> torch.Tensor:
+        """The attention up to o_proj as bf16 [M, heads x 192], what the mono layer
+        kernel reads (``front`` as in ``forward``). The Triton / aiter decode
+        attention writes this call's rows as bf16 where ``forward``'s would be
+        o_proj's MXFP8 input (``ProSparseAttentionImpl.bf16_out``). The day0
+        decode's epilogue still writes E4M3 from ``day0_decode_rows`` rows, so mono
+        refuses a row limit that reaches it (``pro_mono.route.variants_refusal``)."""
+        impl = self.attn.impl
+        impl.bf16_out = True
+        try:
+            return self._attend(
+                positions,
+                hidden_states,
+                hidden_states_scale,
+                index_src,
+                diag_srcs,
+                front,
+            )
+        finally:
+            impl.bf16_out = False
+
+    def _attend(
+        self, positions, hidden_states, hidden_states_scale, index_src, diag_srcs, front
+    ) -> torch.Tensor:
+        """The projections and the attention: o_proj's input, bf16, or the decode
+        attention's E4M3 rows with their scales in ``attn.impl`` (``take_mx_scale``)."""
         if front is not None:
             n = hidden_states.shape[0]
             y = self.qkv_proj(*front)
@@ -466,11 +512,7 @@ class MiniMaxM3ProAttention(nn.Module):
             self.attn.impl._diag_raw = raw
         # the impl reads the four projections where they are (column slices of the two
         # GEMM outputs): index k rides in ``qkv``
-        out = self.attn(q, k, iq, positions, qkv=ik)
-        if out.dtype == torch.float8_e4m3fn:
-            # the decode attention wrote o_proj's MXFP8 input (impl.mx_out)
-            return self.o_proj(out, x_scale=self.attn.impl.take_mx_scale())
-        return self.o_proj(out)
+        return self.attn(q, k, iq, positions, qkv=ik)
 
     def _index_qk(self, x, x_scale=None) -> tuple[torch.Tensor, torch.Tensor]:
         return tuple(
@@ -481,9 +523,20 @@ class MiniMaxM3ProAttention(nn.Module):
 class MiniMaxM3ProDecoderLayer(MiniMaxM3DecoderLayer):
     """A Flash decoder layer with Pro's attention and the lookahead hand-over."""
 
-    def __init__(self, *args, state: ProLookaheadState, **kwargs) -> None:
-        # a plain attribute, set before `nn.Module.__init__` runs inside super()
+    # mono phase 1's gate (``pro_mono.route``), shared by the model's layers; None (a
+    # layer built without one too) runs production's segment only
+    _mono: ProMonoRoute | None = None
+
+    def __init__(
+        self,
+        *args,
+        state: ProLookaheadState,
+        mono: ProMonoRoute | None = None,
+        **kwargs,
+    ) -> None:
+        # plain attributes, set before `nn.Module.__init__` runs inside super()
         self._pro_state = state
+        self._mono = mono
         super().__init__(*args, **kwargs)
         state.norms[self.layer_num] = self.input_layernorm
         state.index_linears[self.layer_num] = (self.self_attn.qkv_proj,)
@@ -569,21 +622,65 @@ class MiniMaxM3ProDecoderLayer(MiniMaxM3DecoderLayer):
             )
         aux_hidden_state = residual.clone() if capture_aux else None
 
+        # A MoE layer of a decode / verify forward within the latched row limit
+        # runs o_proj .. the FFN on the mono kernel (TP-uniform: ``take``).
+        mono = (
+            self._mono.take(self.layer_num, rows)
+            if self._mono is not None and self.is_moe_layer
+            else None
+        )
         index_src = state.source_for(self.layer_num, self.input_layernorm)
-        hidden_states = attn(
-            positions=positions,
-            hidden_states=hidden_states,
-            hidden_states_scale=hidden_states_scale,
-            index_src=index_src,
-            diag_srcs=(
+        attn_in = {
+            "positions": positions,
+            "hidden_states": hidden_states,
+            "hidden_states_scale": hidden_states_scale,
+            "index_src": index_src,
+            "diag_srcs": (
                 state.diag_sources(self.layer_num, self.input_layernorm)
                 if v.diag
                 else None
             ),
-            front=state.front_input(
+            "front": state.front_input(
                 front, rows, (hidden_states, hidden_states_scale), index_src
             ),
+        }
+        if mono is not None:
+            # production's segment of this o_proj is check mode's reference
+            core = attn.forward_core(**attn_in)
+            hidden_states, residual = mono.segment(
+                self,
+                core,
+                residual,
+                lambda res: self._segment(attn.o_proj(core), res, v, mx_norm, fuse),
+            )
+        else:
+            # Neither the attention's inputs nor o_proj's output is held across the
+            # FFN: a prefill's [tokens, hidden] rows would raise the warmup peak the
+            # KV pool is sized from.
+            o = attn(**attn_in)
+            del attn_in, index_src, hidden_states, hidden_states_scale
+            x, x8, x8_scale, residual, routes = self._post_attention(
+                o, residual, v, mx_norm
+            )
+            del o
+            hidden_states = self._ffn(x, x8, x8_scale, fuse, routes)
+        if aux_hidden_state is not None:
+            return hidden_states, residual, aux_hidden_state
+        return hidden_states, residual
+
+    def _segment(self, hidden_states, residual, v, mx_norm: bool, fuse: bool):
+        """Production's post-attention segment on o_proj's output (``forward``'s
+        two steps): ``(ffn_out, residual, x, x8, x8_scale)``."""
+        x, x8, x8_scale, residual, routes = self._post_attention(
+            hidden_states, residual, v, mx_norm
         )
+        return self._ffn(x, x8, x8_scale, fuse, routes), residual, x, x8, x8_scale
+
+    def _post_attention(self, hidden_states, residual, v, mx_norm: bool):
+        """AR #1 + the post-attention norm and the lookahead put, as
+        ``moe_route_glue``'s one launch on a MoE layer it serves:
+        ``(x, x8, x8_scale, residual, routes)``, ``routes`` the glue's outputs
+        (else None) for ``_ffn``."""
         ffn = self.block_sparse_moe if self.is_moe_layer else self.mlp
         if (
             self.is_moe_layer
@@ -596,12 +693,18 @@ class MiniMaxM3ProDecoderLayer(MiniMaxM3DecoderLayer):
             r = moe_route_glue.route(
                 hidden_states, residual, self.post_attention_layernorm, ffn
             )
-            residual = r["residual_out"]
-            state.put(self.layer_num, r["normed"], residual)
-            hidden_states = ffn.forward_glue(r, quant_down=True)
-            if aux_hidden_state is not None:
-                return hidden_states, residual, aux_hidden_state
-            return hidden_states, residual
+            self._pro_state.put(self.layer_num, r["normed"], r["residual_out"])
+            return r["normed"], r["x_q"], r["x_scale"], r["residual_out"], r
+        x, x8, x8_scale, residual = self._post_attention_norm(
+            hidden_states, residual, v, mx_norm
+        )
+        self._pro_state.put(self.layer_num, x, residual)
+        return x, x8, x8_scale, residual, None
+
+    def _post_attention_norm(self, hidden_states, residual, v, mx_norm: bool):
+        """AR #1 + the post-attention norm: ``(x, x8, x8_scale, residual)``,
+        the MXFP8 pair None where the FFN's first GEMM does not read it."""
+        ffn = self.block_sparse_moe if self.is_moe_layer else self.mlp
         # the MoE's router and routed experts read the bf16 output; its shared expert
         # (or the dense MLP) can read the MXFP8 one
         ffn_gate_up = (
@@ -609,36 +712,53 @@ class MiniMaxM3ProDecoderLayer(MiniMaxM3DecoderLayer):
             if self.is_moe_layer and ffn.shared_experts is None
             else (ffn.shared_experts if self.is_moe_layer else ffn).gate_up_proj
         )
-        fuse_ffn_in = mx_norm and ffn_gate_up is not None and _native_a8(ffn_gate_up)
-        if fuse_ffn_in:
-            hidden_states, ffn_x, ffn_x_scale, residual = (
-                fused_allreduce_gemma_rms_norm_mxfp8(
-                    hidden_states,
-                    residual,
-                    self.post_attention_layernorm,
-                    v.ar_lamport_rows,
-                )
-            )
-        else:
-            hidden_states, residual = fused_allreduce_gemma_rms_norm(
-                hidden_states, residual, self.post_attention_layernorm
-            )
-        state.put(self.layer_num, hidden_states, residual)
-        if not fuse:
-            hidden_states = ffn(hidden_states)
-        elif self.is_moe_layer:
-            hidden_states = ffn(
+        if mx_norm and ffn_gate_up is not None and _native_a8(ffn_gate_up):
+            return fused_allreduce_gemma_rms_norm_mxfp8(
                 hidden_states,
-                shared_input=(ffn_x, ffn_x_scale) if fuse_ffn_in else None,
+                residual,
+                self.post_attention_layernorm,
+                v.ar_lamport_rows,
+            )
+        hidden_states, residual = fused_allreduce_gemma_rms_norm(
+            hidden_states, residual, self.post_attention_layernorm
+        )
+        return hidden_states, None, None, residual
+
+    def _ffn(
+        self, hidden_states, ffn_x, ffn_x_scale, fuse: bool, routes=None
+    ) -> torch.Tensor:
+        """The FFN (its TP partial) on the post-attention norm's outputs, or on
+        ``moe_route_glue``'s ``routes``."""
+        ffn = self.block_sparse_moe if self.is_moe_layer else self.mlp
+        if routes is not None:
+            return ffn.forward_glue(routes, quant_down=True)
+        if not fuse:
+            return ffn(hidden_states)
+        if self.is_moe_layer:
+            return ffn(
+                hidden_states,
+                shared_input=None if ffn_x is None else (ffn_x, ffn_x_scale),
                 quant_down=True,
             )
-        elif fuse_ffn_in:
-            hidden_states = ffn(ffn_x, ffn_x_scale, quant_down=True)
-        else:
-            hidden_states = ffn(hidden_states, quant_down=True)
-        if aux_hidden_state is not None:
-            return hidden_states, residual, aux_hidden_state
-        return hidden_states, residual
+        if ffn_x is not None:
+            return ffn(ffn_x, ffn_x_scale, quant_down=True)
+        return ffn(hidden_states, quant_down=True)
+
+
+def _mono_route(atom_config: Config, state: ProLookaheadState, layers) -> ProMonoRoute:
+    """The model's mono phase-1 gate; ``layers()``: its decoder layers (the
+    runner binds them on its first step)."""
+
+    def create():
+        return ProMonoRunner(layers(), state, route.check, route.routed_act)
+
+    route = ProMonoRoute(
+        config_refusal(atom_config),
+        create,
+        read=lambda: (refresh_variants(force=True), _aiter_mx_norm()),
+        group=lambda: get_tp_group().cpu_group,
+    )
+    return route
 
 
 _TEXT_QK = re.compile(r"(model\.layers\.\d+\.self_attn\.)([qk])_proj\.")
@@ -669,10 +789,12 @@ class MiniMaxM3ProForCausalLM(MiniMaxM3SparseForCausalLM):
 
     def __init__(self, atom_config: Config, prefix: str = "") -> None:
         text = getattr(atom_config.hf_config, "text_config", atom_config.hf_config)
+        state = ProLookaheadState(text)
+        mono = _mono_route(atom_config, state, lambda: self.model.layers)
         super().__init__(
             atom_config,
             prefix=prefix,
-            layer_type=partial(MiniMaxM3ProDecoderLayer, state=ProLookaheadState(text)),
+            layer_type=partial(MiniMaxM3ProDecoderLayer, state=state, mono=mono),
         )
         if variants().moe_route_glue:
             # the op's IPC buffers: collective, and before any decode graph is captured

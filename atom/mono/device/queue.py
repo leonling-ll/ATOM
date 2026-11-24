@@ -34,6 +34,24 @@ def take(queue):
     return fx.llvm.atomic_add(queue, fx.Int32(1), syncscope="agent")
 
 
+def take_unmerged(queue):
+    """``take`` as a ``global_atomic_inc`` (wrapping at 2^31 - 1: a count
+    never gets there), which LLVM's atomic optimizer leaves alone. It merges
+    a wave's uniform-address ``add`` into one lane's and reads the old value
+    back at once (``v_readfirstlane``): a wait for every load in flight before
+    it, where ``take``'s caller wants to issue the claim ahead of its loads and
+    read it a task later."""
+    from flydsl._mlir.dialects.llvm import AtomicBinOp
+
+    return fx.llvm._emit_atomic_rmw(
+        AtomicBinOp.uinc_wrap,
+        queue,
+        fx.Int32(0x7FFFFFFF),
+        "agent",
+        fx.llvm.AtomicOrdering.Monotonic,
+    )
+
+
 @traced
 def take_shared(queue, slot, tid):
     """``take`` for the whole CTA: thread 0 takes, every thread reads it from
