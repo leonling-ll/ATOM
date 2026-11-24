@@ -34,6 +34,9 @@ one launch.
 Shapes are fixed by the model: head_dim 256, rotary 64, value 192, index 16 x 128, page 16.
 """
 
+import functools
+import inspect
+
 import torch
 import triton
 import triton.language as tl
@@ -704,9 +707,17 @@ def _aiter_prep():
     return _fused_prep
 
 
-def aiter_prep_available() -> bool:
-    """Whether this aiter has ``fused_qk_norm_rope_cache_mqa`` (``prep_aiter``)."""
-    return bool(_aiter_prep())
+def aiter_prep_available(k_unit: bool = False) -> bool:
+    """Whether this aiter has ``fused_qk_norm_rope_cache_mqa`` (``prep_aiter``); with
+    ``k_unit``, one that writes the plain fp8 K / V cache too (its ``kv_unit_scale``).
+    """
+    op = _aiter_prep()
+    return bool(op) and (not k_unit or _takes_kv_unit_scale(op))
+
+
+@functools.cache
+def _takes_kv_unit_scale(op) -> bool:
+    return "kv_unit_scale" in inspect.signature(op).parameters
 
 
 def prep_aiter_fits(qkv, heads) -> bool:
@@ -743,10 +754,13 @@ def prep_aiter(
     vc4=None,
     k_scale=None,
     v_scale=None,
+    k_unit=False,
 ):
     """``prep`` in one launch of aiter's ``fused_qk_norm_rope_cache_mqa``: the same arguments
     and results (rows as ``prep_aiter_fits`` takes them), any number of heads. The op takes
-    the norm weights and cos / sin in the activation dtype; others go to ``prep``."""
+    the norm weights and cos / sin in the activation dtype; others go to ``prep``.
+    ``k_unit`` (``prep``'s) is the op's ``kv_unit_scale`` (``aiter_prep_available(True)``).
+    """
     q, k, iq, ik = _split_rows(qkv, heads)
     if any(t.dtype != q.dtype for t in (wq, wk, wiq, wik, cos, sin)):
         return prep(
@@ -767,8 +781,11 @@ def prep_aiter(
             vc4=vc4,
             k_scale=k_scale,
             v_scale=v_scale,
+            k_unit=k_unit,
         )
     fp8 = kc4.element_size() == 1
+    # passed only when set: an aiter without kv_unit_scale still serves the scaled cache
+    unit = {"kv_unit_scale": True} if k_unit else {}
     return _aiter_prep()(
         q,
         k,
@@ -793,6 +810,7 @@ def prep_aiter(
         num_index_heads=IDX_HEADS,
         kv_fp8_max=torch.finfo(kc4.dtype).max if fp8 else None,
         index_fp8_max=torch.finfo(ic.dtype).max if ic.element_size() == 1 else None,
+        **unit,
     )
 
 

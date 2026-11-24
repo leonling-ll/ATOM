@@ -512,6 +512,16 @@ ms, a bs1 decode step 14.29 -> 14.13 ms; GSM8K (20-shot, all 1319) 0.9356 agains
 for two baseline runs. `tests/test_minimax_m3_pro_prep_aiter.py` checks it against the Triton prep
 and the torch reference.
 
+On the K-only plain fp8 cache (`"k_only": true, "k_plain_fp8": true`) the aiter prep runs where its
+op takes `kv_unit_scale` (zhuyuhua-v/aiter-M3#11: the clamped cast, scales 1.0); with an aiter
+without it, an NVFP4 index cache or `index_compress`, the Triton prep runs. K codes, the scale plane
+and index K equal Triton's byte for byte at 1-64 rows. GPU time per call at Pro's decode rows (16
+local heads, packed rows, fp8 index cache, CUDA graph, MI355X, Triton -> aiter, us): 1 row 6.5 ->
+4.1, 8 rows 6.7 -> 4.3-4.4, 16 rows 6.8 -> 4.4, 24 rows 6.8 -> 4.4-4.5, 64 rows 6.9 -> 4.7
+(`python tests/test_minimax_m3_pro_prep_aiter.py --bench --k-only --kv fp8 --ic fp8`). On
+zhuyuhua-v's combo configuration the switch gave a 3-run GSM8K 64-shot mean of 0.9396 against
+0.9439 with the Triton prep on the same node.
+
 End to end on 8x MI355X (TP8, `--max-num-batched-tokens 16384`, 256 tokens out, greedy; TPOT in
 steady decode, ms per token):
 

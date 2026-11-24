@@ -208,8 +208,8 @@ class ProVariants:
     # pool's layout cannot change while it serves.
     k_only: bool = False
     # An fp8 K cache as a plain (clamped) cast, its scale plane all 1.0: what moo's and
-    # amd-kernels-day0's kernels read. The normed K is O(1), within e4m3's range. Triton
-    # prep only (aiter's scales every row).
+    # amd-kernels-day0's kernels read. The normed K is O(1), within e4m3's range. The aiter
+    # prep writes it where its op takes ``kv_unit_scale``, else the Triton prep runs.
     k_plain_fp8: bool = False
     # The prefill attention of the K-only cache: "triton", or "day0" (amd-kernels-day0's
     # FlyDSL fp8_sparse_prefill; needs k_plain_fp8, 16 local heads and the package, else
@@ -708,14 +708,13 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
 
     # ------------------------------------------------------------ kernel path --
     def _aiter_prep(self, v: ProVariants) -> bool:
-        """aiter's prep: it scales an fp8 K and writes no NVFP4 index rows, nor the keys the
-        compressed index cache pools."""
+        """aiter's prep: it writes no NVFP4 index rows, nor the keys the compressed index
+        cache pools; the plain fp8 K needs its ``kv_unit_scale``."""
         return (
             v.prep == "aiter"
-            and not v.k_plain_fp8
             and not v.index_compress
             and not self._index_nvfp4()
-            and pro_kernels.aiter_prep_available()
+            and pro_kernels.aiter_prep_available(k_unit=v.k_plain_fp8)
         )
 
     def _index_nvfp4(self) -> bool:
@@ -866,10 +865,11 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
         else:
             ratio = (1.0 if v.mscale == "hf" else float(v.mscale)) / aiter_m
         eps = self.q_norm.variance_epsilon
-        prep = functools.partial(pro_kernels.prep, k_unit=fp8 and v.k_plain_fp8)
+        k_unit = fp8 and v.k_plain_fp8
+        prep = functools.partial(pro_kernels.prep, k_unit=k_unit)
         if self._aiter_prep(v):
             if pro_kernels.prep_aiter_fits(qkv, self.num_heads):
-                prep = pro_kernels.prep_aiter
+                prep = functools.partial(pro_kernels.prep_aiter, k_unit=k_unit)
             elif not getattr(self, "_warned_prep", False):
                 self._warned_prep = True
                 logger.warning(
