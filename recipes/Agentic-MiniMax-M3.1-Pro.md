@@ -36,6 +36,7 @@ points of that. Every setting below is there to enlarge the cache or to keep it 
 | `--text-only` | Builds and loads no vision tower, projector or patch merger (1.8 GiB of weights a GPU); image requests get a 400. AgentX is text only. |
 | `AITER_REUSE_IDENTICAL_COMM_GROUPS=1` | At TP8 aiter's `ep` group has the same ranks as `tp`; this makes it reuse `tp`'s custom all-reduce instead of building a second one (~2.5 GiB a GPU). |
 | `GPTOSS_SWIGLU_MXFP4_BF16_BOUND=1040` | Keeps the routed MoE's activations in bf16 (a16w4) for steps below 1040 rows. aiter's default of 256 switches DSpark verify steps (sequences × 8 rows) to MXFP4 activations, which costs about 0.01 GSM8K (see Accuracy). Prefill chunks stay a4w4. |
+| `"index_compress": true` (optional, off here) | Stores the index cache as one bf16 centroid per 4 tokens (vLLM's compressed index): +17.7% KV blocks, indexer scoring ~4× faster, GSM8K 0.9462. Its AgentX c64 result is pending. Every switch that changes numerics, with its measured accuracy, is in [`MiniMax-M3.1-Pro-Accuracy-Switches.md`](MiniMax-M3.1-Pro-Accuracy-Switches.md). |
 
 ## Measured (CONC 64 proxy)
 
