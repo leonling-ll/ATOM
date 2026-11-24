@@ -669,8 +669,8 @@ def test_check_mode_compares_the_kernels_lookahead_with_productions_copy(
 
     def reference(res):
         r.state.put(4, res, res)  # the real put: the ring rows of reader 6
-        z = torch.zeros(rows, HIDDEN)
-        return z, z, z, z, z
+        z, zs = torch.zeros(rows, HIDDEN), torch.zeros(rows, HIDDEN // 32)
+        return z, z, z, z, zs  # ffn, h_mid, x, x8, x8s
 
     layer = _layer(rec)
     core, res = _inputs(rows)
