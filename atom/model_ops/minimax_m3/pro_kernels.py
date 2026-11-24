@@ -2234,9 +2234,10 @@ def select_logical(score, positions, k, num_warps=8, split=False):
 _fused_scorer = None  # aiter's FlyDSL decode scorer (tests swap it)
 
 
-def fused_scores_available() -> bool:
+def fused_scores_available(centroid: bool = False) -> bool:
     """Whether this aiter has the FlyDSL Pro decode scorer and this GPU runs it
-    (gfx950)."""
+    (gfx950); ``centroid``: for the compressed index cache, which an aiter without
+    ``"centroid"`` in the scorer's formats does not read."""
     if _fused_scorer is not None:
         return True
     try:
@@ -2245,14 +2246,22 @@ def fused_scores_available() -> bool:
         )
     except ImportError:
         return False
+    if centroid:
+        try:
+            from aiter.ops.flydsl.kernels.minimax_m3_pro_index_decode import FORMATS
+        except ImportError:
+            return False
+        if "centroid" not in FORMATS:
+            return False
     return pro_index_decode_supported()
 
 
 def scores_fused(
     iq, ic, block_tables, seq_id, positions, nb, cq, init, local, sc, pool_temp, rows
 ):
-    """``scores``' pool4 / max block scores (``block_mode=BLOCK_POOL4MAX``,
-    ``head_mode=HEAD_MAX``) by aiter's FlyDSL decode scorer: ``[T, nb]`` fp32 with each
+    """``scores``' pool4 / max block scores (``block_mode=BLOCK_POOL4MAX``, or
+    ``BLOCK_CENTROID`` when ``ic`` is the compressed cache; ``head_mode=HEAD_MAX``) by
+    aiter's FlyDSL decode scorer: ``[T, nb]`` fp32 with each
     row's causal blocks written and the rest left unset, which every selection but
     ``torch.topk`` reads past. ``rows`` consecutive rows (1, 2, 4 or 8) share a sequence
     and each tile of keys; the scores equal ``scores``' up to fp32 rounding."""

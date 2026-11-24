@@ -254,3 +254,125 @@ def test_fused_picks_equal_the_triton_picks(nvfp4, lens, rps, width):
     assert torch.equal(r0.gather(1, own), r1.gather(1, own))
     l0, l1 = (K.select_logical(s, b.pos, 128, split=True) for s in (today, fused))
     assert torch.equal(l0.sort(1).values, l1.sort(1).values)
+
+
+def _gate_impl():
+    impl = object.__new__(ProSparseAttentionImpl)
+    impl.dcp_world, impl.layer_num = 1, 0
+    return impl
+
+
+@pytest.mark.parametrize(
+    "compress,cache_rows,dtype,fused",
+    [
+        (True, 4, torch.bfloat16, True),  # the compressed cache: bf16 centroids
+        (False, 16, torch.bfloat16, False),  # a bf16 token cache
+        (True, 4, torch.float8_e4m3fn, False),  # not what index_compress writes
+        (False, 16, torch.float8_e4m3fn, True),
+    ],
+)
+def test_fused_index_takes_the_centroid_cache_only_with_index_compress(
+    monkeypatch, compress, cache_rows, dtype, fused
+):
+    """``"index": "fused"`` reads a bf16 index cache only as ``index_compress``'s
+    centroids."""
+    monkeypatch.setattr(pro_attn, "_FUSED_MIN_ROWS_FP8", 0)
+    monkeypatch.setattr(K, "_fused_scorer", lambda *a, **kw: None)
+    ic = torch.zeros(8, cache_rows, DI, device=DEV).to(dtype)
+    v = ProVariants(
+        kernels=True, attn="aiter", topk="split", index="fused", index_compress=compress
+    )
+    assert _gate_impl()._fused_index(v, True, None, ic, 32) is fused
+
+
+def test_fused_index_declines_centroids_without_the_aiter_format(monkeypatch):
+    """An aiter whose scorer has no centroid format keeps the Triton centroid scores."""
+    monkeypatch.setattr(K, "_fused_scorer", None)
+    monkeypatch.setattr(
+        K, "fused_scores_available", lambda centroid=False: not centroid
+    )
+    ic = torch.zeros(8, 4, DI, device=DEV).to(torch.bfloat16)
+    v = ProVariants(
+        kernels=True, attn="aiter", topk="split", index="fused", index_compress=True
+    )
+    assert _gate_impl()._fused_index(v, True, None, ic, 32) is False
+
+
+@pytest.mark.skipif(
+    not (torch.cuda.is_available() and K.fused_scores_available(centroid=True)),
+    reason="aiter's FlyDSL Pro scorer with the centroid format on gfx950",
+)
+@pytest.mark.parametrize(
+    "lens,rps,width",
+    [
+        ([65536, 30000, 700], 4, None),  # k3 verify
+        ([4100, 33000], 8, 2100),  # k7 verify, a graph's wider table
+        ([131072], 4, 8256),  # 128k, the served table width
+        ([5000, 6000, 7000, 9000], 1, 600),  # plain decode
+    ],
+)
+def test_fused_centroid_picks_equal_the_triton_picks(lens, rps, width):
+    """On the compressed cache, aiter's scorer and the Triton BLOCK_CENTROID scorer,
+    both followed by today's selection, pick the same sets, the own block in its
+    slot."""
+    b = _batch(lens, rps, seed=len(lens) + rps, width=width)
+    g = torch.Generator().manual_seed(rps)
+    ic = torch.randn(b.ic.shape[0], 4, DI, generator=g).to(torch.bfloat16).to(DEV)
+    args = (b.iq, ic, b.bt, b.seq, b.pos, b.nb, None, 1, 9, 1.0)
+    today = K.scores(
+        *args,
+        block_mode=K.BLOCK_CENTROID,
+        head_mode=K.HEAD_MAX,
+        causal=True,
+        tq=min(8, rps & -rps) if rps > 1 else 0,
+    )
+    rows = min(8, rps & -rps) if rps > 1 else 1
+    fused = K.scores_fused(*args[:6], b.cq, 1, 9, 1.0, DI**-0.5, rows)
+    (r0, c0), (r1, c1) = (
+        K.select_rows_split(s, b.bt, b.seq, b.pos, 128) for s in (today, fused)
+    )
+    assert torch.equal(c0, c1)
+    assert torch.equal(r0.sort(1).values, r1.sort(1).values)
+    n_full = (c0 + PG - 1) // PG - 1
+    own = n_full.long()[:, None]
+    assert torch.equal(r0.gather(1, own), r1.gather(1, own))
+    l0, l1 = (K.select_logical(s, b.pos, 128, split=True) for s in (today, fused))
+    assert torch.equal(l0.sort(1).values, l1.sort(1).values)
+
+
+@pytest.mark.parametrize(
+    "compress,dtype", [(True, torch.bfloat16), (False, torch.float8_e4m3fn)]
+)
+def test_fused_index_declines_a_decode_split(monkeypatch, compress, dtype):
+    """Under ``index_split_decode`` a rank scores its share of the rows with Triton,
+    which is faster there, whatever the cache."""
+    monkeypatch.setattr(pro_attn, "_FUSED_MIN_ROWS_FP8", 0)
+    monkeypatch.setattr(K, "_fused_scorer", lambda *a, **kw: None)
+    ic = torch.zeros(8, 4 if compress else 16, DI, device=DEV).to(dtype)
+    v = ProVariants(
+        kernels=True, attn="aiter", topk="split", index="fused", index_compress=compress
+    )
+    impl = _gate_impl()
+    assert impl._fused_index(v, True, None, ic, 32) is True
+    assert impl._fused_index(v, True, None, ic, 32, dsplit=(0, 16)) is False
+
+
+class _Asked(Exception):
+    pass
+
+
+def test_static_path_hands_its_decode_split_to_the_gate(monkeypatch):
+    """The scoring step asks the gate with this rank's decode split."""
+    b = _batch([90, 160, 300, 41], 4, seed=3)
+    impl, _, args = _mini_impl(b, 4, monkeypatch)
+    asked = []
+
+    def gate(v, static, split, ic, n, dsplit=None):
+        asked.append(dsplit)
+        raise _Asked
+
+    monkeypatch.setattr(impl, "_fused_index", gate)
+    v = ProVariants(kernels=True, attn="aiter", topk="split", index="fused")
+    with pytest.raises(_Asked):
+        impl._kernel_attention(*args, v, None, static=True, dsplit=(0, 8))
+    assert asked == [(0, 8)]

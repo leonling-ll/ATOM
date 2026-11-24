@@ -566,7 +566,10 @@ landed as `ffb4cedb0`) instead of Triton's: one launch, each key tile read once 
 sequence, fp8 or NVFP4 index cache (on fp8 from 32 rows a step, below which Triton's is as fast). It takes pool4 / max scores and a `topk` other than `"torch"`;
 elsewhere, and on an aiter without the scorer, the Triton scores run (a warning says so). The
 selection is unchanged and picks the same blocks (the scores agree to fp32 rounding). The default
-stays `"triton"`; per-layer timings are on that aiter PR.
+stays `"triton"`; per-layer timings are on that aiter PR. With `"index_compress": true` it also
+scores the bf16 centroid cache (`BLOCK_CENTROID`; [zhuyuhua-v/aiter-M3#14](https://github.com/zhuyuhua-v/aiter-M3/pull/14)),
+but only where no index split applies: the Agentic recipe's `index_split_decode` keeps the Triton
+scorer, whose per-rank share is faster below 128k.
 
 The block scores run as a tiled kernel (4 or 8 blocks x 16 tokens per program, one `tl.dot`); the
 softmax-pool weights depend on the keys alone, so the pooled scores are the token dots weighted per
