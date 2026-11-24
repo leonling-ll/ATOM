@@ -174,7 +174,10 @@ def _absmax(vals):
 
 def _code(am):
     """The E8M0 code of a 32-block of absolute maximum ``am``: ``quantize_fp8``'s
-    ceil_pow2(max(amax, 1e-10) * f32(1 / 448))."""
+    ceil_pow2(max(amax, 1e-10) * f32(1 / 448)). For a bf16 block the quotient
+    x / 2^code is within +-448 without a clamp: a bf16 amax above 448 * 2^k is
+    at least 450 * 2^k, whose product with f32(1 / 448) is past 2^k, so the
+    code takes the next power (and a non-finite amax gives code 254, x * 0)."""
     return code_ceil(fx.max(am, fx.Float32(1e-10)) * fx.Float32(1.0 / FP8_MAX))
 
 
@@ -216,7 +219,12 @@ def load_core(c, loads):
     ``xs`` (token t's at t O_ROW), their E8M0 codes four a word at ``osc``. A
     thread takes 8 values, 4 threads a block; S * 384 items is a multiple of
     16, so a 16-lane group is either all live or all past the end (clamped,
-    nothing stored)."""
+    nothing stored).
+
+    Straight-line code: every lane of a 16-lane group stores the group's codes
+    word (the same word to the same address), and only a round with lanes
+    past the end branches, so the scheduler interleaves the rounds' chains.
+    No clamp to +-448: a bf16 block's quotient is within it (``_code``)."""
     s, tid = c["S"], c["tid"]
     n = s * CORE_ITEMS
     for i in range_constexpr(len(loads)):
@@ -227,16 +235,22 @@ def load_core(c, loads):
         vals = _unpack([fx.Int32(v[d]) for d in range(4)])
         code = _code(butterfly(_absmax(vals), (1, 2), fx.max))
         inv = rcp_pow2(code)
-        qv = [clamp_fp8(x * inv) for x in vals]
+        qv = [x * inv for x in vals]
         w0 = fp8_pack4(qv[0], qv[1], qv[2], qv[3])
         w1 = fp8_pack4(qv[4], qv[5], qv[6], qv[7])
         # blocks 4 m .. 4 m + 3 (items 16 m ..) in one word, block k in byte k
         codes = butterfly(code << (8 * ((q // 4) % 4)), (4, 8), _or)
-        if tid + THREADS * i < n:
-            fx.ptr_store(w0, c["xs"] + (t * O_ROW + 2 * q))
-            fx.ptr_store(w1, c["xs"] + (t * O_ROW + 2 * q + 1))
-            if q % 16 == 0:
-                fx.ptr_store(codes, c["osc"] + (t * OSC_ROW + q // 16))
+        if const_expr(THREADS * (i + 1) <= n):
+            _core_store(c, t, q, w0, w1, codes)
+        else:
+            if tid + THREADS * i < n:
+                _core_store(c, t, q, w0, w1, codes)
+
+
+def _core_store(c, t, q, w0, w1, codes):
+    fx.ptr_store(w0, c["xs"] + (t * O_ROW + 2 * q))
+    fx.ptr_store(w1, c["xs"] + (t * O_ROW + 2 * q + 1))
+    fx.ptr_store(codes, c["osc"] + (t * OSC_ROW + q // 16))
 
 
 @traced
