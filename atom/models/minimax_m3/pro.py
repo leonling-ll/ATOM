@@ -493,12 +493,15 @@ class MiniMaxM3ProDecoderLayer(MiniMaxM3DecoderLayer):
                 lambda res: self._segment(attn.o_proj(core), res, v, mx_norm, fuse),
             )
         else:
-            # o_proj's output is dead once the norm returns: not held across the FFN
-            # (a prefill's [tokens, hidden] would raise the warmup peak the KV pool
-            # is sized from)
+            # Neither the attention's input nor o_proj's output is held across the
+            # FFN: a prefill's [tokens, hidden] rows would raise the warmup peak the
+            # KV pool is sized from.
+            o = attn(**attn_in)
+            del attn_in, hidden_states, hidden_states_scale
             x, x8, x8_scale, residual, routes = self._post_attention(
-                attn(**attn_in), residual, v, mx_norm
+                o, residual, v, mx_norm
             )
+            del o
             hidden_states = self._ffn(x, x8, x8_scale, fuse, routes)
         if aux_hidden_state is not None:
             return hidden_states, residual, aux_hidden_state

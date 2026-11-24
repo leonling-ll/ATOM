@@ -88,6 +88,7 @@ def _layer(rec, moe=True, route=None):
 
         def __call__(self, **kw):
             rec.calls.append("attn")
+            rec.attn_in = weakref.ref(kw["hidden_states"])
             return self.o_proj(self.forward_core(**kw))
 
         def forward_core(self, **kw):
@@ -104,8 +105,11 @@ def _layer(rec, moe=True, route=None):
 
     def ffn(x, *args, shared_input=None, quant_down=False):
         rec.calls.append(("ffn", shared_input is not None, quant_down))
-        o = getattr(rec, "o_proj_out", None)
-        rec.o_proj_out_live_in_ffn = o is not None and o() is not None
+        rec.live_in_ffn = [
+            name
+            for name in ("attn_in", "o_proj_out")
+            if getattr(rec, name, None) is not None and getattr(rec, name)() is not None
+        ]
         return x * 11
 
     def forward_glue(r, quant_down=False):
@@ -161,13 +165,13 @@ def test_mono_off_is_the_production_path(rec, route):
 
 
 @pytest.mark.parametrize("moe", [True, False])
-def test_o_projs_output_is_freed_before_the_ffn(rec, moe):
-    """As the inline segment did: a prefill's o_proj output [tokens, hidden]
-    is not held while the FFN runs (it would raise the warmup's peak, which
-    the KV pool is sized from)."""
+def test_the_attention_rows_are_freed_before_the_ffn(rec, moe):
+    """As the inline segment did: neither the attention's input nor o_proj's
+    output [tokens, hidden] is held while the FFN runs (a prefill's would
+    raise the warmup's peak, which the KV pool is sized from)."""
     layer = _layer(rec, moe=moe)
     layer(None, _t(1), _t(2))
-    assert rec.o_proj_out_live_in_ffn is False
+    assert rec.live_in_ffn == []
 
 
 def test_a_dense_layer_never_asks_the_route(rec):
