@@ -19,6 +19,7 @@
 
 Needs aiter (``pro`` imports the model stack) and FlyDSL (the runner)."""
 
+import weakref
 from types import SimpleNamespace
 
 import pytest
@@ -95,12 +96,16 @@ def _layer(rec, moe=True, route=None):
 
         def o_proj(self, core):
             rec.calls.append("o_proj")
-            return torch.cat([core, core[:, : H - OK]], 1) * 7
+            out = torch.cat([core, core[:, : H - OK]], 1) * 7
+            rec.o_proj_out = weakref.ref(out)
+            return out
 
     layer.self_attn = Attn()
 
     def ffn(x, *args, shared_input=None, quant_down=False):
         rec.calls.append(("ffn", shared_input is not None, quant_down))
+        o = getattr(rec, "o_proj_out", None)
+        rec.o_proj_out_live_in_ffn = o is not None and o() is not None
         return x * 11
 
     def forward_glue(r, quant_down=False):
@@ -153,6 +158,16 @@ def test_mono_off_is_the_production_path(rec, route):
     assert torch.equal(out, want_out) and torch.equal(res, want_res)
     if r is not None:
         assert r.asked == [(4, N)]
+
+
+@pytest.mark.parametrize("moe", [True, False])
+def test_o_projs_output_is_freed_before_the_ffn(rec, moe):
+    """As the inline segment did: a prefill's o_proj output [tokens, hidden]
+    is not held while the FFN runs (it would raise the warmup's peak, which
+    the KV pool is sized from)."""
+    layer = _layer(rec, moe=moe)
+    layer(None, _t(1), _t(2))
+    assert rec.o_proj_out_live_in_ffn is False
 
 
 def test_a_dense_layer_never_asks_the_route(rec):

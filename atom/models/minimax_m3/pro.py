@@ -493,18 +493,30 @@ class MiniMaxM3ProDecoderLayer(MiniMaxM3DecoderLayer):
                 lambda res: self._segment(attn.o_proj(core), res, v, mx_norm, fuse),
             )
         else:
-            hidden_states, residual, *_ = self._segment(
-                attn(**attn_in), residual, v, mx_norm, fuse
+            # o_proj's output is dead once the norm returns: not held across the FFN
+            # (a prefill's [tokens, hidden] would raise the warmup peak the KV pool
+            # is sized from)
+            x, x8, x8_scale, residual, routes = self._post_attention(
+                attn(**attn_in), residual, v, mx_norm
             )
+            hidden_states = self._ffn(x, x8, x8_scale, fuse, routes)
         if aux_hidden_state is not None:
             return hidden_states, residual, aux_hidden_state
         return hidden_states, residual
 
     def _segment(self, hidden_states, residual, v, mx_norm: bool, fuse: bool):
-        """Production's post-attention segment on o_proj's output: AR #1 + the
-        norm, the lookahead put and the FFN partial, ``(ffn_out, residual,
-        x, x8, x8_scale)`` (the norm's outputs the FFN read). A MoE layer
-        ``moe_route_glue`` serves takes its one launch, else the separate ones."""
+        """Production's post-attention segment on o_proj's output (``forward``'s
+        two steps): ``(ffn_out, residual, x, x8, x8_scale)``."""
+        x, x8, x8_scale, residual, routes = self._post_attention(
+            hidden_states, residual, v, mx_norm
+        )
+        return self._ffn(x, x8, x8_scale, fuse, routes), residual, x, x8, x8_scale
+
+    def _post_attention(self, hidden_states, residual, v, mx_norm: bool):
+        """AR #1 + the post-attention norm and the lookahead put, as
+        ``moe_route_glue``'s one launch on a MoE layer it serves:
+        ``(x, x8, x8_scale, residual, routes)``, ``routes`` the glue's outputs
+        (else None) for ``_ffn``."""
         ffn = self.block_sparse_moe if self.is_moe_layer else self.mlp
         if (
             self.is_moe_layer
@@ -517,15 +529,13 @@ class MiniMaxM3ProDecoderLayer(MiniMaxM3DecoderLayer):
             r = moe_route_glue.route(
                 hidden_states, residual, self.post_attention_layernorm, ffn
             )
-            residual = r["residual_out"]
-            self._pro_state.put(self.layer_num, r["normed"], residual)
-            out = ffn.forward_glue(r, quant_down=True)
-            return out, residual, r["normed"], r["x_q"], r["x_scale"]
+            self._pro_state.put(self.layer_num, r["normed"], r["residual_out"])
+            return r["normed"], r["x_q"], r["x_scale"], r["residual_out"], r
         x, x8, x8_scale, residual = self._post_attention_norm(
             hidden_states, residual, v, mx_norm
         )
         self._pro_state.put(self.layer_num, x, residual)
-        return self._ffn(x, x8, x8_scale, fuse), residual, x, x8, x8_scale
+        return x, x8, x8_scale, residual, None
 
     def _post_attention_norm(self, hidden_states, residual, v, mx_norm: bool):
         """AR #1 + the post-attention norm: ``(x, x8, x8_scale, residual)``,
@@ -550,9 +560,14 @@ class MiniMaxM3ProDecoderLayer(MiniMaxM3DecoderLayer):
         )
         return hidden_states, None, None, residual
 
-    def _ffn(self, hidden_states, ffn_x, ffn_x_scale, fuse: bool) -> torch.Tensor:
-        """The FFN (its TP partial) on the post-attention norm's outputs."""
+    def _ffn(
+        self, hidden_states, ffn_x, ffn_x_scale, fuse: bool, routes=None
+    ) -> torch.Tensor:
+        """The FFN (its TP partial) on the post-attention norm's outputs, or on
+        ``moe_route_glue``'s ``routes``."""
         ffn = self.block_sparse_moe if self.is_moe_layer else self.mlp
+        if routes is not None:
+            return ffn.forward_glue(routes, quant_down=True)
         if not fuse:
             return ffn(hidden_states)
         if self.is_moe_layer:
