@@ -436,7 +436,7 @@ class MiniMaxM3ProAttention(nn.Module):
         """``front``: MXFP8 ``[x; indexer input]`` rows (``ProLookaheadState.front_input``;
         ``x`` alone when the indexer reads it) for one ``qkv_proj`` GEMM: q, k from the
         first ``n`` rows, index q, index k from the last ``n``."""
-        out = self.forward_core(
+        out = self._attend(
             positions, hidden_states, hidden_states_scale, index_src, diag_srcs, front
         )
         if out.dtype == torch.float8_e4m3fn:
@@ -453,11 +453,26 @@ class MiniMaxM3ProAttention(nn.Module):
         diag_srcs: dict[str, torch.Tensor | None] | None = None,
         front: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
-        """The attention up to o_proj: its input, bf16 [M, heads x 192] (what the
-        mono layer kernel reads), or, from ``day0_decode_rows`` rows, the day0
-        decode's E4M3 rows with their scale in ``attn.impl`` (mono refuses a row
-        limit that reaches them: ``pro_mono.route.variants_refusal``). ``front`` as
-        in ``forward``."""
+        """The attention up to o_proj as bf16 [M, heads x 192], what the mono layer
+        kernel reads (``front`` as in ``forward``). The Triton / aiter decode
+        attention writes this call's rows as bf16 where ``forward``'s would be
+        o_proj's MXFP8 input (``ProSparseAttentionImpl.bf16_out``). The day0
+        decode's epilogue still writes E4M3 from ``day0_decode_rows`` rows, so mono
+        refuses a row limit that reaches it (``pro_mono.route.variants_refusal``)."""
+        impl = self.attn.impl
+        impl.bf16_out = True
+        try:
+            return self._attend(
+                positions, hidden_states, hidden_states_scale, index_src, diag_srcs, front
+            )
+        finally:
+            impl.bf16_out = False
+
+    def _attend(
+        self, positions, hidden_states, hidden_states_scale, index_src, diag_srcs, front
+    ) -> torch.Tensor:
+        """The projections and the attention: o_proj's input, bf16, or the decode
+        attention's E4M3 rows with their scales in ``attn.impl`` (``take_mx_scale``)."""
         if front is not None:
             n = hidden_states.shape[0]
             y = self.qkv_proj(*front)

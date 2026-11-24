@@ -230,8 +230,9 @@ class ProVariants:
     # Mono decode phase 1 (``models/minimax_m3/pro_mono``): the most graph rows a decode /
     # verify forward may have for its MoE layers' o_proj .. FFN segment to run as one
     # persistent kernel; 0 (default) off, at most ``pro_mono.config.MAX_ROWS``. Wider
-    # forwards keep production's segment (``moe_route_glue`` where it is on), and a
-    # ``day0_decode_rows`` at or below the limit turns mono off. Latched once, at the
+    # forwards keep production's segment (``moe_route_glue`` where it is on). The layers
+    # mono takes get the decode attention's output as bf16; a ``day0_decode_rows`` at or
+    # below the limit (its epilogue writes E4M3) turns mono off. Latched once, at the
     # first forward (``pro_mono.route``, agreed over the TP group): a later edit of the
     # file does not change it. Off by default until its acceptance gates pass with it
     # on (accuracy: the
@@ -411,6 +412,10 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
     # MXFP8 output (take_mx_scale)
     mx_out = False
     _mx_scale = None
+    # set for one call by ``MiniMaxM3ProAttention.forward_core``: the mono layer kernel
+    # reads the attention's output as bf16, so the Triton / aiter rows below the day0
+    # decode stay bf16 (the day0 decode's epilogue keeps ``day0_decode_mxfp8``)
+    bf16_out = False
 
     is_indexed_sparse_attention = True
     k_only = False  # the pool is ``ProKOnlyLayout`` (no V cache)
@@ -815,8 +820,8 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
         it (``mx_out``). ``day0_dec``: the batch is the day0 decode's (``_day0_decode``),
         whose epilogue writes it under ``day0_decode_mxfp8``. Below that, under
         ``fuse_mxfp8_quant``: the Triton attention always, aiter's where its gluon decode
-        takes ``output_scale``. Off under decode context parallelism (``dcp_world`` > 1),
-        the day0 decode included."""
+        takes ``output_scale``, unless the call is ``bf16_out``'s. Off under decode context
+        parallelism (``dcp_world`` > 1), the day0 decode included."""
         if self.dcp_world > 1:
             return False
         if not self.mx_out:
@@ -824,7 +829,8 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
         if day0_dec:
             return v.day0_decode_mxfp8
         return (
-            v.fuse_mxfp8_quant
+            not self.bf16_out
+            and v.fuse_mxfp8_quant
             and self.value_head_dim % 32 == 0
             and (not self._aiter_attn(v, n) or pro_kernels.aiter_mxfp8_out_available())
         )

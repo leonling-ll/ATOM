@@ -327,6 +327,77 @@ def test_the_default_day0_decode_starts_above_the_row_limit():
     assert variants_refusal(v, True) == "day0_decode_rows 16 within 16"
 
 
+def test_the_rows_mono_reads_stay_bf16_where_o_proj_takes_mxfp8(monkeypatch):
+    """Below the day0 decode, under ``fuse_mxfp8_quant`` with a native MXFP8 o_proj,
+    the Triton decode attention writes o_proj's input as E4M3 rows (``forward``
+    hands them on with their scales); ``forward_core``, what the mono kernel
+    reads as bf16, gets the same rows as bf16 and leaves no scale behind."""
+    heads, hd, dv, n_tok, n = 16, 256, 192, 8, 3  # padding rows past the batch
+    m = object.__new__(pro_attn.ProSparseAttentionImpl)
+    m.num_heads, m.head_dim, m.value_head_dim, m.layer_num = heads, hd, dv, 5
+    m.k_only, m.mx_out, m.index_cache = True, True, None
+    v = ProVariants(kernels=True, attn="triton", k_only=True, mono_ffn_rows=16)
+    assert v.fuse_mxfp8_quant and n < v.day0_decode_rows
+    monkeypatch.setattr(pro_attn, "variants", lambda: v)
+    monkeypatch.setattr(m, "_use_kernels", lambda v: True, raising=False)
+    md = SimpleNamespace(
+        slot_mapping=torch.zeros(n, dtype=torch.long),
+        block_tables=torch.zeros(n, 16, dtype=torch.int32),
+        cu_seqlens_q=torch.arange(0, n + 1, dtype=torch.int32),
+    )
+    fwd = SimpleNamespace(
+        context=SimpleNamespace(is_dummy_run=False, is_prefill=False),
+        attn_metadata=md,
+        kv_cache_data={
+            "layer_5": SimpleNamespace(
+                k_cache=torch.zeros(1, 1, 1, 16, hd, dtype=torch.float8_e4m3fn)
+            )
+        },
+    )
+    monkeypatch.setattr(pro_attn, "get_forward_context", lambda: fwd)
+    scales = []
+
+    def kernel(parts, pos, seq, slots, bt, layer, ic, nb, v, out, **kw):
+        scales.append(kw["mx_scale"])
+        if kw["mx_scale"] is None:
+            out.fill_(1.0)
+        else:
+            out.view(torch.uint8).fill_(0x38)  # 1.0 in e4m3
+            kw["mx_scale"].fill_(127)
+
+    monkeypatch.setattr(m, "_kernel_attention", kernel, raising=False)
+
+    class Attn:
+        impl = m
+
+        def __call__(self, q, k, iq, positions, qkv=None):
+            return self.impl.forward(
+                query=q, key=k, value=iq, position=positions, qkv=qkv
+            )
+
+    a = pro.MiniMaxM3ProAttention.__new__(pro.MiniMaxM3ProAttention)
+    nn.Module.__init__(a)
+    a.qk_sizes, a.index_qk_sizes = [heads * hd, hd], [16 * 128, 128]
+    width = sum(a.qk_sizes) + sum(a.index_qk_sizes)
+    a.qkv_proj = lambda x, x_scale: torch.zeros(x.shape[0], width, dtype=torch.bfloat16)
+    a.attn = Attn()
+    got = []
+    a.o_proj = lambda x, x_scale=None: got.append((x.dtype, x_scale)) or x
+    hidden = torch.zeros(n_tok, 64, dtype=torch.bfloat16)
+    front = (torch.zeros(2 * n_tok, 64), torch.zeros(2 * n_tok, 2))
+    args = (torch.zeros(n_tok, dtype=torch.long), hidden, None, None, None, front)
+
+    core = a.forward_core(*args)
+    assert core.dtype == torch.bfloat16 and core.shape == (n_tok, heads * dv)
+    assert (core[:n] == 1.0).all() and (core[n:] == 0).all()
+    assert scales == [None] and m.take_mx_scale() is None
+    assert not m.bf16_out  # this call only
+
+    a.forward(*args)  # production: o_proj reads the E4M3 rows and their scales
+    assert got[0][0] == torch.float8_e4m3fn and got[0][1] is not None
+    assert got[0][1].shape == (n_tok, heads * dv // 32)
+
+
 # ------------------------------------------------------------- the segment
 
 
