@@ -253,9 +253,8 @@ def test_layer_selects_the_blocks_the_pooled_keys_score_highest(monkeypatch):
     for t in steps[1].tolist():
         s, p = int(c.seq[t]), int(c.pos[t])
         start = c.seq_slice(s)[0]
-        n = (
-            (p + 1) // G * G
-        )  # this row's closed groups (its own block is pinned anyway)
+        # this row's closed groups (its own block is pinned anyway)
+        n = (p + 1) // G * G
         g = keys[start : start + n].float().view(-1, G, DI)
         w = torch.softmax((g * cq).sum(-1) * v.pool_scale, dim=-1)
         cent = (w[..., None] * g).sum(1).to(torch.bfloat16).float()  # [groups, DI]

@@ -8,18 +8,35 @@ kernel. The tool is `scripts/m31pro/kernel_roofline.py`; this page is its readin
 
 | input | state | where |
 |---|---|---|
-| decode traces at 1, 8 and 16 rows, plain decode, context about 1100 tokens a sequence, mono off and mono on | MEASURED (node 257, 2026-11-23 12:13 UTC run `v1model_1123T1213`) | traces `/mnt/m2m_nobackup/zhiyan/mono_v1/prof_v1model_1123T1213_{off,on}/rank_0/`; CSVs `/mnt/m2m_nobackup/zhiyan/roofline/v1model_1123T1213_{off,on}/` (copies in `/home/zhiyan/pro_opt/roofline/results/`) |
-| TP8 all-reduce latency, 1 to 128 rows of 7168 bf16 | MEASURED (node 257, 2026-11-23 07:59 UTC) | `/home/zhiyan/pro_opt/mono/spike_ar/results/w1_1123T0759_bench_ar_B.txt`, as a table in `/home/zhiyan/pro_opt/roofline/peaks_ar_only.json` |
-| mono v1 kernel time at 1, 8 and 16 rows, standalone, uniform routing | MEASURED (node 257, `v1perf_1123T1153`) | `/home/zhiyan/pro_opt/mono/v1/results/v1perf_1123T1153.log` |
-| HBM read bandwidth, empty-kernel time, bf16 / fp8 / MXFP4 GEMM peaks | NOT RUN, queued as `q257/pending/70_roofline_peaks.sh` | spec-sheet values stand in (below) |
-| mono v1 per-stage time (timeline build) | NOT RUN, queued as `71_roofline_mono_tl.sh` | |
-| c1, c4, c8, c16 DSpark k7 traces on #33's config | NOT RUN: c1 / c4 / c8 come from `30_prof17.sh` (#17), c16 from `72_roofline_traces.sh`, which also re-runs this analysis | |
+| c1, c4, c8, c16 DSpark k7 traces on #33's variants (agentic proxy replay, golden AL 4.0, prefix caching) | MEASURED (node 257, 2026-11-23: c1 / c4 / c8 18:38-18:56 UTC, item `30_prof17`; c16 23:14-23:24 UTC, item `72_roofline_traces`, max-num-seqs 32). ATOM `ecb1ac9a` of `/home/zhiyan/pro_opt/atom` (branch `opt/autok`, auto-k off), the tree #17's launcher serves, not `hatwu/m3.1-pro-infx` | traces `/mnt/m2m_nobackup/zhiyan/prof17/prof17/c{1,4,8}/` and `/mnt/m2m_nobackup/zhiyan/roofline/traces_roofline_c16/c16/` (`w*/rank_0/`); CSVs `/home/zhiyan/pro_opt/roofline/results/k7_c1-c16_measpeaks/` |
+| decode traces at 1, 8 and 16 rows, plain decode, about 1100 tokens a sequence, mono off and on | MEASURED (node 257, 2026-11-23 12:13 UTC, run `v1model_1123T1213`) | traces `/mnt/m2m_nobackup/zhiyan/mono_v1/prof_v1model_1123T1213_{off,on}/rank_0/`; CSVs `/home/zhiyan/pro_opt/roofline/results/v1model_1123T1213_{off,on}_measpeaks/` |
+| HBM read bandwidth, empty-kernel time, bf16 / fp8 / MXFP4 GEMM peaks, one GPU | MEASURED (node 257, 2026-11-23 22:58 UTC, item `70_roofline_peaks`) | `/home/zhiyan/pro_opt/roofline/results/peaks_1123T2258.peaks.json`; the analysis reads `peaks_1123T2258_trace_tmin.json` (the same without the empty-kernel time, see the cautions below) |
+| TP8 all-reduce latency, 1 to 128 rows of 7168 bf16, Lamport | MEASURED (node 257, 2026-11-23 07:59 UTC) | `/home/zhiyan/pro_opt/mono/spike_ar/results/w1_1123T0759_bench_ar_B.txt`, as a table in the peaks JSON |
+| mono v1 per-stage time at 1, 8, 16 rows (timeline build, standalone, near-uniform routing) | MEASURED (node 257, 2026-11-23 22:58 UTC, item `71_roofline_mono_tl`; worktree `pro_opt/wt/mono-v1` at `c467bcf9`) | `/home/zhiyan/pro_opt/roofline/results/mono_tl_1123T2258.mono/mono_timeline.json` |
+| mono v1 kernel time at 1, 8, 16 rows, standalone | MEASURED (node 257, `v1perf_1123T1153`) | `/home/zhiyan/pro_opt/mono/v1/results/v1perf_1123T1153.log` |
 
-Until 70 and 72 land, every percent below is against the spec-sheet bandwidth (8.0 TB/s), so
-it understates how close a memory-bound kernel is to what the GPU can reach; and the measured
-widths are plain decode, not DSpark verify. The verify width of c1 at k7 is 8 rows and of c2 is
-16 rows, so the 8- and 16-row columns show those kernels at those row counts, but not the
-indexer and attention at agentic context lengths (100k tokens and more), nor the draft.
+## Measured peaks (one MI355X)
+
+| | measured | spec sheet |
+|---|---:|---:|
+| HBM read, 4 GB (Triton grid-stride read, CUDA graph) | 6.23 TB/s | 8.0 TB/s |
+| HBM read at 1 GB / 128 MB / 32 MB / 16 MB | 6.10 / 5.37 / 3.46 / 2.29 TB/s | |
+| bf16 GEMM 8192^3 (`torch.matmul`) | 1287 TFLOPS | 2516.6 |
+| fp8 e4m3 GEMM 8192^3 (`torch._scaled_mm`) | 2664 TFLOPS | 5033.2 |
+| MXFP4 GEMM 8192^3 (aiter `gemm_a4w4`) | 4412 TFLOPS | 10066.3 |
+| empty Triton kernel in a graph: profiler duration / graph slope | 4.08 us / 1.71 us | |
+| TP8 all-reduce, Lamport, 1 / 8 / 16 / 32 / 64 / 128 rows | 4.2 / 5.9 / 6.3 / 7.4 / 9.7 / 14.2 us | |
+
+The analysis uses the measured values. Two cautions:
+
+- A single read of 16 to 32 MB (one layer's qk_proj, o_proj or shared-expert weights) reaches
+  only 2.3 to 3.5 TB/s in this test, against 6.23 at 4 GB (a fit over 256 MB to 4 GB gives 5.6 us
+  plus 6.26 TB/s). The floor is the classical roofline, `max(t_min, bytes / BW)`, so for those
+  kernels it is below what one launch can reach and their gaps are upper bounds.
+- The empty kernel's profiler duration (4.08 us) is longer than real kernels in the decode
+  traces (0.1th percentile 2.44 us; `_masked_embedding_kernel` 2.55 to 2.76 us), so it is not
+  used as t_min. Item 72's own run of the analysis used it and reads 16 to 38% within 80% of
+  roofline without the routed experts; the numbers below take t_min from the traces.
 
 ## How the floor is computed
 
@@ -33,89 +50,106 @@ is floor over measured time; the gap is time minus floor.
   label when the server ran with `ATOM_ENABLE_DETAILED_ANNOTATION=1`, else `--ctx`).
 - **Routed experts** read the weights of the distinct experts the step picks. The trace does
   not say how many that is, so the model takes the expected count under uniform routing (4 at
-  1 row, 30.9 at 8, 59.2 at 16). Real text routes to fewer, so the routed percent is an upper
-  bound: above 100% means the step touched fewer experts than uniform routing would.
-- **t_min** is the shortest kernel the trace holds (2.88 us mono off, 2.64 us mono on; a memcpy
-  or the embedding). Item 70 measures an empty kernel instead.
-- **F** is the dense spec peak of the kernel's math: bf16 2516.6, fp8 5033.2, fp4 10066.3
-  TFLOPS. At 16 rows no decode kernel comes near it, so the bound is memory or latency.
+  1 row, 30.9 at 8, 59.2 at 16). Real routing touches fewer, so the routed percent is an upper
+  bound. This is why every share below is given twice: without the routed experts (and the mono
+  layer, whose floor uses the same count), which the measurement supports, and with them, an
+  upper bound.
+- **t_min** is the 0.1th-percentile kernel duration of the traces (2.44 us in the k7 traces,
+  2.88 / 2.64 us in the plain-decode ones), not the shortest kernel, so one outlier cannot set it;
+  a kernel can still run below it and read above 100%.
+- **F** is the measured peak of the kernel's math. No decode kernel at these widths comes near
+  it, so the bound is memory, latency or communication.
 - The MXFP8 GEMMs share kernel names across roles; the tool labels them by order between two
   indexer `_prep_kernel` launches (o_proj, then the FFN, then the next layer's qk_proj and
   index_qk_proj).
-- The draft's GEMMs are one group against the draft's weight bytes (traces 72 and 30 hold it;
-  the plain-decode traces here have none).
+- The draft's GEMMs are one group against the draft's weight bytes. Their FLOPs are taken as 2
+  a weight byte a row, right for the MXFP8 weights and twice the real count for the bf16 `fc`
+  and `lm_head`; it would matter only if a draft group turned compute-bound.
+- **The DSpark Markov head** (`_markov_stage1`, one launch a block position, 7 a k7 draft step)
+  reads all of `markov_w2` (200064 x 256 bf16, 102.4 MB, replicated on every rank) plus the
+  sequences' all-gathered base logits: about 103 MB a launch at one sequence. PR #86 shards the
+  head by vocabulary, which cuts what each rank reads 8x; the kernel name stays the same, so a
+  trace of that build needs the model changed to the shard.
+- The all-reduce table is Lamport's. #33's variants send all-reduces of more than 16 rows to
+  another route (`ar_lamport_rows: 16`), so at 24 rows the floor is from a path the step did
+  not take (`allreduce_fusion_kernel_2stage` at c16).
 
-## Where a decode step goes (MEASURED, mono off)
+## Decode step at c1, c4, c8 and c16, DSpark k7 (MEASURED, measured peaks)
 
-From `steps.csv`; "latency-bound" counts the launches whose floor is t_min, that is whose
-bytes would stream in less than one launch's time.
+One step is a target verify of 8 rows a sequence plus the draft (`draft_kv`, `propose_dspark`).
+In the profiled windows of the agentic replay, the pure-decode forwards hold 1 sequence at c1,
+1 or 2 at c4 and c8, and 1 to 3 at c16; the other sessions are between turns or prefilling.
+Prefill-only forwards are 2 to 11% of the forward time and are left out. Per concurrency,
+weighted by forwards (`steps.csv` has each width):
 
-| rows | step us | floor us | within 80% of roofline | latency-bound launches / us | three largest gaps (us a step) |
-|---:|---:|---:|---:|---:|---|
-| 1 | 9262 | 4977 | 0.1% | 1345 / 6781 | routed gemm1 824; `_prep_kernel` 341; `_attn_kernel` 322 |
-| 8 | 11052 | 7009 | 17.2% | 1281 / 6601 | `_prep_kernel` 379; routed gemm1 367; `_attn_kernel` 348 |
-| 16 | 12534 | 9060 | 39.0% | 1281 / 6854 | `_attn_kernel` 481; `_prep_kernel` 383; qk_proj 345 |
+| conc | forwards at 8 / 16 / 24 rows | context a sequence | step us | within 80% of roofline: without the routed experts / all kernels (upper bound) | latency-bound launches / us | three largest gaps (us a step) |
+|---:|---|---:|---:|---:|---:|---|
+| c1 | 388 / - / - | 55.9k | 13542 | 8.4% / 29.1% | 1277 / 7481 | top-k selection `_select_split_kernel` 886; index scores `_score_qtile_kernel` 472; `_prep_kernel` 414 |
+| c4 | 381 / 82 / - | 71.0k | 14254 | 8.3% / 29.6% | 1265 / 7683 | top-k selection 994; index scores 736; `_prep_kernel` 415 |
+| c8 | 228 / 264 / - | 40.8k | 15009 | 8.1% / 33.7% | 1277 / 7821 | top-k selection 823; index scores 754; `_attn_kernel` 452 |
+| c16 | 73 / 99 / 110 | 42.8k | 16197 | 1.2% / 29.2% | 1200 / 7372 | top-k selection 905; index scores 786; `_prep_kernel` 413 |
 
-Kernels with a bytes / FLOPs model cover 99.8 to 99.9% of the kernel time at every width (the
-rest is the logits all-gather, which has no measured latency, and the lm_head-side NCCL
-launch). Launch gaps inside the forward are 42 to 44 us a step and idle between forwards 14 us:
-the graph replays back to back.
+Kernels with a model cover 99.7 to 99.8% of the kernel time in every bucket.
 
-What the table says:
+What it says:
 
-1. **About 1620 launches a step, 1281 to 1345 of them latency-bound.** A forward runs about
-   24 launches a layer; the latency-bound ones, at 4 to 8 us each, cost 6.6 to 6.9 ms of a 9.3
-   to 12.5 ms step, while their bytes would stream in a fraction of that. At t_min each they
-   would still take 3.7 ms. This, not bandwidth, is what limits small-concurrency decode.
-2. **The memory-bound part is the routed experts and the big projections.** At 8 rows the
-   routed gemm1 + gemm2 run at 80% (uniform-routing bound); at 1 row gemm1 runs at 19%
-   (15.8 us a layer for 23 MB). qk_proj (32 MB) and index_qk_proj (16 MB) run at 3.5 to 4 TB/s.
-3. **Mono v1 cuts the launches from about 1620 to 730 a step** (latency-bound: 1281 to 512)
-   and shortens the step by 3.1 / 2.6 / 2.6 ms at 1 / 8 / 16 rows (MEASURED; mono on: 6141 /
-   8480 / 9906 us a step).
+1. **Launch count is the lever.** 1140 to 1280 latency-bound launches (their bytes would
+   stream in less than t_min) take 6.9 to 8.5 ms of a 13.1 to 18.5 ms step. The modelled floor
+   of the whole step is 8.0 ms at 8 rows and 12.8 ms at 24.
+2. **At agentic context the indexer is the largest gap.** At 40k to 71k tokens the top-k
+   selection takes 15 us a layer at 8 rows (1052 us a step at c1) and the index scores 9 us (638
+   us), both against the 2.4 us latency floor: the selection's bytes (the scores of 3500 blocks
+   a row) and the scores' (7 MB of index keys a layer) stream in about 1 us. Together they are 1.4
+   to 1.7 ms a step above their floors.
+3. **The routed experts read 99% of roofline at 8 rows under uniform routing**: 6.2 TB/s, the
+   measured peak, if a step touched 30.9 distinct experts. It is the upper bound; how far they
+   really are waits for the distinct-expert count (brief B4).
+4. **The draft is 7% of the step** (961 us with a model at c1). Its largest kernel, the Markov
+   head, runs at 94% of roofline (122 us a step against 116): it is near its floor, and what
+   would shrink it is reading less (the vocabulary-sharded head of PR #86).
+5. **The within-80% share is a threshold count.** At c16 it falls to 1.2% because the
+   all-reduces, 1130 us a step at 8 rows against 937 at c8 for the same row count, drop from 88%
+   to 73% of their floor; nothing else moved across the line.
 
-Module view at 8 rows (the c1 k7 verify width), mono off:
+## Plain decode at short context, mono off and on (MEASURED, measured peaks)
 
-| module | us a step | share | floor us | % roofline |
-|---|---:|---:|---:|---:|
-| moe.routed (gemm1, gemm2) | 2711 | 24.5% | 2168 | 80.0 (bound) |
-| moe.router (router GEMM, gating, 2 x sorting) | 1279 | 11.6% | 737 | 57.6 |
-| norm_quant (add_rmsnorm_quant x 2, lookahead norm, quantize_fp8) | 1166 | 10.5% | 777 | 66.7 |
-| moe.shared (gate_up, SwiGLU, down, add) | 1158 | 10.5% | 737 | 63.6 |
-| attn.qk_proj (qk_proj, index_qk_proj) | 1077 | 9.7% | 470 | 43.7 |
-| allreduce | 987 | 8.9% | 808 | 81.9 |
-| attn.sparse_attn (`_attn_kernel`, `_combine_kernel`) | 841 | 7.6% | 392 | 46.5 |
-| attn.prep | 575 | 5.2% | 196 | 34.0 |
-| attn.o_proj | 369 | 3.3% | 196 | 53.0 |
-| attn.index_score | 324 | 2.9% | 196 | 60.4 |
-| attn.index_topk | 288 | 2.6% | 196 | 68.0 |
-| lm_head, dense MLP, sampling, misc, the logits all-reduce | 218 | 2.0% | 136 | 62 |
+From #89's traces (`v1model_1123T1213`), about 1100 tokens a sequence, no draft:
 
-The per-kernel tables for every width and both arms are in `summary.md` and `kernels.csv` next
-to the CSVs named in Status.
+| rows | mono | step us | within 80%: without routed / all (upper bound) | latency-bound launches / us | three largest gaps (us a step) |
+|---:|---|---:|---:|---:|---|
+| 1 | off | 9262 | 0.7% / 0.7% | 1273 / 6410 | routed gemm1 771; `_prep_kernel` 341; `_attn_kernel` 322 |
+| 8 | off | 11052 | 9.6% / 34.2% | 1209 / 6212 | `_prep_kernel` 379; `_attn_kernel` 348; index_qk_proj 305 |
+| 16 | off | 12534 | 8.9% / 39.5% | 1209 / 6459 | `_attn_kernel` 481; `_prep_kernel` 383; index_qk_proj 322 |
+| 1 | on | 6141 | 6.8% / 6.8% | 508 / 2783 | mono layer 1335; `_prep_kernel` 341; `_attn_kernel` 333 |
+| 8 | on | 8480 | 6.5% / 6.5% | 508 / 2893 | mono layer 1209; `_prep_kernel` 373; `_attn_kernel` 341 |
+| 16 | on | 9906 | 5.9% / 60.7% | 508 / 3112 | `_attn_kernel` 478; `_prep_kernel` 382; index_qk_proj 316 |
+
+Mono v1 cuts the launches from about 1620 to 730 a step (latency-bound: 1209-1273 to 508) and
+shortens the step by 3.1 / 2.6 / 2.6 ms at 1 / 8 / 16 rows.
 
 ## Gap list
 
-Ranked by gap at 8 rows (mono off), the c1 k7 verify width. "Saving" is the gap itself: the
-most the item can save if the kernels reach their floor (ESTIMATED, an upper bound); items
-that remove launches save up to the whole launch time instead. 1 and 16 rows are given where
-the order differs.
+Ranked by gap at c1, DSpark k7, 8 rows, 55.9k tokens a sequence, measured peaks
+(`k7_c1-c16_measpeaks`). "Saving" is the gap itself: the most the item can save if its kernels
+reach their floor (ESTIMATED, an upper bound); items that remove launches can save up to the
+whole launch time instead.
 
-| # | item | kernels | 8 rows: us / floor / gap | saving a step (ESTIMATED) | notes |
+| # | item | kernels | c1 k7: us / floor / gap a step | saving a step (ESTIMATED) | notes |
 |---:|---|---|---|---|---|
-| 1 | launch count: about 1620 launches a step, 1281 latency-bound | every small kernel | 6601 us in latency-bound launches | mono v1 MEASURED: -2.57 ms at 8 rows (-3.12 at 1, -2.63 at 16) | the lever at c1 to c16; items 2 to 9 are where the remaining launches are |
-| 2 | routed experts | gemm1_a16w4, gemm2_a16w4 | 2711 / 2168 / 542 | up to 0.54 ms at 8 rows, 1.04 ms at 1 row | 1 row: gemm1 at 19% (15.8 us for 23 MB). The weights carry the 640 -> 768 pad: 17% of the routed bytes |
-| 3 | qk_proj + index_qk_proj | two MXFP8 GEMMs a layer, 48 MB together | 1077 / 470 / 607 | up to 0.61 ms | both read the same K = 7168; one launch would also drop 68 launches |
-| 4 | router path | hgemm_bf16, topk_gating, 2 x moe_sorting | 1279 / 737 / 542 | up to 0.54 ms, or 1.28 ms if fused into one launch | four launches a layer for 5.5 MB of weights; mono v1 does it in-kernel |
-| 5 | sparse attention | `_attn_kernel` + `_combine_kernel` | 841 / 392 / 450 | up to 0.45 ms; 0.58 ms at 16 rows | at about 1100 tokens of context; long agentic contexts wait for traces 30 / 72 |
-| 6 | shared expert | gate_up, SwiGLU, down, add | 1175 / 750 / 425 | up to 0.43 ms | four launches for 14 MB; mono v1 runs it in-kernel |
-| 7 | attention prep | `_prep_kernel` | 575 / 196 / 379 | up to 0.38 ms | 8.5 us for well under 1 MB at 8 rows: latency-bound, a fusion candidate (into the qk GEMM's epilogue) |
-| 8 | norms and quantization | add_rmsnorm_quant x 2, fused_qk_rmsnorm_group_quant, quantize_fp8 | 1166 / 777 / 388 | up to 0.39 ms, up to 1.17 ms when fused away | each a separate launch of about 4.3 us for under 0.3 MB |
-| 9 | all-reduce | Lamport one-shot / two-shot, 138 a step | 1000 / 814 / 185 | up to 0.19 ms | the floor is the standalone latency; the excess in the model is rank skew |
-| 10 | o_proj | MXFP8 GEMM, 22.7 MB | 369 / 196 / 174 | up to 0.17 ms | 5.4 us vs 2.84 us at 8 TB/s |
-| 11 | indexer scoring and top-k | `_score_tile_kernel`, `_select_split_kernel` | 612 / 392 / 221 | up to 0.22 ms at 1100 tokens | grows with context; the agentic number needs traces with `sk` (30 / 72). Open PR #87 changes the scorer |
-| 12 | routed intermediate pad 640 -> 768 | gemm1 / gemm2 | 17% of the routed bytes | 13-15% of the routed time at large M (yuhzhu `opt/best.md` 8.1), about 0.35 ms at 8 rows if it holds at small M | open PR #88 removes the pad (rounding-level change) |
-| 13 | DSpark draft at k7 | draft_kv, propose_dspark | no trace yet | - | the tool models it (weights-only group); traces 30 / 72. Open PR #86 measures the draft cost |
+| 1 | launch count | every small kernel | 1277 latency-bound launches, 7481 us | mono v1 MEASURED on plain decode: -3.1 / -2.6 / -2.6 ms at 1 / 8 / 16 rows | items 2 to 10 are where the remaining launches are |
+| 2 | indexer top-k selection | `_select_split_kernel` | 1052 / 166 / 886 | up to 0.89 ms; 0.82 to 0.99 ms at c4 to c16 | 15.5 us a layer for the scores of 3500 blocks a row; grows with context |
+| 3 | router path | hgemm_bf16, topk_gating, 2 x moe_sorting | 1256 / 624 / 631 | up to 0.63 ms, up to 1.26 ms if fused into one launch | four launches a layer for 5.5 MB of weights; mono v1 does it in-kernel |
+| 4 | shared expert | gate_up, SwiGLU, down, add | 1212 / 637 / 576 | up to 0.58 ms | four launches for 14 MB; mono v1 runs it in-kernel |
+| 5 | norms and quantization | add_rmsnorm_quant x 2, fused_qk_rmsnorm_group_quant, quantize_fp8 | 1220 / 659 / 561 | up to 0.56 ms, up to 1.22 ms when fused away | each a separate launch of about 4.5 us for under 0.3 MB |
+| 6 | qk_proj + index_qk_proj | two MXFP8 GEMMs a layer, 48 MB together | 1076 / 529 / 547 | up to 0.55 ms | index_qk_proj runs at 2.2 TB/s, qk_proj at 3.9; both read the same K = 7168 |
+| 7 | sparse attention | `_attn_kernel` + `_combine_kernel` | 846 / 332 / 514 | up to 0.51 ms | 128 selected blocks a row whatever the context |
+| 8 | indexer scores | `_score_qtile_kernel` | 638 / 166 / 472 | up to 0.47 ms; 0.74 to 0.79 ms at c4 to c16 | 9.4 us a layer for 7 MB of fp8 index keys; PR #87 changes the scorer |
+| 9 | attention prep | `_prep_kernel` | 580 / 166 / 414 | up to 0.41 ms | 8.5 us for well under 1 MB: latency-bound, a fusion candidate (into the qk GEMM's epilogue) |
+| 10 | DSpark draft | draft_kv, propose_dspark | 961 / 616 / 344 | up to 0.34 ms | the Markov head is 122 us of it at 94% (PR #86 shards it); the GEMM groups run at 59 to 68% |
+| 11 | o_proj | MXFP8 GEMM, 22.7 MB | 368 / 249 / 119 | up to 0.12 ms | 4.2 TB/s |
+| 12 | all-reduce | Lamport one-shot / two-shot, 141 a step | 950 / 838 / 112 | up to 0.11 ms; 0.34 ms at c16 | the floor is the standalone latency; the excess in the model is rank skew |
+| 13 | routed experts | gemm1_a16w4, gemm2_a16w4 | 2807 / 2784 / 23 | unknown until B4 | at the floor only under uniform routing; at 1 row of plain decode gemm1 runs at 24% |
+| 14 | routed intermediate pad 640 -> 768 | gemm1 / gemm2 | 17% of the routed bytes | about 0.47 ms at c1 if the routed kernels stream at their current rate | PR #88 removes the pad (rounding-level change); 13-15% of the routed time at large M (yuhzhu `opt/best.md` 8.1) |
 
 ## Mono v1 (#55, #70): the MoE layer in one kernel
 
@@ -124,34 +158,37 @@ MXFP8 x + the lookahead norm of layer L+2, the router split over the ranks (48 e
 logits all-gathered), the routed experts in W4A4 without the 640 -> 768 pad, the shared expert
 in MXFP8. AR #2 stays on production's Lamport path.
 
-### Floor by stage (ESTIMATED from the shapes, `--mono-floor 1,8,16`, 8.0 TB/s spec)
+Floors from the shapes and the measured peaks (`--mono-floor 1,8,16`,
+`results/mono_floor_measured.csv`); times from item 71's timeline build (every CTA stamps the
+kernel's points; a stage is the latest CTA past its end point minus the latest past its start,
+median of 31 launches, slowest rank). Its random weights route near-uniformly, so the routed
+floor applies as computed. The timeline build's totals are within 5% of the plain kernel's
+(33.7 / 74.1 / 114.3 us, `v1perf_1123T1153`).
 
-| stage | 1 row | 8 rows | 16 rows | bound |
-|---|---:|---:|---:|---|
-| o_proj (22.7 MB MXFP8) | 2.84 | 2.86 | 2.87 | memory |
-| AR #1 + norm + quant (measured AR latency) | 4.20 | 5.90 | 6.30 | communication |
-| router (0.7-0.9 MB bf16 a rank) | 0.09 | 0.10 | 0.11 | memory |
-| routed W4A4 (U x 7.31 MB, U = 4 / 30.9 / 59.2) | 3.66 | 28.20 | 54.14 | memory |
-| shared MXFP8 (14.2 MB) | 1.78 | 1.80 | 1.82 | memory |
-| AR #2 (outside the kernel) | 4.20 | 5.90 | 6.30 | communication |
-| **kernel floor (all but AR #2)** | **12.6** | **38.9** | **65.2** | |
+| stage (timeline points) | floor 1 / 8 / 16 rows, us | measured 1 / 8 / 16 rows, us | % of floor |
+|---|---|---|---|
+| o_proj: core quant, o GEMM (22.7 MB), push (0 -> 2) | 3.65 / 3.67 / 3.69 | 3.71 / 7.21 / 9.99 | 98 / 51 / 37 |
+| AR #1 + norm + MXFP8 + lookahead norm (2 -> 5) | 4.20 / 5.90 / 6.30 (AR table) | 4.38 / 7.97 / 12.67 | 96 / 74 / 50 |
+| router (0.7-0.9 MB bf16 a rank) | 0.11 / 0.13 / 0.15 | router CTAs' median 9.88 / 17.76 / 25.28, concurrent with the shared gate_up | - |
+| shared MXFP8 (14.2 MB) | 2.28 / 2.31 / 2.33 | gate_up CTAs' median 8.60 / 13.56 / 19.00; its down runs with the routed down | - |
+| routed W4A4 (U x 7.31 MB) | 4.69 / 36.21 / 69.52 | union + x MXFP4 2.28 / 2.96 / 3.15; gate_up 7.00 / 28.26 / 48.38; down + shared down 8.60 / 17.70 / 29.35 | - |
+| router + shared + routed together (5 -> 9) | 7.08 / 38.65 / 72.00 | 23.92 / 56.59 / 89.01 | 30 / 68 / 81 |
+| AR #2, outside the kernel (mean Lamport call in the mono-on trace) | 4.20 / 5.90 / 6.30 | 4.84 / 6.66 / 7.08 | 87 / 89 / 89 |
+| **kernel (all but AR #2)** | **14.93 / 48.22 / 81.99** | **32.05 / 71.81 / 111.71** | **47 / 67 / 73** |
 
-### Measured
+The router, shared and routed stages overlap inside 5 -> 9 (different CTAs), so the timeline
+splits that span by point, not by stage; the CTA medians are not additive.
 
-| | 1 row | 8 rows | 16 rows |
-|---|---:|---:|---:|
-| standalone kernel, uniform routing (`v1perf_1123T1153`, slope) | 33.7 | 74.1 | 114.3 |
-| % of floor | 37% | 52% | 57% |
-| in the model, plain decode (`v1model_1123T1213_on`, mean a MoE layer) | 35.8 | 67.1 | 84.8 |
-| production's FFN segment a MoE layer, same run (`v1perf_1123T1153_off`) | 82.7 | 106.1 | 122.9 |
-| per-stage times | NOT RUN (71) | NOT RUN (71) | NOT RUN (71) |
+Where the time above the floor is:
 
-In the model the routing is real and touches fewer experts than uniform, so the in-model times
-sit below the standalone ones at 8 and 16 rows and cannot be put against the uniform floor.
-Against the standalone run, the kernel spends 21 us above its floor at 1 row, 35 us at 8 and
-49 us at 16, and the floor's growth from 1 to 16 rows (52 us) is the routed weights. So the
-routed stage is where the time above the floor should be; 71's timeline will say how it splits
-between union, routed gate_up and routed down + shared down.
+- **1 row: the FFN span**, 16.8 of the 17.1 us above the floor. The routed gate_up (7.0 us for
+  four experts, 19 MB with gate and up) and the down + shared down (8.6 us) each take a few
+  times their streaming time: at this size the stages are latency-bound, and the router and
+  shared gate_up CTAs (8.6 to 9.9 us) are the critical path into the routed stage.
+- **16 rows: o_proj and AR #1** grow from 8 to 23 us with the rows while their floors stay at 10:
+  12.7 us above the floor, against 17 in the FFN span.
+- In the model (`v1model_1123T1213_on`, plain decode, real routing) the kernel takes 35.8 /
+  67.1 / 84.8 us a MoE layer, against production's FFN segment of 82.7 / 106.1 / 122.9.
 
 ### Methods that apply, with sources
 
@@ -161,48 +198,55 @@ between union, routed gate_up and routed down + shared down.
 | balance the routed down over all CTAs | 448 down tasks over 256 CTAs leave a 1.75-wave tail | Stream-K (Osama et al., PPoPP 2023, arXiv:2301.03598): split the MAC iterations evenly over a fixed grid | applies; aiter's FlyDSL GEMMs already split K (the `sk4` / `sk7` kernels in the trace) |
 | plan the expert schedule in-kernel from the routing | today round-robin tasks | aiter `aiter/ops/flydsl/mega_moe_tp.py` (MegaMoE TP: one persistent launch a TP MoE layer, dynamic schedule up to 256 tokens, AR or AG/RS comm in-kernel) | gfx950 kernel; Pro's 640 intermediate needs tuned rows (`configs/mega_moe_tp_tuned.csv`) |
 | in-kernel all-reduce with the norm and quant fused | v1 does this for AR #1; AR #2 is still a separate Lamport launch | aiter `aiter/dist/device_communicators/custom_all_reduce.py` (Lamport one-shot / two-shot with fused RMSNorm); FlashDMoE, arXiv:2506.04667 (device-initiated communication inside one MoE kernel) | applies: peer memory over XGMI via hipIpc, as v1 and MegaMoE TP use |
-| move the layer boundary to swallow AR #2 | one launch fewer a layer, 4.2 to 6.3 us a layer at the floor | MPK and Hazy Research (whole-layer kernels) | applies; needs the attention side in the same kernel or a peer handshake between kernels |
+| move the layer boundary to swallow AR #2 | one launch fewer a layer, 4.8 to 7.1 us a layer today | MPK and Hazy Research (whole-layer kernels) | applies; needs the attention side in the same kernel or a peer handshake between kernels |
 | skip the zero pad | v1 already reads 640, production 768 | yuhzhu `opt/best.md` 8.1 (p640 13-15% faster at 256-1024 rows) | applies |
 | small-M fused MoE paths | the production comparison point | aiter `aiter/fused_moe.py` (the a16w4 "port" kernels in the trace) | in use |
 
 ## Ready-to-file briefs (not filed)
 
-Check ownership first: `pro_opt/wt/mono-v1-perf` exists, so someone may already be tuning mono
-v1; #3 and #12 / #72 own the indexer.
+Check ownership first for anything touching the indexer: #3 and #12 / #72 own it.
 
-**B1. Mono v1 routed stage: weight prefetch and a balanced down.** Goal: the standalone mono
-v1 kernel at 8 and 16 rows within 75% of its floor (52 and 87 us against 74.1 and 114.3 today).
-File set: `atom/models/minimax_m3/pro_mono/kernels/ffn.py`, its tests. Exit: `perf_layer.py`
-at 1 / 8 / 16 rows meets the target, the 8-GPU FFN test passes, 71's timeline shows the
-routed stages shrinking. Estimate: 200 code, 80 test lines. GPU: 30 min.
+**B1. Mono v1: the FFN span at small rows, o_proj and AR #1 at 16.** Goal: the standalone
+mono v1 kernel at 25 / 60 / 100 us at 1 / 8 / 16 rows (60 / 80 / 82% of its floor; 32.1 /
+71.8 / 111.7 today). File set: `atom/models/minimax_m3/pro_mono/kernels/` (the FFN and the
+o_proj / AR #1 stages), their tests. Exit: `perf_layer.py` at 1 / 8 / 16 rows meets the target,
+the 8-GPU layer test passes, the timeline shows which stages shrank. Estimate: 200 code, 80
+test lines. GPU: 30 min.
 
 **B2. qk_proj and index_qk_proj as one launch.** Goal: one MXFP8 GEMM launch a layer for both
-projections (48 MB) at 6 TB/s or more: about 8 us a layer instead of 15.9 at 8 rows, 0.5 ms a
+projections (48 MB) at 5 TB/s or more: about 10 us a layer instead of 15.8 at c1 k7, 0.4 ms a
 step (ESTIMATED). File set: the aiter-M3 GEMM (a grouped two-A call), ATOM `pro.py`'s caller.
 Exit: a kernel microbench at 1 / 8 / 16 / 32 / 128 rows against the two launches, numerics
 bit-equal, the trace showing 68 launches fewer. Estimate: 150 code, 80 test lines (aiter side
 first). GPU: 30 min.
 
 **B3. Attention prep into the qk GEMM epilogue, combine into the attention.** Goal: 2 launches
-fewer a layer (136 a step; the two kernels take 0.87 ms a step at 8 rows today). File set:
+fewer a layer (136 a step; the two kernels take 0.89 ms a step at c1 k7 today). File set:
 `atom/model_ops/minimax_m3/pro_kernels.py`. Exit: the per-layer attention-side time on a c1 k7
-trace below today's 36 us, the 32k / 64k retrieval check 40 / 40, GSM8K. Estimate: 250 code,
-100 test lines. GPU: 1 h.
+trace below today's, the 32k / 64k retrieval check 40 / 40, GSM8K. Estimate: 250 code, 100
+test lines. GPU: 1 h.
 
 **B4. Count the distinct experts a verify step touches.** Goal: replace the uniform-routing
-assumption in the routed floor with the measured count at c1 to c16 (k7). File set: a
-profile-only counter next to the router (off by default) and `kernel_roofline.py`'s routed
-model reading it. Exit: the routed percent below 100% at every width; the count per width in
-the PR. Estimate: 60 code, 40 test lines. GPU: 20 min.
+assumption in the routed floor with the measured count at c1 to c16 (k7), which decides gap
+item 13. File set: a profile-only counter next to the router (off by default) and
+`kernel_roofline.py`'s routed model reading it. Exit: the routed percent below 100% at every
+width; the count per width in the PR. Estimate: 60 code, 40 test lines. GPU: 20 min.
+
+**B5. Top-k block selection at agentic context (check #12 / #72 first).** Goal:
+`_select_split_kernel` at 56k tokens and 8 rows from 15.5 to 6 us a layer, 0.6 ms a step at c1
+k7 (ESTIMATED). File set: the selection kernel in `atom/model_ops/minimax_m3/pro_kernels.py`.
+Exit: the same tables bit for bit, a kernel microbench at 16k / 64k / 128k context and 8 / 16 /
+24 rows, the c1 k7 trace showing the drop. Estimate: 150 code, 80 test lines. GPU: 30 min.
 
 ## Reproduce
 
 ```bash
 # traces of one rank under c<N>/ directories, the checkpoint's config, measured peaks
-python3 scripts/m31pro/kernel_roofline.py /scratch/prof17/prof17 \
+python3 scripts/m31pro/kernel_roofline.py /mnt/m2m_nobackup/zhiyan/prof17/prof17 \
+  /mnt/m2m_nobackup/zhiyan/roofline/traces_roofline_c16 \
   --config /mnt/m2m_nobackup/zhiyan/models/m3-pro/config.json \
-  --peaks /home/zhiyan/pro_opt/roofline/results/<peaks run>.peaks.json --out <dir>
-# traces without sk labels (the plain-decode runs above): add --ctx 1100
+  --peaks /home/zhiyan/pro_opt/roofline/results/peaks_1123T2258_trace_tmin.json --out <dir>
+# traces without sk labels (the plain-decode runs): add --ctx 1100
 # the mono stage floors
 python3 scripts/m31pro/kernel_roofline.py --config <config.json> --peaks <peaks> --mono-floor 1,8,16
 ```

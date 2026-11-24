@@ -34,9 +34,14 @@ one launch.
 Shapes are fixed by the model: head_dim 256, rotary 64, value 192, index 16 x 128, page 16.
 """
 
+import functools
+import inspect
+
 import torch
 import triton
 import triton.language as tl
+
+from atom.model_ops.blockscale_kernels.quantization import fp8_groups
 
 PAGE = 16
 HEAD_DIM = 256
@@ -704,9 +709,17 @@ def _aiter_prep():
     return _fused_prep
 
 
-def aiter_prep_available() -> bool:
-    """Whether this aiter has ``fused_qk_norm_rope_cache_mqa`` (``prep_aiter``)."""
-    return bool(_aiter_prep())
+def aiter_prep_available(k_unit: bool = False) -> bool:
+    """Whether this aiter has ``fused_qk_norm_rope_cache_mqa`` (``prep_aiter``); with
+    ``k_unit``, one that writes the plain fp8 K / V cache too (its ``kv_unit_scale``).
+    """
+    op = _aiter_prep()
+    return bool(op) and (not k_unit or _takes_kv_unit_scale(op))
+
+
+@functools.cache
+def _takes_kv_unit_scale(op) -> bool:
+    return "kv_unit_scale" in inspect.signature(op).parameters
 
 
 def prep_aiter_fits(qkv, heads) -> bool:
@@ -743,10 +756,13 @@ def prep_aiter(
     vc4=None,
     k_scale=None,
     v_scale=None,
+    k_unit=False,
 ):
     """``prep`` in one launch of aiter's ``fused_qk_norm_rope_cache_mqa``: the same arguments
     and results (rows as ``prep_aiter_fits`` takes them), any number of heads. The op takes
-    the norm weights and cos / sin in the activation dtype; others go to ``prep``."""
+    the norm weights and cos / sin in the activation dtype; others go to ``prep``.
+    ``k_unit`` (``prep``'s) is the op's ``kv_unit_scale`` (``aiter_prep_available(True)``).
+    """
     q, k, iq, ik = _split_rows(qkv, heads)
     if any(t.dtype != q.dtype for t in (wq, wk, wiq, wik, cos, sin)):
         return prep(
@@ -767,8 +783,11 @@ def prep_aiter(
             vc4=vc4,
             k_scale=k_scale,
             v_scale=v_scale,
+            k_unit=k_unit,
         )
     fp8 = kc4.element_size() == 1
+    # passed only when set: an aiter without kv_unit_scale still serves the scaled cache
+    unit = {"kv_unit_scale": True} if k_unit else {}
     return _aiter_prep()(
         q,
         k,
@@ -793,6 +812,7 @@ def prep_aiter(
         num_index_heads=IDX_HEADS,
         kv_fp8_max=torch.finfo(kc4.dtype).max if fp8 else None,
         index_fp8_max=torch.finfo(ic.dtype).max if ic.element_size() == 1 else None,
+        **unit,
     )
 
 
@@ -1400,6 +1420,18 @@ def scores(
 
 # ----------------------------------------------------------------------- attention --
 @triton.jit
+def _store_mx64(ob, sb, x, C: tl.constexpr):
+    """``x`` [16 heads, 64], dims ``C * 64`` on of each head's 192, as ``quantize_fp8``
+    would write the bf16 output: E4M3 at ``ob`` (row stride 192), an E8M0 code a group
+    of 32 at ``sb`` (6 a head)."""
+    q, code, _ = fp8_groups(tl.reshape(x.to(tl.bfloat16).to(tl.float32), (32, 32)))
+    r = tl.arange(0, 32)  # head r // 2, group C * 2 + r % 2
+    col = (r // 2) * 192 + C * 64 + (r % 2) * 32
+    tl.store(ob + col[:, None] + tl.arange(0, 32)[None, :], q)
+    tl.store(sb + (r // 2) * 6 + C * 2 + r % 2, code.to(tl.uint8))
+
+
+@triton.jit
 def _attn_kernel(
     q_ptr,
     stride_q_t,
@@ -1418,9 +1450,12 @@ def _attn_kernel(
     stride_sel,
     out_ptr,
     stride_out_t,
+    os_ptr,
+    stride_os_t,
     ws_m_ptr,
     ws_l_ptr,
     ws_acc_ptr,
+    lse_ptr,
     scale,
     n_entries,
     H,
@@ -1433,6 +1468,8 @@ def _attn_kernel(
     KV_FP8: tl.constexpr,
     VALID_FIRST: tl.constexpr = False,
     EP2: tl.constexpr = 1,
+    MX: tl.constexpr = False,
+    WRITE_LSE: tl.constexpr = False,
 ):
     t = tl.program_id(0)
     sp = tl.program_id(1)
@@ -1530,15 +1567,33 @@ def _attn_kernel(
         m_i = m_new
 
     if SPLITS == 1:
-        inv = 1.0 / l_i
-        ob = out_ptr + t.to(tl.int64) * stride_out_t + (hbase + ar_h)[:, None] * 192
-        tl.store(ob + ar_c[None, :], (acc1 * inv[:, None]).to(out_ptr.dtype.element_ty))
-        tl.store(
-            ob + 64 + ar_c[None, :], (acc2 * inv[:, None]).to(out_ptr.dtype.element_ty)
-        )
-        tl.store(
-            ob + 128 + ar_c[None, :], (acc3 * inv[:, None]).to(out_ptr.dtype.element_ty)
-        )
+        if WRITE_LSE:  # a token with no visible key here: output 0, lse -inf
+            inv = tl.where(l_i > 0, 1.0 / l_i, 0.0)
+            tl.store(
+                lse_ptr + t.to(tl.int64) * H + hbase + ar_h,
+                tl.where(l_i > 0, m_i + tl.log(l_i), float("-inf")),
+            )
+        else:
+            inv = 1.0 / l_i
+        if MX:
+            ob = out_ptr + t.to(tl.int64) * stride_out_t + hbase * 192
+            sb = os_ptr + t.to(tl.int64) * stride_os_t + hbase * 6
+            _store_mx64(ob, sb, acc1 * inv[:, None], 0)
+            _store_mx64(ob, sb, acc2 * inv[:, None], 1)
+            _store_mx64(ob, sb, acc3 * inv[:, None], 2)
+        else:
+            ob = out_ptr + t.to(tl.int64) * stride_out_t + (hbase + ar_h)[:, None] * 192
+            tl.store(
+                ob + ar_c[None, :], (acc1 * inv[:, None]).to(out_ptr.dtype.element_ty)
+            )
+            tl.store(
+                ob + 64 + ar_c[None, :],
+                (acc2 * inv[:, None]).to(out_ptr.dtype.element_ty),
+            )
+            tl.store(
+                ob + 128 + ar_c[None, :],
+                (acc3 * inv[:, None]).to(out_ptr.dtype.element_ty),
+            )
     else:
         wbase = (t.to(tl.int64) * SPLITS + sp) * H + hbase + ar_h
         tl.store(ws_m_ptr + wbase, m_i)
@@ -1556,9 +1611,14 @@ def _combine_kernel(
     ws_acc_ptr,
     out_ptr,
     stride_out_t,
+    os_ptr,
+    stride_os_t,
+    lse_ptr,
     H,
     SPLITS: tl.constexpr,
     SP2: tl.constexpr,
+    MX: tl.constexpr = False,
+    WRITE_LSE: tl.constexpr = False,
 ):
     t = tl.program_id(0)
     h = tl.program_id(1)
@@ -1568,6 +1628,8 @@ def _combine_kernel(
     m = tl.load(ws_m_ptr + wb, mask=ok, other=float("-inf"))
     l = tl.load(ws_l_ptr + wb, mask=ok, other=0.0)
     mx = tl.max(m, axis=0)
+    if WRITE_LSE:  # every split may be empty on this rank
+        mx = tl.where(mx == float("-inf"), 0.0, mx)
     w = tl.exp(m - mx)
     ltot = tl.sum(l * w, axis=0)
     a192 = tl.arange(0, 256)
@@ -1578,11 +1640,36 @@ def _combine_kernel(
         other=0.0,
     )
     o = tl.sum(acc * w[:, None], axis=0) / ltot
-    tl.store(
-        out_ptr + t.to(tl.int64) * stride_out_t + h * 192 + a192,
-        o.to(out_ptr.dtype.element_ty),
-        mask=dm,
-    )
+    if WRITE_LSE:
+        o = tl.where(ltot > 0, o, 0.0)
+        tl.store(
+            lse_ptr + t.to(tl.int64) * H + h,
+            tl.where(ltot > 0, mx + tl.log(ltot), float("-inf")),
+        )
+    if MX:
+        # quantize_fp8 of the bf16 row: 6 groups of 32 (the 2 past 192 are dropped)
+        q, code, _ = fp8_groups(tl.reshape(o.to(tl.bfloat16).to(tl.float32), (8, 32)))
+        g = tl.arange(0, 8)
+        tl.store(
+            out_ptr
+            + t.to(tl.int64) * stride_out_t
+            + h * 192
+            + g[:, None] * 32
+            + tl.arange(0, 32)[None, :],
+            q,
+            mask=(g < 6)[:, None],
+        )
+        tl.store(
+            os_ptr + t.to(tl.int64) * stride_os_t + h * 6 + g,
+            code.to(tl.uint8),
+            mask=g < 6,
+        )
+    else:
+        tl.store(
+            out_ptr + t.to(tl.int64) * stride_out_t + h * 192 + a192,
+            o.to(out_ptr.dtype.element_ty),
+            mask=dm,
+        )
 
 
 def attention(
@@ -1599,6 +1686,8 @@ def attention(
     n_blocks=None,
     k_scale=None,
     valid_first=False,
+    out_scale=None,
+    lse=None,
 ):
     """Attention of every token's local heads over its selected blocks.
 
@@ -1607,9 +1696,16 @@ def attention(
     ``out`` ``[T, H * 192]``. ``splits`` cuts the blocks over that many programs per token
     (for few tokens), ``nblk`` blocks are processed per step. An fp8 ``kc4`` takes its
     per-token scales ``k_scale`` ``[N, 1, page]``. ``valid_first``: ``sel``'s valid blocks
-    lead each row (``select_logical``), and the splits divide those.
+    lead each row (``select_logical``), and the splits divide those. ``lse`` ``[T, H]``
+    fp32: also write each head's log-sum-exp (natural base), -inf with output 0 where the
+    token sees no key, for a log-sum-exp merge of partial outputs.
+    ``out_scale`` ``[T, H * 6]`` uint8: ``out`` is E4M3 and the two are ``quantize_fp8`` of
+    the bf16 output, bit for bit (E8M0 codes a group of 32).
     """
     t, h, _ = q.shape
+    mx = out_scale is not None
+    assert not mx or (out.element_size() == 1 and out_scale.dtype == torch.uint8)
+    assert not (mx and lse is not None), "MXFP8 output and lse are never combined"
     assert h % 16 == 0 and kc4.stride(-1) == 1 and q.stride(-1) == 1
     fp8 = kc4.element_size() == 1
     assert k_scale is not None or not fp8
@@ -1643,9 +1739,12 @@ def attention(
         sel.stride(0) if not dense else 0,
         out,
         out.stride(0),
+        out_scale if mx else out,
+        out_scale.stride(0) if mx else 0,
         ws_m,
         ws_l,
         ws_acc,
+        out if lse is None else lse,
         scale,
         n_entries,
         h,
@@ -1658,6 +1757,8 @@ def attention(
         KV_FP8=fp8,
         VALID_FIRST=valid_first and not dense,
         EP2=triton.next_power_of_2(n_entries),
+        MX=mx,
+        WRITE_LSE=lse is not None,
     )
     if splits > 1:
         _combine_kernel[(t, h)](
@@ -1666,9 +1767,14 @@ def attention(
             ws_acc,
             out,
             out.stride(0),
+            out_scale if mx else out,
+            out_scale.stride(0) if mx else 0,
+            out if lse is None else lse,
             h,
             SPLITS=splits,
             SP2=triton.next_power_of_2(splits),
+            MX=mx,
+            WRITE_LSE=lse is not None,
         )
     return out
 
@@ -2205,6 +2311,63 @@ def select_logical(score, positions, k, num_warps=8, split=False):
     return sel
 
 
+_fused_scorer = None  # aiter's FlyDSL decode scorer (tests swap it)
+
+
+def fused_scores_available(centroid: bool = False) -> bool:
+    """Whether this aiter has the FlyDSL Pro decode scorer and this GPU runs it
+    (gfx950); ``centroid``: for the compressed index cache, which an aiter without
+    ``"centroid"`` in the scorer's formats does not read."""
+    if _fused_scorer is not None:
+        return True
+    try:
+        from aiter.ops.flydsl.minimax_m3_pro_index import (
+            pro_index_decode_supported,
+        )
+    except ImportError:
+        return False
+    if centroid:
+        try:
+            from aiter.ops.flydsl.kernels.minimax_m3_pro_index_decode import FORMATS
+        except ImportError:
+            return False
+        if "centroid" not in FORMATS:
+            return False
+    return pro_index_decode_supported()
+
+
+def scores_fused(
+    iq, ic, block_tables, seq_id, positions, nb, cq, init, local, sc, pool_temp, rows
+):
+    """``scores``' pool4 / max block scores (``block_mode=BLOCK_POOL4MAX``, or
+    ``BLOCK_CENTROID`` when ``ic`` is the compressed cache; ``head_mode=HEAD_MAX``) by
+    aiter's FlyDSL decode scorer: ``[T, nb]`` fp32 with each
+    row's causal blocks written and the rest left unset, which every selection but
+    ``torch.topk`` reads past. ``rows`` consecutive rows (1, 2, 4 or 8) share a sequence
+    and each tile of keys; the scores equal ``scores``' up to fp32 rounding."""
+    global _fused_scorer
+    if _fused_scorer is None:
+        from aiter.ops.flydsl.minimax_m3_pro_index import pro_index_decode_scores
+
+        _fused_scorer = pro_index_decode_scores
+    out = torch.empty(iq.shape[0], nb, dtype=torch.float32, device=iq.device)
+    _fused_scorer(
+        iq,
+        ic,
+        cq,
+        block_tables,
+        seq_id,
+        positions,
+        out,
+        init,
+        local,
+        sc,
+        pool_temp,
+        rows=rows,
+    )
+    return out
+
+
 _pa_decode = None  # aiter's paged-attention decode as ATOM wraps it (tests swap it)
 
 
@@ -2227,26 +2390,40 @@ def _default_partitions(t: int) -> int:
     return min(get_recommended_splits(t, 1), max(1, units // t))
 
 
-_gluon_value_rows = (
-    None  # aiter's pa_decode_gluon if it takes value_rows; False: it does not
-)
+_gluon_args = None  # torch.ops.aiter.pa_decode_gluon's arguments: {name: written}
+
+
+def _gluon_op_args() -> dict:
+    """The arguments of aiter's registered ``torch.ops.aiter.pa_decode_gluon``, each with
+    whether its schema declares it written; empty without the op. Read once."""
+    global _gluon_args
+    if _gluon_args is None:
+        try:
+            import aiter.ops.attention  # noqa: F401  (registers the op)
+
+            schema = torch.ops.aiter.pa_decode_gluon.default._schema
+        except (ImportError, AttributeError):
+            _gluon_args = {}
+        else:
+            _gluon_args = {
+                a.name: a.alias_info is not None and a.alias_info.is_write
+                for a in schema.arguments
+            }
+    return _gluon_args
 
 
 def aiter_value_rows_available() -> bool:
     """Whether this aiter's gluon paged attention reads V from the K cache's rows
     (``pa_decode_gluon(value_rows=True)``): ``attention_aiter(k_rows=True)``."""
-    global _gluon_value_rows
-    if _gluon_value_rows is None:
-        import inspect
+    return "value_rows" in _gluon_op_args()
 
-        try:
-            from aiter.ops.triton.gluon.pa_decode_gluon import pa_decode_gluon
-        except ImportError:
-            _gluon_value_rows = False
-        else:
-            ok = "value_rows" in inspect.signature(pa_decode_gluon).parameters
-            _gluon_value_rows = pa_decode_gluon if ok else False
-    return bool(_gluon_value_rows)
+
+def aiter_mxfp8_out_available() -> bool:
+    """Whether this aiter's gluon paged attention writes its output as MXFP8
+    (``pa_decode_gluon(output_scale=...)``, declared written by the op, so a compiled
+    graph reads the codes the call wrote): ``attention_aiter(out_scale=...)``, over the
+    K-only rows or the V cache."""
+    return _gluon_op_args().get("output_scale", False)
 
 
 def attention_aiter(
@@ -2263,6 +2440,7 @@ def attention_aiter(
     partitions=None,
     value_dim=VALUE_DIM,
     k_rows=False,
+    out_scale=None,
 ):
     """``attention`` on aiter's paged-attention decode (gluon, persistent dispatch), every
     token a sequence of its own over its ``sparse_rows`` table.
@@ -2273,10 +2451,16 @@ def attention_aiter(
     as well. ``k_rows``: ``k_cache`` is the K-only row cache ``[N, 1, 1, page, 256]`` (no V
     cache, ``v_cache`` / ``v_scale`` unused): aiter reads K through its SHUFFLE view and V
     as the rows' last ``value_dim`` dims (``aiter_value_rows_available``).
+    ``out_scale`` ``[T, H * value_dim / 32]`` uint8 (``aiter_mxfp8_out_available``):
+    ``out`` is E4M3, ``quantize_fp8`` of the bf16 output (aiter's PS kernel and reduce
+    write it, for either cache; this call then skips ``run_pa_decode``'s FlyDSL route,
+    which writes bf16).
     """
     t, h, _ = q.shape
     fp8 = k_cache.element_size() == 1
     assert (k_scale is not None and (v_scale is not None or k_rows)) or not fp8
+    assert out_scale is None or aiter_mxfp8_out_available()
+    mx = {} if out_scale is None else {"output_scale": out_scale.view(t, h, -1)}
     if partitions is None:
         partitions = _default_partitions(t)
     partitions = max(1, min(partitions, triton.cdiv(rows.shape[1] * PAGE, 256)))
@@ -2293,7 +2477,7 @@ def attention_aiter(
             (n, 1, PAGE, value_dim), (sb, sb, HEAD_DIM, 1), o + HEAD_DIM - value_dim
         )
         ks = k_scale.unsqueeze(-1) if fp8 else None
-        _gluon_value_rows(
+        torch.ops.aiter.pa_decode_gluon(
             out.view(t, h, value_dim),
             q,
             k_view,
@@ -2310,9 +2494,12 @@ def attention_aiter(
             ks,
             ps=True,
             value_rows=True,
+            **mx,
         )
         return out
-    _pa()(
+    # run_pa_decode's gluon call, straight to aiter's op where it writes MXFP8
+    decode = _pa() if out_scale is None else torch.ops.aiter.pa_decode_gluon
+    decode(
         out.view(t, h, value_dim),
         q,
         k_cache,
@@ -2328,30 +2515,39 @@ def attention_aiter(
         k_scale.unsqueeze(-1) if fp8 else None,
         v_scale.unsqueeze(-1) if fp8 else None,
         ps=True,
+        **mx,
     )
     return out
 
 
-_day0_prefill = None  # amd-kernels-day0's fp8_sparse_prefill; False: not installed
+# aiter's minimax_m3_fp8_sparse_prefill and _supported; False: this aiter lacks them
+_day0_prefill = None
+_day0_supported = None
 
 
-def day0_prefill_available() -> bool:
-    """Whether amd-kernels-day0's FlyDSL sparse prefill (``attention_day0``) imports."""
-    global _day0_prefill
+def day0_prefill_available(page: int = PAGE) -> bool:
+    """Whether aiter's FlyDSL fp8 sparse prefill (``attention_day0``; the kernel is
+    amd-kernels-day0's, ported into aiter) imports and serves this GPU and a K cache of
+    ``page``-token pages (gfx950, 16 heads on one KV head, 256 / 192, top-128 of 16)."""
+    global _day0_prefill, _day0_supported
     if _day0_prefill is None:
         try:
-            from amd_kernels.attention.fp8_sparse_prefill_gqa16_d256_v192_b16_top128.host import (
-                fp8_sparse_prefill,
+            from aiter.ops.flydsl import (
+                minimax_m3_fp8_sparse_prefill,
+                minimax_m3_fp8_sparse_prefill_supported,
             )
         except ImportError:
             _day0_prefill = False
         else:
-            _day0_prefill = fp8_sparse_prefill
-    return bool(_day0_prefill)
+            _day0_prefill = minimax_m3_fp8_sparse_prefill
+            _day0_supported = minimax_m3_fp8_sparse_prefill_supported
+    return bool(_day0_prefill) and _day0_supported(
+        IDX_HEADS, 1, HEAD_DIM, VALUE_DIM, TOPK, PAGE, page
+    )
 
 
 def attention_day0(q, kc4, block_tables, seq_id, positions, sel, out, scale):
-    """``attention`` on amd-kernels-day0's FlyDSL fp8 sparse prefill, over the K-only cache
+    """``attention`` on aiter's FlyDSL fp8 sparse prefill, over the K-only cache
     as a plain fp8 cast (``kc4`` ``[N, 1, page, 256]``): ``q`` ``[T, 16, 256]`` is cast to
     fp8 as well. ``sel`` ``[T, 128]`` block ids, valid first and -1 after (``select_logical``),
     or None: every causal block (at most 128)."""
@@ -2371,6 +2567,78 @@ def attention_day0(q, kc4, block_tables, seq_id, positions, sel, out, scale):
         out.view(t, IDX_HEADS, VALUE_DIM),
     )
     return out
+
+
+# ------------------------------------------------------ decode context parallel --
+# Under DCP the KV and index caches are interleaved a whole 16-token block at a time:
+# global block j of a sequence lives on rank j % W as that rank's local block j // W, at
+# block-table entry j // W (one entry covers W * 16 tokens, 16 of them on each rank).
+# The kernels above then run unchanged on a rank's own blocks, fed the positions below.
+
+
+def dcp_local_positions(positions, rank, world):
+    """Each token's position in ``rank``'s local block sequence, for the scores and the
+    attention over that rank's blocks: local block ``(qb - rank) // world`` (``qb`` the
+    token's own block), its offset there the token's own if ``rank`` holds that block,
+    else 15 (a whole earlier block); -16 when ``rank`` holds none of the causal blocks.
+    """
+    qb = positions // PAGE
+    own = qb % world == rank
+    tail = torch.where(own, positions % PAGE, PAGE - 1)
+    local = torch.div(qb - rank, world, rounding_mode="floor") * PAGE + tail
+    return torch.where(qb >= rank, local, -PAGE)
+
+
+def dcp_pin(score, positions, rank, world, init, local):
+    """``scores``' pins on a rank's local columns, in place: the forced init blocks
+    above every score, the local window below them, by global block index."""
+    j = torch.arange(score.shape[1], device=score.device) * world + rank
+    qb = (positions // PAGE)[:, None]
+    score.masked_fill_(j < init, 1e30)
+    score.masked_fill_(j >= qb + 1 - local, 1e29)
+    return score
+
+
+def dcp_interleave(gathered, world):
+    """The ranks' local scores, all-gathered ``[world * T, NBl]`` (rank-major), as the
+    global ``[T, NBl * world]`` scores: column ``j`` from rank ``j % world``."""
+    return gathered.view(world, -1, gathered.shape[1]).permute(1, 2, 0).flatten(1)
+
+
+def dcp_local_selection(sel, rank, world):
+    """``select_logical``'s global ids ``[T, k]`` cut to those ``rank`` holds, as local
+    block ids, in selection order and leading each row, -1 after (``valid_first``)."""
+    k = sel.shape[1]
+    mine = (sel >= 0) & (sel % world == rank)
+    ar = torch.arange(k, device=sel.device)
+    order = torch.where(mine, ar, ar + k).argsort(dim=1)
+    local = torch.where(mine, torch.div(sel, world, rounding_mode="floor"), -1)
+    return local.gather(1, order).to(torch.int32)
+
+
+def dcp_prefill_plan(block_tables, context_lens, world):
+    """What gathering a prefill's sequences' blocks from every rank needs: ``rows`` the
+    local blocks (``[E]``, every entry of every sequence in order), and ``tables``
+    ``[S, world * max entries]`` int32, each sequence's global blocks in the gathered
+    caches (``dcp_gather_blocks``)."""
+    dev = block_tables.device
+    ne = [-(-int(c) // (PAGE * world)) for c in context_lens]
+    seq = torch.repeat_interleave(torch.arange(len(ne)), torch.tensor(ne))
+    ent = torch.cat([torch.arange(n) for n in ne])
+    rows = block_tables[seq.to(dev), ent.to(dev)].long()
+    tables = torch.zeros(len(ne), world * max(max(ne), 1), dtype=torch.int32)
+    off = 0
+    for s, n in enumerate(ne):
+        tables[s, : world * n] = torch.arange(world * off, world * (off + n))
+        off += n
+    return rows, tables.to(dev)
+
+
+def dcp_gather_blocks(cache, rows, gather, world):
+    """``cache[rows]`` of every rank (``gather`` the all-gather on dim 0) as one cache of
+    global blocks: local entry ``e`` of rank ``r`` becomes block ``world * e + r``."""
+    g = gather(cache[rows].contiguous())
+    return g.view(world, rows.shape[0], *cache.shape[1:]).transpose(0, 1).flatten(0, 1)
 
 
 _day0_decode = (

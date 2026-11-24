@@ -29,6 +29,7 @@ import functools
 import json
 import logging
 import os
+import tempfile
 import time
 from dataclasses import dataclass, fields, replace
 
@@ -164,8 +165,11 @@ class ProVariants:
     # MXFP8 activation quant (E4M3, group-32 E8M0 scales, ``quantize_fp8``'s bytes) written
     # by the ops that produce the activations -- the norms after the all-reduces, the
     # lookahead norm, the SwiGLU -- instead of a ``quantize_fp8`` launch before each native
-    # group32 FP8 GEMM (``pro.py``). Off under ``diag``; the norms keep the unfused path on
-    # an aiter without the MXFP8 norm outputs.
+    # group32 FP8 GEMM (``pro.py``), and the decode / verify attention below the day0
+    # decode writes o_proj's (``_mxfp8_out``: the Triton attention always, aiter's where its
+    # gluon decode takes ``output_scale``; prefill keeps bf16).
+    # Off under ``diag``; the norms keep the unfused path on an aiter without the MXFP8
+    # norm outputs.
     fuse_mxfp8_quant: bool = True
     # A MoE layer's post-attention all-reduce, norm (+ MXFP8 copy), router, sigmoid
     # top-k and moe_sorting as one aiter launch (``models/minimax_m3/moe_route_glue``),
@@ -197,23 +201,50 @@ class ProVariants:
     # two; 0: one): the rows of a sequence read each tile of block keys once, one dot for
     # all their query heads. A plain decode (one row a sequence) keeps one.
     score_tq: int = 0
+    # The decode / verify block scorer of the kernel path: "triton" (``scores``) or
+    # "fused" (``scores_fused``: aiter's FlyDSL scorer, each tile of keys read once
+    # for up to 8 rows of a sequence). "fused" takes the static (graph) decode with
+    # pool4 / max scores (with "index_compress", over the bf16 centroids) and a
+    # selection other than "torch"; everything else, and an aiter or GPU without it,
+    # keeps "triton".
+    index: str = "triton"
     # Rows (tokens) at or below which those fused all-reduce + norm sites run as aiter's
-    # Lamport all-reduce + ``add_rmsnorm_mxfp8`` (two launches, same bytes) instead of
-    # the fused 1-stage kernel: 7.5 vs 9.6 us at 1 row, 9.7 vs 12.6 at 16 (TP8, 7168).
+    # Lamport all-reduce + ``add_rmsnorm_mxfp8`` (two launches) instead of the fused
+    # 1-stage kernel: 7.5 vs 9.6 us at 1 row, 9.7 vs 12.6 at 16 (TP8, 7168). The sum and
+    # the residual are the same bytes; the norm rounds on its own, so a bf16 output can
+    # move by one ulp (one element at 16 rows).
     # Needs the Lamport path on (AITER_CUSTOM_AR_DISABLE_LAMPORT unset); 0 turns it off.
     ar_lamport_rows: int = 0
+    # Rows (tokens) at or below which the same sites run aiter's one-launch Lamport
+    # two-shot all-reduce + residual add + RMSNorm + MXFP8 (the fused 1-stage kernel's
+    # bytes) instead; before ``ar_lamport_rows``. Needs the Lamport path on and an aiter
+    # with ``tensor_model_parallel_fused_allreduce_rmsnorm_lamport`` (else the sites keep
+    # their route); 0 turns it off.
+    ar_fused_rows: int = 0
+    # A MoE layer hands its routed and shared-expert outputs over unsummed, and the next
+    # layer's input all-reduce adds them (``routed + shared`` rounded to bf16, the bytes
+    # of the separate add): inside the ``ar_fused_rows`` kernel up to its rows, as a
+    # separate add before the all-reduce otherwise. Not on the last layer.
+    moe_tail_ar: bool = False
+    # Rows (tokens) at or below which a MoE layer runs its shared expert on a side
+    # stream while its router and routed experts run on the current one, joined before
+    # the layer returns; a CUDA graph records the fork and the join. The same kernels on
+    # the same inputs: the same bytes. It pays with ``moe_tail_ar`` (no add after the
+    # join); 0 turns it off.
+    moe_two_stream_rows: int = 0
     # The K-only cache (``ProKOnlyLayout``): one 256-wide row a token, V read from its tail,
     # no V cache (776 -> 520 B a token and layer with an fp8 KV and a bf16 index cache).
     # The attention is then the Triton one. Read once, when the layers are built: the
     # pool's layout cannot change while it serves.
     k_only: bool = False
     # An fp8 K cache as a plain (clamped) cast, its scale plane all 1.0: what moo's and
-    # amd-kernels-day0's kernels read. The normed K is O(1), within e4m3's range. Triton
-    # prep only (aiter's scales every row).
+    # amd-kernels-day0's kernels read. The normed K is O(1), within e4m3's range. The aiter
+    # prep writes it where its op takes ``kv_unit_scale``, else the Triton prep runs.
     k_plain_fp8: bool = False
     # The prefill attention of the K-only cache: "triton", or "day0" (amd-kernels-day0's
-    # FlyDSL fp8_sparse_prefill; needs k_plain_fp8, 16 local heads and the package, else
-    # "triton").
+    # FlyDSL fp8_sparse_prefill as ported into aiter, aiter.ops.flydsl's
+    # minimax_m3_fp8_sparse_prefill; needs k_plain_fp8, 16 local heads and an aiter that
+    # has it, else "triton").
     prefill_attn: str = "triton"
     # Decode / verify batches of at least this many rows attend with amd-kernels-day0's FlyDSL
     # sparse decode (day0#4, one workgroup a row: ahead of the paged attention from ~24 rows)
@@ -223,7 +254,24 @@ class ProVariants:
     # ... and its epilogue writes o_proj's MXFP8 input (E4M3 + E8M0 of the bf16-rounded rows,
     # quantize_fp8's bytes) where o_proj is a native group32 FP8 GEMM: no separate quant.
     day0_decode_mxfp8: bool = True
+    # Developer profile, not an attention switch (the attention path never reads it): count
+    # the distinct routed experts each MoE layer reads in every forward (TP rank 0) into
+    # ``<diag_tag>_experts.jsonl`` (``eplb.ExpertCountProfile``). A counting run, not a
+    # timing run. Read once, when the model is built: the count runs inside the captured
+    # decode graphs.
+    expert_count: bool = False
+    # The routed experts of a MoE call of at most 64 rows: "aiter" (``fused_moe``) or
+    # "day0": aiter's ``minimax_m3_moe_experts_decode`` (amd-kernels-day0's one-launch
+    # sort, the a16w4 GEMMs at its decode tiles, the 4 slots summed in fp32 in slot order;
+    # ``fused_moe/pro_experts_decode.py``), "aiter" where this aiter lacks it. Read once,
+    # when the layers are built: a captured graph keeps the kernels it recorded.
+    moe_decode: str = "aiter"
 
+
+# Below it, on an fp8 index cache, Triton's query-blocked scores are as fast or faster
+# than aiter's fused scorer (MI355X, 16 rows: 19.6 vs 27.3 us at 32k context, 32.9 vs
+# 28.2 at 128k; 64 rows: 33.3 vs 26.2 at 32k), so "index": "fused" keeps Triton there.
+_FUSED_MIN_ROWS_FP8 = 32
 
 # Below it the all-gather costs more than the scoring it saves (moo's threshold).
 _SPLIT_MIN_TOKENS = 1024
@@ -293,6 +341,16 @@ def refresh_variants(force: bool = False) -> ProVariants:
 
 def variants() -> ProVariants:
     return _variants
+
+
+def diag_path(name: str) -> str:
+    """``name`` in the developer diagnostics' directory (``$ATOM_M3PRO_DIAG_DIR``, else
+    ``m3pro_diag`` under the system temp directory), created if missing."""
+    d = os.environ.get(
+        "ATOM_M3PRO_DIAG_DIR", os.path.join(tempfile.gettempdir(), "m3pro_diag")
+    )
+    os.makedirs(d, exist_ok=True)
+    return os.path.join(d, name)
 
 
 @dataclass(frozen=True)
@@ -377,6 +435,9 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
 
     is_indexed_sparse_attention = True
     k_only = False  # the pool is ``ProKOnlyLayout`` (no V cache)
+    # The decode context parallel group's size: each rank holds every W-th 16-token block
+    # of the KV and index caches (``pro_kernels.dcp_local_positions``).
+    dcp_world = 1
 
     def __init__(
         self,
@@ -449,6 +510,9 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
         # the index-key cache, (blocks, page, index_head_dim).
         self.index_cache: torch.Tensor | None = None
         self.k_only = refresh_variants(force=True).k_only
+        from atom.config import get_current_atom_config
+
+        self.dcp_world = get_current_atom_config().decode_context_parallel_size
         if self.k_only:
             from atom.config import kv_cache_torch_dtype
 
@@ -708,14 +772,13 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
 
     # ------------------------------------------------------------ kernel path --
     def _aiter_prep(self, v: ProVariants) -> bool:
-        """aiter's prep: it scales an fp8 K and writes no NVFP4 index rows, nor the keys the
-        compressed index cache pools."""
+        """aiter's prep: it writes no NVFP4 index rows, nor the keys the compressed index
+        cache pools; the plain fp8 K needs its ``kv_unit_scale``."""
         return (
             v.prep == "aiter"
-            and not v.k_plain_fp8
             and not v.index_compress
             and not self._index_nvfp4()
-            and pro_kernels.aiter_prep_available()
+            and pro_kernels.aiter_prep_available(k_unit=v.k_plain_fp8)
         )
 
     def _index_nvfp4(self) -> bool:
@@ -738,9 +801,13 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
     def _aiter_attn(self, v: ProVariants, n: int = _K_ROWS_AITER_MIN) -> bool:
         """aiter's paged attention for ``n`` rows: on the K-only cache only where it reads V
         from the K rows (``value_rows``), and from ``_K_ROWS_AITER_MIN`` rows up."""
-        return v.attn == "aiter" and (
-            not self.k_only
-            or (n >= _K_ROWS_AITER_MIN and pro_kernels.aiter_value_rows_available())
+        return (
+            v.attn == "aiter"
+            and self.dcp_world == 1
+            and (
+                not self.k_only
+                or (n >= _K_ROWS_AITER_MIN and pro_kernels.aiter_value_rows_available())
+            )
         )
 
     def _day0_decode(self, v: ProVariants, n: int, reqs: int, fp8: bool) -> bool:
@@ -767,6 +834,26 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
         model hands them to o_proj with it), dropped here."""
         scale, self._mx_scale = self._mx_scale, None
         return scale
+
+    def _mxfp8_out(self, v: ProVariants, n: int, day0_dec: bool = False) -> bool:
+        """Whether a decode / verify batch of ``n`` rows writes o_proj's MXFP8 input (E4M3
+        rows, their E8M0 scales through ``take_mx_scale``) instead of bf16, where o_proj takes
+        it (``mx_out``). ``day0_dec``: the batch is the day0 decode's (``_day0_decode``),
+        whose epilogue writes it under ``day0_decode_mxfp8``. Below that, under
+        ``fuse_mxfp8_quant``: the Triton attention always, aiter's where its gluon decode
+        takes ``output_scale``. Off under decode context parallelism (``dcp_world`` > 1),
+        the day0 decode included."""
+        if self.dcp_world > 1:
+            return False
+        if not self.mx_out:
+            return False
+        if day0_dec:
+            return v.day0_decode_mxfp8
+        return (
+            v.fuse_mxfp8_quant
+            and self.value_head_dim % 32 == 0
+            and (not self._aiter_attn(v, n) or pro_kernels.aiter_mxfp8_out_available())
+        )
 
     def _use_kernels(self, v: ProVariants) -> bool:
         """Whether the Triton kernels cover this layer and these variants."""
@@ -797,6 +884,57 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
                 )
             )
         )
+
+    def _fused_index(
+        self, v: ProVariants, static: bool, split, ic, n: int, dsplit=None
+    ) -> bool:
+        """Whether the decode scores take aiter's FlyDSL scorer (``"index":
+        "fused"``): graph-shaped decode rows of one rank, neither an index split
+        (``split``) nor a decode split (``dsplit``), pool4 / max scores, a
+        selection that reads only each row's causal blocks, and an index cache ``ic``
+        it reads: fp8 (from _FUSED_MIN_ROWS_FP8 of the ``n`` rows) or NVFP4, or with
+        ``index_compress`` the bf16 centroids (a bf16 token cache it does not read)."""
+        if v.index != "fused":
+            return False
+        centroid = v.index_compress
+        ok = (
+            static
+            and split is None
+            and dsplit is None
+            and (
+                (centroid and ic.dtype == torch.bfloat16)
+                or (
+                    not centroid
+                    and (
+                        ic.dtype == torch.uint8
+                        or (
+                            ic.dtype == torch.float8_e4m3fn and n >= _FUSED_MIN_ROWS_FP8
+                        )
+                    )
+                )
+            )
+            and self.dcp_world == 1
+            and v.block_score == "pool4"
+            and v.head_reduce == "max"
+            and v.topk != "torch"
+            and pro_kernels.fused_scores_available(centroid)
+        )
+        small_fp8 = ic.dtype == torch.float8_e4m3fn and n < _FUSED_MIN_ROWS_FP8
+        if (
+            static
+            and not ok
+            and not small_fp8
+            and not getattr(self, "_warned_index", False)
+        ):
+            self._warned_index = True
+            logger.warning(
+                "M3-Pro layer %d: index 'fused' needs pool4 / max scores, a topk "
+                "other than 'torch', an fp8, NVFP4 or compressed index cache, no DCP, "
+                "no index split and aiter's FlyDSL Pro scorer (with the centroid "
+                "format for index_compress) on gfx950; decode scores stay Triton's",
+                self.layer_num,
+            )
+        return ok
 
     @staticmethod
     def _device_meta(md, n: int, device):
@@ -845,7 +983,8 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
         table's width), so the selection runs even where every block would fit.
         ``split``: this forward's ``index_split`` plan; the indexer scores this rank's
         rows only (the other rows' index q may be unset). ``mx_scale`` ``[n, H x 192 / 32]``
-        uint8 (with ``out`` E4M3): the day0 decode writes o_proj's MXFP8 input. ``dsplit``:
+        uint8 (with ``out`` E4M3): the decode attention writes o_proj's MXFP8 input
+        (``_mxfp8_out``). ``dsplit``:
         a decode's ``(first, end)`` rows this rank selects (``decode_split``). ``ring``:
         ``(each batch row's first ring row, the ring rows)`` of the compressed index cache
         (``index_compress``; ``ic`` is then its ``[pages, 4, 128]`` centroids).
@@ -866,10 +1005,11 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
         else:
             ratio = (1.0 if v.mscale == "hf" else float(v.mscale)) / aiter_m
         eps = self.q_norm.variance_epsilon
-        prep = functools.partial(pro_kernels.prep, k_unit=fp8 and v.k_plain_fp8)
+        k_unit = fp8 and v.k_plain_fp8
+        prep = functools.partial(pro_kernels.prep, k_unit=k_unit)
         if self._aiter_prep(v):
             if pro_kernels.prep_aiter_fits(qkv, self.num_heads):
-                prep = pro_kernels.prep_aiter
+                prep = functools.partial(pro_kernels.prep_aiter, k_unit=k_unit)
             elif not getattr(self, "_warned_prep", False):
                 self._warned_prep = True
                 logger.warning(
@@ -902,6 +1042,9 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
             k_scale=ks,
             v_scale=vs,
         )
+        if self.dcp_world > 1 and not static:
+            # prep wrote this rank's blocks; the prefill reads every rank's
+            kc4, ks, ic, block_tables = self._dcp_prefill_caches(kc4, ks, ic)
         if compress:
             # the groups this step closes, before any score reads them (a prefill chunk's
             # later rows read its earlier, older-than-local blocks)
@@ -947,12 +1090,12 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
             and v.topk in ("fused", "split")
             and self.num_heads == 16
             and self.topk == pro_kernels.TOPK
-            and pro_kernels.day0_prefill_available()
+            and pro_kernels.day0_prefill_available(kc4.shape[-2])
         )
 
         # decode / verify: FlyDSL sparse decode from day0_decode_rows rows
         day0_dec = static and self._day0_decode(v, n, block_tables.shape[0], fp8)
-        assert mx_scale is None or day0_dec, "an MXFP8 output needs the day0 decode"
+        assert mx_scale is None or static, "prefill attention writes bf16"
 
         valid_first = False  # set where the selection is select_logical's
 
@@ -996,6 +1139,7 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
                     v_scale=vs,
                     fp8_compute=v.attn_fp8_compute,
                     k_rows=self.k_only,
+                    out_scale=mx_scale,
                 )
             return pro_kernels.attention(
                 q,
@@ -1011,6 +1155,7 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
                 n_blocks=nb if sel is None else None,
                 k_scale=ks,
                 valid_first=valid_first,
+                out_scale=mx_scale,
             )
 
         if v.dense_only or (nb <= self.topk and not static):
@@ -1038,6 +1183,11 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
         sc = v.index_scale * (
             self.index_head_dim**-0.5 if v.block_score == "lse" else 1.0
         )
+        if self.dcp_world > 1 and static:
+            score_args = (pool, init, local, sc, block_mode, head_mode)
+            return self._dcp_decode(
+                q, iq, positions, seq_id, block_tables, kc4, ks, ic, v, out, score_args
+            )
         k = min(self.topk, nb)
         rq, rseq, rpos = iq, seq_id, positions  # the rows the indexer scores
         rps = n // block_tables.shape[0]  # rows a sequence (static: k + 1 for a verify)
@@ -1049,30 +1199,53 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
             # every row scores alone, so this rank's rows come out as they would in full
             idx, seg, n_rows, tp = split
             rq, rseq, rpos = iq[idx], seq_id[idx], positions[idx]
-        # decode: one row a sequence, nothing to share; a verify has k + 1 rows a
-        # sequence, so the tile is the largest power of two dividing them (at most
-        # score_tq): a tile never spans two sequences, which would score row by row
-        # (k = 3: 4 rows, not 8). Graph-safe: the shapes alone decide.
-        tq = v.score_tq if not static else min(v.score_tq, rps & -rps) if rps > 1 else 0
-        score = pro_kernels.scores(
-            rq,
-            ic,
-            block_tables,
-            rseq,
-            rpos,
-            nb,
-            self.index_compress_query.data if pool else None,
-            init,
-            local,
-            sc,
-            block_mode=block_mode,
-            head_mode=head_mode,
-            pool_temp=v.pool_scale,
-            # torch.topk reads the whole width; the others only each token's causal blocks
-            # (the score_tq kernel only with score_tq_causal)
-            causal=v.topk != "torch" and (v.score_tq_causal or tq == 0),
-            tq=tq,
-        )
+        if self._fused_index(v, static, split, ic, n, dsplit):
+            # each group of `rows` rows is one sequence's: k + 1 a verify, so the
+            # largest power of two (at most 8) dividing them
+            rows = min(8, rps & -rps) if rps > 1 else 1
+            score = pro_kernels.scores_fused(
+                rq,
+                ic,
+                block_tables,
+                rseq,
+                rpos,
+                nb,
+                self.index_compress_query.data,
+                init,
+                local,
+                sc,
+                v.pool_scale,
+                rows,
+            )
+        else:
+            # decode: one row a sequence, nothing to share; a verify has k + 1 rows a
+            # sequence, so the tile is the largest power of two dividing them (at most
+            # score_tq): a tile never spans two sequences, which would score row by row
+            # (k = 3: 4 rows, not 8). Graph-safe: the shapes alone decide.
+            tq = (
+                v.score_tq
+                if not static
+                else min(v.score_tq, rps & -rps) if rps > 1 else 0
+            )
+            score = pro_kernels.scores(
+                rq,
+                ic,
+                block_tables,
+                rseq,
+                rpos,
+                nb,
+                self.index_compress_query.data if pool else None,
+                init,
+                local,
+                sc,
+                block_mode=block_mode,
+                head_mode=head_mode,
+                pool_temp=v.pool_scale,
+                # torch.topk reads the whole width; the others only each token's causal
+                # blocks (the score_tq kernel only with score_tq_causal)
+                causal=v.topk != "torch" and (v.score_tq_causal or tq == 0),
+                tq=tq,
+            )
         # select_rows_split matches select_rows bit for bit; its cost follows the context
         select = (
             pro_kernels.select_rows_split
@@ -1140,6 +1313,120 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
         else:
             sel = score.topk(k, dim=-1, sorted=False).indices.to(torch.int32)
         return attend(sel)
+
+    # ------------------------------------------------- decode context parallel --
+    def _dcp_prefill_caches(self, kc4, ks, ic):
+        """A prefill's caches under DCP: every block of its sequences, all-gathered from
+        the ranks that hold them, and the block tables into those (the plan is the
+        forward's, the gather each layer's)."""
+        from atom.distributed.dcp_utils import get_dcp_group
+        from atom.model_ops.dcp_ops import dcp_all_gather
+
+        md = get_forward_context().attn_metadata
+        group, w = get_dcp_group(), self.dcp_world
+        plan = getattr(md, "_m3pro_dcp_plan", None)
+        if plan is None:
+            plan = pro_kernels.dcp_prefill_plan(
+                md.block_tables, self._cpu_lengths(md)[1], w
+            )
+            md._m3pro_dcp_plan = plan
+        rows, tables = plan
+
+        def gather(x):
+            return pro_kernels.dcp_gather_blocks(
+                x, rows, lambda t: dcp_all_gather(group, t, 0), w
+            )
+
+        return gather(kc4), None if ks is None else gather(ks), gather(ic), tables
+
+    def _dcp_decode(
+        self, q, iq, positions, seq_id, block_tables, kc4, ks, ic, v, out, score_args
+    ):
+        """A decode step under DCP: every rank scores its own blocks, the scores are
+        all-gathered so each rank selects from all of them as without DCP, each rank
+        attends all query heads over the selected blocks it holds, and a log-sum-exp
+        merge returns this rank's heads."""
+        from atom.config import get_current_atom_config
+        from atom.distributed.dcp_utils import get_dcp_group
+        from atom.model_ops.dcp_ops import (
+            dcp_all_gather,
+            dcp_all_gather_query_heads,
+            dcp_lse_merge,
+        )
+
+        pool, init, local, sc, block_mode, head_mode = score_args
+        group = get_dcp_group()
+        w, r = self.dcp_world, group.rank_in_group
+        n = q.shape[0]
+        md = get_forward_context().attn_metadata
+        capturing = (
+            torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
+        )
+        cached = getattr(md, "_m3pro_dcp_pos", None)
+        if cached is None or cached[0] != capturing or cached[1].shape[0] != n:
+            md._m3pro_dcp_pos = cached = (
+                capturing,
+                pro_kernels.dcp_local_positions(positions, r, w),
+            )
+        qpos = cached[1]
+        nbl = -(-block_tables.shape[1] // w)
+        score = pro_kernels.scores(
+            iq,
+            ic,
+            block_tables,
+            seq_id,
+            qpos,
+            nbl,
+            self.index_compress_query.data if pool else None,
+            0,
+            0,
+            sc,
+            block_mode=block_mode,
+            head_mode=head_mode,
+            pool_temp=v.pool_scale,
+            causal=True,
+            tq=v.score_tq if n > block_tables.shape[0] else 0,
+        )
+        pro_kernels.dcp_pin(score, positions, r, w, init, local)
+        score = pro_kernels.dcp_interleave(dcp_all_gather(group, score, 0), w)
+        sel = pro_kernels.select_logical(
+            score, positions, min(self.topk, nbl * w), split=v.topk == "split"
+        )
+        sel = pro_kernels.dcp_local_selection(sel, r, w)
+        qf = dcp_all_gather_query_heads(group, q)
+        h = qf.shape[1]
+        dv = self.value_head_dim
+        of = q.new_empty(n, h * dv)
+        lse = torch.empty(n, h, dtype=torch.float32, device=q.device)
+        # a rank holds about 1/w of the selected blocks, for w times the heads
+        splits = max(
+            1, (v.attn_splits or (32 if n <= 16 else 16 if n <= 32 else 8)) // w
+        )
+        pro_kernels.attention(
+            qf,
+            kc4,
+            block_tables,
+            seq_id,
+            qpos,
+            sel,
+            of,
+            self.scale * v.scale_mult,
+            splits,
+            nblk=v.attn_nblk,
+            k_scale=ks,
+            valid_first=True,
+            lse=lse,
+        )
+        # the merge takes power-of-two head widths: each head's 192 as three of 64
+        parts = dv // 64
+        merged = dcp_lse_merge(
+            of.view(n, h * parts, 64),
+            lse.repeat_interleave(parts, dim=1),
+            group,
+            backend=get_current_atom_config().dcp_config.comm_backend,
+        )
+        out.copy_(merged.reshape(n, -1))
+        return out
 
     # ---------------------------------------------------------------- forward --
     def decode_split(self, n: int, v: ProVariants, seqs: int = 0):
@@ -1247,6 +1534,11 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
             v = replace(v, dense_only=True)  # the diagnostic reads the dense trajectory
 
         md = fwd.attn_metadata
+        if self.dcp_world > 1 and (not self._use_kernels(v) or v.dense_only):
+            raise NotImplementedError(
+                "MiniMax-M3-Pro under --decode-context-parallel-size needs the kernel "
+                'path ({"kernels": true} in ATOM_M3PRO_VARIANTS) and the indexer'
+            )
         if self._use_kernels(v):
             layer = fwd.kv_cache_data[f"layer_{self.layer_num}"]
             prep_impl = "aiter" if self._aiter_prep(v) else "triton"
@@ -1262,18 +1554,34 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
             ):
                 attn_impl += f"; day0 decode from {v.day0_decode_rows} rows" + (
                     " (MXFP8 out)"
-                    if v.day0_decode_mxfp8 and getattr(self, "mx_out", False)
+                    if self._mxfp8_out(v, v.day0_decode_rows, day0_dec=True)
                     else ""
                 )
-            logged = (attn_impl, prep_impl)
+            # the Triton / aiter rows, below the day0 decode
+            mx_impl = (
+                "off"
+                if not (v.fuse_mxfp8_quant and self.mx_out and self.dcp_world == 1)
+                else (
+                    "on"
+                    if self._mxfp8_out(v, _K_ROWS_AITER_MIN)
+                    else (
+                        "on Triton rows only (this aiter's decode writes bf16)"
+                        if self.k_only
+                        else "off (this aiter's decode writes bf16)"
+                    )
+                )
+            )
+            logged = (attn_impl, prep_impl, mx_impl)
             if self.layer_num == 0 and getattr(self, "_logged_kernels", None) != logged:
                 self._logged_kernels = logged
                 logger.info(
-                    "M3-Pro attention: kernels, %s prep, %s attention, %s%s KV cache (%s)",
+                    "M3-Pro attention: kernels, %s prep, %s attention, %s%s KV cache, "
+                    "Triton / aiter decode MXFP8 out %s (%s)",
                     prep_impl,
                     attn_impl,
                     "K-only " if self.k_only else "",
                     layer.k_cache.dtype,
+                    mx_impl,
                     v,
                 )
             static = not fwd.context.is_prefill
@@ -1288,15 +1596,14 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
                 if n == 0:
                     return query.new_zeros(n_tok, h * self.value_head_dim)
                 nb = (max(ctx) + self.page - 1) // self.page
-            # the day0 decode writes o_proj's MXFP8 input where o_proj takes it (mx_out, set
-            # by the model): E4M3 rows here, their E8M0 scales through take_mx_scale
-            mx = (
-                static
-                and v.day0_decode_mxfp8
-                and getattr(self, "mx_out", False)
-                and self._day0_decode(
+            # the decode attention writes o_proj's MXFP8 input where o_proj takes it (mx_out,
+            # set by the model): E4M3 rows here, their E8M0 scales through take_mx_scale
+            mx = static and self._mxfp8_out(
+                v,
+                n,
+                self._day0_decode(
                     v, n, md.block_tables.shape[0], layer.k_cache.element_size() == 1
-                )
+                ),
             )
             # the kernels write every row they compute in full: zero only the others
             width = h * self.value_head_dim

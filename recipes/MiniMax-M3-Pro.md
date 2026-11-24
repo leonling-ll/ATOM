@@ -48,6 +48,7 @@ The fast configuration (kernel path, decode graphs, FP8 KV and index caches):
 
 ```bash
 export AITER_CUSTOM_AR_DISABLE_LAMPORT=1
+export ATOM_CUSTOM_AR_POOL_BYTES=134217728
 export ATOM_M3PRO_VARIANTS='{"kernels": true, "attn": "aiter", "topk": "split"}'
 
 python -m atom.entrypoints.openai_server \
@@ -58,7 +59,7 @@ python -m atom.entrypoints.openai_server \
   --max-model-len 16384 \
   --max-num-seqs 16 \
   --max-num-batched-tokens 16384 \
-  --gpu-memory-utilization 0.85 \
+  --gpu-memory-utilization 0.94 \
   --block-size 16 \
   --kv_cache_dtype fp8 \
   --index-cache-dtype fp8 \
@@ -70,11 +71,13 @@ Add `--method dspark --num-speculative-tokens 7` for speculative decoding with t
 draft. For the torch reference, leave `ATOM_M3PRO_VARIANTS` unset, add `--enforce-eager` and use
 `--kv_cache_dtype bf16 --index-cache-dtype bf16`; prefix caching was checked on the kernel path only.
 
-* With `ATOM_ONLINE_QUANT_STREAMING=1` and Pro's MoE `pad_align` 128 (the default now) the weights
-  take about 175 GiB per GPU and 0.95 works; see [`Agentic-MiniMax-M3.1-Pro.md`](Agentic-MiniMax-M3.1-Pro.md).
-  The note below is for the old padded, non-streaming load.
-* The weights take about 210 GB per GPU, so keep `--gpu-memory-utilization` at 0.85: at 0.88 the
-  KV pool takes every free byte and the first NCCL barrier fails to allocate.
+* The loader hands the blocks that weight processing frees back to the driver between steps, so the
+  post-load conversion leaves no holes in the allocator (before, about 40 GB per GPU stayed stranded
+  and 0.88 or more failed at the first NCCL barrier). `ATOM_ONLINE_QUANT_STREAMING=1` avoids them
+  another way, by converting while loading; see [`Agentic-MiniMax-M3.1-Pro.md`](Agentic-MiniMax-M3.1-Pro.md).
+* `ATOM_CUSTOM_AR_POOL_BYTES=134217728` gives the custom all-reduce a 128 MiB input pool instead of
+  aiter's 1 GiB: about 2.6 GiB less per GPU before the KV pool is sized, and every all-reduce Pro
+  sends still fits ([`docs/environment_variables.md`](../docs/environment_variables.md#communicator-memory)).
 * `--block-size 16` and `--level 0` are required. Decode graphs need the kernel path: the torch
   path reads the sequence lengths back to the host, raises if a capture reaches it, and runs with
   `--enforce-eager`.
@@ -97,6 +100,57 @@ curl -s http://127.0.0.1:8300/v1/completions -H 'Content-Type: application/json'
 # " Paris. The city is located in the north of the country, on the banks of the Seine River. Paris is the"
 ```
 
+## Chat, tool calls and reasoning
+
+Pro's own `chat_template.jinja` renders the user turns only: no system or developer turn, no tools,
+no assistant or tool turns. A server on it finds no tool-call format and no reasoning tags (`No known
+tool-call format` and `Reasoning channel: </think> (no dialect named in the chat template)` in the
+log), so tool calls and the chain of thought both arrive as `content`. For chat, serve Pro with
+MiniMax-M3's template (`chat_template.jinja` of `amd/MiniMax-M3-MXFP4`) and thinking on; add to any
+launch above:
+
+```bash
+  --chat-template /path/to/MiniMax-M3-MXFP4/chat_template.jinja \
+  --default-chat-template-kwargs '{"thinking_mode": "enabled"}'
+```
+
+The log then reads `Tool-call format: minimax (from the chat template)` and `Reasoning channel:
+</mm:think>`: tool calls arrive as `tool_calls` and the thinking as `reasoning_content`. A request can
+still turn thinking off with `chat_template_kwargs: {"thinking_mode": "disabled"}`.
+
+The [MiniMax Provider Verifier](https://github.com/MiniMax-AI/MiniMax-Provider-Verifier) at
+`c899f95e` (InferenceX's `minimax_m3_full`: 102 requests, temperature 0, `max_tokens` 40960, 5
+concurrent) on the fast configuration with DSpark k=7 and `--max-model-len 196608` (its longest
+prompt is 128,984 tokens, so it needs at least 169,944):
+
+| Model and server | Delivery | Rows answered | `tool_calls_match_rate` | Tool calls made / expected | Schema-valid calls |
+|---|---|---:|---:|---:|---:|
+| Pro on ATOM | non-streaming | 102 / 102 | 0.95 | 83 / 84 | 83 |
+| Pro on ATOM | streaming | 102 / 102 | 0.95 | 83 / 84 | 83 |
+| M3.1-Flash on vLLM | non-streaming | 102 / 102 | 0.97 | 84 / 84 | 83 |
+| M3.1-Flash on vLLM | streaming | 102 / 102 | 0.99 | 84 / 84 | 84 |
+| M3.1-Flash on ATOM | non-streaming | 102 / 102 | 0.99 | 84 / 84 | 83 |
+| M3.1-Flash on ATOM | streaming | 102 / 102 | 0.99 | 84 / 84 | 83 |
+
+The Flash rows are `amd/MiniMax-M3.1-Flash-Quark-MXFP4` with its own chat template and the same
+`thinking_mode`, TP4, fp8 KV cache, no speculative decoding and `--max-model-len 196608`. On vLLM:
+`vllm/vllm-openai-rocm:minimax-m31-flash` (vLLM 0.32.0rc1.dev364) with `--tool-call-parser minimax_m3
+--reasoning-parser minimax_m3 --enable-auto-tool-choice`. On ATOM: the Quark MXFP4 launch of
+[MiniMax-M3.md](MiniMax-M3.md) without its DSpark flags, `--max-num-seqs 16`.
+
+Flash on ATOM matches Flash on vLLM, so the server's shared chat path (template, reasoning split,
+`minimax` parser) loses no requests on Flash; Pro's gap is Pro's own, from the model or from its
+serving path, which no other server runs to compare. Pro's misses are expected-stop
+requests that ran to the 40960-token cap (Flash on vLLM has two of those as well, Flash on ATOM none),
+one summary where a call was expected, and one call written inside the think block, which ATOM
+delivers as reasoning.
+
+`tool_calls_match_rate` counts the labelled requests whose finish reason (`tool_calls` or `stop`)
+matches the label; a schema-valid call's arguments pass the tool's JSON Schema. Nested arguments
+(objects, arrays) arrive as the template's XML elements and are decoded into JSON by ATOM's
+`minimax` parser. Greedy decoding is not bit-reproducible on this stack, so two runs of one server
+differ by a request or two.
+
 ## Accuracy (GSM8K, 64-shot)
 
 With 64 shots a prompt is about 10k tokens (9.0k-11.9k, median 10.4k), so the indexer picks 128 of
@@ -115,7 +169,7 @@ python -m atom.entrypoints.openai_server \
   --max-model-len 16384 \
   --max-num-seqs 16 \
   --max-num-batched-tokens 16384 \
-  --gpu-memory-utilization 0.85 \
+  --gpu-memory-utilization 0.94 \
   --block-size 16 \
   --kv_cache_dtype fp8 \
   --index-cache-dtype bf16 \
@@ -158,7 +212,7 @@ python -m atom.entrypoints.openai_server \
   --max-model-len 131072 \
   --max-num-seqs 32 \
   --max-num-batched-tokens 16384 \
-  --gpu-memory-utilization 0.85 \
+  --gpu-memory-utilization 0.94 \
   --block-size 16 \
   --kv_cache_dtype fp8 \
   --index-cache-dtype bf16 \
@@ -346,6 +400,44 @@ offload off. Stock GSM8K shares no prefix, so nothing is loaded back there; rest
 running the first 450 questions twice on one server, the second pass with 4.60M of its 4.66M prompt
 tokens loaded from CPU: 0.9667 cold, 0.9689 restored, 257 of 450 responses identical.
 
+## Decode context parallelism (DCP 8)
+
+Pro has one KV head, so at TP8 every rank holds the whole K and index caches. With
+`--decode-context-parallel-size 8` each rank holds every eighth 16-token block of them (the
+interleave is set to the block size), and a block-table entry covers 128 tokens. A decode step
+scores each rank's own blocks, all-gathers the scores and selects the same top-128 blocks on every
+rank as without DCP; each rank then attends all 128 query heads over the selected blocks it holds,
+and the partial outputs are merged by log-sum-exp. A prefill all-gathers its sequences' blocks and
+runs as without DCP. It needs the kernel path and runs the Triton attention.
+
+Add to the server's arguments `--decode-context-parallel-size 8`. The DCP group shares the TP
+group's communicator (ATOM sets `AITER_REUSE_IDENTICAL_COMM_GROUPS=1` unless it is set; see
+[communicator memory](../docs/environment_variables.md#communicator-memory)): with `0` aiter builds it
+one of its own over the same GPUs, and the KV pool loses it. The DSpark draft does not run under DCP
+yet (#78), so the server has no `--method dspark`.
+
+Measured on the 15-minute agentic proxy (`SPEC_TOKENS=0 scripts/m31pro/proxy_bench.sh 32`) with the K-only
+cache, CPU KV offload on and `AITER_REUSE_IDENTICAL_COMM_GROUPS=1`, both arms on one tree, without
+DSpark:
+
+| c32 | tok/s/GPU | p90 E2E-normalized interactivity | failed | KV pool (tokens) | decode batch mean |
+|---|---:|---:|---:|---:|---:|
+| DCP 1 | 3761.7 | 3.52 | 0/506 | 651,056 (40,691 blocks of 16) | 9.96 |
+| DCP 8 | 4863.0 | 12.11 | 0/623 | 5,208,448 (40,691 blocks of 128) | 17.05 |
+
+Real request rows per decode forward (`atom:decode_batch_size`), share of forwards:
+
+| batch | 3-4 | 5-8 | 9-12 | 13-16 | 17-24 | 25-32 | forwards |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| DCP 1 | 1.4% | 12.8% | 82.2% | 3.5% | 0 | 0 | 30,870 |
+| DCP 8 | 0.5% | 9.6% | 24.2% | 7.5% | 47.0% | 11.2% | 19,566 |
+
+Both arms had 16.00 GB for KV per GPU, so DCP 8 holds 8x the tokens. At DCP 1 about 10 requests
+wait on average and the pool runs 87% full; at DCP 8 none wait, the pool runs 20% full and every
+prefix hit is served from HBM. Accuracy at DCP 8
+(the GSM8K section's lm-eval command, max-model-len 16384, offload on, no DSpark): 0.9393 +- 0.0066
+flexible-extract; the 14k key-value retrieval is 12/12.
+
 ## Speculative decoding (DSpark)
 
 `--method dspark --num-speculative-tokens 7` drafts with the checkpoint's own 5-layer DSpark model
@@ -507,6 +599,17 @@ It is the recommended setting. Measured on 8x MI355X, max-model-len 131072:
 - At a 1M context (65536 blocks) the sort alone is 0.7–0.8 ms per layer for `"fused"` and
   3–66 us for `"split"`.
 
+`"index": "fused"` scores decode and DSpark-verify rows (the decode graph's static path) with
+aiter-M3's FlyDSL scorer (`pro_index_decode_scores`, [zhuyuhua-v/aiter-M3#5](https://github.com/zhuyuhua-v/aiter-M3/pull/5)
+landed as `ffb4cedb0`) instead of Triton's: one launch, each key tile read once for up to 8 rows of a
+sequence, fp8 or NVFP4 index cache (on fp8 from 32 rows a step, below which Triton's is as fast). It takes pool4 / max scores and a `topk` other than `"torch"`;
+elsewhere, and on an aiter without the scorer, the Triton scores run (a warning says so). The
+selection is unchanged and picks the same blocks (the scores agree to fp32 rounding). The default
+stays `"triton"`; per-layer timings are on that aiter PR. With `"index_compress": true` it also
+scores the bf16 centroid cache (`BLOCK_CENTROID`; [zhuyuhua-v/aiter-M3#14](https://github.com/zhuyuhua-v/aiter-M3/pull/14)),
+but only where no index split applies: the Agentic recipe's `index_split_decode` keeps the Triton
+scorer, whose per-rank share is faster below 128k.
+
 The block scores run as a tiled kernel (4 or 8 blocks x 16 tokens per program, one `tl.dot`); the
 softmax-pool weights depend on the keys alone, so the pooled scores are the token dots weighted per
 group of 4, in the same tile. The module hands the four
@@ -547,6 +650,16 @@ End to end (TP8, the fused-selection configuration, fp8 KV / bf16 index cache, g
 ms, a bs1 decode step 14.29 -> 14.13 ms; GSM8K (20-shot, all 1319) 0.9356 against 0.9303 / 0.9363
 for two baseline runs. `tests/test_minimax_m3_pro_prep_aiter.py` checks it against the Triton prep
 and the torch reference.
+
+On the K-only plain fp8 cache (`"k_only": true, "k_plain_fp8": true`) the aiter prep runs where its
+op takes `kv_unit_scale` (zhuyuhua-v/aiter-M3#11: the clamped cast, scales 1.0); with an aiter
+without it, an NVFP4 index cache or `index_compress`, the Triton prep runs. K codes, the scale plane
+and index K equal Triton's byte for byte at 1-64 rows. GPU time per call at Pro's decode rows (16
+local heads, packed rows, fp8 index cache, CUDA graph, MI355X, Triton -> aiter, us): 1 row 6.5 ->
+4.1, 8 rows 6.7 -> 4.3-4.4, 16 rows 6.8 -> 4.4, 24 rows 6.8 -> 4.4-4.5, 64 rows 6.9 -> 4.7
+(`python tests/test_minimax_m3_pro_prep_aiter.py --bench --k-only --kv fp8 --ic fp8`). On
+zhuyuhua-v's combo configuration the switch gave a 3-run GSM8K 64-shot mean of 0.9396 against
+0.9439 with the Triton prep on the same node.
 
 End to end on 8x MI355X (TP8, `--max-num-batched-tokens 16384`, 256 tokens out, greedy; TPOT in
 steady decode, ms per token):
@@ -594,8 +707,16 @@ bytes `quantize_fp8` would give -- instead of a separate `quantize_fp8` launch b
 - the lookahead norm in `ProLookaheadState.put` writes the reading layer's indexer input;
 - the SwiGLU writes down_proj's input (one Triton kernel).
 
-o_proj's input, written by the paged attention, is still quantized on its own: `quantize_fp8` per
-layer goes from 5 launches to 1.
+`quantize_fp8` per layer goes from 5 launches to 1, o_proj's input. In decode and DSpark verify
+(the decode graphs) that one goes too, with the kernel path: the attention writes o_proj's input as MXFP8 itself, the same bytes `quantize_fp8`
+gives for its bf16 output, and hands the E8M0 scales to o_proj through `take_mx_scale`. Which kernel writes it follows the rows of the batch:
+from `day0_decode_rows` (24) rows on the K-only plain fp8 cache, amd-kernels-day0's FlyDSL sparse decode does, in its epilogue (`day0_decode_mxfp8`, when the `amd_kernels` package imports);
+below that, or without the package, the Triton attention does it in its epilogue and aiter's attention (17
+rows and more on the K-only cache, every row over the V cache) through `pa_decode_gluon(output_scale=...)`, which needs aiter-M3 `d251a5af`
+([zhuyuhua-v/aiter-M3#8](https://github.com/zhuyuhua-v/aiter-M3/pull/8)) or later. Prefill keeps the
+bf16 output and the separate launch. The startup line `M3-Pro attention: ...` reports `day0 decode from 24 rows (MXFP8 out)` for the first, and `Triton / aiter decode MXFP8
+out on`, `on Triton rows only` or `off` for the second, with the reason when this aiter's decode writes bf16 only.
+Bytes, per path: `tests/test_minimax_m3_pro_attn_mxfp8.py`.
 
 The norms need aiter's MXFP8 norm outputs ([zhuyuhua-v/aiter-M3#2](https://github.com/zhuyuhua-v/aiter-M3/pull/2): the custom all-reduce
 MXFP8 epilogue, `add_rmsnorm_mxfp8` for the RCCL route and an E8M0 mode of

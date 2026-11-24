@@ -17,6 +17,7 @@ from atom.config import (
 )
 from atom.distributed.ulysses_sp import local_num_kv_heads
 from atom.model_engine.scheduler import ScheduledBatch
+from atom.model_engine.sequence import Sequence, SequenceType
 from atom.model_ops.attention_mha import PagedAttentionImpl, use_pa_decode_bf16_asm
 from atom.model_ops.minimax_m3.index_buffers import allocate_index_scorers
 from atom.model_ops.minimax_m3.sparse_attn import (
@@ -48,7 +49,7 @@ from .token_layout.decode import (
     query_is_uniform,
     ragged_decode_refusal,
 )
-from .token_layout.slots import slot_mapping
+from .token_layout.slots import dcp_slot_mapping, slot_mapping
 
 logger = logging.getLogger("atom")
 
@@ -1037,6 +1038,53 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         )
         return workinfos
 
+    @property
+    def supports_token_graph(self) -> bool:
+        """MiniMax-M3-Pro: everything outside its attention (the eager region, which
+        reads the live step) is sized by the token count alone, so a prefill or mixed
+        step replays the recorded token-graph bucket it pads to. Decode keeps its FULL
+        request graphs."""
+        return self._has_pro_sparse_attention
+
+    def build_for_token_graph_capture(self, tokens):
+        """A dummy prefill of one ``tokens``-row request, for recording that token-graph
+        bucket: Pro's attention skips a dummy step (no cache write), and the recorded
+        segments only need the step's shape."""
+        seq = Sequence([0] * tokens, block_size=self.block_size)
+        seq.type = SequenceType.PREFILL
+        batch = ScheduledBatch(
+            seqs={seq.id: seq},
+            num_scheduled_tokens=np.array([tokens], dtype=np.int32),
+            total_tokens_num=tokens,
+            total_tokens_num_prefill=tokens,
+            total_seqs_num=1,
+            total_seqs_num_prefill=1,
+            is_dummy_run=True,
+        )
+        # a capture's step carries no token inputs: publish its query layout itself, as
+        # the runner's prepare does for a real step
+        self.publish_query_metadata(np.asarray([tokens], dtype=np.int32), 1, tokens)
+        metadata, positions = self.build(
+            batch=batch,
+            running_bs=1,
+            running_tokens=tokens,
+            max_seqlen_q=tokens,
+            is_prefill=True,
+        )
+        self.prepare_model_inputs(
+            self.model_runner.forward_vars["input_ids"].gpu[:tokens], metadata
+        )
+        context = Context(
+            positions=positions,
+            is_prefill=True,
+            is_dummy_run=True,
+            scheduled_bs=1,
+            scheduled_tokens=tokens,
+            running_bs=1,
+            running_tokens=tokens,
+        )
+        return metadata, context
+
     def _prefill_block_table_rows(self, batch, running_bs, has_cached):
         # Sparse attention and `prefill_attention_triton` read the paged KV
         # cache, so they need the block tables even with no cached tokens.
@@ -1126,13 +1174,24 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
 
         var = self.model_runner.forward_vars
         scheduled_tokens = batch.total_tokens_num_decode
-        var["slot_mapping"].np[:scheduled_tokens] = slot_mapping(
-            positions,
-            lengths,
-            var["block_tables"].np,
-            self.model_runner.block_size,
-            scratch=self.token_axis_scratch,
-        )
+        if self.dcp_world_size > 1:
+            var["slot_mapping"].np[:scheduled_tokens] = dcp_slot_mapping(
+                positions,
+                lengths,
+                var["block_tables"].np,
+                self.model_runner.block_size,
+                self.dcp_world_size,
+                self.dcp_rank,
+                self.cp_kv_cache_interleave_size,
+            )
+        else:
+            var["slot_mapping"].np[:scheduled_tokens] = slot_mapping(
+                positions,
+                lengths,
+                var["block_tables"].np,
+                self.model_runner.block_size,
+                scratch=self.token_axis_scratch,
+            )
         var["positions"].np[:scheduled_tokens] = positions
         self._pad_tokens(scheduled_tokens, running_tokens)
         var["context_lens"].np[:scheduled_bs] = context_lens

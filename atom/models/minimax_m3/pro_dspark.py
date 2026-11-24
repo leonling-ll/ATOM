@@ -33,18 +33,29 @@ Checkpoint layout (MXFP8 [1, 32] linears, BF16 rest; 5 layers):
   language_model.model.dspark.confidence_head.proj.{weight,bias} [1, 7424]
 """
 
+import logging
 import math
 from typing import ClassVar
 
 import torch
 
 from atom.model_loader.weight_names import WeightsMapper
+from atom.model_ops.layernorm import (
+    fused_allreduce_gemma_rms_norm,
+    fused_allreduce_gemma_rms_norm_mxfp8,
+    gemma_rms_norm_mxfp8,
+)
+from atom.model_ops.minimax_m3.pro_attn import variants
 from atom.model_ops.minimax_m3.pro_kernels import attention_aiter
+from atom.models.dspark_draft import linear_out
 from atom.models.minimax_m3.dspark import (
     M3DSparkAttention,
     M3DSparkDecoderLayer,
     MiniMaxM3DSpark,
 )
+from atom.models.minimax_m3.pro import _aiter_mx_norm, _native_a8
+
+logger = logging.getLogger("atom")
 
 DRAFT_PREFIX = "language_model.model.dspark."
 
@@ -85,7 +96,7 @@ class M3ProDSparkAttention(M3DSparkAttention):
 
     def _block_attention_paged(self, q: torch.Tensor, md, cache) -> torch.Tensor:
         """``[context | block]`` attention as ``B * T`` q_len=1 rows over the
-        tables ``prepare_paged_block`` built (sliding window applied there)."""
+        tables ``build_paged_block`` built (sliding window applied there)."""
         k_cache, v_cache, k_scale, v_scale = cache
         rows = q.shape[0]
         q = q.view(rows, self.num_heads, self.head_dim)
@@ -108,11 +119,84 @@ class M3ProDSparkAttention(M3DSparkAttention):
 class M3ProDSparkDecoderLayer(M3DSparkDecoderLayer):
     attention_cls = M3ProDSparkAttention
 
+    def __init__(self, atom_config, config, quant_config, layer_num, prefix=""):
+        super().__init__(atom_config, config, quant_config, layer_num, prefix)
+        # The target's layer epilogues (pro.py): the TP all-reduce folded into
+        # the next Gemma RMSNorm, which also writes the next GEMM's MXFP8 input
+        # (the bytes quantize_fp8 of its bf16 output gives), and SwiGLU-OAI
+        # writing down_proj's MXFP8 input. Same weights, same bf16 all-reduce,
+        # same MXFP8 activation format: 16 -> 11 launches a layer. Gated like
+        # the target's fused norms (fuse_mxfp8_quant, not under the diag
+        # variant, native MXFP8 linears, an aiter with the MXFP8 norms), else
+        # the unfused layer. Decided here because reduce_results is
+        # structural.
+        v = variants()
+        self.fused_epilogues = bool(
+            v.fuse_mxfp8_quant
+            and not v.diag
+            and _native_a8(self.self_attn.qkv_proj, self.mlp.gate_up_proj)
+            and _aiter_mx_norm()
+        )
+        if self.fused_epilogues:
+            self.self_attn.o_proj.reduce_results = False
+            self.mlp.down_proj.reduce_results = False
+
+    def forward(self, positions, hidden_states, residual=None):
+        """Returns the UN-reduced ``(mlp_out, residual)`` when fused: the next
+        layer's input norm, or the model's final norm, all-reduces it."""
+        if not self.fused_epilogues:
+            return super().forward(positions, hidden_states, residual)
+        lamport_rows = variants().ar_lamport_rows
+        if residual is None:
+            residual = hidden_states
+            _, xq, xs, _ = gemma_rms_norm_mxfp8(
+                hidden_states, None, self.input_layernorm, write_bf16=False
+            )
+        else:
+            _, xq, xs, residual = fused_allreduce_gemma_rms_norm_mxfp8(
+                hidden_states, residual, self.input_layernorm, lamport_rows
+            )
+        h = self.self_attn(positions, (xq, xs))
+        _, xq, xs, residual = fused_allreduce_gemma_rms_norm_mxfp8(
+            h, residual, self.post_attention_layernorm, lamport_rows
+        )
+        return self.mlp(xq, xs, quant_down=True), residual
+
 
 class MiniMaxM3ProDSpark(MiniMaxM3DSpark):
     """The DSpark draft inside a MiniMax-M3-Pro checkpoint."""
 
     layer_cls = M3ProDSparkDecoderLayer
+
+    def __init__(self, atom_config, layer_offset: int = 0) -> None:
+        super().__init__(atom_config, layer_offset)
+        logger.info(
+            "M3-Pro DSpark draft layers: %s epilogues",
+            "fused AR+norm+MXFP8" if self.layers[0].fused_epilogues else "unfused",
+        )
+
+    def block_final_norm(self, hidden, residual):
+        """The last layer's all-reduce folded into ``final_norm`` when the
+        layers run the fused epilogues."""
+        if not self.layers[0].fused_epilogues:
+            return super().block_final_norm(hidden, residual)
+        hidden, _ = fused_allreduce_gemma_rms_norm(hidden, residual, self.final_norm)
+        return hidden
+
+    def project_context_mxfp8(self, taps):
+        """``hidden_norm`` writes the context K/V GEMM's MXFP8 input itself
+        (the bytes ``quantize_fp8`` of its bf16 output gives) where the layers
+        run the fused epilogues."""
+        if not self.layers[0].fused_epilogues:
+            return super().project_context_mxfp8(taps)
+        _, xq, xs, _ = gemma_rms_norm_mxfp8(
+            linear_out(self.fc(self.concat_taps(taps))),
+            None,
+            self.hidden_norm,
+            write_bf16=False,
+        )
+        return xq, xs
+
     weights_mapper: ClassVar[WeightsMapper] = _DraftTensorsOnly()
     # Drafts its trained block (`dspark_block_size`, 7) whole when
     # --num-speculative-tokens is smaller; the verify reads the first k.

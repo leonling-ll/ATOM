@@ -40,6 +40,7 @@ from atom.model_ops.base_config import QuantizeMethodBase
 from atom.model_ops.eplb import (
     eplb_append_shared_map_and_record_fused,
     eplb_map_and_record_fused,
+    get_expert_count,
 )
 from atom.model_ops.fused_moe.config import (
     FUSED_MOE_UNQUANTIZED_CONFIG,
@@ -3635,6 +3636,10 @@ class FusedMoE(torch.nn.Module):
         quant_config: Quantization configure.
     """
 
+    # Attached by MiniMax-M3-Pro under its ``moe_decode`` variant
+    # (``fused_moe/pro_experts_decode.py``).
+    pro_decode_experts = None
+
     # Set in __init__ for a shared expert staged into its fused slot.
     shared_expert_staging: SharedExpertStaging | None = None
 
@@ -3671,6 +3676,8 @@ class FusedMoE(torch.nn.Module):
     ):
         super().__init__()
         self.layer_id = layer_id
+        # This layer's row of the expert count (`eplb.enable_expert_count`), or None.
+        self.expert_count_slot: int | None = None
         self.prefix = prefix
         layer_quant_config = (
             quant_config.get_layer_quant_config(prefix, check_children=True)
@@ -5721,6 +5728,19 @@ class FusedMoE(torch.nn.Module):
         topk_weights, topk_ids = self.quant_method.place_experts(
             self, topk_weights, topk_ids, gathered
         )
+        # Pure-TP padded graphs require ROCm/aiter#7294: its FlyDSL,
+        # FlyDSL-v2, and native-MXFP4 stage2 paths reject the sorting
+        # sentinel at the real token count instead of scattering every
+        # padded expert slot into that row.
+        scheduled_tokens_gpu = (
+            context.scheduled_tokens_gpu
+            if split and sp_is_enabled()
+            else None if gathered else pass_scheduled_tokens_gpu(topk_ids.shape[0])
+        )
+        # getattr: the tests' stand-in layers skip __init__.
+        slot = getattr(self, "expert_count_slot", None)
+        if slot is not None:
+            get_expert_count().record_rows(slot, topk_ids, scheduled_tokens_gpu)
         # Only Mxfp4MoEMethod takes a shared output (combine_accepts_shared) or a
         # presorted output (forward_routed).
         shared_kwargs = (
@@ -5741,15 +5761,7 @@ class FusedMoE(torch.nn.Module):
             apply_router_weight_on_input=self.apply_router_weight_on_input,
             prefix=f"{self.prefix}.fused_moe",
             x_scale=x_scale,
-            # Pure-TP padded graphs require ROCm/aiter#7294: its FlyDSL,
-            # FlyDSL-v2, and native-MXFP4 stage2 paths reject the sorting
-            # sentinel at the real token count instead of scattering every
-            # padded expert slot into that row.
-            scheduled_tokens_gpu=(
-                context.scheduled_tokens_gpu
-                if split and sp_is_enabled()
-                else None if gathered else pass_scheduled_tokens_gpu(topk_ids.shape[0])
-            ),
+            scheduled_tokens_gpu=scheduled_tokens_gpu,
             **shared_kwargs,
         )
         if split:
@@ -5866,6 +5878,12 @@ class FusedMoE(torch.nn.Module):
             hidden_states.shape[0]
         ):
             return self.sp_mega_moe.forward(self, hidden_states, router_logits)
+        if (
+            self.pro_decode_experts is not None
+            and shared_add is None
+            and self.pro_decode_experts.runs(self, hidden_states)
+        ):
+            return self.pro_decode_experts.forward(self, hidden_states, router_logits)
 
         if get_dp_group().world_size > 1:
             return self.forward_impl_graph(
