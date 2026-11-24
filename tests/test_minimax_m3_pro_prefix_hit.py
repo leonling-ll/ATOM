@@ -424,6 +424,22 @@ def _sub(rows, idx):
     return None if rows is None else [rows[i] for i in idx.tolist()]
 
 
+def _same_blocks(got, want):
+    """Selections equal row for row; else which rows differ, and how."""
+    if got == want:
+        return True
+    if got is None or want is None or len(got) != len(want):
+        return False
+    diff = [
+        (i, sorted(set(a) ^ set(b)))
+        for i, (a, b) in enumerate(zip(got, want))
+        if a != b
+    ]
+    pytest.fail(
+        f"{len(diff)} of {len(got)} rows select other blocks, first: {diff[:3]}"
+    )
+
+
 @pytest.mark.parametrize("half", [False, True], ids=["hit", "half"])
 @pytest.mark.parametrize("size,ck,vk,spec", _params())
 def test_prefix_hit_equals_cold_prefill(size, ck, vk, spec, half, monkeypatch):
@@ -459,7 +475,7 @@ def test_prefix_hit_equals_cold_prefill(size, ck, vk, spec, half, monkeypatch):
     assert _same(p.snapshot(shared), before), "a hit prefill wrote into a shared block"
     if spec is not None:
         assert sel[0] == spec["pre"]
-    assert sel[1] == _sub(p.full_sel[1], idx)
+    assert _same_blocks(sel[1], _sub(p.full_sel[1], idx))
     _check_new_rows(p, idx, slot)
     assert T._close(got, p.full[idx])
 
@@ -490,7 +506,7 @@ def test_chunked_cold_prefill_equals_one_prefill(size, ck, vk, spec, monkeypatch
             ranks=(spec or {}).get("ranks", 0),
             monkeypatch=monkeypatch,
         )
-        assert sel[1] == _sub(p.full_sel[1], idx)
+        assert _same_blocks(sel[1], _sub(p.full_sel[1], idx))
         _check_new_rows(p, idx, slot)
     assert T._close(got, p.full)
 
@@ -539,7 +555,7 @@ def test_rejected_verify_after_hit_leaves_no_trace(size, ck, vk, spec, monkeypat
         p, v, tail, wide, slot, spy, static=True, ranks=ranks, monkeypatch=monkeypatch
     )
     assert _same(p.snapshot(shared), before)
-    assert sel[1] == cold_sel[1]
+    assert _same_blocks(sel[1], cold_sel[1])
     if spec is not None:
         assert sel[0] == spec["ver"]
     _check_new_rows(p, tail, slot)
