@@ -102,15 +102,17 @@ class ProMonoRoute:
         """Collective: every rank, at the first MoE layer of the first forward."""
         self._latched = True
         v, mx_norm = self._read()
-        why = variants_refusal(v, mx_norm)
+        refused = variants_refusal(v, mx_norm)
         # a refused variant set latches 0 here, which turns every rank off
         act = v.mono_routed_act
         self.rows, why = latch_rows(
-            0 if why else v.mono_ffn_rows, self._group(), act=act
+            0 if refused else v.mono_ffn_rows, self._group(), act=act
         )
         if not self.rows:
             if v.mono_ffn_rows:
-                logger.warning("%s off: %s", WHAT, why)
+                # this rank's own refusal names the cause; the latch's would
+                # only say it latched 0
+                logger.warning("%s off: %s", WHAT, refused or why)
             self._mono.enabled = False
             return
         self.routed_act = act

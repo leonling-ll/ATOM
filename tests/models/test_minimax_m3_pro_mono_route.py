@@ -185,11 +185,16 @@ def test_a_failed_runner_turns_it_off_for_good(monkeypatch):
         ({"day0_decode_rows": 1}, "day0_decode_rows 1 within 16"),
     ],
 )
-def test_variants_the_hand_off_cannot_serve_latch_off(monkeypatch, over, why):
+def test_variants_the_hand_off_cannot_serve_latch_off(monkeypatch, caplog, over, why):
+    import logging
+
     assert variants_refusal(_variants(**over), True) == why
     h = Harness(monkeypatch, **over)
-    assert h.take(1) is None
+    with caplog.at_level(logging.WARNING, logger=route_mod.logger.name):
+        assert h.take(1) is None
     assert h.created == 0 and h.route.rows == 0
+    # the off line names the refusal, not the 0 it latched
+    assert f"mono FFN off: {why}" in caplog.text
 
 
 @pytest.mark.parametrize("day0, rows", [(24, 16), (17, 16), (0, 16), (9, 8)])
