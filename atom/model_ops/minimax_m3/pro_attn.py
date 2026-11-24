@@ -29,6 +29,7 @@ import functools
 import json
 import logging
 import os
+import tempfile
 import time
 from dataclasses import dataclass, fields, replace
 
@@ -164,8 +165,11 @@ class ProVariants:
     # MXFP8 activation quant (E4M3, group-32 E8M0 scales, ``quantize_fp8``'s bytes) written
     # by the ops that produce the activations -- the norms after the all-reduces, the
     # lookahead norm, the SwiGLU -- instead of a ``quantize_fp8`` launch before each native
-    # group32 FP8 GEMM (``pro.py``). Off under ``diag``; the norms keep the unfused path on
-    # an aiter without the MXFP8 norm outputs.
+    # group32 FP8 GEMM (``pro.py``), and the decode / verify attention below the day0
+    # decode writes o_proj's (``_mxfp8_out``: the Triton attention always, aiter's where its
+    # gluon decode takes ``output_scale``; prefill keeps bf16).
+    # Off under ``diag``; the norms keep the unfused path on an aiter without the MXFP8
+    # norm outputs.
     fuse_mxfp8_quant: bool = True
     # A MoE layer's post-attention all-reduce, norm (+ MXFP8 copy), router, sigmoid
     # top-k and moe_sorting as one aiter launch (``models/minimax_m3/moe_route_glue``),
@@ -208,8 +212,8 @@ class ProVariants:
     # pool's layout cannot change while it serves.
     k_only: bool = False
     # An fp8 K cache as a plain (clamped) cast, its scale plane all 1.0: what moo's and
-    # amd-kernels-day0's kernels read. The normed K is O(1), within e4m3's range. Triton
-    # prep only (aiter's scales every row).
+    # amd-kernels-day0's kernels read. The normed K is O(1), within e4m3's range. The aiter
+    # prep writes it where its op takes ``kv_unit_scale``, else the Triton prep runs.
     k_plain_fp8: bool = False
     # The prefill attention of the K-only cache: "triton", or "day0" (amd-kernels-day0's
     # FlyDSL fp8_sparse_prefill; needs k_plain_fp8, 16 local heads and the package, else
@@ -226,11 +230,12 @@ class ProVariants:
     # Mono decode phase 1 (``models/minimax_m3/pro_mono``): the most graph rows a decode /
     # verify forward may have for its MoE layers' o_proj .. FFN segment to run as one
     # persistent kernel; 0 (default) off, at most ``pro_mono.config.MAX_ROWS``. Wider
-    # forwards keep production's segment (``moe_route_glue`` where it is on), and a
-    # ``day0_decode_rows`` at or below the limit turns mono off. Latched once, at the
+    # forwards keep production's segment (``moe_route_glue`` where it is on). The layers
+    # mono takes get the decode attention's output as bf16; a ``day0_decode_rows`` at or
+    # below the limit (its epilogue writes E4M3) turns mono off. Latched once, at the
     # first forward (``pro_mono.route``, agreed over the TP group): a later edit of the
-    # file does not change it. Off by default until the design's acceptance gates pass
-    # with it on (accuracy: the
+    # file does not change it. Off by default until its acceptance gates pass with it
+    # on (accuracy: the
     # exposure and official GSM8K 3-run means, AIME26 avg@16 >= 0.95 twice,
     # retrieval 40/40; speed: a faster measured layer and >= 10% proxy TPOT at c1/c4).
     mono_ffn_rows: int = 0
@@ -240,6 +245,12 @@ class ProVariants:
     # "fp4" (W4A4, aiter a4w4 numerics); the last two quantize the activations, a
     # numerics change. Latched with ``mono_ffn_rows`` and agreed over the TP group.
     mono_routed_act: str = "bf16"
+    # Developer profile, not an attention switch (the attention path never reads it): count
+    # the distinct routed experts each MoE layer reads in every forward (TP rank 0) into
+    # ``<diag_tag>_experts.jsonl`` (``eplb.ExpertCountProfile``). A counting run, not a
+    # timing run. Read once, when the model is built: the count runs inside the captured
+    # decode graphs.
+    expert_count: bool = False
 
 
 # Below it the all-gather costs more than the scoring it saves (moo's threshold).
@@ -310,6 +321,16 @@ def refresh_variants(force: bool = False) -> ProVariants:
 
 def variants() -> ProVariants:
     return _variants
+
+
+def diag_path(name: str) -> str:
+    """``name`` in the developer diagnostics' directory (``$ATOM_M3PRO_DIAG_DIR``, else
+    ``m3pro_diag`` under the system temp directory), created if missing."""
+    d = os.environ.get(
+        "ATOM_M3PRO_DIAG_DIR", os.path.join(tempfile.gettempdir(), "m3pro_diag")
+    )
+    os.makedirs(d, exist_ok=True)
+    return os.path.join(d, name)
 
 
 @dataclass(frozen=True)
@@ -391,9 +412,15 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
     # MXFP8 output (take_mx_scale)
     mx_out = False
     _mx_scale = None
+    # set for one call by ``MiniMaxM3ProAttention.forward_core``: the mono layer kernel
+    # reads the attention's output as bf16, so the Triton / aiter rows below the day0
+    # decode stay bf16 (the day0 decode's epilogue keeps ``day0_decode_mxfp8``)
+    bf16_out = False
 
     is_indexed_sparse_attention = True
     k_only = False  # the pool is ``ProKOnlyLayout`` (no V cache)
+    # The decode context parallel group's size (``decode_context_parallel_size``).
+    dcp_world = 1
 
     def __init__(
         self,
@@ -466,6 +493,9 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
         # the index-key cache, (blocks, page, index_head_dim).
         self.index_cache: torch.Tensor | None = None
         self.k_only = refresh_variants(force=True).k_only
+        from atom.config import get_current_atom_config
+
+        self.dcp_world = get_current_atom_config().decode_context_parallel_size
         if self.k_only:
             from atom.config import kv_cache_torch_dtype
 
@@ -725,14 +755,13 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
 
     # ------------------------------------------------------------ kernel path --
     def _aiter_prep(self, v: ProVariants) -> bool:
-        """aiter's prep: it scales an fp8 K and writes no NVFP4 index rows, nor the keys the
-        compressed index cache pools."""
+        """aiter's prep: it writes no NVFP4 index rows, nor the keys the compressed index
+        cache pools; the plain fp8 K needs its ``kv_unit_scale``."""
         return (
             v.prep == "aiter"
-            and not v.k_plain_fp8
             and not v.index_compress
             and not self._index_nvfp4()
-            and pro_kernels.aiter_prep_available()
+            and pro_kernels.aiter_prep_available(k_unit=v.k_plain_fp8)
         )
 
     def _index_nvfp4(self) -> bool:
@@ -784,6 +813,27 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
         model hands them to o_proj with it), dropped here."""
         scale, self._mx_scale = self._mx_scale, None
         return scale
+
+    def _mxfp8_out(self, v: ProVariants, n: int, day0_dec: bool = False) -> bool:
+        """Whether a decode / verify batch of ``n`` rows writes o_proj's MXFP8 input (E4M3
+        rows, their E8M0 scales through ``take_mx_scale``) instead of bf16, where o_proj takes
+        it (``mx_out``). ``day0_dec``: the batch is the day0 decode's (``_day0_decode``),
+        whose epilogue writes it under ``day0_decode_mxfp8``. Below that, under
+        ``fuse_mxfp8_quant``: the Triton attention always, aiter's where its gluon decode
+        takes ``output_scale``, unless the call is ``bf16_out``'s. Off under decode context
+        parallelism (``dcp_world`` > 1), the day0 decode included."""
+        if self.dcp_world > 1:
+            return False
+        if not self.mx_out:
+            return False
+        if day0_dec:
+            return v.day0_decode_mxfp8
+        return (
+            not self.bf16_out
+            and v.fuse_mxfp8_quant
+            and self.value_head_dim % 32 == 0
+            and (not self._aiter_attn(v, n) or pro_kernels.aiter_mxfp8_out_available())
+        )
 
     def _use_kernels(self, v: ProVariants) -> bool:
         """Whether the Triton kernels cover this layer and these variants."""
@@ -862,7 +912,8 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
         table's width), so the selection runs even where every block would fit.
         ``split``: this forward's ``index_split`` plan; the indexer scores this rank's
         rows only (the other rows' index q may be unset). ``mx_scale`` ``[n, H x 192 / 32]``
-        uint8 (with ``out`` E4M3): the day0 decode writes o_proj's MXFP8 input. ``dsplit``:
+        uint8 (with ``out`` E4M3): the decode attention writes o_proj's MXFP8 input
+        (``_mxfp8_out``). ``dsplit``:
         a decode's ``(first, end)`` rows this rank selects (``decode_split``). ``ring``:
         ``(each batch row's first ring row, the ring rows)`` of the compressed index cache
         (``index_compress``; ``ic`` is then its ``[pages, 4, 128]`` centroids).
@@ -883,10 +934,11 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
         else:
             ratio = (1.0 if v.mscale == "hf" else float(v.mscale)) / aiter_m
         eps = self.q_norm.variance_epsilon
-        prep = functools.partial(pro_kernels.prep, k_unit=fp8 and v.k_plain_fp8)
+        k_unit = fp8 and v.k_plain_fp8
+        prep = functools.partial(pro_kernels.prep, k_unit=k_unit)
         if self._aiter_prep(v):
             if pro_kernels.prep_aiter_fits(qkv, self.num_heads):
-                prep = pro_kernels.prep_aiter
+                prep = functools.partial(pro_kernels.prep_aiter, k_unit=k_unit)
             elif not getattr(self, "_warned_prep", False):
                 self._warned_prep = True
                 logger.warning(
@@ -969,7 +1021,7 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
 
         # decode / verify: FlyDSL sparse decode from day0_decode_rows rows
         day0_dec = static and self._day0_decode(v, n, block_tables.shape[0], fp8)
-        assert mx_scale is None or day0_dec, "an MXFP8 output needs the day0 decode"
+        assert mx_scale is None or static, "prefill attention writes bf16"
 
         valid_first = False  # set where the selection is select_logical's
 
@@ -1013,6 +1065,7 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
                     v_scale=vs,
                     fp8_compute=v.attn_fp8_compute,
                     k_rows=self.k_only,
+                    out_scale=mx_scale,
                 )
             return pro_kernels.attention(
                 q,
@@ -1028,6 +1081,7 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
                 n_blocks=nb if sel is None else None,
                 k_scale=ks,
                 valid_first=valid_first,
+                out_scale=mx_scale,
             )
 
         if v.dense_only or (nb <= self.topk and not static):
@@ -1279,18 +1333,34 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
             ):
                 attn_impl += f"; day0 decode from {v.day0_decode_rows} rows" + (
                     " (MXFP8 out)"
-                    if v.day0_decode_mxfp8 and getattr(self, "mx_out", False)
+                    if self._mxfp8_out(v, v.day0_decode_rows, day0_dec=True)
                     else ""
                 )
-            logged = (attn_impl, prep_impl)
+            # the Triton / aiter rows, below the day0 decode
+            mx_impl = (
+                "off"
+                if not (v.fuse_mxfp8_quant and self.mx_out and self.dcp_world == 1)
+                else (
+                    "on"
+                    if self._mxfp8_out(v, _K_ROWS_AITER_MIN)
+                    else (
+                        "on Triton rows only (this aiter's decode writes bf16)"
+                        if self.k_only
+                        else "off (this aiter's decode writes bf16)"
+                    )
+                )
+            )
+            logged = (attn_impl, prep_impl, mx_impl)
             if self.layer_num == 0 and getattr(self, "_logged_kernels", None) != logged:
                 self._logged_kernels = logged
                 logger.info(
-                    "M3-Pro attention: kernels, %s prep, %s attention, %s%s KV cache (%s)",
+                    "M3-Pro attention: kernels, %s prep, %s attention, %s%s KV cache, "
+                    "Triton / aiter decode MXFP8 out %s (%s)",
                     prep_impl,
                     attn_impl,
                     "K-only " if self.k_only else "",
                     layer.k_cache.dtype,
+                    mx_impl,
                     v,
                 )
             static = not fwd.context.is_prefill
@@ -1305,15 +1375,14 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
                 if n == 0:
                     return query.new_zeros(n_tok, h * self.value_head_dim)
                 nb = (max(ctx) + self.page - 1) // self.page
-            # the day0 decode writes o_proj's MXFP8 input where o_proj takes it (mx_out, set
-            # by the model): E4M3 rows here, their E8M0 scales through take_mx_scale
-            mx = (
-                static
-                and v.day0_decode_mxfp8
-                and getattr(self, "mx_out", False)
-                and self._day0_decode(
+            # the decode attention writes o_proj's MXFP8 input where o_proj takes it (mx_out,
+            # set by the model): E4M3 rows here, their E8M0 scales through take_mx_scale
+            mx = static and self._mxfp8_out(
+                v,
+                n,
+                self._day0_decode(
                     v, n, md.block_tables.shape[0], layer.k_cache.element_size() == 1
-                )
+                ),
             )
             # the kernels write every row they compute in full: zero only the others
             width = h * self.value_head_dim

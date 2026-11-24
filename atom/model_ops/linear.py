@@ -2767,6 +2767,11 @@ class MinimaxM3QKVParallelLinearWithIndexer(QKVParallelLinear):
     The sparse attention layers emit ``[q | k | v | index_q | index_k]`` from a
     single column-parallel GEMM. ``index_q`` follows the KV-head sharding and
     replication rules, while ``index_k`` is a single replicated head.
+
+    ``v_head_size=0`` drops ``v`` (M3-Pro: V is cut from K).
+    ``replicate_index_heads`` keeps every index head on every rank (M3-Pro's
+    indexer is replicated), as indexer-only CP does, so ``index_q`` need not
+    shard like the KV heads.
     """
 
     _nvfp4_global_scale_shard_map: ClassVar[dict[str, int]] = {
@@ -2789,16 +2794,18 @@ class MinimaxM3QKVParallelLinearWithIndexer(QKVParallelLinear):
         quant_config: QuantizationConfig | None = None,
         source_quant_dtype: torch.dtype = None,
         prefix: str = "",
+        v_head_size: int | None = None,
+        replicate_index_heads: bool = False,
         **kwargs,
     ):
-        if total_num_index_heads != total_num_kv_heads:
+        if not replicate_index_heads and total_num_index_heads != total_num_kv_heads:
             raise ValueError(
                 "MiniMax-M3 index_q must shard like KV heads: "
                 "total_num_index_heads must equal total_num_kv_heads."
             )
 
         self.head_size = head_size
-        self.v_head_size = head_size
+        self.v_head_size = head_size if v_head_size is None else v_head_size
         self.index_head_size = index_head_size
         self.total_num_heads = total_num_heads
         self.total_num_kv_heads = total_num_kv_heads
@@ -2819,8 +2826,9 @@ class MinimaxM3QKVParallelLinearWithIndexer(QKVParallelLinear):
         from atom.distributed.indexer_cp import indexer_cp_enabled
 
         self.indexer_cp = indexer_cp_enabled()
+        self.index_q_replicated = self.indexer_cp or replicate_index_heads
         self.num_index_heads = (
-            self.total_num_index_heads if self.indexer_cp else self.num_kv_heads
+            self.total_num_index_heads if self.index_q_replicated else self.num_kv_heads
         )
 
         output_sizes = [
@@ -2844,16 +2852,18 @@ class MinimaxM3QKVParallelLinearWithIndexer(QKVParallelLinear):
 
     def _shard_offset_size(self, loaded_shard_id: str) -> tuple[int, int]:
         h = self.head_size
+        vh = self.v_head_size
         ih = self.index_head_size
         nq = self.num_heads
         nkv = self.num_kv_heads
         nidx = self.num_index_heads
+        index_start = (nq + nkv) * h + nkv * vh
         mapping = {
             "q": (0, nq * h),
             "k": (nq * h, nkv * h),
-            "v": ((nq + nkv) * h, nkv * h),
-            "index_q": ((nq + 2 * nkv) * h, nidx * ih),
-            "index_k": ((nq + 2 * nkv) * h + nidx * ih, ih),
+            "v": ((nq + nkv) * h, nkv * vh),
+            "index_q": (index_start, nidx * ih),
+            "index_k": (index_start + nidx * ih, ih),
         }
         if loaded_shard_id not in mapping:
             raise ValueError(
@@ -2887,7 +2897,7 @@ class MinimaxM3QKVParallelLinearWithIndexer(QKVParallelLinear):
         if loaded_shard_id == "q":
             shard_rank = self.tp_rank
         elif loaded_shard_id == "index_k" or (
-            loaded_shard_id == "index_q" and self.indexer_cp
+            loaded_shard_id == "index_q" and self.index_q_replicated
         ):
             # Replicated: shard_size already spans every index head, so there is
             # only one shard to take.
