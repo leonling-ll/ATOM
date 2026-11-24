@@ -204,6 +204,12 @@ class ProVariants:
     # of the separate add): inside the ``ar_fused_rows`` kernel up to its rows, as a
     # separate add before the all-reduce otherwise. Not on the last layer.
     moe_tail_ar: bool = False
+    # Rows (tokens) at or below which a MoE layer runs its shared expert on a side
+    # stream while its router and routed experts run on the current one, joined before
+    # the layer returns; a CUDA graph records the fork and the join. The same kernels on
+    # the same inputs: the same bytes. It pays with ``moe_tail_ar`` (no add after the
+    # join); 0 turns it off.
+    moe_two_stream_rows: int = 0
     # The K-only cache (``ProKOnlyLayout``): one 256-wide row a token, V read from its tail,
     # no V cache (776 -> 520 B a token and layer with an fp8 KV and a bf16 index cache).
     # The attention is then the Triton one. Read once, when the layers are built: the

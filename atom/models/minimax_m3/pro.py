@@ -489,6 +489,7 @@ class MiniMaxM3ProDecoderLayer(MiniMaxM3DecoderLayer):
                 shared_input=(ffn_x, ffn_x_scale) if fuse_ffn_in else None,
                 quant_down=True,
                 defer_shared=defer,
+                two_streams=0 < hidden_states.shape[0] <= v.moe_two_stream_rows,
             )
             if defer:
                 hidden_states, state.moe_tail = hidden_states
