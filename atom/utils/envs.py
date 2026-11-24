@@ -1079,6 +1079,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_USE_CUSTOM_ALL_GATHER": lambda: (
         os.getenv("ATOM_USE_CUSTOM_ALL_GATHER", "1").lower() == "1"
     ),
+    # Input pool of aiter's custom all-reduce, in bytes (see
+    # atom/distributed/comm_memory.py). Unset keeps aiter's 1 GiB.
+    "ATOM_CUSTOM_AR_POOL_BYTES": lambda: _optional_int_env(
+        "ATOM_CUSTOM_AR_POOL_BYTES", min_value=1
+    ),
     # Pure-DP LM head strategy (only active when the model TP group is size 1 and
     # the DP group is size > 1, i.e. pure DP attention on decode; every other
     # case — TP>1, DP off, prefill, ragged/draft rows — auto-falls back to the

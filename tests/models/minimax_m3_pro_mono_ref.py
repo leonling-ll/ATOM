@@ -194,7 +194,7 @@ def layer_report(got, want, g_ahead=None, eps_ahead=None):
 
 
 # The kernel's o_proj sums K in another order than the fp64 reference, so a
-# bf16 partial can differ in its last bit (design section 12); everything after
+# bf16 partial can differ in its last bit; everything after
 # it is production's recipe. The largest per-row relative error norm a row may
 # show, set so that every partial element 1 ulp off (the worst that allows)
 # still passes: on this test's inputs that gives at most 0.0065 (h_mid, x) and

@@ -10,6 +10,7 @@ and the counter says so.
 """
 
 import types
+from unittest import mock
 
 import numpy as np
 import pytest
@@ -20,6 +21,7 @@ from atom.config import CompilationConfig, Config
 from atom.metrics.dispatch import ForwardDispatchMetrics
 from atom.model_engine.arg_utils import EngineArgs, parse_size_list
 from atom.utils.forward_context import ForwardMode
+from atom.utils.region_graph import TokenGraph
 
 C32_MAX_NUM_SEQS = 2 * 32
 BUDGET = 16384
@@ -93,6 +95,40 @@ def _decode(bs, ladder):
     )
 
 
+def _prefill(tokens, ladder, buckets):
+    """One request's prefill of ``tokens`` new rows, with the prefill token-graph
+    ``buckets`` recorded (none: every prefill runs eagerly)."""
+    batch = types.SimpleNamespace(
+        total_seqs_num=1,
+        total_seqs_num_prefill=1,
+        total_tokens_num=tokens,
+        total_tokens_num_prefill=tokens,
+        total_tokens_num_decode=0,
+        num_scheduled_tokens=np.array([tokens], dtype=np.int32),
+        has_prefill=True,
+        is_dummy_run=False,
+        final_prefill_requests=lambda: 1,
+    )
+    with mock.patch.object(
+        TokenGraph,
+        "captured_sizes",
+        staticmethod(lambda phase=None: buckets if phase == "prefill" else ()),
+    ):
+        return ForwardMode.decide(
+            batch=batch,
+            dp_size=1,
+            dp_group=None,
+            enforce_eager=False,
+            step_needs_eager=False,
+            capture_sizes=ladder,
+            is_block_drafter=True,
+            tbo_on=False,
+            local_tbo=(False, False, 0, 0),
+            max_seqlen_q=tokens,
+            running_tokens_per_dp_rank=np.zeros(1, dtype=np.int32),
+        )
+
+
 def test_every_series_reads_zero_before_any_step():
     registry = CollectorRegistry()
     ForwardDispatchMetrics(registry=registry)
@@ -157,3 +193,38 @@ def test_a_draft_replays_only_where_every_declared_pass_was_recorded(Drafter):
     assert not Drafter.draft_replays(both, 8)
     assert not Drafter.draft_replays(drafter(_Pass({4}), _Pass({2})), 4)
     assert not Drafter.draft_replays(drafter(), 4)
+
+
+# The default `ATOM_TOKEN_GRAPH_SIZES`, as a backend with `supports_token_graph`
+# records them.
+PREFILL_BUCKETS = (256, 512, 1024, 2048, 3072)
+
+
+def test_a_small_prefill_that_replays_its_token_graph_counts_as_a_replay(
+    model_runner,
+):
+    """A warm agentic turn (142 new tokens) pads to the 256 bucket and replays
+    it; a 16k chunk is past every bucket and runs eagerly. Both are prefills,
+    so only the graph column tells them apart."""
+    ladder = _c32_ladder(model_runner)
+    registry = CollectorRegistry()
+    metrics = ForwardDispatchMetrics(registry=registry)
+    for tokens in (142, 3072, BUDGET):
+        mode = _prefill(tokens, ladder, PREFILL_BUCKETS)
+        assert not mode.use_cudagraph
+        metrics.record("target", mode.is_prefill, mode.replays_graph)
+    small = _prefill(142, ladder, PREFILL_BUCKETS)
+    assert small.prefill_token_graph and small.running_tokens == 256
+    samples = _samples(registry)
+    assert samples[("target", "prefill", "true")] == 2
+    assert samples[("target", "prefill", "false")] == 1
+
+
+def test_without_recorded_prefill_buckets_every_prefill_counts_eager(model_runner):
+    ladder = _c32_ladder(model_runner)
+    registry = CollectorRegistry()
+    metrics = ForwardDispatchMetrics(registry=registry)
+    mode = _prefill(142, ladder, ())
+    assert mode.running_tokens == 142
+    metrics.record("target", mode.is_prefill, mode.replays_graph)
+    assert _samples(registry)[("target", "prefill", "false")] == 1
