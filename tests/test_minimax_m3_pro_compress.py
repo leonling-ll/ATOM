@@ -221,7 +221,7 @@ def test_layer_selects_the_blocks_the_pooled_keys_score_highest(monkeypatch):
 
     def attention_spy(q, kc4, bt, seq, pos, sel, out, scale, *a, **k):
         for i, t in enumerate(rows_now["r"].tolist()):
-            sel_seen[t] = set(x for x in sel[i].tolist() if x >= 0)
+            sel_seen[t] = {x for x in sel[i].tolist() if x >= 0}
         return real_attention(q, kc4, bt, seq, pos, sel, out, scale, *a, **k)
 
     monkeypatch.setattr(K, "prep", prep_spy)
