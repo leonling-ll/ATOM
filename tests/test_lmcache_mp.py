@@ -374,6 +374,57 @@ def test_auto_rank_collapse_distinguishes_glm52_mla_from_minimax_m3_gqa():
     assert deployment._tp_replication_factor(minimax) == 1
 
 
+def _minimax_m3(kv_heads: int, **kw) -> SimpleNamespace:
+    config = _config(model_type="minimax_m3_vl", tp=8, **kw)
+    config.hf_config.architectures = ["MiniMaxM3SparseForConditionalGeneration"]
+    config.hf_config.text_config = SimpleNamespace(num_key_value_heads=kv_heads)
+    return config
+
+
+def test_auto_rank_collapse_stores_minimax_m31_pro_once(monkeypatch):
+    """M3.1-Pro caches one KV head for the whole model, so every rank's PAGE bytes
+    (KV, scales, index cache) are the same: one copy for the TP group. Flash (GQA)
+    keeps one shard a rank."""
+    from atom.utils import selector
+
+    assert deployment._tp_replication_factor(_minimax_m3(kv_heads=1)) == 8
+    assert deployment._tp_replication_factor(_minimax_m3(kv_heads=4)) == 1
+
+    # Its DSpark draft owns a pool; an MQA draft keeps the object replicated, a
+    # GQA one does not.
+    monkeypatch.setattr(selector, "attn_family", lambda _hf: selector.Family.MHA)
+    pro = _minimax_m3(kv_heads=1)
+    pro.speculative_config = SimpleNamespace(
+        method="dspark", draft_model_hf_config=SimpleNamespace(num_key_value_heads=1)
+    )
+    assert deployment._tp_replication_factor(pro) == 8
+    pro.speculative_config.draft_model_hf_config.num_key_value_heads = 2
+    assert deployment._tp_replication_factor(pro) == 1
+
+
+@pytest.mark.parametrize(
+    "kv_heads,tp,dcp,pcp,want",
+    [
+        (1, 8, 1, 1, 8),
+        (4, 8, 1, 1, 1),
+        (1, 8, 2, 1, 1),
+        (1, 8, 1, 2, 1),
+        (1, 1, 1, 1, 1),
+    ],
+)
+def test_mqa_tp_replication_factor(kv_heads, tp, dcp, pcp, want):
+    from atom.kv_transfer.offload.config import mqa_tp_replication_factor
+
+    config = SimpleNamespace(
+        tensor_parallel_size=tp,
+        decode_context_parallel_size=dcp,
+        prefill_context_parallel_size=pcp,
+    )
+    wrapped = SimpleNamespace(text_config=SimpleNamespace(num_key_value_heads=kv_heads))
+    assert mqa_tp_replication_factor(config, wrapped) == want
+    assert mqa_tp_replication_factor(config, wrapped.text_config) == want
+
+
 def test_auto_rank_collapse_keeps_kimi_k3_per_rank():
     # MLA KV is replicated, but the KDA checkpoint images stored in the same
     # PAGE units hold TP-sharded heads.

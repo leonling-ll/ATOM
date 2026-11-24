@@ -968,12 +968,20 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 ],
                 extra,
             )
+        from atom.kv_transfer.offload.config import mqa_tp_replication_factor
+
+        runner = getattr(self, "model_runner", None)  # none: a bare export, sharded
         return KVTransferTensors(
             pages=pages,
-            # GQA/MQA KV heads are sharded or only partially replicated across
-            # TP. In particular MiniMax-M3 must keep one stored shard per rank;
-            # whole-object TP collapse is unsafe for this PAGE layout.
-            tp_replication_factor=1,
+            # GQA KV heads are sharded or only partially replicated across TP
+            # (MiniMax-M3 Flash keeps one stored shard per rank); one KV head for
+            # the whole model (M3.1-Pro, MQA) is the same bytes on every rank,
+            # index cache included (every rank writes every row's index keys).
+            tp_replication_factor=(
+                1
+                if runner is None
+                else mqa_tp_replication_factor(runner.config, runner.config.hf_config)
+            ),
         )
 
     def refresh_flydsl_plan(self, context_lens, *, create=False):
