@@ -3,6 +3,7 @@
 
 """The Pro proxy benchmark's acceptance length and launch, from its dry run."""
 
+import itertools
 import os
 import shutil
 import subprocess
@@ -117,3 +118,37 @@ def test_pro_recipe_launch(tmp_path):
     assert values["AITER_QUICK_REDUCE_QUANTIZATION"] == "NONE"
     assert "ATOM_KV_OFFLOAD" not in values
     assert values["ATOM_CUSTOM_AR_POOL_BYTES"] == "134217728"
+
+
+AGENTIC_LADDER = (
+    "[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,18,20,22,24,26,28,30,32,"
+    "48,64,128,256,512]"
+)
+
+
+def _ladders(args):
+    """Every --cudagraph-capture-sizes value in the dry run's server flags."""
+    words = args.replace("\\", "").split()
+    pairs = itertools.pairwise(words)
+    return [b for a, b in pairs if a == "--cudagraph-capture-sizes"]
+
+
+def test_agentic_launch_captures_graphs_between_8_16_and_32(tmp_path):
+    done, _, args = _dry_run(tmp_path, RECIPE="agentic")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert _ladders(args) == [AGENTIC_LADDER]
+
+
+def test_pro_launch_keeps_the_default_ladder(tmp_path):
+    done, _, args = _dry_run(tmp_path)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert _ladders(args) == []
+
+
+def test_server_extra_ladder_comes_after_the_recipe_ladder(tmp_path):
+    # the server's argument parser keeps the last value, so SERVER_EXTRA wins
+    done, _, args = _dry_run(
+        tmp_path, RECIPE="agentic", SERVER_EXTRA="--cudagraph-capture-sizes [1,2]"
+    )
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert _ladders(args) == [AGENTIC_LADDER, "[1,2]"]

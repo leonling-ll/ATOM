@@ -139,6 +139,7 @@ python3 -m atom.entrypoints.openai_server \
   --max-model-len 132096 \
   --max-num-seqs $((2 * CONC)) \
   --max-num-batched-tokens 16384 \
+  --cudagraph-capture-sizes "[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,18,20,22,24,26,28,30,32,48,64,128,256,512]" \
   --gpu-memory-utilization 0.95 \
   --online_quant_config '{"layer_quant_config": {"*.experts": "mxfp4"}}' \
   --method dspark \
@@ -170,6 +171,21 @@ InferenceX takes the value from the model's golden AL curve for the served think
 draft length. Pro's thinking-on curve (InferenceX's golden AL file for minimax-m3.1-pro) is 2.94 at
 7 draft tokens; `scripts/m31pro/proxy_bench.sh` holds the whole curve and picks the value for its
 `SPEC_TOKENS`. There is no thinking-off curve yet.
+
+### Decode graph sizes
+
+A decode step replays the smallest captured graph that holds its sequences, and the padded rows
+of that graph cost index score and top-k time as real rows do. The default ladder
+(`EngineArgs.cudagraph_capture_sizes`) has nothing between 8, 16 and 32 sequences, so a step with
+9 sequences replays the 16-sequence graph and one with 17 the 32-sequence graph. The
+`--cudagraph-capture-sizes` ladder above adds every size from 9 to 16 and every second size from
+18 to 32; the startup cut to `--max-num-seqs` drops what CONC cannot reach.
+`scripts/m31pro/proxy_bench.sh` with `RECIPE=agentic` launches with the same ladder.
+
+At CONC 32 the cut leaves 26 graphs against the default's 12: capture takes 280 s instead of
+114 s and the graph pool 1.32 GiB instead of 0.64 GiB. KV sizing reserves the same graph estimate
+for either ladder, so the KV pool does not shrink; the extra pool comes out of the HBM left unused
+under the 0.95 target. Step times and the c32 proxy before and after are in #99.
 
 ## 2. Run the AgentX profile
 

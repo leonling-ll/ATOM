@@ -34,7 +34,7 @@
 #                    SPEC_TOKENS and THINKING; refused where there is none]
 #   RECIPE           pro: recipes/MiniMax-M3-Pro.md's fast configuration;
 #                    agentic: recipes/Agentic-MiniMax-M3.1-Pro.md's launch,
-#                    CPU KV offload included [pro]
+#                    CPU KV offload and its capture-size ladder included [pro]
 #   MAX_NUM_SEQS     [16 below CONC 8, else 2 x CONC]
 #   MAX_MODEL_LEN    [MAX_CONTEXT + 1024: room for the chat template]
 #   PORT             server port [8300]
@@ -110,6 +110,7 @@ SERVER_LOG=/app/logs_claude/atom_server.log
 export AITER_LOG_LEVEL=WARNING
 export AITER_QUICK_REDUCE_QUANTIZATION=NONE
 export KV_CACHE_DTYPE=fp8
+recipe_args=()
 case "$RECIPE" in
 pro)
     export AITER_CUSTOM_AR_DISABLE_LAMPORT=1
@@ -130,6 +131,10 @@ agentic)
     export LMCACHE_MAX_LOCAL_CPU_SIZE=184
     export LMCACHE_CHUNK_SIZE=256
     export PYTHONHASHSEED=0
+    # Graphs between 8, 16 and 32 sequences: a step replays the smallest graph
+    # that holds its sequences, and padded rows cost index score time.
+    recipe_args=(--cudagraph-capture-sizes
+        "[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,18,20,22,24,26,28,30,32,48,64,128,256,512]")
     ;;
 *)
     echo "proxy_bench: RECIPE must be pro or agentic, not $RECIPE" >&2
@@ -145,7 +150,7 @@ server_args=(--trust-remote-code
     --index-cache-dtype fp8
     --level 0
     --online_quant_config '{"layer_quant_config": {"*.experts": "mxfp4"}}'
-    "${spec_args[@]}" "${server_extra[@]}")
+    "${recipe_args[@]}" "${spec_args[@]}" "${server_extra[@]}")
 
 if [ "${PROXY_DRY_RUN:-0}" = 1 ]; then
     echo "acceptance_length=${ACCEPT_LENGTH:-none}"
