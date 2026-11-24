@@ -244,8 +244,8 @@ later chunk of a chunked prefill. Checked on the kernel path with fp8 caches, wi
   wrong, 51 turn right). Stock GSM8K, whose few-shot examples differ per question, hits almost nothing.
 
 The checks above ran on the separate K and V caches. For the K-only cache the Agentic recipe
-(`Agentic-MiniMax-M3.1-Pro.md`) serves, with day0 prefill, the indexer split over the ranks and the
-FlyDSL / aiter decode, three checks cover hits:
+(`Agentic-MiniMax-M3.1-Pro.md`) serves, with day0 prefill, the compressed index cache, the indexer
+split over the ranks and the FlyDSL / aiter decode, three checks cover hits:
 
 * `tests/test_minimax_m3_pro_prefix_hit.py`: a request admitted through the block manager's prefix walk
   (a full hit, a half hit) prefills only its uncached rows. It must select the blocks a cold prefill

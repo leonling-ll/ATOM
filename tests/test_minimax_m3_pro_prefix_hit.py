@@ -2,8 +2,10 @@
 """A prefix-cache hit on MiniMax-M3-Pro's caches computes what a cold prefill computes.
 
 A hit skips the forward of the cached tokens, so every per-token side effect they had
-(K row, K scale, index-K row) must already sit in the shared blocks, and nothing a new
-token computes may depend on anything else the skipped forward did. The layout comes from
+(K row, K scale, index-K row, or the compressed index cache's row of 4 keys) must already
+sit in the shared blocks, and nothing a new token computes may depend on anything else the
+skipped forward did: the second request's index-key ring starts with junk tagged with the
+positions below its first new token, as a slot another request left. The layout comes from
 the real ``BlockManager``: request A prefills every token and publishes its blocks, then a
 second request is admitted through the prefix walk, claims A's blocks for the hit and
 fresh blocks (holding a recycled pool's garbage) for the rest, and runs
@@ -20,9 +22,9 @@ cache), write A's bytes for its new tokens, leave the shared blocks byte for byt
 were, and give A's attention output within ``test_minimax_m3_pro_kernels._close``.
 
 Without a GPU the kernels run in Triton's interpreter (the small variants); the served
-variants (top-128 over contexts past 128 blocks, day0 prefill, aiter's K-only decode,
-FlyDSL's sparse decode, the indexer split over 8 emulated ranks) need a GPU and the
-packages they run on.
+variants (top-128 over contexts past 128 blocks, day0 prefill, the compressed index
+cache, aiter's K-only decode, FlyDSL's sparse decode, the indexer split over 8 emulated
+ranks) need a GPU and the packages they run on.
 """
 
 from __future__ import annotations
@@ -71,6 +73,7 @@ SERVED = {
     "score_tq": 8,
     "k_plain_fp8": True,
     "prefill_attn": "day0",
+    "index_compress": True,
 }
 
 # name: (sizes, Case kwargs, ProVariants kwargs, GPU-only spec or None). A spec names the
@@ -89,6 +92,18 @@ VARIANTS = {
         SMALL,
         KONLY8,
         {"topk": "split", "attn": "aiter", "score_tq": 8, "k_plain_fp8": True},
+        None,
+    ),
+    "konly_fp8plain_compress": (
+        SMALL,
+        KONLY8,
+        {
+            "topk": "split",
+            "attn": "aiter",
+            "score_tq": 8,
+            "k_plain_fp8": True,
+            "index_compress": True,
+        },
         None,
     ),
     "day0_prefill": (
@@ -117,6 +132,18 @@ VARIANTS = {
         BIG8,
         KONLY8,
         {**SERVED, "index_split": True, "index_split_decode": 64},
+        {
+            "needs": ("day0", "day0_decode"),
+            "pre": "attention_day0",
+            "ver": "attention_day0_decode",
+            "ranks": 8,
+        },
+    ),
+    # the same without the compressed index cache: per-token fp8 index rows
+    "index_split8_tokens": (
+        BIG8,
+        KONLY8,
+        {**SERVED, "index_compress": False, "index_split": True},
         {
             "needs": ("day0", "day0_decode"),
             "pre": "attention_day0",
@@ -213,7 +240,7 @@ class Pool:
     """A's case on a ``BlockManager``'s pool: caches of the pool's size full of garbage,
     A's sequences admitted (cold) and their block table in the case."""
 
-    def __init__(self, size, ck, seed=21):
+    def __init__(self, size, ck, vk, seed=21):
         c = T.Case(
             size["lens"],
             topk=size["topk"],
@@ -248,7 +275,19 @@ class Pool:
             k_scale=c.ks,
             v_scale=c.ks if c.vc4 is None else c.vs,
         )
+        self.compress = vk.get("index_compress", False)
+        if self.compress:
+            # vLLM's compressed index cache: a bf16 centroid of every GROUP keys
+            shape = (self.n_blocks, PG // K.GROUP, K.IDX_DIM)
+            c.ic = _garbage_like(torch.empty(shape, dtype=torch.bfloat16), g)
+            # the rings of raw index keys a request's later steps pool from: A's
+            # requests own slots 0..S-1, a second request's S..2S-1
+            self.ring_rows = 2 * c.S * K.RING_ROWS
+            ring, ring_pos = c.impl._ring_buffers(self.ring_rows, DEV, DT)
+            ring.copy_(_garbage_like(ring, g))
+            ring_pos.fill_(-1)
         c.impl.index_cache = c.ic
+        self.base = torch.arange(c.S, dtype=torch.int32, device=DEV) * K.RING_ROWS
         self.toks = [
             list(range(10_000 * (s + 1), 10_000 * (s + 1) + n))
             for s, n in enumerate(c.lens)
@@ -311,11 +350,34 @@ class Pool:
             idx += list(range(a + lo[s], b if hi is None else a + hi[s]))
         return torch.tensor(idx, device=DEV, dtype=torch.long)
 
+    def ring(self):
+        return (self.base, self.ring_rows) if self.compress else None
+
+    def second_rings(self, cached):
+        """Ring slots for a second request set: junk keys tagged with the positions just
+        below each request's first new token, as a slot another request left holds. A
+        group that read them would pool a key this request never computed."""
+        c = self.c
+        self.base = (
+            torch.arange(c.S, device=DEV, dtype=torch.int32) + c.S
+        ) * K.RING_ROWS
+        if not self.compress:
+            return
+        ring, ring_pos = c.impl._ring, c.impl._ring_pos
+        for s, p in enumerate(cached):
+            for q in range(max(0, p - K.RING_ROWS), p):
+                row = int(self.base[s]) + q % K.RING_ROWS
+                ring[row] = torch.randn(K.IDX_DIM, device=DEV).to(ring.dtype) * 3
+                ring_pos[row] = q
+
     def bytes_of(self, slot):
-        """Per-token cache bytes at ``slot``: the K row, its scale, the index row."""
+        """Per-token cache bytes at ``slot``: the K row, its scale, the index row (with
+        the compressed index cache, the row of the token's group)."""
         c, blk, off = self.c, slot // PG, slot % PG
         k = c.kc4[blk, :, off, :].reshape(blk.shape[0], -1).view(torch.uint8)
         s = None if c.ks is None else c.ks[blk, 0, off].clone()
+        if self.compress:
+            off = off // K.GROUP
         i = c.ic[blk, off].reshape(blk.shape[0], -1).view(torch.uint8)
         return k.clone(), s, i.clone()
 
@@ -353,6 +415,7 @@ def _run(p, v, idx, bt, slot, spy, qkv=None, static=False, ranks=0, monkeypatch=
             static=static,
             split=split,
             dsplit=dsplit,
+            ring=p.ring(),
         )
         return out
 
@@ -363,7 +426,13 @@ def _run(p, v, idx, bt, slot, spy, qkv=None, static=False, ranks=0, monkeypatch=
         return out, _blocks(launch, bt, seq, pos)
     n = idx.shape[0]
 
+    # each rank runs the step once, from the rings as they stood before it
+    rings = (c.impl._ring.clone(), c.impl._ring_pos.clone()) if p.compress else None
+
     def rank(r):
+        if rings is not None:
+            c.impl._ring.copy_(rings[0])
+            c.impl._ring_pos.copy_(rings[1])
         if static:
             per = n // ranks
             return call(dsplit=(r * per, (r + 1) * per))
@@ -402,7 +471,7 @@ def _setup(size, ck, vk, spec, monkeypatch):
         for need in spec["needs"]:
             if not _NEEDS[need]():
                 pytest.skip(f"needs {need}")
-    p, v, spy = Pool(size, ck), ProVariants(**vk), Spy(monkeypatch)
+    p, v, spy = Pool(size, ck, vk), ProVariants(**vk), Spy(monkeypatch)
     # A: every token, cold; its blocks are published once its forward has run
     p.full, p.full_sel = _run(
         p, v, torch.arange(p.c.T, device=DEV), p.c.bt, p.c.slot, spy
@@ -414,6 +483,13 @@ def _setup(size, ck, vk, spec, monkeypatch):
 
 
 def _check_new_rows(p, idx, slot):
+    if p.compress:
+        # a group's row is written once its last token is: only groups this step closed
+        seq, pos = p.c.seq[idx], p.c.pos[idx]
+        end = torch.zeros(p.c.S, dtype=pos.dtype, device=DEV)
+        end.scatter_reduce_(0, seq.long(), pos + 1, reduce="amax")
+        closed = (pos // K.GROUP + 1) * K.GROUP <= end[seq.long()]
+        idx, slot = idx[closed], slot[closed]
     for a, b in zip(p.bytes_of(p.c.slot[idx]), p.bytes_of(slot)):
         assert (a is None) == (b is None)
         assert a is None or torch.equal(a, b), "a new token's cache bytes differ"
@@ -448,6 +524,7 @@ def test_prefix_hit_equals_cold_prefill(size, ck, vk, spec, half, monkeypatch):
     keep = size["keep"]
     b = p.admit(p.half_prompts(keep) if half else p.toks)
     cached = [s.num_cached_tokens for s in b]
+    p.second_rings(cached)
     for n, k, got in zip(c.lens, keep, cached):
         if half:
             assert got == k
@@ -490,6 +567,7 @@ def test_chunked_cold_prefill_equals_one_prefill(size, ck, vk, spec, monkeypatch
     ]
     b = p.admit(fresh)
     assert all(s.num_cached_tokens == 0 for s in b)
+    p.second_rings([0] * c.S)
     bt = p.table(b)
     cuts = [[0, n // 3 + 5, 2 * n // 3 + 3, n] for n in c.lens]  # not block aligned
     got = torch.zeros_like(p.full)
@@ -526,6 +604,7 @@ def test_rejected_verify_after_hit_leaves_no_trace(size, ck, vk, spec, monkeypat
     keep = size["keep"]
     b = p.admit(p.half_prompts(keep))
     assert [s.num_cached_tokens for s in b] == keep
+    p.second_rings(keep)
     bt = p.table(b)
     shared = p.shared(b)
     before = p.snapshot(shared)
