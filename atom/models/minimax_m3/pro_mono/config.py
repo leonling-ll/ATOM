@@ -17,8 +17,8 @@ one width read off the loaded model is the routed planes' padded intermediate
 (``RoutedPlanes``: the loader's ``pad_align`` decides it), which an FFN build
 bakes as ``P1Build.inter_r``.
 
-The phase is off unless ``ProVariants.mono_ffn_rows`` is set. Its value is
-latched once, at the first MoE layer of the first forward (``route``), and
+The phase serves forwards of up to ``ProVariants.mono_ffn_rows`` rows (16 by
+default; 0 turns it off). Its value is latched once, at the first MoE layer of the first forward (``route``), and
 agreed over the TP group (``latch_rows``): the per-forward re-read of
 ``ATOM_M3PRO_VARIANTS`` must never flip it, because a forward whose ranks
 disagree on mono waits in-kernel for ever.

@@ -95,6 +95,7 @@ tokens loaded from the CPU tier and the re-ask's TTFT down from 2.85 s to 0.20 s
 | Speculative decoding | DSpark, 7 tokens, synthetic acceptance length 2.94 (golden AL, thinking enabled) |
 | Prefill | 16384-token chunks; prefill attention from amd-kernels-day0 when its `amd_kernels` package imports, otherwise the Triton kernel |
 | Decode attention | from 24 rows, amd-kernels-day0's FlyDSL sparse decode with an MXFP8 output for `o_proj`, when its `amd_kernels` package imports; otherwise aiter |
+| MoE layers at ≤ 16 rows | mono decode (`mono_ffn_rows` 16, the default): a decode or verify forward of at most 16 rows runs each MoE layer's `o_proj` through its FFN partial as one persistent FlyDSL kernel, with A16W4 routed experts (bf16 activations, the same MXFP4 weights). Needs FlyDSL and the Lamport all-reduce (`ar_lamport_rows` 16); without them production serves those layers |
 | `max-num-seqs` | 2 × CONC (128) |
 
 ## 1. Start the ATOM server
@@ -151,6 +152,9 @@ Check the startup log:
   `--text-only` and the comm-group reuse). A pool near 35 GB means pad_align 128 is not in; near
   11 GB, streaming quant is not on.
 - One `Creating LMCacheEngine` line per rank with `'max_local_cpu_size': 184.0`.
+- After the first request, one `MiniMax-M3.1-Pro mono FFN: forwards of 1 .. 16 rows, routed experts
+  A16W4` line per rank. A `MiniMax-M3.1-Pro mono FFN off: <why>` line means mono is off and
+  production serves every MoE layer.
 
 ### Host memory for LMCache
 
