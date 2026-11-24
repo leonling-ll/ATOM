@@ -73,7 +73,6 @@ from atom.models.minimax_m3.pro_mono.layout import (
     TP,
     X4_ROW,
     X8_ROW,
-    XH_ROW,
     XSC_WORDS,
     P1Build,
     ag_pair,
@@ -84,6 +83,7 @@ from atom.models.minimax_m3.pro_mono.layout import (
     rs_pair,
     scratch_layout,
     token_tiles,
+    xk_row,
 )
 from atom.models.minimax_m3.pro_mono.sources import SOURCES
 from atom.mono.device.mx import (
@@ -318,9 +318,9 @@ def stage_o(c):
                     fx.Int32(ws[p]) >> (g4 * 8),
                     fx.Int32(sb) >> (g4 * 8),
                 )
-        # tile k's accumulators a tile of ``red`` on
+        # tile k's accumulators in ``red_tile`` k
         for k in range_constexpr(tiles):
-            fx.ptr_store(acc[k], c["red"] + ((k * WAVES + wave) * 64 + lane) * 4)
+            fx.ptr_store(acc[k], ffn.red_tile(c, k) + (wave * 64 + lane) * 4)
         gpu.barrier()
         # the 4 K quarters summed in wave order: thread (token, row of 32), a
         # pass a token tile (THREADS = O_ROWS x TOKEN_TILE cells)
@@ -329,7 +329,7 @@ def stage_o(c):
                 tk = tid // O_ROWS
                 grp = (tid % O_ROWS) // 16
                 tot = row_sum(
-                    c["red"] + k * WAVES * 64 * 4,
+                    ffn.red_tile(c, k),
                     tid % 16,
                     tk,
                     [grp * 4 + w for w in range(4)],
@@ -364,6 +364,9 @@ def ar_reduce(c, ins):
     .. 16 rows, the owner's before its second sum went out.)"""
     lane, la = c["lane"], c["lookahead"]
     n = len(ins)
+    # the passes' values below (a, b, d) hold three tokens a wave: a wider
+    # build (25 .. 32 rows) needs a fourth set, not a silently dropped pass
+    assert 1 <= n <= 3, f"AR #1 takes 1 .. 3 tokens a wave, got {n}"
     # bound before the traced ifs: names their branches bind are not seen
     # past them otherwise (a second pass's, unused at <= 8 rows; a third's,
     # unused at <= 16)
@@ -500,14 +503,17 @@ def ar_norm(c, ins, held, w_post, w_ahead):
 
 
 @traced
-def ar_tokens(c, ps):
-    """A wave's tokens (pass indices ``ps``: token wave + 8 p) of this CTA's
-    128 columns, two a lane: reduce, gather, norm."""
+def ar_tokens(c, ps, last=None):
+    """A wave's tokens (pass indices ``ps``: token wave + 8 p, at most
+    ``last`` when given) of this CTA's 128 columns, two a lane: reduce,
+    gather, norm."""
     lane, wave, j = c["lane"], c["wave"], c["j"]
     col = j * COLS + 2 * lane
     ins = []
     for k in range_constexpr(len(ps)):
         t = wave + 8 * ps[k]
+        if const_expr(last is not None and k == len(ps) - 1):
+            t = fx.min(t, last)
         ins.append((t, col, _unpack(_ld_words(c["res"], (t * HIDDEN + col) // 2, 1))))
     # the weights before any poll
     w_post = _ld_words(c["g_post"], col // 2, 1)
@@ -529,6 +535,7 @@ def build(key: P1Build):
     s = key.tokens
     ffn_on = key.upto == "ffn"
     passes = -(-s // WAVES)
+    assert passes <= 3, f"{s} rows: AR #1 runs at most 3 passes (ar_reduce)"
     play = peer_layout()
     slay = scratch_layout(key)
     play_plain = plain_layout(key)
@@ -538,8 +545,9 @@ def build(key: P1Build):
 
     fp8 = ffn_on and key.routed_act == "fp8"
     bf16 = ffn_on and key.routed_act == "bf16"
+    tiles = token_tiles(s)
     # ``xs``: the o stage's MXFP8 core rows, then (FFN) the router's bf16 x
-    # slice, a W4A8 build's MXFP8 x rows or an A16W4 build's bf16 x K halves
+    # slice, a W4A8 build's MXFP8 x rows or an A16W4 build's bf16 x K slices
     # (the routed B operands: union to ug) and the shared mid's MXFP8 rows
     # (down; A16W4 every pick's bf16 mid row past them, ``ffn.load_mids``) --
     # stages apart, past barriers
@@ -547,23 +555,28 @@ def build(key: P1Build):
     if fp8:
         xs_row = max(O_ROW, X8_ROW)
     if bf16:
-        xs_row = max(O_ROW, XH_ROW)
+        xs_row = max(O_ROW, xk_row(key.routed_act, s), SM_ROW + TOPK * MIDB_ROW)
     assert xs_row >= (ffn.R_KLEN + 8) // 2 and xs_row >= SM_ROW
-    # A16W4's down: the staged mids past the shared mid's rows. A build that
-    # shrinks ``xs`` a token (a wider one, to fit the CU's LDS) has to stage
-    # them in passes instead
-    assert not bf16 or xs_row >= SM_ROW + TOPK * MIDB_ROW, (
-        f"A16W4 staged mids need {SM_ROW + TOPK * MIDB_ROW} xs words a token, "
-        f"the build has {xs_row}"
-    )
+    # An FFN build past one token tile (A16W4 only) keeps one tile of ``red``
+    # and puts the o stage's ``osc`` and ``misc`` and every stage's second
+    # ``red`` tile (``ffn.red_tile``) in ``xs``, where nothing else is then:
+    # with the staged mids whole, 24 rows' regions would pass the CU's LDS.
+    # The down, whose mids fill ``xs``, runs its second tile's shared sum
+    # through ``red`` in a second pass.
+    compact = ffn_on and tiles > 1
+    red_words = WAVES * 64 * 4
+    if compact:
+        o_end = s * (O_ROW + OSC_ROW + O_ROWS)
+        x_end = s * max(xk_row(key.routed_act, s), (ffn.R_KLEN + 8) // 2)
+        assert max(o_end, x_end) <= s * xs_row - red_words, (o_end, x_end)
 
     @fx.struct
     class Smem:
         xs: fx.Array[fx.Int32, s * xs_row, 16]
-        osc: fx.Array[fx.Int32, s * OSC_ROW, 16]
+        osc: fx.Array[fx.Int32, 4 if compact else s * OSC_ROW, 16]
         # a wave's 16x16 accumulators, a token tile's after another
-        red: fx.Array[fx.Float32, token_tiles(s) * WAVES * 64 * 4, 16]
-        misc: fx.Array[fx.Float32, O_ROWS * s, 16]
+        red: fx.Array[fx.Float32, (1 if compact else tiles) * red_words, 16]
+        misc: fx.Array[fx.Float32, 4 if compact else O_ROWS * s, 16]
         tls: fx.Array[fx.Int64, TL_POINTS, 16]
 
     mw = ffn.mask_words(s)
@@ -632,12 +645,19 @@ def build(key: P1Build):
             "g_post": g_post, "g_ahead": g_ahead, "h_mid": h_mid, "x": x,
             "x8": x8, "x8s": x8s, "la8": la8, "la8s": la8s,
             "xs": lds.xs.ptr, "osc": lds.osc.ptr, "red": lds.red.ptr,
-            "misc": lds.misc.ptr,
+            "red1": lds.red.ptr + red_words, "misc": lds.misc.ptr,
             "put": mb.put, "put_bf": mb.put_bf, "put_words": mb.put_words,
             "poll": mb.poll, "peek": mb.peek, "stamp": lambda k: stamp(tl_on, tls, tid, k),
             "ffn_on": ffn_on, "routed_act": key.routed_act,
             "planes": key.planes if ffn_on else None,
         }  # fmt: skip
+        if const_expr(compact):
+            xs = lds.xs.ptr
+            c |= {
+                "osc": xs + s * O_ROW,
+                "misc": fx.recast_iter(fx.Float32, xs + s * (O_ROW + OSC_ROW)),
+                "red1": fx.recast_iter(fx.Float32, xs + (s * xs_row - red_words)),
+            }
         if const_expr(ffn_on):
             # the norm writes MXFP4 x to ``plain`` (one buffer resource over
             # every plain region, a region a word offset); the rest of the
@@ -652,6 +672,15 @@ def build(key: P1Build):
         if const_expr(passes == 1):
             if (bid < NT) & (wave < s):
                 ar_tokens(c, [0])
+        elif const_expr(compact):
+            # an FFN build past one token tile: every wave three tokens, one
+            # code path; a wave past the last token's (wave + 16 >= S) takes
+            # the last token again, the same sums and stores a second time.
+            # The two paths below (a wave's third pass or not), with the
+            # FFN's arguments held across them, passed the SGPRs at 17 .. 23
+            # rows with the lookahead (spills; one path at 24 fits)
+            if bid < NT:
+                ar_tokens(c, list(range(passes)), last=s - 1)
         else:
             # waves holding a token in every pass; the rest skip the last
             every = s - WAVES * (passes - 1)

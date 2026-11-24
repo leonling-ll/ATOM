@@ -30,7 +30,10 @@ What must hold:
 * with padding rows (``nvalid`` below the width, ``PADDED``) the real rows'
   FFN partial is the unpadded launch's bit for bit, and the padding rows'
   finite: a padding row is routed nowhere, so the union may shrink and the
-  routed tasks land on other CTAs, but no real row's sum changes.
+  routed tasks land on other CTAs, but no real row's sum changes;
+* past 16 rows (A16W4: two token tiles, ug over K quarters) the same, and
+  with a hot router bias (``HOT``: every row picks two experts) a slot of
+  more than 16 picks runs the second token tile of ug and down.
 
 Needs 8 GPUs of 256 CUs (MI355X), aiter and FlyDSL, about 7 GB a GPU; skipped
 otherwise.
@@ -85,20 +88,32 @@ INTER_V, INTER_R, INTER_S = 640, 640, 640
 # the lookahead); W4A8 (32/32 on GPU at 05a6fc80) and W4A4 (26/26 at
 # c467bcf9) at one row and the widest, so every format stays covered (and
 # runs padded)
+# A16W4 past 16 rows: a third token a wave's AR pass (17), 20, the widest
+# (24, with and without the lookahead), and the widest with the hot router
+# bias (a fourth field, ``HOT``)
 CASES = (
     (1, True, "bf16"), (2, True, "bf16"), (3, True, "bf16"), (4, True, "bf16"),
     (8, True, "bf16"), (9, True, "bf16"), (16, True, "bf16"),
     (16, False, "bf16"),
     (1, True, "fp8"), (16, True, "fp8"), (1, True, "fp4"), (16, True, "fp4"),
+    (17, True, "bf16"), (20, True, "bf16"), (24, True, "bf16"),
+    (24, False, "bf16"), (24, True, "bf16", "hot"),
 )  # fmt: skip
 
 
 # a case run again with only its first rows real (``nvalid``): A16W4 at 8 -> 5
-# and 16 -> 9 real rows, the other formats at 16 -> 9
+# and 16 -> 9 real rows, the other formats at 16 -> 9; the 24-row build with
+# 17 and 20 real rows (the hot one 20: its hot slots still past 16 picks)
 PADDED = {
     (8, True, "bf16"): 5, (16, True, "bf16"): 9,
     (16, True, "fp8"): 9, (16, True, "fp4"): 9,
+    (24, True, "bf16"): 17, (24, False, "bf16"): 20,
+    (24, True, "bf16", "hot"): 20,
 }  # fmt: skip
+
+# the hot cases' router bias: these experts' + 2.0 (a sigmoid is below 1, the
+# bias's std 0.02), so every row picks both and their slots hold every row
+HOT = (7, 300)
 
 
 def _inputs(case):
@@ -113,6 +128,13 @@ def _router():
     g = torch.Generator().manual_seed(23)
     w = (torch.randn(EXPERTS, HIDDEN, generator=g) * GATE_STD).to(torch.bfloat16)
     return w, torch.randn(EXPERTS, generator=g) * BIAS_STD
+
+
+def _hot(bias):
+    """``bias`` with the ``HOT`` experts' raised."""
+    out = bias.clone()
+    out[list(HOT)] += 2.0
+    return out
 
 
 def _planes(rank, dev):
@@ -195,7 +217,7 @@ def _worker(rank, port, queue, done, inputs):
                 debug=True,
                 routed_act=act,
             )
-            for s, la, act in CASES
+            for s, la, act, *_ in CASES
         ]
         launches = compile_kernels([(build(k), ABI) for k in keys])
         peers = PeerBuffer(L.peer_bytes(), group, rank, TP, dev)
@@ -213,6 +235,7 @@ def _worker(rank, port, queue, done, inputs):
         s_o = shuffle_mxfp8_bpreshuffle_scale(ws.to(dev)).contiguous()
         w_post, w_ahead = (t.to(dev) for t in _norm_weights())
         w_gate, bias = (t.to(dev) for t in _router())
+        bias_hot = _hot(bias)
         routed, shared = _planes(rank, dev)
         band = w_gate[L.E_RANK * rank : L.E_RANK * (rank + 1)]
         table = {
@@ -222,9 +245,17 @@ def _worker(rank, port, queue, done, inputs):
         }  # fmt: skip
         addrs = {n: t.data_ptr() for n, t in table.items()}
         addrs["queue"] = scratch.data_ptr() + L.queue_word_offset(keys[0], LAYER)
-        moe_w = torch.tensor(
-            [addrs[n] for n in L.MOE_TABLE], dtype=torch.int64, device=dev
-        )
+        moe_ws = {
+            hot: torch.tensor(
+                [
+                    {**addrs, "bias": bias_hot.data_ptr()}[n] if hot else addrs[n]
+                    for n in L.MOE_TABLE
+                ],
+                dtype=torch.int64,
+                device=dev,
+            )
+            for hot in (False, True)
+        }
         deq = {}
 
         def routed_of(e):
@@ -236,8 +267,11 @@ def _worker(rank, port, queue, done, inputs):
             return deq[e]
 
         results = []
-        for key, launch, (core, res) in zip(keys, launches, inputs):
+        for case, key, launch, (core, res) in zip(CASES, keys, launches, inputs):
             s = key.tokens
+            hot = len(case) > 3
+            moe_w = moe_ws[hot]
+            bias_c = bias_hot if hot else bias
             core, res = core.to(dev), res.to(dev)
 
             def z(*shape, dt=torch.uint8):
@@ -251,7 +285,7 @@ def _worker(rank, port, queue, done, inputs):
                 "ffn_out": z(s, HIDDEN, dt=torch.bfloat16),
             }  # fmt: skip
 
-            def run(nvalid=0, out=out, core=core, res=res, launch=launch):
+            def run(nvalid=0, out=out, core=core, res=res, launch=launch, moe_w=moe_w):
                 args = ABI.pack(
                     {
                         "core": core.data_ptr(), "w_o": w_o.data_ptr(),
@@ -285,9 +319,9 @@ def _worker(rank, port, queue, done, inputs):
                 rl.contiguous().view(torch.float32).permute(1, 0, 2).reshape(s, -1)
             ).to(torch.bfloat16)
             x8 = out["x8"].view(torch.float8_e4m3fn)
-            ref_logits = route_reference(out["x"], w_gate, bias)[0]
+            ref_logits = route_reference(out["x"], w_gate, bias_c)[0]
             route_bad = route_failures(
-                logits.cpu(), picks.cpu(), weights.cpu(), ref_logits.cpu(), bias.cpu()
+                logits.cpu(), picks.cpu(), weights.cpu(), ref_logits.cpu(), bias_c.cpu()
             )
             want = ffn_reference(
                 out["x"], x8, out["x8s"], picks, weights, routed_of,
@@ -295,7 +329,7 @@ def _worker(rank, port, queue, done, inputs):
             )  # fmt: skip
             got = out["ffn_out"]
             pad = None
-            nv = PADDED.get((s, key.lookahead, key.routed_act))
+            nv = PADDED.get(case)
             if nv is not None:
                 # the same rows again, only the first nv real: the real rows'
                 # partial bit for bit, the padding rows' finite
@@ -323,7 +357,7 @@ def _worker(rank, port, queue, done, inputs):
             results.append(
                 {
                     "rows": s, "lookahead": key.lookahead, "waits": waits,
-                    "act": key.routed_act,
+                    "act": key.routed_act, "hot": hot,
                     "norm": norm, "picks": picks.cpu(), "weights": weights.cpu(),
                     "route_bad": route_bad,
                     "ffn_bad": ffn_failures(got.cpu(), want.cpu()),
@@ -426,6 +460,16 @@ def test_every_ranks_ffn_partial_matches_the_reference(ranks, case):
             f" |U| {r['union']}"
         )
         assert not r["ffn_bad"], (rank, r["rows"], r["act"], r["ffn_bad"])
+
+
+def test_the_hot_case_fills_a_second_token_tile(ranks):
+    """The hot bias puts every row on the ``HOT`` experts: their slots hold
+    24 picks, past one token tile (ug's and down's tile 1 run)."""
+    for i, case in enumerate(CASES):
+        if len(case) > 3:
+            picks = ranks[0][i]["picks"]
+            for e in HOT:
+                assert int((picks == e).sum()) == case[0] > 16, (case, e)
 
 
 @pytest.mark.parametrize("case", [i for i, c in enumerate(CASES) if c in PADDED])

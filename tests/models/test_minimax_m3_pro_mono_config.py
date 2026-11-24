@@ -17,6 +17,7 @@ from atom.models.minimax_m3.pro_mono.config import (
     HIDDEN,
     INTER_FULL,
     MAX_ROWS,
+    MAX_ROWS_A16W4,
     MAX_ROWS_LAYOUT,
     Q_HEADS,
     ROUTED_ACT_NAMES,
@@ -29,6 +30,7 @@ from atom.models.minimax_m3.pro_mono.config import (
     config_refusal,
     gate_rows,
     latch_rows,
+    max_rows,
     routed_width_refusal,
     rows_refusal,
 )
@@ -222,10 +224,27 @@ def test_rows_in_range_latch(rows):
     assert got == rows and (why is None) == (rows > 0)
 
 
-@pytest.mark.parametrize("rows", [-1, MAX_ROWS + 1, 32, "8", 8.0, True])
+@pytest.mark.parametrize("rows", [-1, MAX_ROWS_A16W4 + 1, 32, "8", 8.0, True])
 def test_rows_out_of_range_turn_the_phase_off(rows):
     assert rows_refusal(rows) is not None
     assert latch_rows(rows, None)[0] == 0
+
+
+@pytest.mark.parametrize("rows", [MAX_ROWS + 1, 20, MAX_ROWS_A16W4])
+def test_a16w4_serves_up_to_24_rows_w4a4_and_w4a8_16(rows):
+    """A16W4's FFN build takes two token tiles (17 .. 24 rows); W4A4 and W4A8
+    hold one, so a latch past 16 turns them off with the reason."""
+    assert (MAX_ROWS, MAX_ROWS_A16W4) == (16, 24)
+    assert max_rows("bf16") == MAX_ROWS_A16W4
+    assert rows_refusal(rows, "bf16") is None
+    assert latch_rows(rows, None, act="bf16") == (rows, None)
+    assert gate_rows(rows, rows) and gate_rows(1, rows)
+    for act in ("fp4", "fp8"):
+        assert max_rows(act) == MAX_ROWS
+        assert rows_refusal(MAX_ROWS, act) is None
+        why = rows_refusal(rows, act)
+        assert why == f"mono_ffn_rows {rows} outside 0 .. 16 ({ROUTED_ACT_NAMES[act]})"
+        assert latch_rows(rows, None, act=act) == (0, why)
 
 
 def test_ranks_that_read_different_rows_turn_it_off_on_every_rank(monkeypatch):
@@ -288,7 +307,8 @@ def test_the_gate_takes_only_rows_inside_the_latched_limit():
     assert not gate_rows(9, 8)
     assert not gate_rows(0, 8)
     assert not gate_rows(4, 0)  # off
-    assert not gate_rows(17, MAX_ROWS + 1)  # never past MAX_ROWS
+    # never past the widest build's (A16W4's) rows
+    assert not gate_rows(MAX_ROWS_A16W4 + 1, MAX_ROWS_A16W4 + 1)
 
 
 def test_variants_take_the_row_limit():

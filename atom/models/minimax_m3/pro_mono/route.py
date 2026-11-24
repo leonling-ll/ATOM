@@ -61,12 +61,12 @@ def variants_refusal(v, mx_norm: bool) -> str | None:
         (v.lookahead_src == "resid_in", f"lookahead_src {v.lookahead_src!r}"),
         (
             # a value ``latch_rows`` refuses is reported there
-            rows_refusal(v.mono_ffn_rows) is not None
+            rows_refusal(v.mono_ffn_rows, v.mono_routed_act) is not None
             or v.ar_lamport_rows >= v.mono_ffn_rows,
             f"ar_lamport_rows {v.ar_lamport_rows} below {v.mono_ffn_rows}",
         ),
         (
-            rows_refusal(v.mono_ffn_rows) is not None
+            rows_refusal(v.mono_ffn_rows, v.mono_routed_act) is not None
             or not 0 < v.day0_decode_rows <= v.mono_ffn_rows,
             f"day0_decode_rows {v.day0_decode_rows} within {v.mono_ffn_rows}",
         ),
