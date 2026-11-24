@@ -258,9 +258,11 @@ split over the ranks and the FlyDSL / aiter decode, three checks cover hits:
 * `scripts/m31pro/pfx_probe.py probe` against a running server (started as the Agentic recipe does,
   without LMCache and without `--spec-decode-acceptance-length`): key / value questions over 32k and 64k
   lists, each request served from the cache (`hit`, `half`, and `turn2` on blocks that decode published)
-  against the same token ids prefilled cold, at concurrency 1 and 8. It passes when every answer is
-  right and hits part from their cold twins only at near-ties, at most 2 more often than two cold runs
-  part from each other.
+  against the same token ids prefilled cold, at concurrency 1 and 8. Greedy decoding here is not
+  reproducible (a prompt sent cold twice parts after its answer, at confident tokens), so hits are
+  judged against two cold runs of the same prompts: it passes when every answer is right, every hit's
+  answer equals its cold twin's, and per phase the divergences, the off-tie ones and the largest
+  logprob gap before them stay within the cold-vs-cold floor (+2, +2, +0.25).
 
   ```bash
   python3 scripts/m31pro/pfx_probe.py probe --port 8000 --model "${MODEL_PATH}" --out probe.jsonl --lengths 32000
