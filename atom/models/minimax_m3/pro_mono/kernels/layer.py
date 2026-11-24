@@ -191,10 +191,11 @@ def _or(a, b):
 def core_loads(c):
     """The core rows' loads (bf16 [S, 3072], plain: the attention wrote them),
     every round of ``load_core``'s strided loop, issued before anything else
-    of the o stage: a round's stores are conditional, so a load in a later
-    round went out only after the earlier round's use, which waited (``vmcnt``
-    in issue order) for every w_o load issued before it -- 5 serial L2 round
-    trips at 8 rows, 11 at 16."""
+    of the o stage: ``load_core`` fences every round with ``sched_barrier``
+    (and a partial round's stores are conditional), so a core load left in a
+    later round would go out only after the earlier round's use, which waits
+    (``vmcnt`` in issue order) for every load issued before it -- 5 serial L2
+    round trips at 8 rows, 11 at 16, before these loads were hoisted."""
     s, tid = c["S"], c["tid"]
     n = s * CORE_ITEMS
     r_core = rsrc(c["core"])
@@ -221,10 +222,12 @@ def load_core(c, loads, issue):
     16, so a 16-lane group is either all live or all past the end (clamped,
     nothing stored).
 
-    Straight-line code: every lane of a 16-lane group stores the group's codes
-    word (the same word to the same address), and only a round with lanes
-    past the end branches, so the scheduler interleaves the rounds' chains.
-    No clamp to +-448: a bf16 block's quotient is within it (``_code``).
+    A round is straight-line code: every lane of a 16-lane group stores the
+    group's codes word (the same word to the same address), so there is no
+    per-item branch; only a round with lanes past the end branches. Each
+    round is fenced by ``sched_barrier(0)`` at both ends, so its share of the
+    weight loads goes out ahead of its quantization and nothing moves across
+    rounds. No clamp to +-448: a bf16 block's quotient is within it (``_code``).
 
     ``issue``: the o stage's weight loads (callables), issued a share before
     each round: a wave's buffer loads issue in order behind the CU's earlier
