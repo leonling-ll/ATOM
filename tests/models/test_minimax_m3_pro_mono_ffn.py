@@ -390,6 +390,8 @@ def test_ffn_lds_fits_at_the_widest_build(act):
     )  # fmt: skip
     assert 4 * words <= LDS_BYTES
     if act == "bf16":
+        # the down's staged mids fit ``xs`` past the shared mid's rows
+        assert xs_row >= L.SM_ROW + L.TOPK * L.MIDB_ROW
         # whole bf16 x rows would not fit: the reason for the K-half tasks
         whole = words + s * (2 * L.XH_WORDS + 4 - xs_row)
         assert 4 * whole > LDS_BYTES
@@ -430,6 +432,27 @@ def test_a16w4_operands_follow_the_w13_and_w2_tiles():
     for g, col in itertools.product(range(L.UG_GROUPS), range(0, L.UG_COLS, 2)):
         assert 2 * L.interb_word(0, g, col) == L.UG_COLS * g + col
     assert L.interb_word(1, 0, 0) == L.INTERB_WORDS == L.INTER_V // 2
+
+
+def test_a16w4_staged_mids_are_the_down_operands_without_bank_conflicts():
+    """The down's B operands from the staged mids (``ffn.load_mids``: ``inter``
+    word w of pick row r -> LDS word r MIDB_ROW + w): ``midb_word`` is
+    ``interb_word`` in the padded row, and a lane group's 16 reads (pick rows
+    r .. r + 15, 16 B each, any first row) cover the 64 banks once."""
+    for row, st, kb, j in itertools.product(
+        range(2 * L.TOPK), range(L.W2_STEPS), range(4), range(4)
+    ):
+        w = L.interb_word(row, 4 * st + kb, 8 * j)
+        r, off = divmod(w, L.INTERB_WORDS)
+        assert r == row and L.midb_word(row, st, kb, j) == r * L.MIDB_ROW + off
+        assert off + 4 <= L.INTERB_WORDS < L.MIDB_ROW
+    for r0, st, kb, j in itertools.product(
+        range(L.TOPK), range(L.W2_STEPS), range(4), range(4)
+    ):
+        words = [L.midb_word(r0 + c, st, kb, j) for c in range(16)]
+        assert all(w % 4 == 0 for w in words)
+        banks = {(w + d) % 64 for w in words for d in range(4)}
+        assert len(banks) == 64
 
 
 # ------------------------------------------------------------ the reference

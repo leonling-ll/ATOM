@@ -54,6 +54,7 @@ from atom.models.minimax_m3.pro_mono.kernels import ffn
 from atom.models.minimax_m3.pro_mono.layout import (
     ABI_NAMES,
     FFN_REGIONS,
+    MIDB_ROW,
     NORM_REGIONS,
     NT,
     O_CPW,
@@ -511,13 +512,16 @@ def build(key: P1Build):
     # ``xs``: the o stage's MXFP8 core rows, then (FFN) the router's bf16 x
     # slice, a W4A8 build's MXFP8 x rows or an A16W4 build's bf16 x K halves
     # (the routed B operands: union to ug) and the shared mid's MXFP8 rows
-    # (down) -- stages apart, past barriers
+    # (down; A16W4 every pick's bf16 mid row past them, ``ffn.load_mids``) --
+    # stages apart, past barriers
     xs_row = O_ROW
     if fp8:
         xs_row = max(O_ROW, X8_ROW)
     if bf16:
         xs_row = max(O_ROW, XH_ROW)
     assert xs_row >= (ffn.R_KLEN + 8) // 2 and xs_row >= SM_ROW
+    # A16W4's down: the staged mids past the shared mid's rows
+    assert not bf16 or xs_row >= SM_ROW + TOPK * MIDB_ROW
 
     @fx.struct
     class Smem:
@@ -629,6 +633,7 @@ def build(key: P1Build):
                 ],
                 "rlog_own": preg(c["own"], play["rlog"][0], "rlog"),
                 "xl": lds.xs.ptr, "sm8": lds.xs.ptr,
+                "midl": lds.xs.ptr + s * SM_ROW,
                 "xbl": lds.xs.ptr if fp8 or bf16 else fl.x4l.ptr,
                 "xsl": fl.xsl.ptr,
                 "smsc": fl.smsc.ptr,
