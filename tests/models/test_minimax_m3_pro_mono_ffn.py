@@ -483,6 +483,26 @@ def test_a16w4_staged_mids_are_the_down_operands_without_bank_conflicts():
         assert len(banks) == 64
 
 
+def test_a16w4_down_batches_carry_no_slot_past_every_waves_union():
+    """``ffn.down_batch``: wave w takes the slots w, w + 8, .. of U a batch at
+    a time, and a slot past U still dequantizes and multiplies its zero tile.
+    An A16W4 build's batch never holds a slot that is past U for every wave
+    (1 and 2 rows: one slot), and where U can pass WAVES experts it keeps the
+    two slots of w2 in flight that the staged mids allow; W4A4 / W4A8 keep
+    ``DOWN_BATCH`` at every width."""
+    pytest.importorskip("flydsl")
+    pytest.importorskip("aiter")
+    from atom.models.minimax_m3.pro_mono.kernels import ffn
+
+    for s in range(1, MAX_ROWS + 1):
+        nb = ffn.down_batch({"routed_act": "bf16", "S": s})
+        assert WAVES * (nb - 1) < L.max_u(s), s
+        if L.max_u(s) > WAVES:
+            assert nb == L.DOWN_BATCH, s
+        for act in ("fp4", "fp8"):
+            assert ffn.down_batch({"routed_act": act, "S": s}) == L.DOWN_BATCH
+
+
 # ------------------------------------------------------------ the reference
 
 

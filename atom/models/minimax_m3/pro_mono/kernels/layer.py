@@ -520,8 +520,13 @@ def build(key: P1Build):
     if bf16:
         xs_row = max(O_ROW, XH_ROW)
     assert xs_row >= (ffn.R_KLEN + 8) // 2 and xs_row >= SM_ROW
-    # A16W4's down: the staged mids past the shared mid's rows
-    assert not bf16 or xs_row >= SM_ROW + TOPK * MIDB_ROW
+    # A16W4's down: the staged mids past the shared mid's rows. A build that
+    # shrinks ``xs`` a token (a wider one, to fit the CU's LDS) has to stage
+    # them in passes instead
+    assert not bf16 or xs_row >= SM_ROW + TOPK * MIDB_ROW, (
+        f"A16W4 staged mids need {SM_ROW + TOPK * MIDB_ROW} xs words a token, "
+        f"the build has {xs_row}"
+    )
 
     @fx.struct
     class Smem:
