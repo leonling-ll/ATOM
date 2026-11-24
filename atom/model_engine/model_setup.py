@@ -19,13 +19,14 @@ from aiter.dist.utils import get_distributed_init_method
 from torch import nn
 
 from atom.config import Config, local_device_index, set_current_atom_config
+from atom.distributed.comm_memory import custom_ar_pool, share_identical_groups
 from atom.distributed.simulated_tp import apply_simulated_tp, reject_simulated_tp
 from atom.distributed.ulysses_sp import check_aiter_sp_api, sp_is_enabled
 from atom.model_engine.tp_multinode import managed_store_client
 from atom.model_loader.loader import load_model
 from atom.models.registry import support_model_arch_dict
 from atom.spec_decode.factory import build_drafter
-from atom.utils import resolve_obj_by_qualname
+from atom.utils import envs, resolve_obj_by_qualname
 from atom.utils.distributed.utils import (
     raise_timeout_if_dp_spans_nodes,
     raise_timeout_if_tp_spans_nodes,
@@ -119,22 +120,24 @@ def init_model_env(config: Config, rank: int) -> torch.device:
     else:
         # The group spans the devices that exist; apply_simulated_tp then
         # makes it *report* the logical width so layers shard that many ways.
-        init_dist_env(
-            config.tp_world_size,
-            rankID=rank,
-            backend="nccl",
-            distributed_init_method=distributed_init_method,
-            # This node's physical device index. Without it aiter derives a
-            # local rank from the DP-scaled global rank, which overruns the
-            # device list on every node after the first.
-            local_rank=local_device_rank,
-            data_parallel_size=config.parallel_config.data_parallel_size,
-            data_parallel_rank=config.parallel_config.data_parallel_rank,
-            prefill_context_model_parallel_size=config.pcp_group_size,
-            decode_context_parallel_size=getattr(
-                config, "decode_context_parallel_size", 1
-            ),
-        )
+        share_identical_groups(config.enable_expert_parallel)
+        with custom_ar_pool(envs.ATOM_CUSTOM_AR_POOL_BYTES):
+            init_dist_env(
+                config.tp_world_size,
+                rankID=rank,
+                backend="nccl",
+                distributed_init_method=distributed_init_method,
+                # This node's physical device index. Without it aiter derives a
+                # local rank from the DP-scaled global rank, which overruns the
+                # device list on every node after the first.
+                local_rank=local_device_rank,
+                data_parallel_size=config.parallel_config.data_parallel_size,
+                data_parallel_rank=config.parallel_config.data_parallel_rank,
+                prefill_context_model_parallel_size=config.pcp_group_size,
+                decode_context_parallel_size=getattr(
+                    config, "decode_context_parallel_size", 1
+                ),
+            )
         apply_simulated_tp(config)
     return device
 

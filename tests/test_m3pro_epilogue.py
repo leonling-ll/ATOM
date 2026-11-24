@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
-"""MiniMax-M3-Pro's packed projections (q+k in ``qk_proj``, index q+k in
-``index_qk_proj``, and the names that route the checkpoint into them) and the routed
-scale folded into the routing weights."""
+"""MiniMax-M3-Pro's packed projections (q, k, index q and index k in ``qkv_proj``, and
+the names that route the checkpoint into it) and the routed scale folded into the
+routing weights."""
 
 from __future__ import annotations
 
@@ -45,19 +45,22 @@ def _target(name: str) -> tuple[str, object] | None:
     [
         (
             "language_model.model.layers.3.self_attn.q_proj.weight",
-            ("language_model.model.layers.3.self_attn.qk_proj.weight", "q"),
+            ("language_model.model.layers.3.self_attn.qkv_proj.weight", "q"),
         ),
         (
             "language_model.model.layers.67.self_attn.k_proj.weight_scale_inv",
-            ("language_model.model.layers.67.self_attn.qk_proj.weight_scale", "k"),
+            ("language_model.model.layers.67.self_attn.qkv_proj.weight_scale", "k"),
         ),
         (
             "language_model.model.layers.0.self_attn.index_q_proj.weight",
-            ("language_model.model.layers.0.self_attn.index_qk_proj.weight", 0),
+            ("language_model.model.layers.0.self_attn.qkv_proj.weight", "index_q"),
         ),
         (
             "language_model.model.layers.9.self_attn.index_k_proj.weight_scale_inv",
-            ("language_model.model.layers.9.self_attn.index_qk_proj.weight_scale", 1),
+            (
+                "language_model.model.layers.9.self_attn.qkv_proj.weight_scale",
+                "index_k",
+            ),
         ),
         # the vision tower's attention keeps its names (its tower is unfused)
         (
