@@ -99,7 +99,7 @@ tokens loaded from the CPU tier and the re-ask's TTFT down from 2.85 s to 0.20 s
 |---|---|
 | Hardware | 8×MI355X (`gfx950`) |
 | ATOM | `yuhua/m3.1-pro` (this recipe's commit) |
-| aiter | aiter-M3 `hatwu/m3.1-pro-infx` at `a26613a8a` (with the inter-640 MoE rows, `[Config] [Tuning] [gfx950] MiniMax-M3.1-Pro MXFP4 MoE rows at inter 640`, the FlyDSL fp8 sparse prefill, and from `b85ce1a27` the op the `ar_fused_rows` / `moe_tail_ar` variants need, off here); `yuhua/m3.1-pro` adds the a16w4 rows at 256/512/1024 tokens, the MXFP8 GEMM rows and `moe_route_glue`. Those rows are built in: do not list `best/tune3/new_rows.csv` or other copies in `AITER_CONFIG_FMOE` (duplicate rows abort startup) |
+| aiter | aiter-M3 `yuhua/m3.1-pro` with aiter-M3#19 merged: the inter-640 MoE rows (`[Config] [Tuning] [gfx950] MiniMax-M3.1-Pro MXFP4 MoE rows at inter 640`), the a16w4 rows at 256/512/1024 tokens, the MXFP8 GEMM rows and `moe_route_glue`, and from `hatwu/m3.1-pro-infx` the FlyDSL fp8 sparse prefill (`a26613a8a`) and the op the `ar_fused_rows` / `moe_tail_ar` variants need (`b85ce1a27`, off here). Those rows are built in: do not list `best/tune3/new_rows.csv` or other copies in `AITER_CONFIG_FMOE` (duplicate rows abort startup) |
 | Parallelism | TP8, DCP=1 |
 | KV cache | FP8, K only, `--block-size 16`; index cache FP8 |
 | Prefix cache | on |
@@ -112,7 +112,7 @@ tokens loaded from the CPU tier and the re-ask's TTFT down from 2.85 s to 0.20 s
 
 ## 0. Build aiter-M3 into the container
 
-The launch below needs aiter-M3 `hatwu/m3.1-pro-infx` at `a26613a8a` (`zhuyuhua-v/aiter-M3`): on the image's own aiter
+The launch below needs aiter-M3 `yuhua/m3.1-pro` with aiter-M3#19 merged (`zhuyuhua-v/aiter-M3`; `hatwu/m3.1-pro-infx` at `a26613a8a` lacks `moe_route_glue`): on the image's own aiter
 the server falls back on three paths, each named in its log:
 
 | Fallback | Log line |
@@ -129,7 +129,7 @@ the runs (the build lives in its filesystem):
 cd /app/aiter-test
 base=$(git rev-parse HEAD)
 git fetch /w/aiter-M3.bundle '+refs/heads/*:refs/m3/*'
-git checkout --detach a26613a8a                # aiter-M3 hatwu/m3.1-pro-infx
+git checkout --detach refs/m3/yuhua/m3.1-pro   # aiter-M3 yuhua/m3.1-pro, #19 merged
 git log -1 --format='aiter %H'                  # record it with the results
 ```
 
@@ -395,11 +395,12 @@ flock /tmp/m31pro-gpu.lock bash scripts/m31pro/proxy_bench.sh 32 "${OUT_DIR}"
   the run measures 2.530 (`atom:mtp_average_tokens_per_forward`). Output text is `synthetic`.
 - No `amd_kernels`: day0's prefill kernel runs from aiter-M3. `day0_decode_rows` (default 24)
   needs the `amd_kernels` package, so decode keeps aiter's attention.
-- `"prep": "aiter"` runs Triton's prep here: aiter's prep declines `k_plain_fp8` and
-  `index_compress` (the server logs `triton prep`).
-- `"index": "fused"` is inert with `index_compress` on: the FlyDSL scorer declines the bf16
-  centroid cache and every decode score is Triton's BLOCK_CENTROID (one
-  `decode scores stay Triton's` line a layer and rank). It takes over when `index_compress` is off.
+- `"prep": "aiter"` runs Triton's prep here: aiter's prep declines `index_compress` (the
+  server logs `triton prep`).
+- `"index": "fused"` with `index_compress` on (#183): graphs below `index_split_decode` (64 rows)
+  score the bf16 centroid cache with aiter-M3#14's FlyDSL scorer; split graphs keep Triton's
+  BLOCK_CENTROID per-rank share. The rows measured below ran before #183, when every decode
+  score was Triton's.
 - The capture ladder is #99's. At `--max-num-seqs 64` and k=3 the startup cut keeps 26 graphs,
   1 to 64.
 - With k=3 a verify step at CONC 32 is at most 128 rows, under aiter's default 256-row MXFP4
@@ -414,7 +415,7 @@ Startup log, measured without the AR pool: `available_for_kv=77.69GB ... num_kvc
 
 | Change | In this launch |
 |---|---|
-| #108 / #122 | `"index": "fused"`: decode and verify scores on aiter-M3's FlyDSL scorer. Inert with `index_compress` on (above). |
+| #108 / #122 | `"index": "fused"`: decode and verify scores on aiter-M3's FlyDSL scorer; with `index_compress` on, only graphs below `index_split_decode` (above). |
 | #119 / #124 | `"prefill_attn": "day0"`: aiter-M3's FlyDSL `minimax_m3_fp8_sparse_prefill`, no `amd_kernels` import. |
 | #110 / #127 | `"ar_fused_rows": 128`: up to 128 rows, the all-reduce + residual + RMSNorm + MXFP8 sites run as one Lamport launch. `moe_tail_ar` stays off. |
 | #99 / #155 | The capture ladder between 8, 16 and 32 sequences (Decode graph sizes, above). |
