@@ -48,6 +48,7 @@ The fast configuration (kernel path, decode graphs, FP8 KV and index caches):
 
 ```bash
 export AITER_CUSTOM_AR_DISABLE_LAMPORT=1
+export ATOM_CUSTOM_AR_POOL_BYTES=134217728
 export ATOM_M3PRO_VARIANTS='{"kernels": true, "attn": "aiter", "topk": "split"}'
 
 python -m atom.entrypoints.openai_server \
@@ -58,7 +59,7 @@ python -m atom.entrypoints.openai_server \
   --max-model-len 16384 \
   --max-num-seqs 16 \
   --max-num-batched-tokens 16384 \
-  --gpu-memory-utilization 0.85 \
+  --gpu-memory-utilization 0.94 \
   --block-size 16 \
   --kv_cache_dtype fp8 \
   --index-cache-dtype fp8 \
@@ -70,11 +71,13 @@ Add `--method dspark --num-speculative-tokens 7` for speculative decoding with t
 draft. For the torch reference, leave `ATOM_M3PRO_VARIANTS` unset, add `--enforce-eager` and use
 `--kv_cache_dtype bf16 --index-cache-dtype bf16`; prefix caching was checked on the kernel path only.
 
-* With `ATOM_ONLINE_QUANT_STREAMING=1` and Pro's MoE `pad_align` 128 (the default now) the weights
-  take about 175 GiB per GPU and 0.95 works; see [`Agentic-MiniMax-M3.1-Pro.md`](Agentic-MiniMax-M3.1-Pro.md).
-  The note below is for the old padded, non-streaming load.
-* The weights take about 210 GB per GPU, so keep `--gpu-memory-utilization` at 0.85: at 0.88 the
-  KV pool takes every free byte and the first NCCL barrier fails to allocate.
+* The loader hands the blocks that weight processing frees back to the driver between steps, so the
+  post-load conversion leaves no holes in the allocator (before, about 40 GB per GPU stayed stranded
+  and 0.88 or more failed at the first NCCL barrier). `ATOM_ONLINE_QUANT_STREAMING=1` avoids them
+  another way, by converting while loading; see [`Agentic-MiniMax-M3.1-Pro.md`](Agentic-MiniMax-M3.1-Pro.md).
+* `ATOM_CUSTOM_AR_POOL_BYTES=134217728` gives the custom all-reduce a 128 MiB input pool instead of
+  aiter's 1 GiB: about 2.6 GiB less per GPU before the KV pool is sized, and every all-reduce Pro
+  sends still fits ([`docs/environment_variables.md`](../docs/environment_variables.md#communicator-memory)).
 * `--block-size 16` and `--level 0` are required. Decode graphs need the kernel path: the torch
   path reads the sequence lengths back to the host, raises if a capture reaches it, and runs with
   `--enforce-eager`.
@@ -115,7 +118,7 @@ python -m atom.entrypoints.openai_server \
   --max-model-len 16384 \
   --max-num-seqs 16 \
   --max-num-batched-tokens 16384 \
-  --gpu-memory-utilization 0.85 \
+  --gpu-memory-utilization 0.94 \
   --block-size 16 \
   --kv_cache_dtype fp8 \
   --index-cache-dtype bf16 \
@@ -158,7 +161,7 @@ python -m atom.entrypoints.openai_server \
   --max-model-len 131072 \
   --max-num-seqs 32 \
   --max-num-batched-tokens 16384 \
-  --gpu-memory-utilization 0.85 \
+  --gpu-memory-utilization 0.94 \
   --block-size 16 \
   --kv_cache_dtype fp8 \
   --index-cache-dtype bf16 \
@@ -509,6 +512,16 @@ ms, a bs1 decode step 14.29 -> 14.13 ms; GSM8K (20-shot, all 1319) 0.9356 agains
 for two baseline runs. `tests/test_minimax_m3_pro_prep_aiter.py` checks it against the Triton prep
 and the torch reference.
 
+On the K-only plain fp8 cache (`"k_only": true, "k_plain_fp8": true`) the aiter prep runs where its
+op takes `kv_unit_scale` (zhuyuhua-v/aiter-M3#11: the clamped cast, scales 1.0); with an aiter
+without it, an NVFP4 index cache or `index_compress`, the Triton prep runs. K codes, the scale plane
+and index K equal Triton's byte for byte at 1-64 rows. GPU time per call at Pro's decode rows (16
+local heads, packed rows, fp8 index cache, CUDA graph, MI355X, Triton -> aiter, us): 1 row 6.5 ->
+4.1, 8 rows 6.7 -> 4.3-4.4, 16 rows 6.8 -> 4.4, 24 rows 6.8 -> 4.4-4.5, 64 rows 6.9 -> 4.7
+(`python tests/test_minimax_m3_pro_prep_aiter.py --bench --k-only --kv fp8 --ic fp8`). On
+zhuyuhua-v's combo configuration the switch gave a 3-run GSM8K 64-shot mean of 0.9396 against
+0.9439 with the Triton prep on the same node.
+
 End to end on 8x MI355X (TP8, `--max-num-batched-tokens 16384`, 256 tokens out, greedy; TPOT in
 steady decode, ms per token):
 
@@ -555,8 +568,16 @@ bytes `quantize_fp8` would give -- instead of a separate `quantize_fp8` launch b
 - the lookahead norm in `ProLookaheadState.put` writes the reading layer's indexer input;
 - the SwiGLU writes down_proj's input (one Triton kernel).
 
-o_proj's input, written by the paged attention, is still quantized on its own: `quantize_fp8` per
-layer goes from 5 launches to 1.
+`quantize_fp8` per layer goes from 5 launches to 1, o_proj's input. In decode and DSpark verify
+(the decode graphs) that one goes too, with the kernel path: the attention writes o_proj's input as MXFP8 itself, the same bytes `quantize_fp8`
+gives for its bf16 output, and hands the E8M0 scales to o_proj through `take_mx_scale`. Which kernel writes it follows the rows of the batch:
+from `day0_decode_rows` (24) rows on the K-only plain fp8 cache, amd-kernels-day0's FlyDSL sparse decode does, in its epilogue (`day0_decode_mxfp8`, when the `amd_kernels` package imports);
+below that, or without the package, the Triton attention does it in its epilogue and aiter's attention (17
+rows and more on the K-only cache, every row over the V cache) through `pa_decode_gluon(output_scale=...)`, which needs aiter-M3 `d251a5af`
+([zhuyuhua-v/aiter-M3#8](https://github.com/zhuyuhua-v/aiter-M3/pull/8)) or later. Prefill keeps the
+bf16 output and the separate launch. The startup line `M3-Pro attention: ...` reports `day0 decode from 24 rows (MXFP8 out)` for the first, and `Triton / aiter decode MXFP8
+out on`, `on Triton rows only` or `off` for the second, with the reason when this aiter's decode writes bf16 only.
+Bytes, per path: `tests/test_minimax_m3_pro_attn_mxfp8.py`.
 
 The norms need aiter's MXFP8 norm outputs ([zhuyuhua-v/aiter-M3#2](https://github.com/zhuyuhua-v/aiter-M3/pull/2): the custom all-reduce
 MXFP8 epilogue, `add_rmsnorm_mxfp8` for the RCCL route and an E8M0 mode of
