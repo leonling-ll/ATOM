@@ -41,6 +41,8 @@ import torch
 import triton
 import triton.language as tl
 
+from atom.model_ops.blockscale_kernels.quantization import fp8_groups
+
 PAGE = 16
 HEAD_DIM = 256
 ROT = 64
@@ -1418,6 +1420,18 @@ def scores(
 
 # ----------------------------------------------------------------------- attention --
 @triton.jit
+def _store_mx64(ob, sb, x, C: tl.constexpr):
+    """``x`` [16 heads, 64], dims ``C * 64`` on of each head's 192, as ``quantize_fp8``
+    would write the bf16 output: E4M3 at ``ob`` (row stride 192), an E8M0 code a group
+    of 32 at ``sb`` (6 a head)."""
+    q, code, _ = fp8_groups(tl.reshape(x.to(tl.bfloat16).to(tl.float32), (32, 32)))
+    r = tl.arange(0, 32)  # head r // 2, group C * 2 + r % 2
+    col = (r // 2) * 192 + C * 64 + (r % 2) * 32
+    tl.store(ob + col[:, None] + tl.arange(0, 32)[None, :], q)
+    tl.store(sb + (r // 2) * 6 + C * 2 + r % 2, code.to(tl.uint8))
+
+
+@triton.jit
 def _attn_kernel(
     q_ptr,
     stride_q_t,
@@ -1436,6 +1450,8 @@ def _attn_kernel(
     stride_sel,
     out_ptr,
     stride_out_t,
+    os_ptr,
+    stride_os_t,
     ws_m_ptr,
     ws_l_ptr,
     ws_acc_ptr,
@@ -1451,6 +1467,7 @@ def _attn_kernel(
     KV_FP8: tl.constexpr,
     VALID_FIRST: tl.constexpr = False,
     EP2: tl.constexpr = 1,
+    MX: tl.constexpr = False,
 ):
     t = tl.program_id(0)
     sp = tl.program_id(1)
@@ -1549,14 +1566,25 @@ def _attn_kernel(
 
     if SPLITS == 1:
         inv = 1.0 / l_i
-        ob = out_ptr + t.to(tl.int64) * stride_out_t + (hbase + ar_h)[:, None] * 192
-        tl.store(ob + ar_c[None, :], (acc1 * inv[:, None]).to(out_ptr.dtype.element_ty))
-        tl.store(
-            ob + 64 + ar_c[None, :], (acc2 * inv[:, None]).to(out_ptr.dtype.element_ty)
-        )
-        tl.store(
-            ob + 128 + ar_c[None, :], (acc3 * inv[:, None]).to(out_ptr.dtype.element_ty)
-        )
+        if MX:
+            ob = out_ptr + t.to(tl.int64) * stride_out_t + hbase * 192
+            sb = os_ptr + t.to(tl.int64) * stride_os_t + hbase * 6
+            _store_mx64(ob, sb, acc1 * inv[:, None], 0)
+            _store_mx64(ob, sb, acc2 * inv[:, None], 1)
+            _store_mx64(ob, sb, acc3 * inv[:, None], 2)
+        else:
+            ob = out_ptr + t.to(tl.int64) * stride_out_t + (hbase + ar_h)[:, None] * 192
+            tl.store(
+                ob + ar_c[None, :], (acc1 * inv[:, None]).to(out_ptr.dtype.element_ty)
+            )
+            tl.store(
+                ob + 64 + ar_c[None, :],
+                (acc2 * inv[:, None]).to(out_ptr.dtype.element_ty),
+            )
+            tl.store(
+                ob + 128 + ar_c[None, :],
+                (acc3 * inv[:, None]).to(out_ptr.dtype.element_ty),
+            )
     else:
         wbase = (t.to(tl.int64) * SPLITS + sp) * H + hbase + ar_h
         tl.store(ws_m_ptr + wbase, m_i)
@@ -1574,9 +1602,12 @@ def _combine_kernel(
     ws_acc_ptr,
     out_ptr,
     stride_out_t,
+    os_ptr,
+    stride_os_t,
     H,
     SPLITS: tl.constexpr,
     SP2: tl.constexpr,
+    MX: tl.constexpr = False,
 ):
     t = tl.program_id(0)
     h = tl.program_id(1)
@@ -1596,11 +1627,30 @@ def _combine_kernel(
         other=0.0,
     )
     o = tl.sum(acc * w[:, None], axis=0) / ltot
-    tl.store(
-        out_ptr + t.to(tl.int64) * stride_out_t + h * 192 + a192,
-        o.to(out_ptr.dtype.element_ty),
-        mask=dm,
-    )
+    if MX:
+        # quantize_fp8 of the bf16 row: 6 groups of 32 (the 2 past 192 are dropped)
+        q, code, _ = fp8_groups(tl.reshape(o.to(tl.bfloat16).to(tl.float32), (8, 32)))
+        g = tl.arange(0, 8)
+        tl.store(
+            out_ptr
+            + t.to(tl.int64) * stride_out_t
+            + h * 192
+            + g[:, None] * 32
+            + tl.arange(0, 32)[None, :],
+            q,
+            mask=(g < 6)[:, None],
+        )
+        tl.store(
+            os_ptr + t.to(tl.int64) * stride_os_t + h * 6 + g,
+            code.to(tl.uint8),
+            mask=g < 6,
+        )
+    else:
+        tl.store(
+            out_ptr + t.to(tl.int64) * stride_out_t + h * 192 + a192,
+            o.to(out_ptr.dtype.element_ty),
+            mask=dm,
+        )
 
 
 def attention(
@@ -1617,6 +1667,7 @@ def attention(
     n_blocks=None,
     k_scale=None,
     valid_first=False,
+    out_scale=None,
 ):
     """Attention of every token's local heads over its selected blocks.
 
@@ -1626,8 +1677,12 @@ def attention(
     (for few tokens), ``nblk`` blocks are processed per step. An fp8 ``kc4`` takes its
     per-token scales ``k_scale`` ``[N, 1, page]``. ``valid_first``: ``sel``'s valid blocks
     lead each row (``select_logical``), and the splits divide those.
+    ``out_scale`` ``[T, H * 6]`` uint8: ``out`` is E4M3 and the two are ``quantize_fp8`` of
+    the bf16 output, bit for bit (E8M0 codes a group of 32).
     """
     t, h, _ = q.shape
+    mx = out_scale is not None
+    assert not mx or (out.element_size() == 1 and out_scale.dtype == torch.uint8)
     assert h % 16 == 0 and kc4.stride(-1) == 1 and q.stride(-1) == 1
     fp8 = kc4.element_size() == 1
     assert k_scale is not None or not fp8
@@ -1661,6 +1716,8 @@ def attention(
         sel.stride(0) if not dense else 0,
         out,
         out.stride(0),
+        out_scale if mx else out,
+        out_scale.stride(0) if mx else 0,
         ws_m,
         ws_l,
         ws_acc,
@@ -1676,6 +1733,7 @@ def attention(
         KV_FP8=fp8,
         VALID_FIRST=valid_first and not dense,
         EP2=triton.next_power_of_2(n_entries),
+        MX=mx,
     )
     if splits > 1:
         _combine_kernel[(t, h)](
@@ -1684,9 +1742,12 @@ def attention(
             ws_acc,
             out,
             out.stride(0),
+            out_scale if mx else out,
+            out_scale.stride(0) if mx else 0,
             h,
             SPLITS=splits,
             SP2=triton.next_power_of_2(splits),
+            MX=mx,
         )
     return out
 
@@ -2245,26 +2306,40 @@ def _default_partitions(t: int) -> int:
     return min(get_recommended_splits(t, 1), max(1, units // t))
 
 
-_gluon_value_rows = (
-    None  # aiter's pa_decode_gluon if it takes value_rows; False: it does not
-)
+_gluon_args = None  # torch.ops.aiter.pa_decode_gluon's arguments: {name: written}
+
+
+def _gluon_op_args() -> dict:
+    """The arguments of aiter's registered ``torch.ops.aiter.pa_decode_gluon``, each with
+    whether its schema declares it written; empty without the op. Read once."""
+    global _gluon_args
+    if _gluon_args is None:
+        try:
+            import aiter.ops.attention  # noqa: F401  (registers the op)
+
+            schema = torch.ops.aiter.pa_decode_gluon.default._schema
+        except (ImportError, AttributeError):
+            _gluon_args = {}
+        else:
+            _gluon_args = {
+                a.name: a.alias_info is not None and a.alias_info.is_write
+                for a in schema.arguments
+            }
+    return _gluon_args
 
 
 def aiter_value_rows_available() -> bool:
     """Whether this aiter's gluon paged attention reads V from the K cache's rows
     (``pa_decode_gluon(value_rows=True)``): ``attention_aiter(k_rows=True)``."""
-    global _gluon_value_rows
-    if _gluon_value_rows is None:
-        import inspect
+    return "value_rows" in _gluon_op_args()
 
-        try:
-            from aiter.ops.triton.gluon.pa_decode_gluon import pa_decode_gluon
-        except ImportError:
-            _gluon_value_rows = False
-        else:
-            ok = "value_rows" in inspect.signature(pa_decode_gluon).parameters
-            _gluon_value_rows = pa_decode_gluon if ok else False
-    return bool(_gluon_value_rows)
+
+def aiter_mxfp8_out_available() -> bool:
+    """Whether this aiter's gluon paged attention writes its output as MXFP8
+    (``pa_decode_gluon(output_scale=...)``, declared written by the op, so a compiled
+    graph reads the codes the call wrote): ``attention_aiter(out_scale=...)``, over the
+    K-only rows or the V cache."""
+    return _gluon_op_args().get("output_scale", False)
 
 
 def attention_aiter(
@@ -2281,6 +2356,7 @@ def attention_aiter(
     partitions=None,
     value_dim=VALUE_DIM,
     k_rows=False,
+    out_scale=None,
 ):
     """``attention`` on aiter's paged-attention decode (gluon, persistent dispatch), every
     token a sequence of its own over its ``sparse_rows`` table.
@@ -2291,10 +2367,16 @@ def attention_aiter(
     as well. ``k_rows``: ``k_cache`` is the K-only row cache ``[N, 1, 1, page, 256]`` (no V
     cache, ``v_cache`` / ``v_scale`` unused): aiter reads K through its SHUFFLE view and V
     as the rows' last ``value_dim`` dims (``aiter_value_rows_available``).
+    ``out_scale`` ``[T, H * value_dim / 32]`` uint8 (``aiter_mxfp8_out_available``):
+    ``out`` is E4M3, ``quantize_fp8`` of the bf16 output (aiter's PS kernel and reduce
+    write it, for either cache; this call then skips ``run_pa_decode``'s FlyDSL route,
+    which writes bf16).
     """
     t, h, _ = q.shape
     fp8 = k_cache.element_size() == 1
     assert (k_scale is not None and (v_scale is not None or k_rows)) or not fp8
+    assert out_scale is None or aiter_mxfp8_out_available()
+    mx = {} if out_scale is None else {"output_scale": out_scale.view(t, h, -1)}
     if partitions is None:
         partitions = _default_partitions(t)
     partitions = max(1, min(partitions, triton.cdiv(rows.shape[1] * PAGE, 256)))
@@ -2311,7 +2393,7 @@ def attention_aiter(
             (n, 1, PAGE, value_dim), (sb, sb, HEAD_DIM, 1), o + HEAD_DIM - value_dim
         )
         ks = k_scale.unsqueeze(-1) if fp8 else None
-        _gluon_value_rows(
+        torch.ops.aiter.pa_decode_gluon(
             out.view(t, h, value_dim),
             q,
             k_view,
@@ -2328,9 +2410,12 @@ def attention_aiter(
             ks,
             ps=True,
             value_rows=True,
+            **mx,
         )
         return out
-    _pa()(
+    # run_pa_decode's gluon call, straight to aiter's op where it writes MXFP8
+    decode = _pa() if out_scale is None else torch.ops.aiter.pa_decode_gluon
+    decode(
         out.view(t, h, value_dim),
         q,
         k_cache,
@@ -2346,6 +2431,7 @@ def attention_aiter(
         k_scale.unsqueeze(-1) if fp8 else None,
         v_scale.unsqueeze(-1) if fp8 else None,
         ps=True,
+        **mx,
     )
     return out
 

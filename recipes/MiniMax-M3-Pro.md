@@ -568,8 +568,16 @@ bytes `quantize_fp8` would give -- instead of a separate `quantize_fp8` launch b
 - the lookahead norm in `ProLookaheadState.put` writes the reading layer's indexer input;
 - the SwiGLU writes down_proj's input (one Triton kernel).
 
-o_proj's input, written by the paged attention, is still quantized on its own: `quantize_fp8` per
-layer goes from 5 launches to 1.
+`quantize_fp8` per layer goes from 5 launches to 1, o_proj's input. In decode and DSpark verify
+(the decode graphs) that one goes too, with the kernel path: the attention writes o_proj's input as MXFP8 itself, the same bytes `quantize_fp8`
+gives for its bf16 output, and hands the E8M0 scales to o_proj through `take_mx_scale`. Which kernel writes it follows the rows of the batch:
+from `day0_decode_rows` (24) rows on the K-only plain fp8 cache, amd-kernels-day0's FlyDSL sparse decode does, in its epilogue (`day0_decode_mxfp8`, when the `amd_kernels` package imports);
+below that, or without the package, the Triton attention does it in its epilogue and aiter's attention (17
+rows and more on the K-only cache, every row over the V cache) through `pa_decode_gluon(output_scale=...)`, which needs aiter-M3 `d251a5af`
+([zhuyuhua-v/aiter-M3#8](https://github.com/zhuyuhua-v/aiter-M3/pull/8)) or later. Prefill keeps the
+bf16 output and the separate launch. The startup line `M3-Pro attention: ...` reports `day0 decode from 24 rows (MXFP8 out)` for the first, and `Triton / aiter decode MXFP8
+out on`, `on Triton rows only` or `off` for the second, with the reason when this aiter's decode writes bf16 only.
+Bytes, per path: `tests/test_minimax_m3_pro_attn_mxfp8.py`.
 
 The norms need aiter's MXFP8 norm outputs ([zhuyuhua-v/aiter-M3#2](https://github.com/zhuyuhua-v/aiter-M3/pull/2): the custom all-reduce
 MXFP8 epilogue, `add_rmsnorm_mxfp8` for the RCCL route and an E8M0 mode of
