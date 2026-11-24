@@ -1725,6 +1725,9 @@ def test_worker_pre_submit_drops_are_immediately_terminal(
         ),
         _step_event(worker),
     )
+    # Terminal at the first poll; off the step, that poll is the transfer
+    # thread's next round, which `get_finished` waits on for only a moment.
+    _settle(worker)
 
     output = worker.get_finished()
 
