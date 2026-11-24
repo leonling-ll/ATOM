@@ -393,12 +393,9 @@ def ar_reduce(c, ins):
                 lo = lo + plo
                 hi = hi + phi
             lo, hi = bf16_round(lo), bf16_round(hi)
-            for p in range_constexpr(TP):
-                c["put_bf"](
-                    preg(c["bases"][p], c["off"]["ag"], "ag"),
-                    2 * ag_pair(t, col),
-                    [lo, hi],
-                )
+            # the sums of squares first: every CTA's norm waits for all 56
+            # tasks' (the last owner of any rank), a CTA's gather only for its
+            # owner's sum
             v0 = lo + rr[0]
             v1 = hi + rr[1]
             words = [wave_sum(v0 * v0 + v1 * v1).bitcast(fx.Int32)]
@@ -412,6 +409,12 @@ def ar_reduce(c, ins):
                         agsq_pair(c["j"], t),
                         words,
                     )
+            for p in range_constexpr(TP):
+                c["put_bf"](
+                    preg(c["bases"][p], c["off"]["ag"], "ag"),
+                    2 * ag_pair(t, col),
+                    [lo, hi],
+                )
             held_o.append((v0, v1))
         a0, a1 = held_o[0]
         if const_expr(n == 2):
