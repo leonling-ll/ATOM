@@ -204,8 +204,9 @@ class ProVariants:
     # The decode / verify block scorer of the kernel path: "triton" (``scores``) or
     # "fused" (``scores_fused``: aiter's FlyDSL scorer, each tile of keys read once
     # for up to 8 rows of a sequence). "fused" takes the static (graph) decode with
-    # pool4 / max scores and a selection other than "torch"; everything else, and an
-    # aiter or GPU without it, keeps "triton".
+    # pool4 / max scores (with "index_compress", over the bf16 centroids) and a
+    # selection other than "torch"; everything else, and an aiter or GPU without it,
+    # keeps "triton".
     index: str = "triton"
     # Rows (tokens) at or below which those fused all-reduce + norm sites run as aiter's
     # Lamport all-reduce + ``add_rmsnorm_mxfp8`` (two launches) instead of the fused
@@ -884,26 +885,39 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
             )
         )
 
-    def _fused_index(self, v: ProVariants, static: bool, split, ic, n: int) -> bool:
+    def _fused_index(
+        self, v: ProVariants, static: bool, split, ic, n: int, dsplit=None
+    ) -> bool:
         """Whether the decode scores take aiter's FlyDSL scorer (``"index":
-        "fused"``): graph-shaped decode rows of one rank, pool4 / max scores, a
-        selection that reads only each row's causal blocks, an fp8 or NVFP4 index
-        cache ``ic`` (it reads no bf16 one), and on fp8 at least _FUSED_MIN_ROWS_FP8 of
-        the ``n`` rows."""
+        "fused"``): graph-shaped decode rows of one rank, neither an index split
+        (``split``) nor a decode split (``dsplit``), pool4 / max scores, a
+        selection that reads only each row's causal blocks, and an index cache ``ic``
+        it reads: fp8 (from _FUSED_MIN_ROWS_FP8 of the ``n`` rows) or NVFP4, or with
+        ``index_compress`` the bf16 centroids (a bf16 token cache it does not read)."""
         if v.index != "fused":
             return False
+        centroid = v.index_compress
         ok = (
             static
             and split is None
+            and dsplit is None
             and (
-                ic.dtype == torch.uint8
-                or (ic.dtype == torch.float8_e4m3fn and n >= _FUSED_MIN_ROWS_FP8)
+                (centroid and ic.dtype == torch.bfloat16)
+                or (
+                    not centroid
+                    and (
+                        ic.dtype == torch.uint8
+                        or (
+                            ic.dtype == torch.float8_e4m3fn and n >= _FUSED_MIN_ROWS_FP8
+                        )
+                    )
+                )
             )
             and self.dcp_world == 1
             and v.block_score == "pool4"
             and v.head_reduce == "max"
             and v.topk != "torch"
-            and pro_kernels.fused_scores_available()
+            and pro_kernels.fused_scores_available(centroid)
         )
         small_fp8 = ic.dtype == torch.float8_e4m3fn and n < _FUSED_MIN_ROWS_FP8
         if (
@@ -915,8 +929,9 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
             self._warned_index = True
             logger.warning(
                 "M3-Pro layer %d: index 'fused' needs pool4 / max scores, a topk "
-                "other than 'torch', an fp8 or NVFP4 index cache, no DCP and aiter's "
-                "FlyDSL Pro scorer on gfx950; decode scores stay Triton's",
+                "other than 'torch', an fp8, NVFP4 or compressed index cache, no DCP, "
+                "no index split and aiter's FlyDSL Pro scorer (with the centroid "
+                "format for index_compress) on gfx950; decode scores stay Triton's",
                 self.layer_num,
             )
         return ok
@@ -1184,7 +1199,7 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
             # every row scores alone, so this rank's rows come out as they would in full
             idx, seg, n_rows, tp = split
             rq, rseq, rpos = iq[idx], seq_id[idx], positions[idx]
-        if self._fused_index(v, static, split, ic, n):
+        if self._fused_index(v, static, split, ic, n, dsplit):
             # each group of `rows` rows is one sequence's: k + 1 a verify, so the
             # largest power of two (at most 8) dividing them
             rows = min(8, rps & -rps) if rps > 1 else 1
