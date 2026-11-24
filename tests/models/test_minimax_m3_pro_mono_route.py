@@ -30,6 +30,7 @@ def _variants(**over):
         "lookahead_src": "resid_in",
         "ar_lamport_rows": 16,
         "mono_routed_act": "bf16",
+        "day0_decode_rows": 24,
     }
     fields.update(over)
     return SimpleNamespace(**fields)
@@ -179,6 +180,9 @@ def test_a_failed_runner_turns_it_off_for_good(monkeypatch):
         ({"lookahead_src": "resid"}, "lookahead_src 'resid'"),
         ({"ar_lamport_rows": 8}, "ar_lamport_rows 8 below 16"),
         ({"ar_lamport_rows": 0}, "ar_lamport_rows 0 below 16"),
+        # the day0 decode hands o_proj E4M3 rows from day0_decode_rows rows on
+        ({"day0_decode_rows": 16}, "day0_decode_rows 16 within 16"),
+        ({"day0_decode_rows": 1}, "day0_decode_rows 1 within 16"),
     ],
 )
 def test_variants_the_hand_off_cannot_serve_latch_off(monkeypatch, over, why):
@@ -186,6 +190,15 @@ def test_variants_the_hand_off_cannot_serve_latch_off(monkeypatch, over, why):
     h = Harness(monkeypatch, **over)
     assert h.take(1) is None
     assert h.created == 0 and h.route.rows == 0
+
+
+@pytest.mark.parametrize("day0, rows", [(24, 16), (17, 16), (0, 16), (9, 8)])
+def test_a_day0_decode_above_the_row_limit_or_off_is_served(monkeypatch, day0, rows):
+    """The Agentic recipe's 24 against mono's 16, or the day0 decode off."""
+    over = {"day0_decode_rows": day0, "mono_ffn_rows": rows}
+    assert variants_refusal(_variants(**over), True) is None
+    h = Harness(monkeypatch, **over)
+    assert h.take(rows) is h.runner and h.route.rows == rows
 
 
 def test_a_bad_row_limit_is_left_to_the_latch():

@@ -352,7 +352,8 @@ class MiniMaxM3ProAttention(nn.Module):
     ) -> torch.Tensor:
         """The attention up to o_proj: its input, bf16 [M, heads x 192] (what the
         mono layer kernel reads), or, from ``day0_decode_rows`` rows, the day0
-        decode's E4M3 rows with their scale in ``attn.impl``."""
+        decode's E4M3 rows with their scale in ``attn.impl`` (mono refuses a row
+        limit that reaches them: ``pro_mono.route.variants_refusal``)."""
         own = [self.qk_proj]
         if index_src is None:
             own.append(self.index_qk_proj)

@@ -296,6 +296,18 @@ def test_a_dense_layer_never_takes_the_glue(rec, glue):
     assert "glue" not in rec.calls and ("ffn", False, True) in rec.calls
 
 
+def test_the_default_day0_decode_starts_above_the_row_limit():
+    """``ProVariants``' own defaults: the day0 decode from 24 rows leaves
+    mono's 16 on; a day0 decode from 16 rows turns mono off."""
+    from atom.models.minimax_m3.pro_mono.route import variants_refusal
+
+    v = ProVariants(ar_lamport_rows=16, moe_route_glue=True, mono_ffn_rows=16)
+    assert v.day0_decode_rows == 24 and v.day0_decode_mxfp8
+    assert variants_refusal(v, True) is None
+    v = ProVariants(ar_lamport_rows=16, mono_ffn_rows=16, day0_decode_rows=16)
+    assert variants_refusal(v, True) == "day0_decode_rows 16 within 16"
+
+
 # ------------------------------------------------------------- the segment
 
 

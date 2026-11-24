@@ -50,7 +50,9 @@ def variants_refusal(v, mx_norm: bool) -> str | None:
     residual, MXFP8 (``ProLookaheadState.put``'s ``resid_in`` branch). Its
     in-kernel AR #1 sums in the Lamport all-reduce's order, so production's
     AR #1 must be the Lamport one at every width mono serves
-    (``ar_lamport_rows``), or h_mid would differ from production's."""
+    (``ar_lamport_rows``), or h_mid would differ from production's. It reads
+    the attention's bf16 output, so the day0 decode, which hands o_proj E4M3
+    rows from ``day0_decode_rows`` rows, must start above the row limit."""
     checks = [
         (not v.diag, "the diag variant"),
         (v.fuse_mxfp8_quant, "fuse_mxfp8_quant off"),
@@ -62,6 +64,11 @@ def variants_refusal(v, mx_norm: bool) -> str | None:
             rows_refusal(v.mono_ffn_rows) is not None
             or v.ar_lamport_rows >= v.mono_ffn_rows,
             f"ar_lamport_rows {v.ar_lamport_rows} below {v.mono_ffn_rows}",
+        ),
+        (
+            rows_refusal(v.mono_ffn_rows) is not None
+            or not 0 < v.day0_decode_rows <= v.mono_ffn_rows,
+            f"day0_decode_rows {v.day0_decode_rows} within {v.mono_ffn_rows}",
         ),
     ]
     return next((why for ok, why in checks if not ok), None)
