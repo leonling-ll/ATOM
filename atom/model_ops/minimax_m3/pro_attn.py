@@ -1024,6 +1024,11 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
             "pool4": pro_kernels.BLOCK_POOL4MAX,
             "lse": pro_kernels.BLOCK_TOKLSE,
         }[v.block_score]
+        if v.index_compress:
+            # ``ic`` is the compressed cache: its rows are the blocks' pool4 centroids,
+            # so the block score is their max (pool4 / max on precomputed centroids)
+            assert v.block_score == "pool4", "index_compress replaces the pool4 scores"
+            block_mode, pool = pro_kernels.BLOCK_CENTROID, False
         head_mode = {
             "sum": pro_kernels.HEAD_SUM,
             "mean": pro_kernels.HEAD_SUM,

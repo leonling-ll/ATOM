@@ -55,6 +55,10 @@ BLOCK_TOKMAX = 0
 BLOCK_POOL4MAX = 1
 BLOCK_POOL4MEAN = 2
 BLOCK_TOKLSE = 3
+# vLLM's compressed index cache: a block's score is the max over its 4 centroid rows (every 4
+# index keys softmax-pooled into one bf16 row when written, ``ic_c [pages, 4, 128]``)
+BLOCK_CENTROID = 4
+CENTROID_ROWS = 4
 HEAD_SUM = 0
 HEAD_MAX = 1
 HEAD_LSE = 2
@@ -933,6 +937,44 @@ def _score_tile_kernel(
                 tl.store(
                     obase + jb, tl.full([BB], float("-inf"), tl.float32), mask=jb < NB
                 )
+        elif BLOCK_MODE == 4:  # the compressed index cache: 4 centroid rows a block
+            one = tl.arange(0, 1)
+            ik, live = _load_block_keys(
+                ic_ptr,
+                ic_sb,
+                ic_so,
+                bt_ptr,
+                stride_bt,
+                tl.load(seq_ptr + t),
+                j0,
+                qb,
+                NB,
+                BB,
+                DI,
+                4,
+            )
+            score = _row_tile_scores(
+                iq_ptr,
+                t + one,
+                one == 0,
+                qpos + one,
+                ik,
+                live,
+                j0,
+                cq_ptr,
+                sc,
+                pool_temp,
+                init_blocks,
+                local_blocks,
+                1,
+                BB,
+                NI,
+                DI,
+                PG,
+                BLOCK_MODE,
+                HEAD_MODE,
+            )
+            tl.store(obase + jb, tl.reshape(score, (BB,)), mask=jb < NB)
         else:
             seq = tl.load(seq_ptr + t)
             r = tl.arange(0, BB * PG)
@@ -1034,7 +1076,8 @@ def _row_tile_scores(
 ):
     """_score_tile_kernel's scores ``[R, BB]`` of the ``R`` rows ``t`` (``rmask`` the real
     ones, ``qpos`` their positions) over one tile of keys ``ik`` ``[BB*PG, DI]`` of blocks
-    ``j0..`` (``live`` the loaded keys): one dot for all ``R * NI`` query heads."""
+    ``j0..`` (``live`` the loaded keys): one dot for all ``R * NI`` query heads.
+    ``BLOCK_CENTROID``: ``ik`` is ``[BB*4, DI]``, the blocks' compressed rows."""
     ar_d = tl.arange(0, DI)
     ar_i = tl.arange(0, NI)
     qrow = tl.reshape(
@@ -1054,6 +1097,9 @@ def _row_tile_scores(
         bs = tl.max(dm, axis=3)  # [R, NI, BB]
         if BLOCK_MODE == 3:
             bs = tl.log(tl.sum(tl.exp(dm - bs[:, :, :, None]), axis=3)) + bs
+    elif BLOCK_MODE == 4:
+        # ``ik`` holds the blocks' centroid rows (``[BB*4, DI]``): the max of q . c over them
+        bs = tl.max(tl.reshape(dots, (R, NI, BB, 4)), axis=3)  # [R, NI, BB]
     else:
         cq = tl.load(cq_ptr + ar_d).to(tl.float32)
         lg = tl.sum(ik.to(tl.float32) * cq[None, :], axis=1) * pool_temp  # [BB*PG]
@@ -1136,6 +1182,7 @@ def _score_qtile_kernel(
     BLOCK_MODE: tl.constexpr,
     HEAD_MODE: tl.constexpr,
     CAUSAL: tl.constexpr = False,
+    RPB: tl.constexpr = 16,  # key rows a block: PG, or CENTROID_ROWS (BLOCK_CENTROID)
 ):
     """_score_tile_kernel's scores for ``TQ`` rows at once: rows of one sequence share each
     tile of block keys (loaded once, one dot for the ``TQ * NI`` query heads); a tile whose
@@ -1167,7 +1214,7 @@ def _score_qtile_kernel(
             NB,
             BB,
             DI,
-            PG,
+            RPB,
         )
         score = _row_tile_scores(
             iq_ptr,
@@ -1208,7 +1255,7 @@ def _score_qtile_kernel(
                 NB,
                 BB,
                 DI,
-                PG,
+                RPB,
             )
             score = _row_tile_scores(
                 iq_ptr,
@@ -1272,6 +1319,8 @@ def scores(
     out = torch.empty(t, nb, dtype=torch.float32, device=iq.device)
     assert ic.stride(-1) == 1 and (tiled or not causal)
     nv = ic.dtype == torch.uint8
+    if block_mode == BLOCK_CENTROID:  # ic is the compressed cache, ic_c [pages, 4, DI]
+        assert tiled and not nv and ic.shape[1:] == (CENTROID_ROWS, IDX_DIM), ic.shape
     assert tiled or not nv, "NVFP4 index pages: the tiled scorer only"
     assert not (tq and nv), "NVFP4 index pages: score_tq unsupported"
     if bb is None:
@@ -1304,6 +1353,7 @@ def scores(
             BLOCK_MODE=block_mode,
             HEAD_MODE=head_mode,
             CAUSAL=causal,
+            RPB=CENTROID_ROWS if block_mode == BLOCK_CENTROID else PAGE,
         )
         return out
     tiles = triton.cdiv(nb, bb)

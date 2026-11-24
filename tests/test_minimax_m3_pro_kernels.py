@@ -487,6 +487,110 @@ class TestScores:
             assert _close(got[fin], ref[fin]), bb
 
 
+class TestCompressedIndex:
+    """``BLOCK_CENTROID``: scores over vLLM's compressed index cache ``ic_c [pages, 4, 128]``
+    (every 4 index keys softmax-pooled into one row when written): a block's score is the
+    head-reduce of the max over its 4 rows of ``iq . c``, with the usual pins."""
+
+    @staticmethod
+    def _ic_c(c, dtype=torch.bfloat16):
+        # the write path's rows: ATOM's own pool4 centroids of every page's 16 keys
+        return c.impl._centroids(c.ic.float(), ProVariants()).to(dtype)
+
+    @staticmethod
+    def _ref(c, ic_c, nb, init, local, sc, head_mode):
+        qb = c.pos // PG
+        cent = ic_c.float()[c.bt[c.seq].long()]  # [T, NB, 4, DI]
+        # scaled before the head reduce, as the kernel does (lse is not scale-equivariant)
+        dots = torch.einsum("thd,tjrd->thjr", c.iq.float(), cent[:, :nb]).amax(-1) * sc
+        if head_mode == K.HEAD_MAX:
+            score = dots.amax(1)
+        elif head_mode == K.HEAD_SUM:
+            score = dots.sum(1)
+        else:
+            score = torch.logsumexp(dots, 1)
+        j = torch.arange(nb, device=DEV)[None, :]
+        score = torch.where(j < init, 1e30, score)
+        score = torch.where(j >= qb[:, None] + 1 - local, 1e29, score)
+        return torch.where(j <= qb[:, None], score, float("-inf"))
+
+    @pytest.mark.parametrize("head_mode", [K.HEAD_MAX, K.HEAD_SUM, K.HEAD_LSE])
+    def test_every_path_scores_as_the_reference(self, case, head_mode):
+        c, nb = case, case.bt.shape[1]
+        ic_c = self._ic_c(c)
+        want = self._ref(c, ic_c, nb, 2, 3, 0.1, head_mode)
+        causal = torch.arange(nb, device=DEV)[None, :] <= (c.pos // PG)[:, None]
+        args = (c.iq, ic_c, c.bt, c.seq, c.pos, nb, None, 2, 3, 0.1)
+        kw = {"block_mode": K.BLOCK_CENTROID, "head_mode": head_mode}
+        runs = {}
+        for bb in (4, 8):
+            for causal_on in (False, True):
+                runs[("tile", bb, causal_on)] = K.scores(
+                    *args, **kw, bb=bb, causal=causal_on
+                )
+        for tq in (2, 8):
+            for causal_on in (False, True):
+                runs[("qtile", tq, causal_on)] = K.scores(
+                    *args, **kw, tq=tq, causal=causal_on
+                )
+        for name, got in runs.items():
+            assert torch.allclose(got[causal], want[causal], rtol=1e-3, atol=1e-3), name
+            if not name[2]:  # the full launch also writes the future blocks as -inf
+                assert torch.isinf(got[~causal]).all(), name
+
+    def test_equals_pool4_on_the_same_keys(self, case):
+        # pooling is linear: sum_i w_i (q . k_i) == q . (sum_i w_i k_i). With fp32 rows the
+        # centroid scores are today's pool4 / max scores to rounding
+        c, nb = case, case.bt.shape[1]
+        causal = torch.arange(nb, device=DEV)[None, :] <= (c.pos // PG)[:, None]
+        kw = {"head_mode": K.HEAD_MAX, "pool_temp": ProVariants().pool_scale}
+        pool4 = K.scores(
+            c.iq,
+            c.ic,
+            c.bt,
+            c.seq,
+            c.pos,
+            nb,
+            c.impl.index_compress_query.data,
+            2,
+            3,
+            1.0,
+            block_mode=K.BLOCK_POOL4MAX,
+            **kw,
+        )
+        cent = K.scores(
+            c.iq,
+            self._ic_c(c, torch.float32),
+            c.bt,
+            c.seq,
+            c.pos,
+            nb,
+            None,
+            2,
+            3,
+            1.0,
+            block_mode=K.BLOCK_CENTROID,
+            **kw,
+        )
+        assert torch.allclose(cent[causal], pool4[causal], rtol=1e-3, atol=1e-3)
+
+    def test_rejects_a_token_cache(self, case):
+        with pytest.raises(AssertionError):
+            K.scores(
+                case.iq,
+                case.ic,
+                case.bt,
+                case.seq,
+                case.pos,
+                case.bt.shape[1],
+                None,
+                2,
+                3,
+                1.0,
+                block_mode=K.BLOCK_CENTROID,
+            )
+
+
 class TestAttention:
     def _run(self, case, tokens, splits, dense, nblk=4, n_blocks=None):
         sel = None if dense else _tokmax_sel(case)
