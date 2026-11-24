@@ -83,7 +83,11 @@ With the full 237eada chat template and `--timeout-keep-alive 600` (same node, 6
 | Configuration | Prefix hit (measured phase) | P90 E2E-norm interactivity | tok/s/GPU | Requests |
 |---|---|---|---|---|
 | Batch 1 (807d48cd) | 69.8% | 22.37 | 11485 | 938 |
-| + `index_compress` (this recipe) | 74.6% | **31.34** | **12340** | 1024 |
+| + `index_compress` | 74.6% | **31.34** | **12340** | 1024 |
+| + 128 MiB AR pool and shared communicator (a22ad7cb) | 75.6% | 32.49 | 12310 | – |
+| + #177 / aiter-M3#19 sync, `--cudagraph-capture-sizes`, prefill prewarm before the client (**this recipe**: ATOM 2239b0cc, aiter 6b9b5e32) | 76.3% | **33.11** | **12826** | 1058 |
+
+The same last two rows on a second node (LMCache 140 GiB): 24.64 / 11,329 -> **27.00 / 12,066**. The last row's server got a short prefill prewarm (35 prompts of 1k-16k tokens, 32 concurrent) before the client started, so no kernel compiled inside the measured window; the rows above it had none, so part of the last step may be first-use compiles they paid.
 
 Shared communicator and 128 MiB AR pool (`ATOM_CUSTOM_AR_POOL_BYTES`), same-node A/B on a second node (LMCache 140 GiB, Pro template, 600 s): KV blocks 203,438 -> 218,199, P90 21.25 -> **24.71** (+16%), 11,479 -> **11,861** tok/s/GPU (+3.3%), 0 failed, no VRAM step after KV sizing.
 
