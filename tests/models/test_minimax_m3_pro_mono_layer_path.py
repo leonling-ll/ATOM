@@ -7,6 +7,9 @@
   AR #1 + norm, the lookahead put, the MoE -- and returns their outputs;
 * a MoE layer the route takes: the attention stops before o_proj and the
   runner's segment returns the layer's (FFN partial, residual);
+* with ``moe_route_glue`` on: the forwards mono takes never call the glue,
+  the wider ones (and every one with mono off) take the glue's launch where
+  it applies, else the separate launches;
 * the launch (``ProMonoRunner.launch``, the compiled kernel faked): every
   ABI argument by name, the layer's ``moe_w`` table in ``MOE_TABLE`` order;
 * the segment (``ProMonoRunner.segment``, its launch faked): the lookahead in
@@ -34,8 +37,8 @@ NATIVE = SimpleNamespace(native_a8_group_rows=1)
 PLAIN = SimpleNamespace(native_a8_group_rows=None)
 
 
-def _t(seed, cols=H):
-    return torch.randn(N, cols, generator=torch.Generator().manual_seed(seed))
+def _t(seed, cols=H, rows=N):
+    return torch.randn(rows, cols, generator=torch.Generator().manual_seed(seed))
 
 
 class Recorder:
@@ -100,6 +103,11 @@ def _layer(rec, moe=True, route=None):
         rec.calls.append(("ffn", shared_input is not None, quant_down))
         return x * 11
 
+    def forward_glue(r, quant_down=False):
+        rec.calls.append(("glue_ffn", quant_down))
+        return r["normed"] * 17
+
+    ffn.forward_glue = forward_glue
     ffn.shared_experts = SimpleNamespace(gate_up_proj=NATIVE)
     ffn.gate_up_proj = NATIVE
     if moe:
@@ -124,12 +132,14 @@ PRODUCTION_CALLS = [
 
 
 class Route:
-    def __init__(self, runner):
-        self.runner, self.asked = runner, []
+    """``ProMonoRoute.take`` with a latched row limit (None: every width)."""
+
+    def __init__(self, runner, limit=None):
+        self.runner, self.asked, self.limit = runner, [], limit
 
     def take(self, layer_id, rows):
         self.asked.append((layer_id, rows))
-        return self.runner
+        return self.runner if self.limit is None or rows <= self.limit else None
 
 
 @pytest.mark.parametrize("route", ["none", "declines"])
@@ -175,6 +185,96 @@ def test_a_taken_layer_stops_before_o_proj_and_returns_the_segment(rec):
     _, _, _, h_mid = reference(res_in.clone())
     assert rec.calls[-2:] == ["o_proj", ("ar_mx", 16)]
     assert torch.equal(h_mid, _production(hidden, residual)[1])
+
+
+# ---------------------------------------------------- mono and the route glue
+
+
+@pytest.fixture
+def glue(rec, monkeypatch):
+    """``moe_route_glue`` on, its launch recorded: AR #1 + norm (+ MXFP8)
+    and the routes for up to ``MAX_ROWS`` rows."""
+    monkeypatch.setattr(
+        pro_attn, "_variants", ProVariants(ar_lamport_rows=16, moe_route_glue=True)
+    )
+    limit = pro.moe_route_glue.MAX_ROWS
+    monkeypatch.setattr(pro.moe_route_glue, "applies", lambda moe, rows: rows <= limit)
+
+    def route(x, residual, norm, moe):
+        rec.calls.append("glue")
+        h_mid = x + residual
+        return {
+            "normed": h_mid * 2, "x_q": h_mid * 3, "x_scale": h_mid * 4,
+            "residual_out": h_mid,
+        }  # fmt: skip
+
+    monkeypatch.setattr(pro.moe_route_glue, "route", route)
+    return limit
+
+
+GLUE_CALLS = ["ar_in", "attn", "core", "o_proj", "glue", ("put", 4), ("glue_ffn", True)]
+
+
+def _glue_production(hidden, residual):
+    """What the layer computes with the recorders on the glue's path."""
+    _, h_mid = _production(hidden, residual)
+    return h_mid * 2 * 17, h_mid
+
+
+class SegmentRunner:
+    def __init__(self, rec):
+        self.rec = rec
+
+    def segment(self, layer, core, residual, reference):
+        self.rec.calls.append("segment")
+        self.reference = reference
+        return core.sum(), residual
+
+
+@pytest.mark.parametrize("rows", [1, 2, 8, 16])
+def test_forwards_mono_takes_never_call_the_glue(rec, glue, rows):
+    layer = _layer(rec, route=Route(SegmentRunner(rec), limit=16))
+    layer(None, _t(1, rows=rows), _t(2, rows=rows))
+    assert rec.calls == ["ar_in", "core", "segment"]
+
+
+@pytest.mark.parametrize("rows", [17, 24, 64, 512])
+def test_wider_forwards_take_the_glue(rec, glue, rows):
+    route = Route(SegmentRunner(rec), limit=16)
+    layer = _layer(rec, route=route)
+    hidden, residual = _t(1, rows=rows), _t(2, rows=rows)
+    out, res = layer(None, hidden, residual)
+    assert rec.calls == GLUE_CALLS and route.asked == [(4, rows)]
+    want_out, want_res = _glue_production(hidden, residual)
+    assert torch.equal(out, want_out) and torch.equal(res, want_res)
+
+
+def test_beyond_the_glue_the_separate_launches_run(rec, glue):
+    rows = glue + 1
+    layer = _layer(rec, route=Route(SegmentRunner(rec), limit=16))
+    hidden, residual = _t(1, rows=rows), _t(2, rows=rows)
+    out, res = layer(None, hidden, residual)
+    assert rec.calls == PRODUCTION_CALLS
+    want_out, want_res = _production(hidden, residual)
+    assert torch.equal(out, want_out) and torch.equal(res, want_res)
+
+
+@pytest.mark.parametrize("route", ["none", "declines"])
+@pytest.mark.parametrize("rows", [1, 8, 16])
+def test_with_mono_off_the_glue_serves_every_width(rec, glue, route, rows):
+    r = None if route == "none" else Route(None)
+    layer = _layer(rec, route=r)
+    hidden, residual = _t(1, rows=rows), _t(2, rows=rows)
+    out, res = layer(None, hidden, residual)
+    assert rec.calls == GLUE_CALLS
+    want_out, want_res = _glue_production(hidden, residual)
+    assert torch.equal(out, want_out) and torch.equal(res, want_res)
+
+
+def test_a_dense_layer_never_takes_the_glue(rec, glue):
+    layer = _layer(rec, moe=False, route=Route(SegmentRunner(rec), limit=16))
+    layer(None, _t(1), _t(2))
+    assert "glue" not in rec.calls and ("ffn", False, True) in rec.calls
 
 
 # ------------------------------------------------------------- the segment
