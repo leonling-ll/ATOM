@@ -1178,9 +1178,17 @@ def down_loads(c, rgd, nu, b0, j, live):
     return av + sw
 
 
+def down_batch(c) -> int:
+    """A wave's slots whose w2 is in flight together: ``DOWN_BATCH``; one in
+    an A16W4 build whose union is at most a slot a wave (``max_u`` <=
+    ``WAVES``: 1 and 2 rows), where a second slot is always past U and would
+    only add its zero tile's dequant and MFMAs to every wave's down."""
+    return 1 if bf16_routed(c) and max_u(c["S"]) <= WAVES else DOWN_BATCH
+
+
 def batch_loads(c, rgd, nu, b0, live):
     """``down_loads`` of every slot of a wave's batch from b0."""
-    return [down_loads(c, rgd, nu, b0, j, live) for j in range(DOWN_BATCH)]
+    return [down_loads(c, rgd, nu, b0, j, live) for j in range(down_batch(c))]
 
 
 def inter_operands(c, row):
@@ -1357,7 +1365,7 @@ def wait_ug(c, nu):
 def stage_down(c, rgd, nu, ops0, sops, nrgd):
     """Hidden rows 16 rgd ..: the shared down (waves < SD_STEPS a K chunk each,
     MXFP8 of ``smid`` from LDS), then every slot's w2 against its picks (wave
-    w the slots w, w + 8, ..; a batch of ``DOWN_BATCH`` in flight, the next
+    w the slots w, w + 8, ..; a batch of ``down_batch`` in flight, the next
     issued under this one's MFMAs, past the last batch the next task's first:
     ``ops0`` / ``sops`` this task's first and its shared down's, issued a task
     ahead) -> bf16(w acc) a pick in LDS -> the routed sum in top-k order
@@ -1366,7 +1374,7 @@ def stage_down(c, rgd, nu, ops0, sops, nrgd):
     down operands (zeros past DOWN_TASKS)."""
     s, tid, lane, wave, red = c["S"], c["tid"], c["lane"], c["wave"], c["red"]
     rt = c["rt"]
-    nbat = DOWN_BATCH
+    nbat = down_batch(c)
     g4 = lane // 16
     # every wave (a branch on the wave left its mask live from the kernel's
     # start); waves past SD_STEPS multiply zeros, left out of the sum
