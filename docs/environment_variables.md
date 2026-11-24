@@ -49,6 +49,14 @@ Every node reads its own environment, so a variable that changes what a rank com
 
 The nodes trust each other: the engine's store and the workers' reply channels are unauthenticated TCP on `--data-parallel-master-ip` and carry pickled objects, so that address must be on a network only the nodes can reach.
 
+## Communicator memory
+
+aiter builds an RCCL communicator and a custom all-reduce for every group of more than one rank, at init and before the KV pool is sized (`atom/distributed/comm_memory.py`). Without expert parallelism ATOM sets `AITER_REUSE_IDENTICAL_COMM_GROUPS=1` unless it is already set, so a group over exactly the TP ranks (the EP group, the DCP group at DCP = TP) shares TP's communicator instead of building its own; `AITER_REUSE_IDENTICAL_COMM_GROUPS=0` builds them all.
+
+| Variable | Type | Default | Description |
+|----------|------|---------|-------------|
+| **ATOM_CUSTOM_AR_POOL_BYTES** | int | unset (aiter's 1 GiB) | Input pool of aiter's custom all-reduce, in bytes. On gfx9 the pool also sizes a scratch region twice its size, so 1 GiB costs 3 GiB a communicator. Must be at least twice `AITER_CUSTOM_AR_MAX_SIZE` (64 MiB by default), so every all-reduce keeps its route; each communicator's custom all-gather cutoff stays at what the default pool gives its group (capped at the pool) unless `AITER_CUSTOM_AG_MAX_SIZE` is set. `134217728` (128 MiB) suits the defaults. |
+
 ## Pipeline parallelism
 
 | Variable | Type | Default | Description |

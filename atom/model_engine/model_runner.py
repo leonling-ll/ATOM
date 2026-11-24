@@ -26,12 +26,18 @@ from aiter.dist.parallel_state import (
     get_dp_group,
     get_pp_group,
     get_tp_group,
+    get_world_group,
     graph_capture,
 )
 from torch.profiler import record_function
 
 from atom import structured_output
 from atom.config import Config, set_current_atom_config
+from atom.distributed.comm_memory import (
+    build_dcp_communicator,
+    group_broadcast,
+    host_barrier,
+)
 from atom.distributed.group_agreement import (
     agree_kv_budget,
     free_after_runtime_reserve,
@@ -1420,6 +1426,10 @@ class ModelRunner:
         sweep_start = time.time()
         for n in sweep:
             self._dummy_prefill(1, n)
+        # The warmup prefill never decodes, and DCP's decode combine is an
+        # all-to-all on torch's process group: build its communicator here,
+        # where the KV budget measures it.
+        build_dcp_communicator()
         torch.cuda.empty_cache()
         logger.info(
             f"{self.label}: warmup_model {time.time() - start_time:.2f} seconds with {num_seqs} reqs {total_tokens_num} tokens"
@@ -2481,15 +2491,13 @@ class ModelRunner:
                     f"diff={diff_pct:.1%}"
                 )
 
-        # Skip on single-rank: a world_size==1 barrier is a no-op but still
-        # forces lazy NCCL communicator creation (CUDA-allocs its buffers),
-        # which can OOM/fail on single-card runs. The process group stays
-        # initialized so get_tp_group() and friends keep working.
+        # On the world's gloo group: an NCCL barrier would build an RCCL
+        # communicator (buffers on every GPU) after the KV pool took its share.
         if (
             torch.distributed.is_initialized()
             and torch.distributed.get_world_size() > 1
         ):
-            torch.distributed.barrier()
+            host_barrier(get_world_group().cpu_group)
         return True
 
     def _local_tbo_eligibility(
@@ -3587,7 +3595,7 @@ class ModelRunner:
                     top_ps,
                 )
                 if target_token_ids.numel() and get_tp_group().world_size > 1:
-                    target_token_ids = get_tp_group().broadcast(target_token_ids, src=0)
+                    target_token_ids = group_broadcast(get_tp_group(), target_token_ids)
             bonus_token_ids = self.sampler(
                 logits=bonus_logits,
                 temperatures=temperatures,
@@ -3632,7 +3640,7 @@ class ModelRunner:
                 self.tokenID_processor.is_deferred_out, hasattr(self, "drafter")
             )
         ):
-            sampled_tokens = get_tp_group().broadcast(sampled_tokens, src=0)
+            sampled_tokens = group_broadcast(get_tp_group(), sampled_tokens)
 
         # From the ids every rank now agrees on. Only a deferred step needs
         # it: otherwise the host has these ids before the next forward.
@@ -3657,7 +3665,7 @@ class ModelRunner:
             sampled_logprobs = pack_token_logprobs(*sampled_logprobs)
             if get_tp_group().world_size > 1 and self.tokenID_processor.is_deferred_out:
                 # One bit-preserving broadcast for scores, candidate IDs and ranks.
-                sampled_logprobs = get_tp_group().broadcast(sampled_logprobs, src=0)
+                sampled_logprobs = group_broadcast(get_tp_group(), sampled_logprobs)
 
         # An overridden step's outputs are ready on its output stream, before
         # the work it queued after them on this one.

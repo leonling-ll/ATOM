@@ -48,6 +48,7 @@ The fast configuration (kernel path, decode graphs, FP8 KV and index caches):
 
 ```bash
 export AITER_CUSTOM_AR_DISABLE_LAMPORT=1
+export ATOM_CUSTOM_AR_POOL_BYTES=134217728
 export ATOM_M3PRO_VARIANTS='{"kernels": true, "attn": "aiter", "topk": "split"}'
 
 python -m atom.entrypoints.openai_server \
@@ -74,6 +75,9 @@ draft. For the torch reference, leave `ATOM_M3PRO_VARIANTS` unset, add `--enforc
   post-load conversion leaves no holes in the allocator (before, about 40 GB per GPU stayed stranded
   and 0.88 or more failed at the first NCCL barrier). `ATOM_ONLINE_QUANT_STREAMING=1` avoids them
   another way, by converting while loading; see [`Agentic-MiniMax-M3.1-Pro.md`](Agentic-MiniMax-M3.1-Pro.md).
+* `ATOM_CUSTOM_AR_POOL_BYTES=134217728` gives the custom all-reduce a 128 MiB input pool instead of
+  aiter's 1 GiB: about 2.6 GiB less per GPU before the KV pool is sized, and every all-reduce Pro
+  sends still fits ([`docs/environment_variables.md`](../docs/environment_variables.md#communicator-memory)).
 * `--block-size 16` and `--level 0` are required. Decode graphs need the kernel path: the torch
   path reads the sequence lengths back to the host, raises if a capture reaches it, and runs with
   `--enforce-eager`.
@@ -316,9 +320,10 @@ rank as without DCP; each rank then attends all 128 query heads over the selecte
 and the partial outputs are merged by log-sum-exp. A prefill all-gathers its sequences' blocks and
 runs as without DCP. It needs the kernel path and runs the Triton attention.
 
-Add to the server's arguments `--decode-context-parallel-size 8`, and to its environment
-`AITER_REUSE_IDENTICAL_COMM_GROUPS=1`: without it aiter builds the DCP group a communicator of its
-own over the TP group's GPUs, and the KV pool loses it. The DSpark draft does not run under DCP
+Add to the server's arguments `--decode-context-parallel-size 8`. The DCP group shares the TP
+group's communicator (ATOM sets `AITER_REUSE_IDENTICAL_COMM_GROUPS=1` unless it is set; see
+[communicator memory](../docs/environment_variables.md#communicator-memory)): with `0` aiter builds it
+one of its own over the same GPUs, and the KV pool loses it. The DSpark draft does not run under DCP
 yet (#78), so the server has no `--method dspark`.
 
 Measured on the 15-minute agentic proxy (`SPEC_TOKENS=0 scripts/m31pro/proxy_bench.sh 32`) with the K-only
