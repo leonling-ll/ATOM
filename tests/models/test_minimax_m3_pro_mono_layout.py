@@ -237,7 +237,7 @@ def test_the_gpu_tests_checks_catch_injected_bugs(s):
 
 
 def test_the_gpu_tests_bounds_pass_every_partial_one_ulp_off():
-    """Design section 12's tolerance: a partial may differ in its last bf16 bit."""
+    """The bounds allow a partial to differ in its last bf16 bit."""
     _, parts, res, wp, wa = _case(3)
     want = layer_reference(parts, res, wp, wa, 1e-6, 1e-6)
     g = torch.Generator().manual_seed(5)

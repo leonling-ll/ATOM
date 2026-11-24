@@ -36,7 +36,9 @@ points of that. Every setting below is there to enlarge the cache or to keep it 
 | `--text-only` | Builds and loads no vision tower, projector or patch merger (1.8 GiB of weights a GPU); image requests get a 400. AgentX is text only. |
 | `AITER_REUSE_IDENTICAL_COMM_GROUPS=1` | At TP8 aiter's `ep` group has the same ranks as `tp`; this makes it reuse `tp`'s custom all-reduce instead of building a second one (~2.5 GiB a GPU). |
 | `GPTOSS_SWIGLU_MXFP4_BF16_BOUND=1040` | Keeps the routed MoE's activations in bf16 (a16w4) for steps below 1040 rows. aiter's default of 256 switches DSpark verify steps (sequences × 8 rows) to MXFP4 activations, which costs about 0.01 GSM8K (see Accuracy). Prefill chunks stay a4w4. |
-| `"index_compress": true` (optional, off here) | Stores the index cache as one bf16 centroid per 4 tokens (vLLM's compressed index): +17.7% KV blocks, indexer scoring ~4× faster, GSM8K 0.9462. Its AgentX c64 result is pending. Every switch that changes numerics, with its measured accuracy, is in [`MiniMax-M3.1-Pro-Accuracy-Switches.md`](MiniMax-M3.1-Pro-Accuracy-Switches.md). |
+| `ATOM_TOKEN_GRAPH_SIZES=256,512,1024,2048` | Pro's prefills of up to 2048 tokens pad to the smallest bucket and replay a recorded token graph instead of issuing ~2170 launches from the host (attention stays eager). Measured on the #33 launch and variants (no `moe_route_glue` / `index_compress`, util 0.87, no LMCache), not yet on this recipe's variants: a warm turn on a cached 55k / 94k prefix at c1, paired medians of 8: 16-128 new tokens TTFT 160-191 ms -> 83-125 ms (prefill forward 104 ms -> 24-39 ms); ~1050 new tokens (padded to 2048) -18 to -29 ms; ~2820 new tokens padded to the default's 3072 bucket +5 ms, so 3072 is left out. |
+| `"index_compress": true` | Stores the index cache as one bf16 centroid per 4 tokens (vLLM's compressed index): +17.7% KV blocks, indexer scoring ~4× faster, GSM8K 0.9462; c64 P90 30.22 → 34.43, 11,254 → 11,569 tok/s/GPU. Every switch that changes numerics, with its measured accuracy, is in [`MiniMax-M3.1-Pro-Accuracy-Switches.md`](MiniMax-M3.1-Pro-Accuracy-Switches.md). |
+| `ATOM_CUSTOM_AR_POOL_BYTES=134217728` | Sizes aiter's custom all-reduce pool to 128 MiB (routing unchanged: twice the 64 MiB AR cutoff), and token-id broadcasts and post-KV barriers no longer make torch build its own RCCL communicator (~2.4 GiB, one of them after KV sizing). Non-torch memory 9.44 -> 5.31 GB, +7.3% KV blocks. |
 
 ## Measured (CONC 64 proxy)
 
@@ -73,6 +75,16 @@ same node and setup, 600 s:
 |---|---|---|---|---|---|
 | All of the above + bound 1040 | 78.7% | 21.51 | 9562 | 869 | 0.9393 |
 | + decode kernels: FlyDSL sparse decode with MXFP8 out, merged MXFP8 GEMM rows, MoE route glue, `index_split_decode` | 79.7% | **30.22** | **11254** | 1022 | 0.9424 |
+| + `index_compress` (compressed bf16 index cache, +17.7% KV blocks) | 83.2% measured phase (batch 1: 82.5%) | **34.43** | **11569** | 1055 | 0.9462 |
+
+With the full 237eada chat template and `--timeout-keep-alive 600` (same node, 600 s, AL 2.94):
+
+| Configuration | Prefix hit (measured phase) | P90 E2E-norm interactivity | tok/s/GPU | Requests |
+|---|---|---|---|---|
+| Batch 1 (807d48cd) | 69.8% | 22.37 | 11485 | 938 |
+| + `index_compress` (this recipe) | 74.6% | **31.34** | **12340** | 1024 |
+
+Shared communicator and 128 MiB AR pool (`ATOM_CUSTOM_AR_POOL_BYTES`), same-node A/B on a second node (LMCache 140 GiB, Pro template, 600 s): KV blocks 203,438 -> 218,199, P90 21.25 -> **24.71** (+16%), 11,479 -> **11,861** tok/s/GPU (+3.3%), 0 failed, no VRAM step after KV sizing.
 
 `index_split_decode` alone gives 29.10 / 10864; the decode kernels add the rest.
 
@@ -94,6 +106,7 @@ tokens loaded from the CPU tier and the re-ask's TTFT down from 2.85 s to 0.20 s
 | Speculative decoding | DSpark, 7 tokens, synthetic acceptance length 2.94 (golden AL, thinking enabled) |
 | Prefill | 16384-token chunks; prefill attention from amd-kernels-day0 when its `amd_kernels` package imports, otherwise the Triton kernel |
 | Decode attention | from 24 rows, amd-kernels-day0's FlyDSL sparse decode with an MXFP8 output for `o_proj`, when its `amd_kernels` package imports; otherwise aiter |
+| Decode front | up to 16 rows (`ar_lamport_rows`), a layer's q, k, index q and index k come from one MXFP8 GEMM over `[x; lookahead input]`; above it, two GEMMs |
 | `max-num-seqs` | 2 × CONC (128) |
 
 ## 1. Start the ATOM server
@@ -102,17 +115,20 @@ Start a fresh server for each run.
 
 ```bash
 export MODEL_PATH="${MODEL_PATH:-/data/models/m3-pro}"
+export CHAT_TEMPLATE="${CHAT_TEMPLATE:-}"     # set to the 237eada chat_template.jinja if the snapshot ships the 1 KB stub (see below)
 export PORT="${PORT:-8000}"
 export CONC="${CONC:-64}"
 
 export AITER_LOG_LEVEL=WARNING
 unset AITER_CUSTOM_AR_DISABLE_LAMPORT          # ar_lamport_rows needs the Lamport path
-export ATOM_M3PRO_VARIANTS='{"kernels": true, "attn": "aiter", "topk": "split", "prep": "aiter", "index_split": true, "score_tq": 8, "ar_lamport_rows": 16, "k_only": true, "k_plain_fp8": true, "prefill_attn": "day0", "index_split_decode": 64, "moe_route_glue": true}'
+export ATOM_M3PRO_VARIANTS='{"kernels": true, "attn": "aiter", "topk": "split", "prep": "aiter", "index_split": true, "score_tq": 8, "ar_lamport_rows": 16, "k_only": true, "k_plain_fp8": true, "prefill_attn": "day0", "index_split_decode": 64, "moe_route_glue": true, "index_compress": true}'
 export ATOM_WARMUP_TOKENS=auto
 export ATOM_ONLINE_QUANT_STREAMING=1
 export ATOM_CACHE_AWARE_ADMISSION=1
 export AITER_REUSE_IDENTICAL_COMM_GROUPS=1
+export ATOM_CUSTOM_AR_POOL_BYTES=134217728   # 128 MiB custom all-reduce pool (non-torch 9.4 -> 5.3 GB)
 export GPTOSS_SWIGLU_MXFP4_BF16_BOUND=1040     # bf16 MoE activations up to 128 seqs x 8 verify rows
+export ATOM_TOKEN_GRAPH_SIZES=256,512,1024,2048  # small prefills replay token graphs; no 3072 bucket
 
 # LMCache CPU offload
 export ATOM_KV_OFFLOAD=lmcache
@@ -141,8 +157,12 @@ python3 -m atom.entrypoints.openai_server \
   --num-speculative-tokens 7 \
   --spec-decode-acceptance-length 2.94 \
   --text-only \
+  --timeout-keep-alive 600 \
+  ${CHAT_TEMPLATE:+--chat-template "${CHAT_TEMPLATE}"} \
   2>&1 | tee "server-m31pro-agentx-c${CONC}.log"
 ```
+
+**Chat template.** Serve with the checkpoint's full M3.1-Pro template (revision 237eada, the one vLLM uses; it has the `thinking_mode` switch and defaults to thinking on). Snapshot 9d6169d5 has the same weights, config and tokenizer but ships a 1,165-byte stub `chat_template.jinja` that renders only the user messages, so AgentX prompts come out about 21% short; with that snapshot set `CHAT_TEMPLATE` to the 237eada file. `--timeout-keep-alive 600` keeps the server from closing pooled connections that aiperf (300 s pool) still reuses: with the default 5 s a warmup request can hit a closed socket and abort the run.
 
 Check the startup log:
 
