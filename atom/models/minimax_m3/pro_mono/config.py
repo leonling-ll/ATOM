@@ -4,10 +4,11 @@
 other is refused.
 
 Phase 1 replaces one segment of each MoE layer (4 .. 67) in decode and DSpark
-verify forwards of at most ``MAX_ROWS`` rows: o_proj, the first all-reduce and
-the post-attention Gemma RMSNorm (+ MXFP8, + the lookahead's norm of layer
-L + 2), the router, the routed and shared experts and their combine. Attention,
-the indexer, the dense layers, AR #2 and prefill stay on the production path.
+verify forwards of at most ``max_rows`` rows (A16W4 24, W4A4 / W4A8 16): o_proj,
+the first all-reduce and the post-attention Gemma RMSNorm (+ MXFP8, + the
+lookahead's norm of layer L + 2), the router, the routed and shared experts and
+their combine. Attention, the indexer, the dense layers, AR #2 and prefill
+stay on the production path.
 
 Every width a kernel loops over, places tasks by or lays a region out with is a
 build-time constant of ``ProDims(8)``: the kernels place o_proj, the column

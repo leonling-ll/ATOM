@@ -45,7 +45,10 @@ build's the bf16 x)::
             K halves (``ug_split``), a task list and a queue word a half, a
             CTA's tasks all of its half (``task_lists``): the half-1 task
             sends its fp32 gate / up partials (``ugp``), the half-0 task adds
-            them to its own and finishes the task
+            them to its own and finishes the task. Past one token tile (17 ..
+            24 rows) A16W4 splits over K quarters instead, a list each, a CTA
+            running two tasks of its quarter at once (``ug_per_cta``); the
+            quarter-0 task adds the other three's partials
     down    DOWN_TASKS (16 hidden rows), the task list's entries past the ug
             tasks (the same queue: a CTA that drew fewer or faster ug tasks
             takes more down tasks, so the 448 fill no rounds of their own;
