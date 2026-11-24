@@ -550,7 +550,7 @@ def prep(
 
 
 @triton.jit
-def _compress_pool_kernel(
+def _compress_insert_kernel(
     ik_ptr,
     pos_ptr,
     seq_ptr,
@@ -563,18 +563,26 @@ def _compress_pool_kernel(
     out_sb,
     out_sr,
     pool_scale,
+    T,
     PG: tl.constexpr,
     G: tl.constexpr,
     RR: tl.constexpr,
+    POOL: tl.constexpr,
+    STORE: tl.constexpr,
 ):
-    """One closing token (position % G == G - 1): softmax-pool its group's G keys with the
-    compress query into the group's bf16 row. A key of this step is read from ``ik``, an
-    earlier one from the request's ring, where it must carry its own position; a key
-    found in neither (no ring slot, or one taken by another request) is left out."""
+    """POOL, a closing token (position % G == G - 1): softmax-pool its group's G keys with
+    the compress query into the group's bf16 row. A key of this step is read from ``ik``,
+    an earlier one from the request's ring, where it must carry its own position; a key
+    found in neither (no ring slot, or one taken by another request) is left out.
+
+    STORE: keep a request's last RR keys of the step in its ring (row position % RR,
+    tagged with the position): a later step's groups read the ones before it from there.
+    Both in one launch only where no ring row is both pooled and stored (``max_rows``).
+    """
     t = tl.program_id(0)
     p = tl.load(pos_ptr + t)
     slot = tl.load(slot_ptr + t)
-    if (slot >= 0) & (p % G == G - 1):
+    if POOL & (slot >= 0) & (p % G == G - 1):
         s = tl.load(seq_ptr + t)
         base = tl.load(base_ptr + s)
         g = tl.arange(0, G)
@@ -589,7 +597,8 @@ def _compress_pool_kernel(
         row = base + q % RR
         rowc = tl.where(base >= 0, row, 0)
         has_ring = (base >= 0).to(tl.int32)
-        kept = (has_ring * (tl.load(ring_pos_ptr + rowc) == q).to(tl.int32)) != 0
+        ring_q = tl.load(ring_pos_ptr + rowc, mask=~mine, other=-1)  # not stored here
+        kept = (has_ring * (ring_q == q).to(tl.int32)) != 0
         from_ring = (kept.to(tl.int32) * (1 - mine.to(tl.int32))) != 0
         here = mine | kept
         d = tl.arange(0, D_IDX)
@@ -615,32 +624,13 @@ def _compress_pool_kernel(
         tl.store(
             out_ptr + blk * out_sb + r * out_sr + d, c.to(out_ptr.dtype.element_ty)
         )
-
-
-@triton.jit
-def _ring_store_kernel(
-    ik_ptr,
-    pos_ptr,
-    seq_ptr,
-    slot_ptr,
-    base_ptr,
-    ring_ptr,
-    ring_pos_ptr,
-    T,
-    RR: tl.constexpr,
-):
-    """Keep a request's last RR keys of the step in its ring (row position % RR, tagged
-    with the position): a later step's groups read the ones before it from there."""
-    t = tl.program_id(0)
-    slot = tl.load(slot_ptr + t)
     s = tl.where(
         slot >= 0, tl.load(seq_ptr + t), 0
     )  # a pad row's batch row is no index
     base = tl.load(base_ptr + s)
     nxt = tl.minimum(t + RR, T - 1)
     last = (t + RR >= T) | (tl.load(seq_ptr + nxt) != s)
-    if (slot >= 0) & (base >= 0) & last:
-        p = tl.load(pos_ptr + t)
+    if STORE & (slot >= 0) & (base >= 0) & last:
         row = (base + p % RR).to(tl.int64)
         d = tl.arange(0, D_IDX)
         tl.store(
@@ -649,8 +639,24 @@ def _ring_store_kernel(
         tl.store(ring_pos_ptr + row, p)
 
 
+# A request's n rows of a step store positions first .. first + n - 1 while its pooling
+# reads ring positions first - (GROUP - 1) .. first - 1: no ring row is in both while
+# n + GROUP - 1 <= RING_ROWS.
+FUSED_INSERT_MAX_ROWS = RING_ROWS - GROUP + 1
+
+
 def compress_insert(
-    ik, positions, seq_id, slots, ring_base, ring, ring_pos, cq, pool_scale, ic_c
+    ik,
+    positions,
+    seq_id,
+    slots,
+    ring_base,
+    ring,
+    ring_pos,
+    cq,
+    pool_scale,
+    ic_c,
+    max_rows=0,
 ):
     """Pool the groups this step closes into the compressed index cache, then keep each
     request's trailing keys in its ring.
@@ -661,33 +667,21 @@ def compress_insert(
     row's first ring row (-1: none), ``ring`` ``[R, 128]`` and ``ring_pos`` ``[R]`` int32 the
     rings and their rows' positions (-1: empty), ``cq`` ``[128]`` the layer's compress query,
     ``ic_c`` ``[pages, PAGE / GROUP, 128]`` bf16. Two launches: the pooling reads the rings
-    before this step's keys overwrite them.
+    before this step's keys overwrite them. ``max_rows``: a bound on any request's rows
+    in the step (0: none); at most ``FUSED_INSERT_MAX_ROWS``, one launch, the same bytes.
     """
     t = ik.shape[0]
     if t == 0:
         return
     assert ik.is_contiguous() and ring.is_contiguous() and ic_c.stride(-1) == 1
     assert ic_c.shape[1:] == (PAGE // GROUP, IDX_DIM) and ring.shape[1] == IDX_DIM
-    _compress_pool_kernel[(t,)](
-        ik,
-        positions,
-        seq_id,
-        slots,
-        ring_base,
-        ring,
-        ring_pos,
-        cq,
-        ic_c,
-        ic_c.stride(0),
-        ic_c.stride(1),
-        pool_scale,
-        PG=PAGE,
-        G=GROUP,
-        RR=RING_ROWS,
-    )
-    _ring_store_kernel[(t,)](
-        ik, positions, seq_id, slots, ring_base, ring, ring_pos, t, RR=RING_ROWS
-    )
+    args = (ik, positions, seq_id, slots, ring_base, ring, ring_pos, cq, ic_c)
+    args += (ic_c.stride(0), ic_c.stride(1), pool_scale, t)
+    fused = 0 < max_rows <= FUSED_INSERT_MAX_ROWS
+    for pool, store in [(True, True)] if fused else [(True, False), (False, True)]:
+        _compress_insert_kernel[(t,)](
+            *args, PG=PAGE, G=GROUP, RR=RING_ROWS, POOL=pool, STORE=store
+        )
 
 
 _fused_prep = (

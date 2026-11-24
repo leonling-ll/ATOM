@@ -197,6 +197,10 @@ class ProVariants:
     # vLLM's compressed index cache: every 4 index keys softmax-pooled into one bf16 row
     # (ic_c [pages, 4, 128]), written after prep; the scorer reads those rows only.
     index_compress: bool = False
+    # ... and a decode / verify graph whose requests hold at most 13 rows each (k <= 12)
+    # pools and stores the ring in one launch instead of two: the same bytes. Read from
+    # the graph's shape, so a captured graph keeps the launches it recorded.
+    index_compress_fused: bool = False
     # Prefill and speculative-verify scores take ``score_tq`` rows per program (a power of
     # two; 0: one): the rows of a sequence read each tile of block keys once, one dot for
     # all their query heads. A plain decode (one row a sequence) keeps one.
@@ -999,6 +1003,7 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
         mx_scale=None,
         dsplit=None,
         ring=None,
+        max_rows=0,
         day0_lens=None,
     ):
         """The whole layer in four launches (``prep`` / ``scores`` + top-k / ``attention``).
@@ -1015,6 +1020,7 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
         a decode's ``(first, end)`` rows this rank selects (``decode_split``). ``ring``:
         ``(each batch row's first ring row, the ring rows)`` of the compressed index cache
         (``index_compress``; ``ic`` is then its ``[pages, 4, 128]`` centroids).
+        ``max_rows``: a bound on any sequence's rows, 0 when none (``compress_insert``).
         ``day0_lens``: the day0 decode's request lengths (``_day0_lens``), else computed
         in the call.
         """
@@ -1094,6 +1100,7 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
                 self.index_compress_query.data,
                 v.pool_scale,
                 ic,
+                max_rows=max_rows if v.index_compress_fused else 0,
             )
         scale = self.scale * v.scale_mult
         nblk = v.attn_nblk
@@ -1674,6 +1681,7 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
                     getattr(md, "pro_ring_base", None),
                     getattr(md, "pro_ring_rows", 0),
                 ),
+                max_rows=int(md.max_seqlen_q) if static else 0,
                 day0_lens=self._day0_lens(md, n, position) if day0_dec else None,
             )
             if mx:
