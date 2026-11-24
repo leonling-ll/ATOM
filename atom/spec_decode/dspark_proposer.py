@@ -278,7 +278,8 @@ class DSparkProposer(Drafter):
         self._blk_offsets = torch.arange(1, t + 1, **i64)
         if self.model.block_attention_is_mla:
             # The MLA block plan's CSR. A draft that attends its block another
-            # way builds what it reads in `prepare_paged_block`.
+            # way builds what it reads in `prepare_paged_block` or
+            # `build_paged_block`.
             self._blk_last_page_lens = torch.ones(max_bs, **i32)
             self._blk_kv_indptr = torch.zeros(max_bs + 1, **i32)
             # Holds the pad tail's own first page ids while it borrows block 0
@@ -915,6 +916,17 @@ class DSparkProposer(Drafter):
 
     # ---- separate-draft-model path (Kimi-K3) --------------------------------
 
+    def _publish_paged_block(
+        self, attn_metadata, slots, block_tables, ctx_lens, T, max_seqlen_k
+    ) -> None:
+        """The block's paged addressing, as every block attention reads it."""
+        attn_metadata.slot_mapping = slots
+        attn_metadata.block_tables = block_tables
+        attn_metadata.cu_seqlens_q = self._blk_cu_seqlens_q[: ctx_lens.shape[0] + 1]
+        attn_metadata.context_lens = ctx_lens
+        attn_metadata.max_seqlen_q = T
+        attn_metadata.max_seqlen_k = max_seqlen_k
+
     def _build_paged_block_metadata(
         self,
         forward_context,
@@ -964,13 +976,17 @@ class DSparkProposer(Drafter):
         attn_metadata.causal = False
 
         # Filled for the PADDED batch: the backbone runs the pad rows too, so
-        # they need positions to embed and rotate.
+        # they need positions to embed and rotate. A draft that builds its own
+        # paged block metadata writes them there, with everything else.
         block_positions = self._blk_positions[:running_bs]
-        torch.add(
-            anchor_positions.view(running_bs, 1),
-            self._blk_offsets.view(1, T),
-            out=block_positions,
-        )
+        k_cache_bound = self._bound_draft_k_cache(forward_context) is not None
+        builds_block = k_cache_bound and self.model.builds_paged_block
+        if not builds_block:
+            torch.add(
+                anchor_positions.view(running_bs, 1),
+                self._blk_offsets.view(1, T),
+                out=block_positions,
+            )
 
         # q_out dtype for the draft's MLA decode, ahead of the dummy return
         # below because that pass needs it just as much: MLA allocates q_out
@@ -985,7 +1001,7 @@ class DSparkProposer(Drafter):
                 self._blk_dtype_q = dtype_q
         attn_metadata.dtype_q = dtype_q
 
-        if self._bound_draft_k_cache(forward_context) is None:
+        if not k_cache_bound:
             # warmup_model() runs before allocate_kv_cache(), so there is no
             # paged state to describe. The block forward still runs on that
             # pass -- it doubles as memory profiling, and omitting the draft
@@ -999,6 +1015,28 @@ class DSparkProposer(Drafter):
             return
 
         block_tables = self.runner.forward_vars["block_tables"].gpu[:running_bs]
+        if builds_block:
+            # The positions, slots and lengths below and the draft's own
+            # per-row tables, in one launch into the same buffers (MiniMax-
+            # M3.1, non-DCP and non-MLA by construction).
+            slots = self._blk_slots[: running_bs * T]
+            ctx_lens = self._blk_ctx_lens[:running_bs]
+            self.model.build_paged_block(
+                attn_metadata,
+                block_tables,
+                anchor_positions,
+                block_positions,
+                slots,
+                ctx_lens,
+                block_table_state(self.runner.forward_vars["block_tables"]).lengths,
+                scheduled_bs,
+                self._draft_entry_tokens,
+                self._paged_pad_ctx_len,
+            )
+            self._publish_paged_block(
+                attn_metadata, slots, block_tables, ctx_lens, T, max_seqlen_k
+            )
+            return
         slots = self._blk_slots[: running_bs * T].view(running_bs, T)  # stable
         # Each request's KV spans [0, anchor] (context) ++ the T block rows.
         ctx_lens = self._blk_ctx_lens[:running_bs]  # stable
@@ -1059,12 +1097,9 @@ class DSparkProposer(Drafter):
             slots[scheduled_bs:].fill_(-1)
             ctx_lens[scheduled_bs:].fill_(self._paged_pad_ctx_len)
 
-        attn_metadata.slot_mapping = slots.view(-1)
-        attn_metadata.block_tables = block_tables
-        attn_metadata.cu_seqlens_q = self._blk_cu_seqlens_q[: running_bs + 1]
-        attn_metadata.context_lens = ctx_lens
-        attn_metadata.max_seqlen_q = T
-        attn_metadata.max_seqlen_k = max_seqlen_k
+        self._publish_paged_block(
+            attn_metadata, slots.view(-1), block_tables, ctx_lens, T, max_seqlen_k
+        )
         if not self.model.block_attention_is_mla:
             # A non-MLA block read builds what it reads itself, so no CSR or
             # MLA plan is built.

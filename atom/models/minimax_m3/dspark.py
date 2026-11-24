@@ -31,7 +31,7 @@ and per-token fp8 cache format.
 The block attention is ``B * T`` independent q_len=1 paged decode rows --
 non-causal by construction -- over each request's ``[context | block]``,
 through the per-row ASM / Gluon decode the target's sparse layers run and a
-page-16 table ``prepare_paged_block`` builds outside the graph; the block's own K/V
+page-16 table ``build_paged_block`` builds outside the graph; the block's own K/V
 are written into the cache first, except at positions past the request's
 allocated pages. No host sync and fixed shapes, so the block pass is CUDA-graph
 captured like the other drafts. The per-row decode takes one KV head per rank,
@@ -61,6 +61,7 @@ from torch import nn
 
 from atom.config import QuantizationConfig
 from atom.kv_transfer.disaggregation import kv_config_has_producer
+from atom.model_ops.dspark_block_meta import dspark_block_meta
 from atom.model_ops.layernorm import GemmaRMSNorm
 from atom.model_ops.linear import QKVParallelLinear, ReplicatedLinear, RowParallelLinear
 from atom.model_ops.minimax_m3.sparse_attn import (
@@ -95,61 +96,6 @@ def _draft_rope_theta(config) -> float:
     if not theta:
         raise ValueError("MiniMax-M3 DSpark draft config names no rope_theta.")
     return float(theta)
-
-
-def _page16_table(
-    block_tables: torch.Tensor,  # [rb, W] ids of pages of n page-16s each
-    out: torch.Tensor,  # [rb, n * W]
-    sub_pages: torch.Tensor,  # [n] = arange(n)
-) -> torch.Tensor:
-    """Page-16 ids of a table of ``n``-page-16 pages: page p covers
-    ``p * n + 0..n-1`` (n = 8 for M3.1's page-128 pool, 1 for M3-Pro's page-16).
-
-    Through ``copy_`` of an expanded view: an ``out=`` of the ``[rb, W, 1]``
-    product would be resized to that shape rather than broadcast over the
-    sub-pages, leaving ``[8p0, 8p1+1, 8p2+2, ...]``.
-    """
-    rb, W = block_tables.shape
-    n = sub_pages.shape[0]
-    out3 = out.view(rb, W, n)
-    out3.copy_(block_tables.unsqueeze(-1).expand(rb, W, n))
-    out3.mul_(n).add_(sub_pages)
-    return out
-
-
-def _window_rows(
-    bt16_flat: torch.Tensor,  # [(rb + 1) * P] request tables, then P of slack
-    ctx_eff: torch.Tensor,  # [rb] keys each request can read
-    positions: torch.Tensor,  # [rb * T] each row's own position
-    row_req: torch.Tensor,  # [rb * T] the request each row belongs to
-    window: int,  # 0: attend the whole context
-    real_rows: int,  # rows past this are padding
-    start16: torch.Tensor,  # [rb * T] int64 scratch
-    out_tables: torch.Tensor,  # [rb * T, P]
-    out_lens: torch.Tensor,  # [rb * T]
-) -> None:
-    """Each block row's page-16 table and length under the sliding window.
-
-    A row at position p attends the keys from ``p - window + 1`` on, as the
-    reference does (the whole block is inside that window). The per-row
-    decode starts a row at a page boundary, so the row starts at the page-16
-    holding that key and also reads up to 15 keys before it. Its table is
-    the P-wide window of its request's table from that page on, taken from
-    the flat buffer; its length ends it within its own request's columns,
-    so what that window runs into past them is never read.
-    """
-    P = out_tables.shape[1]
-    if window:
-        torch.sub(positions, window - 1, out=start16)
-        start16.clamp_(min=0).div_(ASM_PAGE_SIZE, rounding_mode="floor")
-        # Pad rows read one page.
-        start16[real_rows:].zero_()
-    else:
-        start16.zero_()
-    torch.index_select(ctx_eff, 0, row_req, out=out_lens)
-    out_lens.sub_(start16, alpha=ASM_PAGE_SIZE)
-    start16.add_(row_req, alpha=P)  # each row's first entry in the flat buffer
-    torch.index_select(bt16_flat.unfold(0, P, 1), 0, start16, out=out_tables)
 
 
 class M3DSparkAttention(nn.Module):
@@ -298,7 +244,11 @@ class M3DSparkAttention(nn.Module):
                 f"The block pass decodes one KV head per rank; this rank holds "
                 f"{self.num_kv_heads} of {self.total_num_kv_heads}"
             )
-        qkv = linear_out(self.qkv_proj(hidden_states))
+        # An (x, x_scale) pair is the MXFP8 input a fused norm already wrote.
+        x, x_scale = (
+            hidden_states if isinstance(hidden_states, tuple) else (hidden_states, None)
+        )
+        qkv = linear_out(self.qkv_proj(x, x_scale=x_scale))
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         cache = self._bound_cache()
         if cache is None:
@@ -322,7 +272,7 @@ class M3DSparkAttention(nn.Module):
 
         A length-1 query sees its whole context, so per-row decode is the
         non-causal block attention by construction. The rows read the request's
-        page-16 table and capped length that ``prepare_paged_block`` built
+        page-16 table and capped length that ``build_paged_block`` built
         (``dspark_bt16_rows`` / ``dspark_ctx_rows``, sliding window applied
         there), through the same per-row ASM / Gluon decode the target's sparse
         layers run -- no host sync, fixed shapes, so the block can be captured.
@@ -390,8 +340,10 @@ class MiniMaxM3DSpark(DSparkDraftModel):
     reference embeds with the target's table as is.
     """
 
-    # Per-row MHA decode; its tables are built in `prepare_paged_block`.
+    # Per-row MHA decode; its slots, lengths and tables are built in
+    # `build_paged_block`.
     block_attention_is_mla = False
+    builds_paged_block = True
 
     layer_cls: ClassVar[type[M3DSparkDecoderLayer]] = M3DSparkDecoderLayer
 
@@ -463,52 +415,47 @@ class MiniMaxM3DSpark(DSparkDraftModel):
         self.embed_tokens = None
         self.lm_head = None
 
-        # `prepare_paged_block`'s buffers, sized here and allocated on its
+        # `build_paged_block`'s buffers, sized here and allocated on its
         # first call.
         self.max_num_seqs = atom_config.max_num_seqs
-        self._bt16 = None
+        self._block_rows_p = None
 
     # ---- drafting entry points (called by the proposer) --------------------
 
-    def _alloc_block_rows(self, P: int, T: int, pages: int, device) -> None:
+    def _alloc_block_rows(self, P: int, T: int, device) -> None:
         """The first call is the warmup, ahead of any capture: these addresses
         are the ones every recording bakes in."""
         max_bs = self.max_num_seqs
         self._alloc_cap = AllocationCap(max_bs, device)
-        # One row of slack past the last request: `_window_rows` reads every
-        # row as a P-wide window of this buffer.
-        self._bt16_flat = torch.zeros(
-            (max_bs + 1) * P, dtype=torch.int32, device=device
-        )
-        self._bt16 = self._bt16_flat[: max_bs * P].view(max_bs, P)
         self._bt16_rows = torch.zeros(max_bs * T, P, dtype=torch.int32, device=device)
         self._ctx_rows = torch.zeros(max_bs * T, dtype=torch.int32, device=device)
-        self._row_req = torch.arange(
-            max_bs, dtype=torch.int64, device=device
-        ).repeat_interleave(T)
-        self._sub_pages = torch.arange(pages, dtype=torch.int32, device=device)
-        self._start16 = torch.zeros(max_bs * T, dtype=torch.int64, device=device)
-        self._ctx_eff = torch.zeros(max_bs, dtype=torch.int32, device=device)
+        self._block_rows_p = P
 
-    def prepare_paged_block(
+    def build_paged_block(
         self,
         attn_metadata,
         block_tables: torch.Tensor,  # [running_bs, W] ids of entry_tokens pages
-        block_positions: torch.Tensor,  # [running_bs, T]
-        slots: torch.Tensor,  # [running_bs, T] -- the block's KV write slots
-        ctx_lens: torch.Tensor,  # [running_bs] anchor + 1 + T
+        anchor_positions: torch.Tensor,  # [running_bs] staged, pad rows 0
+        block_positions: torch.Tensor,  # [running_bs, T] out
+        slots: torch.Tensor,  # [running_bs * T] out, the block's KV write slots
+        ctx_lens: torch.Tensor,  # [running_bs] out, anchor + 1 + T
         allocated_pages,  # [>= scheduled_bs] host, pages each request holds
         scheduled_bs: int,
         entry_tokens: int,  # tokens one page id spans, the slots' unit
+        pad_ctx_len: int,  # a pad row's context, on page 0
     ) -> None:
-        """Per-row paged decode tables for the block.
+        """The block's positions, KV write slots and context lengths, and each
+        block row's page-16 table and length, in one launch
+        (`dspark_block_meta`), into buffers sized at ``max_num_seqs`` and only
+        sliced, so a captured block replays against this step's numbers.
 
         The block is attended as ``running_bs * T`` independent q_len=1 decode
         rows -- non-causal by construction -- each over its request's
         ``[context | block]`` through a page-16 block table, the layout the
-        target's sparse decode kernels read. Everything lands in buffers sized at
-        ``max_num_seqs`` and is only sliced, so a captured block replays against
-        this step's numbers.
+        target's sparse decode kernels read. A row at position p attends the
+        keys from ``p - window + 1`` on, from the page-16 that holds that key,
+        so it also reads up to 15 keys before it; its length ends it within
+        its own request's table.
 
         Block positions can run past the pages the scheduler has allocated for
         the request (it allocates through the verify window, the block reaches
@@ -517,42 +464,47 @@ class MiniMaxM3DSpark(DSparkDraftModel):
         prefix caching, a prefix every request shares. Such positions are
         neither written (slot -1) nor read (the row's context is capped at what
         is allocated): their draft rows simply miss a few of their own keys.
+        ``ctx_lens`` (``attn_metadata.context_lens``) stays uncapped.
         """
         running_bs, T = block_positions.shape
-        pages = entry_tokens // ASM_PAGE_SIZE  # page-16s per table entry
-        P = pages * block_tables.shape[1]
-        if self._bt16 is None or self._bt16.shape[1] != P:
-            self._alloc_block_rows(P, T, pages, block_tables.device)
-
-        alloc = self._alloc_cap.apply(
-            allocated_pages, scheduled_bs, block_positions, slots, entry_tokens
+        P = (entry_tokens // ASM_PAGE_SIZE) * block_tables.shape[1]
+        if self._block_rows_p != P:
+            self._alloc_block_rows(P, T, block_tables.device)
+        alloc_pages = self._alloc_cap.stage_pages(
+            allocated_pages, scheduled_bs, running_bs
         )
-        # The rows' own lengths; `ctx_lens` is left as the proposer built it.
-        ctx_eff = self._ctx_eff[:running_bs]
-        torch.minimum(ctx_lens, alloc, out=ctx_eff)
-
-        bt16 = _page16_table(block_tables, self._bt16[:running_bs], self._sub_pages)
-        if running_bs > scheduled_bs:
-            # A pad row reads one page: page 0.
-            bt16[scheduled_bs:, :pages].copy_(self._sub_pages)
-
         rows = running_bs * T
-        _window_rows(
-            self._bt16_flat,
-            ctx_eff,
-            block_positions.view(-1),
-            self._row_req[:rows],
-            self.sliding_window,
-            scheduled_bs * T,
-            self._start16[:rows],
+        dspark_block_meta(
+            anchor_positions,
+            block_tables,
+            alloc_pages,
+            block_positions,
+            slots,
+            ctx_lens,
             self._bt16_rows[:rows],
             self._ctx_rows[:rows],
+            scheduled_bs=scheduled_bs,
+            entry_tokens=entry_tokens,
+            window=self.sliding_window,
+            pad_ctx_len=pad_ctx_len,
         )
         attn_metadata.dspark_bt16_rows = self._bt16_rows[:rows]
         attn_metadata.dspark_ctx_rows = self._ctx_rows[:rows]
 
     def head_and_sample(self, hidden, anchor_ids, num_draft):
         bs = anchor_ids.shape[0]
+        if self._samples_off_the_vocab_shard(self.lm_head):
+            # Under TP: no logits all-gather, V / tp rows of markov_w2 a
+            # position; the same ids and confidences.
+            out_ids, markov_embeds = self._sample_block_off_the_vocab_shard(
+                hidden, self.lm_head, anchor_ids, num_draft
+            )
+            confidence = None
+            if self.confidence_head is not None:
+                confidence = self.confidence_head(
+                    hidden.view(bs, num_draft, -1), markov_embeds
+                )
+            return out_ids, confidence
         base_logits = self.lm_head(hidden).view(bs, num_draft, -1)
         out_ids = anchor_ids.new_empty(bs, num_draft + 1)
         out_ids[:, 0] = anchor_ids
