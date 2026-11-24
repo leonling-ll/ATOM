@@ -189,3 +189,78 @@ def test_prep_hands_over_the_keys_it_would_cache():
     )
     assert torch.equal(ik, cached)
     assert not c2.ic.any()  # the index cache itself is not written
+
+
+def test_layer_selects_the_blocks_the_pooled_keys_score_highest(monkeypatch):
+    """``_kernel_attention`` with ``index_compress`` over two steps (a prefill of each request's
+    first rows, then the rest): every row of the second step attends the blocks a torch
+    reference picks from the centroids of the very bf16 keys ``prep`` produced (max over a
+    block's 4 rows, then over heads; sink and local pinned), its scores reading rows both
+    steps wrote."""
+    pytest.importorskip("aiter", reason="the layer test case builds an attention impl")
+    from test_minimax_m3_pro_kernels import DT, VD, Case, H, TestImplGlue
+
+    from atom.model_ops.minimax_m3.pro_attn import ProVariants
+
+    c = Case([150, 97], topk=8, seed=7)
+    v = ProVariants(index_compress=True, topk="fused")
+    TestImplGlue()._impl_with_rope(c, v)
+    ic_c = torch.zeros(c.ic.shape[0], PG // G, DI, dtype=torch.bfloat16, device=DEV)
+    ring = (torch.tensor([0, RR], dtype=torch.int32, device=DEV), 4 * RR)
+    keys = torch.zeros(c.T, DI, dtype=DT, device=DEV)
+    iqs = torch.zeros(c.T, 16, DI, dtype=DT, device=DEV)
+    sel_seen = {}
+    real_prep, real_attention = K.prep, K.attention
+    rows_now = {}
+
+    def prep_spy(*a, **k):
+        q, iq = real_prep(*a, **k)
+        keys[rows_now["r"]] = k["ik_out"]
+        iqs[rows_now["r"]] = iq
+        return q, iq
+
+    def attention_spy(q, kc4, bt, seq, pos, sel, out, scale, *a, **k):
+        for i, t in enumerate(rows_now["r"].tolist()):
+            sel_seen[t] = set(x for x in sel[i].tolist() if x >= 0)
+        return real_attention(q, kc4, bt, seq, pos, sel, out, scale, *a, **k)
+
+    monkeypatch.setattr(K, "prep", prep_spy)
+    monkeypatch.setattr(K, "attention", attention_spy)
+    a0, a1 = c.seq_slice(0), c.seq_slice(1)
+    steps = [
+        torch.cat([torch.arange(a0[0], a0[0] + 120), torch.arange(a1[0], a1[0] + 80)]),
+        torch.cat([torch.arange(a0[0] + 120, a0[1]), torch.arange(a1[0] + 80, a1[1])]),
+    ]
+    for r in steps:
+        r = r.to(DEV)
+        rows_now["r"] = r
+        out = torch.zeros(r.numel(), H * VD, dtype=DT, device=DEV)
+        c.impl._kernel_attention(
+            c.qkv[r], c.pos[r], c.seq[r], c.slot[r], c.bt, c.layer, ic_c,
+            c.bt.shape[1], v, out, ring=ring,
+        )
+    # the reference: centroids of each request's groups, then each row's top-k blocks
+    cq = c.impl.index_compress_query.data.float()
+    for t in steps[1].tolist():
+        s, p = int(c.seq[t]), int(c.pos[t])
+        start = c.seq_slice(s)[0]
+        n = (p + 1) // G * G  # this row's closed groups (its own block is pinned anyway)
+        g = keys[start : start + n].float().view(-1, G, DI)
+        w = torch.softmax((g * cq).sum(-1) * v.pool_scale, dim=-1)
+        cent = (w[..., None] * g).sum(1).to(torch.bfloat16).float()  # [groups, DI]
+        dots = torch.einsum("hd,cd->hc", iqs[t].float(), cent) * v.index_scale
+        qb = p // PG
+        nb = qb + 1
+        score = torch.full((nb,), float("-inf"))
+        for j in range(nb):
+            rows = dots[:, j * (PG // G) : (j + 1) * (PG // G)]
+            if rows.shape[1]:
+                score[j] = rows.amax(-1).amax().item()
+        init, local = c.impl.init_blocks, c.impl.local_blocks
+        for j in range(nb):
+            if j < init:
+                score[j] = 1e30
+            elif j >= qb + 1 - local:
+                score[j] = 1e29
+        want = set(score.topk(min(c.topk, nb)).indices.tolist())
+        assert sel_seen[t] == want, (t, p, sorted(sel_seen[t] ^ want))
