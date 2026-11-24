@@ -9,7 +9,7 @@ The configuration uses:
 - FP8 K-only KV cache and FP8 index cache, `--block-size 16`
 - native GPU prefix caching plus LMCache CPU offload
 - cache-aware admission in the scheduler
-- DSpark speculative decoding (the checkpoint's draft), 7 tokens, synthetic acceptance 4.0
+- DSpark speculative decoding (the checkpoint's draft), 7 tokens, synthetic acceptance 2.94 (the golden AL, thinking enabled)
 - the SemiAnalysis Weka AgentX workload (AIPerf scenario `inferencex-agentx-mvp`)
 
 Related guides: [`MiniMax-M3-Pro.md`](MiniMax-M3-Pro.md) (generic serving, kernels, GSM8K and
@@ -65,6 +65,16 @@ load, and nothing was preempted. The last row branches off the pad_align 128 row
 below turns everything on at once, a combination not yet measured as a whole. GSM8K (64-shot,
 one run, real DSpark acceptance) with streaming quant and pad_align 128 is 0.9424.
 
+The rows above force acceptance 4.0. At the golden AL (2.94 for k=7, thinking enabled), on the
+same node and setup, 600 s:
+
+| Configuration | Prefix hit | P90 E2E-norm interactivity | tok/s/GPU | Requests | GSM8K |
+|---|---|---|---|---|---|
+| All of the above + bound 1040 | 78.7% | 21.51 | 9562 | 869 | 0.9393 |
+| + decode kernels: FlyDSL sparse decode with MXFP8 out, merged MXFP8 GEMM rows, MoE route glue, `index_split_decode` | 79.7% | **30.22** | **11254** | 1022 | 0.9424 |
+
+`index_split_decode` alone gives 29.10 / 10864; the decode kernels add the rest.
+
 An LMCache smoke on this configuration (util 0.73 so the pool is small; an 18.6k-token prompt is
 pushed out of HBM by 14 fillers and asked again) gets the same answers both times, with 18432
 tokens loaded from the CPU tier and the re-ask's TTFT down from 2.85 s to 0.20 s.
@@ -75,13 +85,14 @@ tokens loaded from the CPU tier and the re-ask's TTFT down from 2.85 s to 0.20 s
 |---|---|
 | Hardware | 8×MI355X (`gfx950`) |
 | ATOM | `yuhua/m3.1-pro` (this recipe's commit) |
-| aiter | `yuhua/m3.1-pro` with the inter-640 MoE rows (`[Config] [Tuning] [gfx950] MiniMax-M3.1-Pro MXFP4 MoE rows at inter 640`) and the a16w4 rows at 256/512/1024 tokens |
+| aiter | `yuhua/m3.1-pro` with the inter-640 MoE rows (`[Config] [Tuning] [gfx950] MiniMax-M3.1-Pro MXFP4 MoE rows at inter 640`) and the a16w4 rows at 256/512/1024 tokens, the MXFP8 GEMM rows and `moe_route_glue`. Those rows are built in: do not list `best/tune3/new_rows.csv` or other copies in `AITER_CONFIG_FMOE` (duplicate rows abort startup) |
 | Parallelism | TP8, DCP=1 |
 | KV cache | FP8, K only, `--block-size 16`; index cache FP8 |
 | Prefix cache | on |
 | CPU offload | LMCache, 184 GiB a rank, chunk 256 |
-| Speculative decoding | DSpark, 7 tokens, synthetic acceptance length 4.0 |
+| Speculative decoding | DSpark, 7 tokens, synthetic acceptance length 2.94 (golden AL, thinking enabled) |
 | Prefill | 16384-token chunks; prefill attention from amd-kernels-day0 when its `amd_kernels` package imports, otherwise the Triton kernel |
+| Decode attention | from 24 rows, amd-kernels-day0's FlyDSL sparse decode with an MXFP8 output for `o_proj`, when its `amd_kernels` package imports; otherwise aiter |
 | `max-num-seqs` | 2 × CONC (128) |
 
 ## 1. Start the ATOM server
@@ -95,7 +106,7 @@ export CONC="${CONC:-64}"
 
 export AITER_LOG_LEVEL=WARNING
 unset AITER_CUSTOM_AR_DISABLE_LAMPORT          # ar_lamport_rows needs the Lamport path
-export ATOM_M3PRO_VARIANTS='{"kernels": true, "attn": "aiter", "topk": "split", "prep": "aiter", "index_split": true, "score_tq": 8, "ar_lamport_rows": 16, "k_only": true, "k_plain_fp8": true, "prefill_attn": "day0"}'
+export ATOM_M3PRO_VARIANTS='{"kernels": true, "attn": "aiter", "topk": "split", "prep": "aiter", "index_split": true, "score_tq": 8, "ar_lamport_rows": 16, "k_only": true, "k_plain_fp8": true, "prefill_attn": "day0", "index_split_decode": 64, "moe_route_glue": true}'
 export ATOM_WARMUP_TOKENS=auto
 export ATOM_ONLINE_QUANT_STREAMING=1
 export ATOM_CACHE_AWARE_ADMISSION=1
@@ -127,7 +138,7 @@ python3 -m atom.entrypoints.openai_server \
   --online_quant_config '{"layer_quant_config": {"*.experts": "mxfp4"}}' \
   --method dspark \
   --num-speculative-tokens 7 \
-  --spec-decode-acceptance-length 4.0 \
+  --spec-decode-acceptance-length 2.94 \
   --text-only \
   2>&1 | tee "server-m31pro-agentx-c${CONC}.log"
 ```
@@ -157,7 +168,7 @@ launcher handles it:
 
 ### Synthetic acceptance
 
-`--spec-decode-acceptance-length 4.0` is the InferenceX synthetic acceptance override: the
+`--spec-decode-acceptance-length 2.94` is the InferenceX synthetic acceptance override: the
 DSpark draft still runs, and the flag decides how many draft tokens are committed. It is
 **performance-only**; output text is replaced by `synthetic` tokens. Drop it for any accuracy run.
 
