@@ -9,6 +9,7 @@ import importlib.util
 import json
 import re
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -32,14 +33,32 @@ class Codec:
         return raw[0] + 3 if len(raw) == 1 else None
 
 
+SPECIAL = (
+    1  # a token id the logprobs leave out (no character: the codec never makes it)
+)
+
+
 class Server:
     """What the probe sees of ATOM: prompts as ids, a block-granular prefix cache that
-    keeps the last block back and indexes the answer's blocks too, LRU over ``cap``."""
+    keeps the last block back and indexes the answer's blocks too, LRU over ``cap``, and
+    /metrics counters from a snapshot refreshed every ``refresh`` seconds. Knobs:
+    ``flip`` (index: the character there turns, confidently, on a hit), ``repeat_flip``
+    (it turns on every repeat of a prompt, cached or not: run-to-run noise),
+    ``special`` (odd-sum prompts get a special token after the answer)."""
 
-    def __init__(self, cap=8000, cache=True, flip_on_hit=False):
-        self.cap, self.cache, self.flip_on_hit = cap, cache, flip_on_hit
-        self.store, self.lock = [], threading.Lock()
+    def __init__(self, cap=8000, refresh=0.05):
+        self.cap, self.cache, self.refresh = cap, True, refresh
+        self.flip, self.repeat_flip, self.special = None, False, False
+        self.store, self.seen, self.lock = [], set(), threading.Lock()
         self.m = {"cached": 0, "full": 0, "acc": 0, "steps": 0}
+        self.snap, self.stamp = dict(self.m), time.time()
+        self.stop = threading.Event()
+        threading.Thread(target=self._refresher, daemon=True).start()
+
+    def _refresher(self):
+        while not self.stop.wait(self.refresh):
+            with self.lock:
+                self.snap, self.stamp = dict(self.m), time.time()
 
     def cached(self, ids):
         best = 0
@@ -63,21 +82,30 @@ class Server:
         out = (f" {val.group(1) if val else '?'}." + "\nQuestion: next" * 4)[:n]
         with self.lock:
             hit = self.cached(ids)
-            if hit and self.flip_on_hit and n > 12:
-                out = out[:12] + "#" + out[13:]  # a confident token turns
-            self.store.append(ids + [ord(c) + 3 for c in out])
+            again = tuple(ids) in self.seen
+            self.seen.add(tuple(ids))
+            at = 12 if self.repeat_flip and again else self.flip if hit else None
+            if at is not None and n > at:
+                out = out[:at] + "#" + out[at + 1 :]  # a confident token turns
+            out_ids = [ord(c) + 3 for c in out]
+            if self.special and sum(ids) % 2 and n > 12:
+                out_ids = out_ids[:10] + [SPECIAL] + out_ids[11:]
+                out = out[:10] + out[11:]
+            self.store.append(ids + out_ids)
             while sum(map(len, self.store)) > self.cap:
                 self.store.pop(0)
             self.m["cached"] += hit
             self.m["full"] += len(ids)
-            self.m["acc"] += 2 * len(out)
-            self.m["steps"] += len(out)
-        return out, hit
+            self.m["acc"] += 2 * len(out_ids)
+            self.m["steps"] += len(out_ids)
+        return out, hit, len(out_ids)
 
     def metrics(self):
-        m = self.m
+        with self.lock:
+            m, stamp = dict(self.snap), self.stamp
         return (
             "# HELP atom:mtp_accepted_tokens x\n"
+            f"atom:metrics_last_refresh_timestamp_seconds {stamp}\n"
             f"atom:kv_cache_blocks_total {self.cap // BS}\n"
             f"atom:prefix_cache_cached_tokens {m['cached']}\n"
             f"atom:prefix_cache_full_tokens {m['full']}\n"
@@ -108,7 +136,7 @@ def server():
         def do_POST(self):
             req = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
             ids, n = req["prompt_token_ids"], req["max_tokens"]
-            out, hit = state.complete(ids, n)
+            out, hit, n_out = state.complete(ids, n)
             ent = [
                 {
                     "token": c,
@@ -127,7 +155,7 @@ def server():
                 ],
                 "usage": {
                     "prompt_tokens": len(ids),
-                    "completion_tokens": len(out),
+                    "completion_tokens": n_out,
                     "prompt_tokens_details": {"cached_tokens": hit},
                 },
             }
@@ -137,6 +165,7 @@ def server():
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
     state.port = httpd.server_address[1]
     yield state
+    state.stop.set()
     httpd.shutdown()
 
 
@@ -149,11 +178,13 @@ def _probe(server, tmp_path, capsys):
         codec=Codec(),
     )  # fmt: skip
     recs = [json.loads(line) for line in out.read_text().splitlines()]
-    return rc, recs, capsys.readouterr().out
+    text = capsys.readouterr().out
+    rows = [json.loads(x[4:]) for x in text.splitlines() if x.startswith("ROW ")]
+    return rc, recs, rows, text
 
 
 def test_probe_passes_on_a_faithful_cache(server, tmp_path, capsys):
-    rc, recs, out = _probe(server, tmp_path, capsys)
+    rc, recs, rows, out = _probe(server, tmp_path, capsys)
     assert rc == 0, out
     by = {}
     for r in recs:
@@ -165,19 +196,56 @@ def test_probe_passes_on_a_faithful_cache(server, tmp_path, capsys):
     assert all(r["cached"] > r["turn1"] // BS * BS for r in by["turn2"])
     for twin in ("cold", "cold2", "half_cold", "turn2_cold"):
         assert all(r["cached"] == 0 for r in by[twin]), twin
+    # every token logged: bytes, chosen logprob, top logprobs
+    assert all(len(r["toks"]) == 40 and len(r["toks"][0]) == 3 for r in recs)
+    # the phase's counters are read after the server's refresh, not before it
+    for r in rows:
+        assert r["prompt_tokens"] == r["req_prompt"], r
+        assert r["cached_tokens"] == r["req_cached"], r
     assert "RESULT PASS" in out
 
 
 def test_a_confident_token_turning_on_a_hit_fails(server, tmp_path, capsys):
-    server.flip_on_hit = True
-    rc, _, out = _probe(server, tmp_path, capsys)
+    server.flip = 12  # after the answer
+    rc, _, _, out = _probe(server, tmp_path, capsys)
     assert rc == 1
-    assert "off-tie" in out.splitlines()[-1]
+    assert "off_tie 3 > 0 + 2" in out.splitlines()[-1]
+
+
+def test_an_answer_turning_on_a_hit_fails(server, tmp_path, capsys):
+    server.flip = 3  # inside the 8-hex answer
+    rc, _, _, out = _probe(server, tmp_path, capsys)
+    assert rc == 1
+    assert "answers differ" in out.splitlines()[-1]
+
+
+def test_hits_at_the_noise_floor_pass(server, tmp_path, capsys):
+    # every repeat of a prompt turns a confident token, cold or cached: cold2 parts
+    # from cold as much as the hits do
+    server.repeat_flip = True
+    rc, _, rows, out = _probe(server, tmp_path, capsys)
+    assert rc == 0, out
+    hit = [r for r in rows if r["phase"] == "hit"]
+    assert all(r["off_tie"] == r["floor"]["off_tie"] == 3 for r in hit)
+
+
+def test_turn1_answers_with_a_left_out_token_are_not_judged(server, tmp_path, capsys):
+    server.special = True
+    rc, recs, _, out = _probe(server, tmp_path, capsys)
+    assert rc == 0, out
+    turn2 = [r for r in recs if r["phase"] == "turn2"]
+    gaps = [r for r in turn2 if r["answer_gap"]]
+    assert 0 < len(gaps) < len(turn2)
+    # the cache matched up to the left-out token's block only
+    assert all(r["cached"] <= (r["turn1"] + 10) // BS * BS for r in gaps)
+    assert all(
+        r["cached"] > r["turn1"] // BS * BS for r in turn2 if not r["answer_gap"]
+    )
 
 
 def test_a_run_without_hits_does_not_count(server, tmp_path, capsys):
     server.cache = False
-    rc, _, out = _probe(server, tmp_path, capsys)
+    rc, _, _, out = _probe(server, tmp_path, capsys)
     assert rc == 2 and "RESULT INVALID" in out
 
 
@@ -188,21 +256,23 @@ def _toks(text, margin=5.0, lp=-0.01):
 def test_divergence_rule():
     twin = _toks("abcdef")
     assert probe.compare(twin, _toks("abcdef")) == {
-        "diverged": False, "at": None, "near_tie": None, "dlp": 0.0, "ok": True,
+        "diverged": False, "at": None, "near_tie": None, "off_tie": False,
+        "dlp": 0.0, "strict": True,
     }  # fmt: skip
-    # parting where the twin was sure: a failure
+    # parting where the twin was sure: an off-tie divergence
     got = probe.compare(twin, _toks("abcxef"))
-    assert got["diverged"] and got["at"] == 3 and got["near_tie"] is False
-    assert not got["ok"]
-    # parting at a near-tie of the twin's: a divergence, not a failure
+    assert got["diverged"] and got["at"] == 3 and got["off_tie"] and not got["strict"]
+    # parting at a near-tie of the twin's: a divergence, not an off-tie one
     tie = twin[:3] + _toks("d", margin=0.3) + twin[4:]
     got = probe.compare(tie, _toks("abcxef"))
-    assert got["diverged"] and got["near_tie"] and got["ok"]
-    # same tokens, a logprob off by more than the tolerance before the parting
-    assert not probe.compare(twin, _toks("ab") + _toks("cdef", lp=-0.2))["ok"]
+    assert got["diverged"] and got["near_tie"] and not got["off_tie"] and got["strict"]
+    # same tokens, logprobs apart before the parting: reported against the 0.05
+    got = probe.compare(twin, _toks("ab") + _toks("cdef", lp=-0.2))
+    assert not got["diverged"] and got["dlp"] == pytest.approx(0.19)
+    assert not got["strict"] and not got["off_tie"]
     # one stopped early on a token the logprobs leave out
     got = probe.compare(twin, _toks("abcd"))
-    assert got["diverged"] and got["at"] == 4 and got["ok"]
+    assert got["diverged"] and got["at"] == 4 and not got["off_tie"]
 
 
 def _samples(path, rights):
