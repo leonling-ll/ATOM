@@ -221,7 +221,7 @@ def test_layer_selects_the_blocks_the_pooled_keys_score_highest(monkeypatch):
 
     def attention_spy(q, kc4, bt, seq, pos, sel, out, scale, *a, **k):
         for i, t in enumerate(rows_now["r"].tolist()):
-            sel_seen[t] = set(x for x in sel[i].tolist() if x >= 0)
+            sel_seen[t] = {x for x in sel[i].tolist() if x >= 0}
         return real_attention(q, kc4, bt, seq, pos, sel, out, scale, *a, **k)
 
     monkeypatch.setattr(K, "prep", prep_spy)
@@ -236,15 +236,25 @@ def test_layer_selects_the_blocks_the_pooled_keys_score_highest(monkeypatch):
         rows_now["r"] = r
         out = torch.zeros(r.numel(), H * VD, dtype=DT, device=DEV)
         c.impl._kernel_attention(
-            c.qkv[r], c.pos[r], c.seq[r], c.slot[r], c.bt, c.layer, ic_c,
-            c.bt.shape[1], v, out, ring=ring,
+            c.qkv[r],
+            c.pos[r],
+            c.seq[r],
+            c.slot[r],
+            c.bt,
+            c.layer,
+            ic_c,
+            c.bt.shape[1],
+            v,
+            out,
+            ring=ring,
         )
     # the reference: centroids of each request's groups, then each row's top-k blocks
     cq = c.impl.index_compress_query.data.float()
     for t in steps[1].tolist():
         s, p = int(c.seq[t]), int(c.pos[t])
         start = c.seq_slice(s)[0]
-        n = (p + 1) // G * G  # this row's closed groups (its own block is pinned anyway)
+        # this row's closed groups (its own block is pinned anyway)
+        n = (p + 1) // G * G
         g = keys[start : start + n].float().view(-1, G, DI)
         w = torch.softmax((g * cq).sum(-1) * v.pool_scale, dim=-1)
         cent = (w[..., None] * g).sum(1).to(torch.bfloat16).float()  # [groups, DI]
