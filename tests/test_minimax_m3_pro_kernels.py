@@ -1376,6 +1376,68 @@ class TestImplGlue:
             )
             assert torch.equal(verify[i], alone[0]), (i, int(c.pos[t]))
 
+    @pytest.mark.parametrize("topk", ["fused", "split"])
+    def test_decode_split_logical_over_ranks_equals_one_rank(self, topk, monkeypatch):
+        # the block-id branch of the decode split (the day0 decode / Triton attention take
+        # select_logical's ids, not page tables): 4 ranks, a contiguous quarter of 8 decode
+        # rows each, all-gathered; every rank's attention output equals one rank selecting
+        # all of them, bit for bit
+        comm = SimpleNamespace(tensor_model_parallel_all_gather=None)
+        monkeypatch.setitem(sys.modules, "aiter.dist.communication_op", comm)
+        c = Case([150, 97], topk=8, seed=3)
+        self._run(c, {}, {"attn": "triton", "topk": topk}, monkeypatch)
+        tok = torch.tensor(
+            [
+                c.lens[0] - 1,
+                c.T - 1,
+                140,
+                c.lens[0] + 90,
+                100,
+                c.lens[0] + 60,
+                130,
+                149,
+            ],
+            device=DEV,
+        )
+        seq = (tok >= c.lens[0]).long()
+        wide = torch.cat([c.bt, torch.zeros_like(c.bt).repeat(1, 4)], dim=1)
+        v = ProVariants(attn="triton", topk=topk, index_split_decode=8)
+
+        def run(dsplit):
+            got = torch.zeros(len(tok), H * VD, dtype=DT, device=DEV)
+            c.impl._kernel_attention(
+                c.qkv[tok],
+                c.pos[tok],
+                seq,
+                c.slot[tok],
+                wide,
+                c.layer,
+                c.ic,
+                wide.shape[1],
+                v,
+                got,
+                static=True,
+                dsplit=dsplit,
+            )
+            return got
+
+        want = run(None)
+        shares, tp = [], 4
+        monkeypatch.setattr(
+            comm,
+            "tensor_model_parallel_all_gather",
+            lambda x, dim: (shares.append(x.clone()), x.repeat(tp, 1))[1],
+        )
+        for r in range(tp):
+            run((2 * r, 2 * r + 2))
+        assert all(s.shape == (2, 8) for s in shares)  # block ids, not [table | ctx]
+        mine = list(shares)
+        monkeypatch.setattr(
+            comm, "tensor_model_parallel_all_gather", lambda x, dim: torch.cat(mine)
+        )
+        for r in range(tp):
+            assert torch.equal(run((2 * r, 2 * r + 2)), want), r
+
     def test_decode_split_plan(self, monkeypatch):
         ps = SimpleNamespace(
             get_tensor_model_parallel_world_size=lambda: 8,
