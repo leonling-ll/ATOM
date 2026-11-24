@@ -164,9 +164,7 @@ def test_fused_rows_write_the_callers_mxfp8_rows(tp_ar, monkeypatch):
         return hidden_states, q, q_scale, residual
 
     monkeypatch.setattr(tp_ar.layernorm, "_lamport_ar_on", lambda: True)
-    monkeypatch.setattr(
-        tp_ar.layernorm, "_lamport_fused_ar_rms_norm_mxfp8", one_launch
-    )
+    monkeypatch.setattr(tp_ar.layernorm, "_lamport_fused_ar_rms_norm_mxfp8", one_launch)
     q_out = torch.zeros(4, 64, dtype=torch.uint8)
     q_scale_out = torch.zeros(4, 2, dtype=torch.uint8)
     _, got_q, got_s, _ = tp_ar.layernorm.fused_allreduce_gemma_rms_norm_mxfp8(
