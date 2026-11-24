@@ -336,6 +336,12 @@ split over the ranks and the FlyDSL / aiter decode, three checks cover hits:
     --off off/*/samples_gsm8k_pfx_*.jsonl --on-metrics before.json after.json
   ```
 
+Results (MI355X TP8; tests unchanged since 6384a207). The hit test: 44 passed / 20 skipped in the
+interpreter, 40 passed on GPU. gsm8k_pfx at 5812c071, both servers with the Agentic variants without
+`ATOM_TOKEN_GRAPH_SIZES`: 0.9325 with prefix caching, 0.9196 without, 34 questions right to wrong and 51
+wrong to right (McNemar p 0.082), cached share 0.993, measured AL 4.10 on both (golden 2.94). Both are
+below `pair`'s absolute 0.94 bar. The probe with the round-2 rule has not run yet.
+
 ## CPU KV offload
 
 Prefix blocks evicted from HBM can be kept in host DRAM and loaded back instead of recomputed, through
