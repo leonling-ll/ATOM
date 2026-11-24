@@ -305,7 +305,7 @@ The server's `/metrics` has what explains a run: `atom:prefix_cache_hit_ratio`,
 ## CONC 32
 
 The current best CONC 32 configuration, as `scripts/m31pro/proxy_bench.sh` launches it with
-`RECIPE=agentic`. It differs from the CONC 64 launch above: DSpark runs 3 draft tokens, the
+`RECIPE=agentic`. It differs from the CONC 64 launch above: DSpark runs 5 draft tokens, the
 variants add the c32 kernels. Everything else is the section 1 launch: `RECIPE=agentic` launches
 that block's env and flags (`tests/test_m31pro_proxy_bench.py` diffs the two), and the full chat
 template comes from `CHAT_TEMPLATE`.
@@ -368,8 +368,8 @@ python3 -m atom.entrypoints.openai_server \
   --gpu-memory-utilization 0.95 \
   --online_quant_config '{"layer_quant_config": {"*.experts": "mxfp4"}}' \
   --method dspark \
-  --num-speculative-tokens 3 \
-  --spec-decode-acceptance-length 2.53 \
+  --num-speculative-tokens 5 \
+  --spec-decode-acceptance-length 2.89 \
   --text-only \
   --timeout-keep-alive 600 \
   --chat-template "${CHAT_TEMPLATE}" \
@@ -384,7 +384,7 @@ named here is the full one with the `thinking_mode` switch that `recipes/MiniMax
 with and `scripts/m31pro/aime_gate.sh` uses; the 237eada file is not on `/shared_nfs`.
 
 ```bash
-export RECIPE=agentic SPEC_TOKENS=3
+export RECIPE=agentic SPEC_TOKENS=5
 export MODEL="${MODEL_PATH}"
 export CHAT_TEMPLATE=/shared_nfs/huggingface_models/amd/MiniMax-M3-MXFP4/chat_template.jinja
 export ATOM_M3PRO_VARIANTS='{"index": "fused", "ar_fused_rows": 128, "day0_decode_rows": 48}'
@@ -392,10 +392,12 @@ export ATOM_TOKEN_GRAPH_SIZES=256,512,1024,2048,3072,4096
 flock /tmp/m31pro-gpu.lock bash scripts/m31pro/proxy_bench.sh 32 "${OUT_DIR}"
 ```
 
-- **AL is forced.** k=3 at Pro's golden AL 2.53 (thinking on), per the owner's k=3 ruling;
-  `proxy_bench.sh` takes it from its golden AL curve for `SPEC_TOKENS=3`. The server logs
-  `Forced speculative acceptance ON: mean acceptance length 2.5300 over 3 draft positions`, and
-  the run measures 2.530 (`atom:mtp_average_tokens_per_forward`). Output text is `synthetic`.
+- **AL is forced.** k=5 at Pro's golden AL 2.89 (thinking on), as vLLM moo runs c32; on the
+  full template k=5 matched k=3's throughput at a higher p90
+  ([#7](https://github.com/zhuyuhua-v/ATOM-M3/issues/7), 2026-11-25). `proxy_bench.sh` takes the
+  AL from its golden AL curve for `SPEC_TOKENS=5`. The server logs
+  `Forced speculative acceptance ON: mean acceptance length 2.8900 over 5 draft positions`, and
+  the run measures 2.89 (`atom:mtp_average_tokens_per_forward`). Output text is `synthetic`.
 - No `amd_kernels`: day0's prefill and decode kernels run from aiter-M3. The day0 decode
   needs an aiter-M3 at `3c55cbcc2` or later; an older build keeps aiter's paged attention.
   `"day0_decode_rows": 48` (the default is 24): at 24 to 40 decode rows, most CONC 32 k=3
@@ -406,9 +408,9 @@ flock /tmp/m31pro-gpu.lock bash scripts/m31pro/proxy_bench.sh 32 "${OUT_DIR}"
 - `"index": "fused"` is inert with `index_compress` on: the FlyDSL scorer declines the bf16
   centroid cache and every decode score is Triton's BLOCK_CENTROID (one
   `decode scores stay Triton's` line a layer and rank). It takes over when `index_compress` is off.
-- The capture ladder is #99's. At `--max-num-seqs 64` and k=3 the startup cut keeps 26 graphs,
+- The capture ladder is #99's. At `--max-num-seqs 64` and k=5 the startup cut keeps 26 graphs,
   1 to 64.
-- With k=3 a verify step at CONC 32 is at most 128 rows, under aiter's default 256-row MXFP4
+- With k=5 a verify step at CONC 32 is at most 192 rows, under aiter's default 256-row MXFP4
   activation bound, so at CONC 32 `GPTOSS_SWIGLU_MXFP4_BF16_BOUND=1040` changes only steps of
   256 to 1039 rows, which are prefill chunks. The measured rows below ran without it.
 
