@@ -33,16 +33,23 @@
 #   ACCEPT_LENGTH    forced DSpark acceptance length [the golden AL of
 #                    SPEC_TOKENS and THINKING; refused where there is none]
 #   RECIPE           pro: recipes/MiniMax-M3-Pro.md's fast configuration;
-#                    agentic: recipes/Agentic-MiniMax-M3.1-Pro.md's launch,
-#                    CPU KV offload and its capture-size ladder included [pro]
+#                    agentic: the launch in recipes/Agentic-MiniMax-M3.1-Pro.md's
+#                    "1. Start the ATOM server", every env and flag of it
+#                    (tests/test_m31pro_proxy_bench.py diffs the two) [pro]
+#   CHAT_TEMPLATE    agentic: --chat-template file; unset, a checkpoint
+#                    chat_template.jinja without the thinking_mode switch (the
+#                    1 KB stub) is refused []
 #   MAX_NUM_SEQS     [16 below CONC 8, else 2 x CONC]
 #   MAX_MODEL_LEN    [MAX_CONTEXT + 1024: room for the chat template]
 #   PORT             server port [8300]
 #   GPU_MEM_UTIL     --gpu-memory-utilization [pro 0.94, agentic 0.95]
 #   SERVER_EXTRA     more server flags, split on spaces, e.g. --load_dummy=xavier []
-#   ATOM_CUSTOM_AR_POOL_BYTES  custom all-reduce input pool [pro 134217728;
-#                    agentic unset, aiter's default, as the recipe launches]
-#   ATOM_M3PRO_VARIANTS  Pro attention variants [RECIPE's]
+#   ATOM_CUSTOM_AR_POOL_BYTES  custom all-reduce input pool [134217728]
+#   GPTOSS_SWIGLU_MXFP4_BF16_BOUND  agentic: bf16 MoE activation bound [1040]
+#   ATOM_M3PRO_VARIANTS  Pro attention variants: pro replaces its variants with
+#                    it; agentic merges it onto the recipe's, so a caller adds
+#                    keys such as {"index": "fused", "ar_fused_rows": 128}
+#                    [RECIPE's]
 #   PROXY_DRY_RUN    1: print the acceptance length, the server environment and
 #                    flags, and exit before anything runs
 #   With RECIPE=pro the server inherits the rest of the environment, so CPU
@@ -121,8 +128,14 @@ pro)
 agentic)
     # ar_lamport_rows needs the Lamport path.
     unset AITER_CUSTOM_AR_DISABLE_LAMPORT
-    default_variants='{"kernels": true, "attn": "aiter", "topk": "split", "prep": "aiter", "index_split": true, "score_tq": 8, "ar_lamport_rows": 16, "k_only": true, "k_plain_fp8": true, "prefill_attn": "day0"}'
+    recipe_variants='{"kernels": true, "attn": "aiter", "topk": "split", "prep": "aiter", "index_split": true, "score_tq": 8, "ar_lamport_rows": 16, "k_only": true, "k_plain_fp8": true, "prefill_attn": "day0", "index_split_decode": 64, "moe_route_glue": true, "index_compress": true}'
+    default_variants=$(python3 -c 'import json, sys
+print(json.dumps({**json.loads(sys.argv[1]), **json.loads(sys.argv[2] or "{}")}))'         "$recipe_variants" "${ATOM_M3PRO_VARIANTS:-}")
+    unset ATOM_M3PRO_VARIANTS
     export GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.95}"
+    export AITER_REUSE_IDENTICAL_COMM_GROUPS=1
+    export ATOM_CUSTOM_AR_POOL_BYTES="${ATOM_CUSTOM_AR_POOL_BYTES:-134217728}"
+    export GPTOSS_SWIGLU_MXFP4_BF16_BOUND="${GPTOSS_SWIGLU_MXFP4_BF16_BOUND:-1040}"
     export ATOM_WARMUP_TOKENS=auto
     export ATOM_ONLINE_QUANT_STREAMING=1
     export ATOM_CACHE_AWARE_ADMISSION=1
@@ -134,7 +147,16 @@ agentic)
     # Graphs between 8, 16 and 32 sequences: a step replays the smallest graph
     # that holds its sequences, and padded rows cost index score time.
     recipe_args=(--cudagraph-capture-sizes
-        "[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,18,20,22,24,26,28,30,32,48,64,128,256,512]")
+        "[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,18,20,22,24,26,28,30,32,48,64,128,256,512]"
+        --text-only --timeout-keep-alive 600)
+    # The 1 KB stub some snapshots ship renders only the user messages.
+    if [ -n "${CHAT_TEMPLATE:-}" ]; then
+        recipe_args+=(--chat-template "$CHAT_TEMPLATE")
+    elif [ -f "$MODEL/chat_template.jinja" ] &&
+        ! grep -q thinking_mode "$MODEL/chat_template.jinja"; then
+        echo "proxy_bench: $MODEL/chat_template.jinja is not the full M3.1-Pro"             "template; set CHAT_TEMPLATE to it" >&2
+        exit 1
+    fi
     ;;
 *)
     echo "proxy_bench: RECIPE must be pro or agentic, not $RECIPE" >&2
@@ -154,7 +176,7 @@ server_args=(--trust-remote-code
 
 if [ "${PROXY_DRY_RUN:-0}" = 1 ]; then
     echo "acceptance_length=${ACCEPT_LENGTH:-none}"
-    env | grep -E '^(ATOM_|AITER_|LMCACHE_|PYTHONHASHSEED=|GPU_MEM_UTIL=|KV_CACHE_DTYPE=|MAX_NUM_SEQS=)' | sort
+    env | grep -E '^(ATOM_|AITER_|GPTOSS_|LMCACHE_|PYTHONHASHSEED=|GPU_MEM_UTIL=|KV_CACHE_DTYPE=|MAX_NUM_SEQS=)' | sort
     printf 'server_args:'
     printf ' %q' "${server_args[@]}"
     echo

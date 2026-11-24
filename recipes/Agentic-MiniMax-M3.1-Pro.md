@@ -303,9 +303,9 @@ The server's `/metrics` has what explains a run: `atom:prefix_cache_hit_ratio`,
 
 The current best CONC 32 configuration, as `scripts/m31pro/proxy_bench.sh` launches it with
 `RECIPE=agentic`. It differs from the CONC 64 launch above: DSpark runs 3 draft tokens, the
-variants add the c32 kernels, and it leaves out what the c32 runs did not set
-(`ATOM_CUSTOM_AR_POOL_BYTES`, `GPTOSS_SWIGLU_MXFP4_BF16_BOUND`, `--timeout-keep-alive`,
-`--chat-template`).
+variants add the c32 kernels. Everything else is the section 1 launch: `RECIPE=agentic` launches
+that block's env and flags (`tests/test_m31pro_proxy_bench.py` diffs the two), and the full chat
+template comes from `CHAT_TEMPLATE`.
 
 ### aiter-M3 for CONC 32
 
@@ -324,6 +324,7 @@ The numbers below ran on aiter-M3 `3c55cbcc2` with the route-glue files of `yuhu
 
 ```bash
 export MODEL_PATH="${MODEL_PATH:-/data/models/m3-pro}"
+export CHAT_TEMPLATE="${CHAT_TEMPLATE:-/shared_nfs/huggingface_models/amd/MiniMax-M3-MXFP4/chat_template.jinja}"
 export PORT="${PORT:-8000}"
 export CONC=32
 
@@ -335,6 +336,8 @@ export ATOM_M3PRO_VARIANTS='{"kernels": true, "attn": "aiter", "topk": "split", 
 export ATOM_WARMUP_TOKENS=auto
 export ATOM_ONLINE_QUANT_STREAMING=1
 export ATOM_CACHE_AWARE_ADMISSION=1
+export ATOM_CUSTOM_AR_POOL_BYTES=134217728
+export GPTOSS_SWIGLU_MXFP4_BF16_BOUND=1040
 
 # LMCache CPU offload
 export ATOM_KV_OFFLOAD=lmcache
@@ -364,16 +367,22 @@ python3 -m atom.entrypoints.openai_server \
   --num-speculative-tokens 3 \
   --spec-decode-acceptance-length 2.53 \
   --text-only \
+  --timeout-keep-alive 600 \
+  --chat-template "${CHAT_TEMPLATE}" \
   2>&1 | tee "server-m31pro-agentx-c${CONC}.log"
 ```
 
-The proxy run starts the same server; `proxy_bench.sh` sets the quick all-reduce, Lamport,
-LMCache and capture-ladder settings itself:
+The proxy run starts the same server. `RECIPE=agentic` sets the section 1 env and flags itself and
+merges `ATOM_M3PRO_VARIANTS` onto the section 1 variants, so only the c32 keys go there. It refuses
+a checkpoint whose `chat_template.jinja` is the stub unless `CHAT_TEMPLATE` is set. The template
+named here is the full one with the `thinking_mode` switch that `recipes/MiniMax-M3-Pro.md` serves
+with and `scripts/m31pro/aime_gate.sh` uses; the 237eada file is not on `/shared_nfs`.
 
 ```bash
-export RECIPE=agentic SPEC_TOKENS=3 SERVER_EXTRA=--text-only AITER_REUSE_IDENTICAL_COMM_GROUPS=1
+export RECIPE=agentic SPEC_TOKENS=3
 export MODEL="${MODEL_PATH}"
-export ATOM_M3PRO_VARIANTS='...'               # the variants above
+export CHAT_TEMPLATE=/shared_nfs/huggingface_models/amd/MiniMax-M3-MXFP4/chat_template.jinja
+export ATOM_M3PRO_VARIANTS='{"index": "fused", "ar_fused_rows": 128}'
 flock /tmp/m31pro-gpu.lock bash scripts/m31pro/proxy_bench.sh 32 "${OUT_DIR}"
 ```
 
@@ -391,9 +400,10 @@ flock /tmp/m31pro-gpu.lock bash scripts/m31pro/proxy_bench.sh 32 "${OUT_DIR}"
 - The capture ladder is #99's. At `--max-num-seqs 64` and k=3 the startup cut keeps 26 graphs,
   1 to 64.
 - With k=3 a verify step at CONC 32 is at most 128 rows, under aiter's default 256-row MXFP4
-  activation bound, so the c32 runs leave `GPTOSS_SWIGLU_MXFP4_BF16_BOUND` unset.
+  activation bound, so at CONC 32 `GPTOSS_SWIGLU_MXFP4_BF16_BOUND=1040` changes only steps of
+  256 to 1039 rows, which are prefill chunks. The measured rows below ran without it.
 
-Startup log: `available_for_kv=77.69GB ... num_kvcache_blocks=211452`, one
+Startup log, measured without the AR pool: `available_for_kv=77.69GB ... num_kvcache_blocks=211452`, one
 `M3-Pro moe_route_glue: fused all-reduce + norm + router + top-k + sort` line a rank, and one
 `Creating LMCacheEngine` line a rank with `'max_local_cpu_size': 184.0`.
 
@@ -421,7 +431,7 @@ row. Run details are in #7.
 **These rows ran with the stub chat template.** The checkpoint's 1,165-byte `chat_template.jinja`
 renders only the user messages, so every AgentX prompt is about 21% short (see the chat template
 note in section 1). The rows compare with each other, not with the CONC 64 tables or with a run
-on the full 237eada template. #182 makes `proxy_bench.sh` launch the recipe's full template.
+on the full template. The launch above, as `proxy_bench.sh` now starts it, has not been measured yet.
 
 | Run | ATOM | aiter | k | AL | tok/s/GPU | P90 E2E-norm interactivity | Failed |
 |---|---|---|---|---|---:|---:|---|
