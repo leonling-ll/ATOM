@@ -1550,18 +1550,19 @@ class TestImplGlue:
         monkeypatch.setitem(sys.modules, "aiter.dist.parallel_state", ps)
         c = Case([150, 97], topk=8, seed=3)
         v = ProVariants(attn="aiter", topk="split", index_split_decode=64)
-        assert c.impl.decode_split(512, v) == (192, 256)
+        assert c.impl.decode_split(512, v) == (192, 256, 64)
         assert c.impl.decode_split(32, v) is None  # under the threshold
-        assert c.impl.decode_split(68, v) is None  # not a multiple of the TP size
+        assert c.impl.decode_split(68, v) == (27, 36, 9)  # ceil(68 / 8) rows a rank
         assert c.impl.decode_split(512, replace(v, index_split_decode=0)) is None
         assert c.impl.decode_split(512, replace(v, topk="torch")) is None
         assert c.impl.decode_split(512, replace(v, attn="triton")) is None
         # whole sequences a rank: 512 rows of 64 sequences (8 each) split, of 128 (4 each)
-        # too; 520 rows of 65 sequences: 65 rows a rank would cut a sequence
-        assert c.impl.decode_split(512, v, 64) == (192, 256)
-        assert c.impl.decode_split(512, v, 128) == (192, 256)
-        assert c.impl.decode_split(520, v, 65) is None
-        assert c.impl.decode_split(512, v, 4) is None  # 64 rows a rank, 128 a sequence
+        # too; 520 rows of 65 sequences: shares of 9 sequences, the last one short; 4
+        # sequences of 128 rows: a sequence a rank, ranks 4-7 past the last one
+        assert c.impl.decode_split(512, v, 64) == (192, 256, 64)
+        assert c.impl.decode_split(512, v, 128) == (192, 256, 64)
+        assert c.impl.decode_split(520, v, 65) == (216, 288, 72)
+        assert c.impl.decode_split(512, v, 4) == (384, 512, 128)
         # under DCP the index cache is sharded by block: DCP's own split, not this one
         from atom.distributed import dcp_utils
 

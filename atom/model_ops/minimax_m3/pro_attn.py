@@ -186,9 +186,10 @@ class ProVariants:
     # index q is computed; kept so variants files that set it still parse.
     index_split_proj: bool = True
     # Decode / speculative-verify indexer split over the TP ranks: in a graph of at least
-    # this many rows (0: off), a multiple of the TP size, on aiter's page tables, each rank
-    # scores and selects one contiguous share of the rows and the [page table | ctx] rows are
-    # all-gathered back in order. Bit for bit the same selection, an eighth of the work.
+    # this many rows (0: off), on aiter's page tables, each rank scores and selects one
+    # contiguous share of ceil(sequences / TP) whole sequences (the last shares short or
+    # empty, padded to the same rows) and the [page table | ctx] rows are all-gathered
+    # back in order, cut to the graph's rows. Bit for bit the same selection.
     index_split_decode: int = 0
     # The score_tq kernel (prefill, speculative verify) leaves the tiles past a program's
     # rows unwritten instead of -inf, as the selections that read only causal blocks allow
@@ -1017,7 +1018,8 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
         rows only (the other rows' index q may be unset). ``mx_scale`` ``[n, H x 192 / 32]``
         uint8 (with ``out`` E4M3): the decode attention writes o_proj's MXFP8 input
         (``_mxfp8_out``). ``dsplit``:
-        a decode's ``(first, end)`` rows this rank selects (``decode_split``). ``ring``:
+        a decode's ``(first, end[, share])`` rows this rank selects into a share of
+        ``share`` rows (default ``end - first``) it all-gathers (``decode_split``). ``ring``:
         ``(each batch row's first ring row, the ring rows)`` of the compressed index cache
         (``index_compress``; ``ic`` is then its ``[pages, 4, 128]`` centroids).
         ``max_rows``: a bound on any sequence's rows, 0 when none (``compress_insert``).
@@ -1231,7 +1233,8 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
         rps = n // block_tables.shape[0]  # rows a sequence (static: k + 1 for a verify)
         if dsplit is not None:
             # whole sequences a rank (decode_split), so no score tile spans two of them
-            r0, r1 = dsplit
+            r0, r1 = dsplit[:2]
+            share = dsplit[2] if len(dsplit) > 2 else r1 - r0
             rq, rseq, rpos = iq[r0:r1], seq_id[r0:r1], positions[r0:r1]
         if split is not None:
             # every row scores alone, so this rank's rows come out as they would in full
@@ -1302,21 +1305,23 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
                 mine = pro_kernels.select_logical(
                     score, rpos, k, split=v.topk == "split"
                 )
+                if share > r1 - r0:
+                    mine = torch.cat([mine, mine.new_empty(share - r1 + r0, k)])
                 return attend(
-                    tensor_model_parallel_all_gather(mine, dim=0).contiguous()
+                    tensor_model_parallel_all_gather(mine, dim=0)[:n].contiguous()
                 )
-            # this rank's [page table | ctx] rows, written in place by the selection
-            mine = torch.empty(r1 - r0, k + 1, dtype=torch.int32, device=iq.device)
+            # this rank's [page table | ctx] rows, written in place by the selection; a
+            # short share's tail is left unset, gathered past row n and cut
+            mine = torch.empty(share, k + 1, dtype=torch.int32, device=iq.device)
+            m = mine[: r1 - r0]
             if select is pro_kernels.select_rows_split:
-                select(
-                    score, block_tables, rseq, rpos, k, rows=mine[:, :k], ctx=mine[:, k]
-                )
+                select(score, block_tables, rseq, rpos, k, rows=m[:, :k], ctx=m[:, k])
             else:
                 rows, ctx = select(score, block_tables, rseq, rpos, k)
-                mine[:, :k], mine[:, k] = rows, ctx
+                m[:, :k], m[:, k] = rows, ctx
             # the shares are contiguous and in rank order: gathered, the rows are in place;
             # aiter takes the page table at any row stride, the lengths contiguous
-            full = tensor_model_parallel_all_gather(mine, dim=0)
+            full = tensor_model_parallel_all_gather(mine, dim=0)[:n]
             return attend(None, (full[:, :k], full[:, k].contiguous()))
         if split is not None:
             from aiter.dist.communication_op import tensor_model_parallel_all_gather
@@ -1468,10 +1473,13 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
 
     # ---------------------------------------------------------------- forward --
     def decode_split(self, n: int, v: ProVariants, seqs: int = 0):
-        """This rank's ``(first, end)`` rows of a graph's ``n`` decode rows of ``seqs``
-        sequences under ``index_split_decode``, or ``None``: every rank selects every row.
-        A rank's share holds whole sequences (``n / seqs`` rows each). The shapes alone
-        decide, so every rank and layer agrees and a graph holds it."""
+        """This rank's ``(first, end, share)`` rows of a graph's ``n`` decode rows of
+        ``seqs`` sequences under ``index_split_decode``, or ``None``: every rank selects
+        every row. Rank r's share is rows ``r * share`` on, ceil(seqs / TP) whole sequences
+        (``n / seqs`` rows each); it selects rows ``first .. end`` into the share's head,
+        and the rest of the share, gathered past row ``n``, is cut. A rank past the last
+        sequence selects that sequence again into rows it gathers past ``n``. The shapes
+        alone decide, so every rank and layer agrees and a graph holds it."""
         if not v.index_split_decode or n < v.index_split_decode:
             return None
         if not self._aiter_attn(v, n) or v.topk not in ("fused", "split"):
@@ -1491,12 +1499,14 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
         )
 
         tp = get_tensor_model_parallel_world_size()
-        rps = n // seqs if seqs else 1
-        if tp == 1 or n % tp or (n // tp) % rps:
+        if tp == 1 or (seqs and n % seqs):
             return None
-        share = n // tp
-        rank = get_tensor_model_parallel_rank()
-        return rank * share, (rank + 1) * share
+        rps = n // seqs if seqs else 1
+        share = -(-(n // rps) // tp) * rps
+        first = get_tensor_model_parallel_rank() * share
+        if first >= n:
+            first = n - rps
+        return first, min(first + share, n), share
 
     def index_split(self, n_tok: int):
         """This forward's ``index_split`` plan, ``(idx, seg, n, tp)`` (``row_split_index``
