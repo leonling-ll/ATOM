@@ -33,7 +33,8 @@ rules is HTTP 400 before generation.
   refused.
 
 Whether a deployment serves images at all is the model's to say:
-DeepSeek-V4.1 refuses them under DSpark and DP attention.
+DeepSeek-V4.1 refuses them under DSpark and DP attention, and MiniMax-M3
+under `--text-only`, which also skips loading its vision encoder.
 
 ## Responses and Messages
 

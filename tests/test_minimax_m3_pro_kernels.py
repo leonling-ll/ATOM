@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import itertools
 import os
+import sys
 
 import pytest
 import torch
@@ -25,12 +26,14 @@ if not torch.cuda.is_available():
 pytest.importorskip("triton")
 pytest.importorskip("aiter", reason="pro_attn imports the ATOM attention base")
 
+from dataclasses import replace
 from types import SimpleNamespace
 
 import triton
 import triton.language as tl
 
 from atom.model_ops.layernorm import GemmaRMSNorm
+from atom.model_ops.minimax_m3 import pro_attn
 from atom.model_ops.minimax_m3 import pro_kernels as K
 from atom.model_ops.minimax_m3.pro_attn import (
     ProKOnlyLayout,
@@ -451,6 +454,10 @@ class TestScores:
             for programs in (1, 2, None):
                 got = K.scores(*args, **kw, bb=bb, causal=True, programs=programs)
                 assert torch.equal(got[causal], full[causal]), (bb, programs)
+            for tq in (2, 8):  # the score_tq kernel: the same causal scores either way
+                want = K.scores(*args, **kw, bb=bb, tq=tq)
+                got = K.scores(*args, **kw, bb=bb, tq=tq, causal=True)
+                assert torch.equal(got[causal], want[causal]), (bb, tq)
 
     @pytest.mark.parametrize(
         "mode", [K.BLOCK_TOKMAX, K.BLOCK_TOKLSE, K.BLOCK_POOL4MAX, K.BLOCK_POOL4MEAN]
@@ -478,6 +485,110 @@ class TestScores:
             got = K.scores(*args, **kw, bb=bb)
             assert torch.equal(torch.isfinite(got), fin), bb
             assert _close(got[fin], ref[fin]), bb
+
+
+class TestCompressedIndex:
+    """``BLOCK_CENTROID``: scores over vLLM's compressed index cache ``ic_c [pages, 4, 128]``
+    (every 4 index keys softmax-pooled into one row when written): a block's score is the
+    head-reduce of the max over its 4 rows of ``iq . c``, with the usual pins."""
+
+    @staticmethod
+    def _ic_c(c, dtype=torch.bfloat16):
+        # the write path's rows: ATOM's own pool4 centroids of every page's 16 keys
+        return c.impl._centroids(c.ic.float(), ProVariants()).to(dtype)
+
+    @staticmethod
+    def _ref(c, ic_c, nb, init, local, sc, head_mode):
+        qb = c.pos // PG
+        cent = ic_c.float()[c.bt[c.seq].long()]  # [T, NB, 4, DI]
+        # scaled before the head reduce, as the kernel does (lse is not scale-equivariant)
+        dots = torch.einsum("thd,tjrd->thjr", c.iq.float(), cent[:, :nb]).amax(-1) * sc
+        if head_mode == K.HEAD_MAX:
+            score = dots.amax(1)
+        elif head_mode == K.HEAD_SUM:
+            score = dots.sum(1)
+        else:
+            score = torch.logsumexp(dots, 1)
+        j = torch.arange(nb, device=DEV)[None, :]
+        score = torch.where(j < init, 1e30, score)
+        score = torch.where(j >= qb[:, None] + 1 - local, 1e29, score)
+        return torch.where(j <= qb[:, None], score, float("-inf"))
+
+    @pytest.mark.parametrize("head_mode", [K.HEAD_MAX, K.HEAD_SUM, K.HEAD_LSE])
+    def test_every_path_scores_as_the_reference(self, case, head_mode):
+        c, nb = case, case.bt.shape[1]
+        ic_c = self._ic_c(c)
+        want = self._ref(c, ic_c, nb, 2, 3, 0.1, head_mode)
+        causal = torch.arange(nb, device=DEV)[None, :] <= (c.pos // PG)[:, None]
+        args = (c.iq, ic_c, c.bt, c.seq, c.pos, nb, None, 2, 3, 0.1)
+        kw = {"block_mode": K.BLOCK_CENTROID, "head_mode": head_mode}
+        runs = {}
+        for bb in (4, 8, None):  # None: the centroid default, 16
+            for causal_on in (False, True):
+                runs[("tile", bb, causal_on)] = K.scores(
+                    *args, **kw, bb=bb, causal=causal_on
+                )
+        for tq in (2, 8):
+            for causal_on in (False, True):
+                runs[("qtile", tq, causal_on)] = K.scores(
+                    *args, **kw, tq=tq, causal=causal_on
+                )
+        for name, got in runs.items():
+            assert torch.allclose(got[causal], want[causal], rtol=1e-3, atol=1e-3), name
+            if not name[2]:  # the full launch also writes the future blocks as -inf
+                assert torch.isinf(got[~causal]).all(), name
+
+    def test_equals_pool4_on_the_same_keys(self, case):
+        # pooling is linear: sum_i w_i (q . k_i) == q . (sum_i w_i k_i). With fp32 rows the
+        # centroid scores are today's pool4 / max scores to rounding
+        c, nb = case, case.bt.shape[1]
+        causal = torch.arange(nb, device=DEV)[None, :] <= (c.pos // PG)[:, None]
+        kw = {"head_mode": K.HEAD_MAX, "pool_temp": ProVariants().pool_scale}
+        pool4 = K.scores(
+            c.iq,
+            c.ic,
+            c.bt,
+            c.seq,
+            c.pos,
+            nb,
+            c.impl.index_compress_query.data,
+            2,
+            3,
+            1.0,
+            block_mode=K.BLOCK_POOL4MAX,
+            **kw,
+        )
+        cent = K.scores(
+            c.iq,
+            self._ic_c(c, torch.float32),
+            c.bt,
+            c.seq,
+            c.pos,
+            nb,
+            None,
+            2,
+            3,
+            1.0,
+            block_mode=K.BLOCK_CENTROID,
+            **kw,
+        )
+        assert torch.allclose(cent[causal], pool4[causal], rtol=1e-3, atol=1e-3)
+
+    def test_rejects_a_token_cache(self, case):
+        with pytest.raises(AssertionError):
+            K.scores(
+                case.iq,
+                case.ic,
+                case.bt,
+                case.seq,
+                case.pos,
+                case.bt.shape[1],
+                None,
+                2,
+                3,
+                1.0,
+                block_mode=K.BLOCK_CENTROID,
+            )
 
 
 class TestAttention:
@@ -1222,6 +1333,241 @@ class TestImplGlue:
         assert _close(got[:2], out[tok[:2]])
         assert all(torch.equal(a, b) for a, b in zip(caches, (c.kc4, c.vc4, c.ic)))
 
+    @pytest.mark.parametrize("topk", ["fused", "split"])
+    def test_decode_split_over_ranks_equals_one_rank(self, topk, monkeypatch):
+        # index_split_decode: each of 4 ranks selects its contiguous quarter of 8 decode
+        # rows; the all-gathered [page table | ctx] rows give every rank the same output as
+        # one rank selecting all of them
+        # the conftest stands torch.distributed in for aiter.dist
+        comm = SimpleNamespace(tensor_model_parallel_all_gather=None)
+        monkeypatch.setitem(sys.modules, "aiter.dist.communication_op", comm)
+        c = Case([150, 97], topk=8, seed=3)
+        self._run(c, {}, {"attn": "aiter", "topk": topk}, monkeypatch)
+        tok = torch.tensor(
+            [
+                c.lens[0] - 1,
+                c.T - 1,
+                140,
+                c.lens[0] + 90,
+                100,
+                c.lens[0] + 60,
+                130,
+                149,
+            ],
+            device=DEV,
+        )
+        seq = (tok >= c.lens[0]).long()
+        wide = torch.cat([c.bt, torch.zeros_like(c.bt).repeat(1, 4)], dim=1)
+        v = ProVariants(attn="aiter", topk=topk, index_split_decode=8)
+
+        def run(dsplit):
+            got = torch.zeros(len(tok), H * VD, dtype=DT, device=DEV)
+            c.impl._kernel_attention(
+                c.qkv[tok],
+                c.pos[tok],
+                seq,
+                c.slot[tok],
+                wide,
+                c.layer,
+                c.ic,
+                wide.shape[1],
+                v,
+                got,
+                static=True,
+                dsplit=dsplit,
+            )
+            return got
+
+        want = run(None)
+        shares, tp = [], 4
+        monkeypatch.setattr(
+            comm,
+            "tensor_model_parallel_all_gather",
+            lambda x, dim: (shares.append(x.clone()), x.repeat(tp, 1))[1],
+        )
+        for r in range(tp):
+            run((2 * r, 2 * r + 2))
+        mine = list(shares)
+        monkeypatch.setattr(
+            comm, "tensor_model_parallel_all_gather", lambda x, dim: torch.cat(mine)
+        )
+        for r in range(tp):
+            assert torch.equal(run((2 * r, 2 * r + 2)), want), r
+
+    @pytest.mark.parametrize("attn", ["aiter", "triton"])
+    @pytest.mark.parametrize("tq_causal", [False, True])
+    @pytest.mark.parametrize("dsplit", [False, True])
+    def test_verify_rows_select_as_single_row_decodes(
+        self, attn, tq_causal, dsplit, monkeypatch
+    ):
+        # a DSpark verify (k = 7: 8 rows a sequence, score_tq 8 in the graph) must select,
+        # row by row, the blocks a plain decode of that one row would: its own causal
+        # top-k with the sink and local blocks of its own position. Two of the sequences'
+        # 8 rows straddle a block boundary. The attention is replaced by a recorder of
+        # what it is given (aiter: the page tables and lengths; Triton: the block ids).
+        k1, init, local = 8, 1, 9
+        c = Case([403, 512, 330], topk=16, seed=11, init=init, local=local)
+        base = {"attn": attn, "topk": "split", "score_tq": 8}
+        self._run(c, {}, base, monkeypatch)  # fills the K, V and index caches
+        seen = []
+
+        def rec_aiter(q, kc, vc, rows, ctx, out, *a, **kw):
+            seen.append(torch.cat([rows, ctx[:, None]], dim=1).clone())
+            return out
+
+        def rec_triton(q, kc4, bt, seq, pos, sel, out, *a, **kw):
+            seen.append(sel.clone())
+            return out
+
+        monkeypatch.setattr(K, "attention_aiter", rec_aiter)
+        monkeypatch.setattr(K, "attention", rec_triton)
+        wide = torch.cat([c.bt, torch.zeros_like(c.bt).repeat(1, 4)], dim=1)
+        ends = [sum(c.lens[: s + 1]) for s in range(c.S)]
+        tok = torch.cat([torch.arange(e - k1, e) for e in ends]).to(DEV)
+        v = ProVariants(
+            **base,
+            init_blocks=init,
+            local_blocks=local,
+            score_tq_causal=tq_causal,
+            index_split_decode=8 if dsplit else 0,
+        )
+
+        def run(rows, table, seq, ds=None):
+            seen.clear()
+            c.impl._kernel_attention(
+                c.qkv[rows],
+                c.pos[rows],
+                seq,
+                c.slot[rows],
+                table,
+                c.layer,
+                c.ic,
+                table.shape[1],
+                v,
+                torch.zeros(len(rows), H * VD, dtype=DT, device=DEV),
+                static=True,
+                dsplit=ds,
+            )
+            assert len(seen) == 1
+            return seen[0]
+
+        seq = torch.arange(c.S, device=DEV).repeat_interleave(k1)
+        if dsplit and attn == "aiter":
+            # 3 ranks, a sequence each, through a fake all-gather of their shares
+            comm = SimpleNamespace(tensor_model_parallel_all_gather=None)
+            monkeypatch.setitem(sys.modules, "aiter.dist.communication_op", comm)
+            shares = []
+            monkeypatch.setattr(
+                comm,
+                "tensor_model_parallel_all_gather",
+                lambda x, dim: (shares.append(x.clone()), x.repeat(c.S, 1))[1],
+            )
+            for r in range(c.S):
+                run(tok, wide, seq, (k1 * r, k1 * r + k1))
+            mine = list(shares)
+            monkeypatch.setattr(
+                comm, "tensor_model_parallel_all_gather", lambda x, dim: torch.cat(mine)
+            )
+            verify = run(tok, wide, seq, (0, k1))
+        else:
+            verify = run(tok, wide, seq)
+        for i, t in enumerate(tok.tolist()):
+            s = i // k1
+            alone = run(
+                torch.tensor([t], device=DEV),
+                wide[s : s + 1],
+                torch.zeros(1, dtype=torch.long, device=DEV),
+            )
+            assert torch.equal(verify[i], alone[0]), (i, int(c.pos[t]))
+
+    @pytest.mark.parametrize("topk", ["fused", "split"])
+    def test_decode_split_logical_over_ranks_equals_one_rank(self, topk, monkeypatch):
+        # the block-id branch of the decode split (the day0 decode / Triton attention take
+        # select_logical's ids, not page tables): 4 ranks, a contiguous quarter of 8 decode
+        # rows each, all-gathered; every rank's attention output equals one rank selecting
+        # all of them, bit for bit
+        comm = SimpleNamespace(tensor_model_parallel_all_gather=None)
+        monkeypatch.setitem(sys.modules, "aiter.dist.communication_op", comm)
+        c = Case([150, 97], topk=8, seed=3)
+        self._run(c, {}, {"attn": "triton", "topk": topk}, monkeypatch)
+        tok = torch.tensor(
+            [
+                c.lens[0] - 1,
+                c.T - 1,
+                140,
+                c.lens[0] + 90,
+                100,
+                c.lens[0] + 60,
+                130,
+                149,
+            ],
+            device=DEV,
+        )
+        seq = (tok >= c.lens[0]).long()
+        wide = torch.cat([c.bt, torch.zeros_like(c.bt).repeat(1, 4)], dim=1)
+        v = ProVariants(attn="triton", topk=topk, index_split_decode=8)
+
+        def run(dsplit):
+            got = torch.zeros(len(tok), H * VD, dtype=DT, device=DEV)
+            c.impl._kernel_attention(
+                c.qkv[tok],
+                c.pos[tok],
+                seq,
+                c.slot[tok],
+                wide,
+                c.layer,
+                c.ic,
+                wide.shape[1],
+                v,
+                got,
+                static=True,
+                dsplit=dsplit,
+            )
+            return got
+
+        want = run(None)
+        shares, tp = [], 4
+        monkeypatch.setattr(
+            comm,
+            "tensor_model_parallel_all_gather",
+            lambda x, dim: (shares.append(x.clone()), x.repeat(tp, 1))[1],
+        )
+        for r in range(tp):
+            run((2 * r, 2 * r + 2))
+        assert all(s.shape == (2, 8) for s in shares)  # block ids, not [table | ctx]
+        mine = list(shares)
+        monkeypatch.setattr(
+            comm, "tensor_model_parallel_all_gather", lambda x, dim: torch.cat(mine)
+        )
+        for r in range(tp):
+            assert torch.equal(run((2 * r, 2 * r + 2)), want), r
+
+    def test_decode_split_plan(self, monkeypatch):
+        ps = SimpleNamespace(
+            get_tensor_model_parallel_world_size=lambda: 8,
+            get_tensor_model_parallel_rank=lambda: 3,
+        )
+        monkeypatch.setitem(sys.modules, "aiter.dist.parallel_state", ps)
+        c = Case([150, 97], topk=8, seed=3)
+        v = ProVariants(attn="aiter", topk="split", index_split_decode=64)
+        assert c.impl.decode_split(512, v) == (192, 256)
+        assert c.impl.decode_split(32, v) is None  # under the threshold
+        assert c.impl.decode_split(68, v) is None  # not a multiple of the TP size
+        assert c.impl.decode_split(512, replace(v, index_split_decode=0)) is None
+        assert c.impl.decode_split(512, replace(v, topk="torch")) is None
+        assert c.impl.decode_split(512, replace(v, attn="triton")) is None
+        # whole sequences a rank: 512 rows of 64 sequences (8 each) split, of 128 (4 each)
+        # too; 520 rows of 65 sequences: 65 rows a rank would cut a sequence
+        assert c.impl.decode_split(512, v, 64) == (192, 256)
+        assert c.impl.decode_split(512, v, 128) == (192, 256)
+        assert c.impl.decode_split(520, v, 65) is None
+        assert c.impl.decode_split(512, v, 4) is None  # 64 rows a rank, 128 a sequence
+        # under DCP the index cache is sharded by block: DCP's own split, not this one
+        from atom.distributed import dcp_utils
+
+        monkeypatch.setattr(dcp_utils, "get_dcp_world_size", lambda: 8)
+        assert c.impl.decode_split(512, v, 64) is None
+
     @pytest.mark.skipif(not GPU, reason="CUDA graphs need a GPU")
     @pytest.mark.parametrize(
         "attn,topk",
@@ -1722,3 +2068,149 @@ class TestValidFirst:
             c.q, c.kc4, c.bt, c.seq, c.pos, sel, ref, D**-0.5, 1, nblk=2, k_scale=c.ks
         )
         assert _close(out, ref)
+
+
+class TestDay0Decode:
+    """amd-kernels-day0's FlyDSL sparse decode (``day0_decode_rows``): decode / verify batches
+    from 24 rows on the K-only fp8 cache, select_logical's block ids, and its MXFP8 epilogue
+    handed to o_proj (dispatch only: the kernel itself is the package's, tested there).
+    """
+
+    def test_wrapper_lengths_and_arguments(self, monkeypatch):
+        got = {}
+
+        def fake(q, k_cache, topk, bt, seq_lens, qlen, scale, out, out_scale):
+            got.update(
+                q=q, k=k_cache, seq_lens=seq_lens, qlen=qlen, out=out, s=out_scale
+            )
+
+        monkeypatch.setattr(K, "_day0_decode", fake)
+        qlen, reqs = 4, 3
+        t = qlen * reqs
+        pos = torch.cat([torch.arange(10, 14), torch.arange(50, 54), torch.arange(4)])
+        slots = torch.arange(t)
+        slots[8:] = -1  # request 2: a graph's padding request
+        kc4 = torch.zeros(5, 1, PG, D, dtype=FP8)
+        out = torch.empty(t, H * VD, dtype=FP8)
+        scale = torch.empty(t, H * VD // 32, dtype=torch.uint8)
+        q = torch.randn(t, H, D)
+        K.attention_day0_decode(
+            q, kc4, None, pos, slots, None, out, 0.1, qlen, out_scale=scale
+        )
+        assert got["seq_lens"].tolist() == [14, 54, 0]
+        assert got["seq_lens"].dtype == torch.int32 and got["qlen"] == qlen
+        assert got["q"].dtype == FP8 and got["k"].shape == (5, PG, D)
+        assert got["out"].shape == (t, H, VD) and got["s"] is scale
+
+    def _verify_case(self):
+        lens = [150, 97, 60, 80, 120, 70]
+        c = Case(lens, topk=8, seed=3, kv_dtype=FP8, k_only=True)
+        c.impl.k_only = True
+        TestImplGlue()._impl_with_rope(c, ProVariants())
+        qlen = 4  # a verify of k + 1 = 4 rows a request
+        tok = torch.cat(
+            [
+                torch.arange(c.seq_slice(s)[1] - qlen, c.seq_slice(s)[1])
+                for s in range(c.S)
+            ]
+        ).to(DEV)
+        seq = torch.arange(c.S, device=DEV).repeat_interleave(qlen)
+        return c, tok, seq, qlen
+
+    @pytest.mark.parametrize("rows_min,day0", [(24, True), (25, False)])
+    def test_verify_batch_dispatch(self, monkeypatch, rows_min, day0):
+        c, tok, seq, qlen = self._verify_case()
+        monkeypatch.setattr(K, "TOPK", 8)
+        monkeypatch.setattr(K, "aiter_value_rows_available", lambda: True)
+        monkeypatch.setattr(K, "day0_decode_available", lambda: True)
+        got = {}
+
+        def fake_day0(q, kc4, bt, pos, slots, sel, out, scale, ql, out_scale=None):
+            got.update(sel=sel, qlen=ql, out_scale=out_scale)
+            return out
+
+        def fake_aiter(*a, **k):
+            got["aiter"] = True
+            return a[5]
+
+        monkeypatch.setattr(K, "attention_day0_decode", fake_day0)
+        monkeypatch.setattr(K, "attention_aiter", fake_aiter)
+        kw = {"topk": "split", "attn": "aiter", "k_only": True, "k_plain_fp8": True}
+        v = ProVariants(**kw, day0_decode_rows=rows_min)
+        n = tok.numel()
+        wide = torch.cat([c.bt, torch.zeros_like(c.bt).repeat(1, 3)], dim=1)
+        mx = (
+            torch.empty(n, H * VD // 32, dtype=torch.uint8, device=DEV)
+            if day0
+            else None
+        )
+        out = torch.zeros(n, H * VD, dtype=FP8 if day0 else DT, device=DEV)
+        c.impl._kernel_attention(
+            c.qkv[tok], c.pos[tok], seq, c.slot[tok], wide, c.layer, c.ic,
+            wide.shape[1], v, out, static=True, mx_scale=mx,
+        )  # fmt: skip
+        assert ("sel" in got) == day0 and ("aiter" in got) != day0
+        if day0:
+            sel, pos = got["sel"], c.pos[tok]
+            assert got["qlen"] == qlen and got["out_scale"] is mx
+            assert tuple(sel.shape) == (n, 8) and sel.dtype == torch.int32
+            valid = sel >= 0
+            qb = (pos // PG).unsqueeze(1).expand_as(sel)
+            assert (sel[valid] <= qb[valid]).all()
+            assert torch.equal(valid.sum(1), torch.clamp(pos // PG + 1, max=8))
+            # valid first, -1 after
+            assert (valid.int().diff(dim=1) <= 0).all()
+
+    def _impl(self, mx_out):
+        m = object.__new__(ProSparseAttentionImpl)
+        m.num_heads, m.head_dim, m.value_head_dim, m.layer_num = H, D, VD, 1
+        m.k_only, m.mx_out, m.index_cache = True, mx_out, None
+        return m
+
+    @pytest.mark.parametrize("mx_out", [True, False])
+    def test_forward_returns_mxfp8_for_o_proj(self, monkeypatch, mx_out):
+        n_tok, n = 32, 24  # 8 padding rows past the batch
+        m = self._impl(mx_out)
+        v = ProVariants(kernels=True, k_only=True, k_plain_fp8=True, topk="split")
+        monkeypatch.setattr(pro_attn, "variants", lambda: v)
+        monkeypatch.setattr(m, "_use_kernels", lambda v: True, raising=False)
+        monkeypatch.setattr(
+            m, "_day0_decode", lambda v, n, reqs, fp8: True, raising=False
+        )
+        monkeypatch.setattr(K, "day0_decode_available", lambda: True)
+        md = SimpleNamespace(
+            slot_mapping=torch.zeros(n, dtype=torch.long),
+            block_tables=torch.zeros(6, 16, dtype=torch.int32),
+            cu_seqlens_q=torch.arange(0, 25, 4, dtype=torch.int32),
+        )
+        layer = SimpleNamespace(k_cache=torch.zeros(1, 1, 1, PG, D, dtype=FP8))
+        fwd = SimpleNamespace(
+            context=SimpleNamespace(is_dummy_run=False, is_prefill=False),
+            attn_metadata=md,
+            kv_cache_data={"layer_1": layer},
+        )
+        monkeypatch.setattr(pro_attn, "get_forward_context", lambda: fwd)
+
+        def fake_kernel(parts, pos, seq, slots, bt, layer, ic, nb, v, out, **kw):
+            assert out.shape[0] == n
+            out.view(torch.uint8).fill_(0x38)  # 1.0 in e4m3 (bf16 bytes otherwise)
+            if kw["mx_scale"] is not None:
+                kw["mx_scale"].fill_(127)
+
+        monkeypatch.setattr(m, "_kernel_attention", fake_kernel, raising=False)
+        q = torch.zeros(n_tok, H * D)
+        out = m.forward(q, q, q, position=torch.zeros(n_tok, dtype=torch.long), qkv=q)
+        assert out.shape == (n_tok, H * VD)
+        if not mx_out:
+            assert out.dtype == q.dtype and m.take_mx_scale() is None
+            return
+        assert out.dtype == FP8
+        assert (out[:n].float() == 1.0).all() and (out[n:].view(torch.uint8) == 0).all()
+        scale = m.take_mx_scale()
+        assert scale.dtype == torch.float8_e8m0fnu and scale.shape == (
+            n_tok,
+            H * VD // 32,
+        )
+        su = scale.view(torch.uint8)
+        assert (su[:n] == 127).all() and (su[n:] == 0).all()
+        assert m.take_mx_scale() is None  # taken once

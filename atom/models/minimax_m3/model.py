@@ -531,6 +531,27 @@ class MiniMaxM3MoE(nn.Module):
             return routed_output.view(orig_shape), shared.view(orig_shape)
         return (routed_output + shared).view(orig_shape)
 
+    def forward_glue(self, r: dict, quant_down: bool = False) -> torch.Tensor:
+        """`forward` on the outputs of ``moe_route_glue.route`` (normed rows, their
+        MXFP8 copy, the routes and their BM=16 sort, the zeroed routed output): the
+        routed experts take the sort as a registered presort, so no gate, top-k or
+        sort runs here."""
+        from aiter.fused_moe import register_presorted_moe
+
+        from atom.models.minimax_m3 import moe_route_glue
+
+        register_presorted_moe(moe_route_glue.presort(r, self))
+        routed_output = self.experts.forward_routed(
+            r["normed"], r["topk_weights"], r["topk_ids"], r["moe_buf"]
+        )
+        if (
+            not self.experts.fold_routed_scaling_factor
+            and self.routed_scaling_factor != 1.0
+        ):
+            routed_output = routed_output * self.routed_scaling_factor
+        shared = self.shared_experts(r["x_q"], r["x_scale"], quant_down=quant_down)
+        return routed_output + shared
+
 
 class MiniMaxM3Attention(nn.Module):
     def __init__(

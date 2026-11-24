@@ -344,6 +344,21 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             ),
         }
         self.model_runner.forward_vars.update(pa_persistent_metadata)
+        # MiniMax-M3-Pro's compressed index cache (`index_compress`): every request owns
+        # a ring of its latest raw index keys at a persistent slot; `pro_ring_base` is
+        # each batch row's first ring row, published with the phase's metadata.
+        self._pro_ring_slots = None
+        if self._pro_index_compress():
+            from atom.model_ops.minimax_m3.pro_kernels import RING_ROWS
+            from atom.spec_decode.draft_q_slots import DraftQSlots
+
+            self._pro_ring_slots = DraftQSlots(4 * self.max_bs, RING_ROWS)
+            ring_base = CpuGpuBuffer(
+                self.max_bs, publication_group="pro_ring", **i32_kwargs
+            )
+            ring_base.np[:] = -1
+            ring_base.gpu.fill_(-1)
+            self.model_runner.forward_vars["pro_ring_base"] = ring_base
         if model_runner.config.enable_tbo:
             self._allocate_ubatch_buffers(max_qlen)
 
@@ -358,7 +373,45 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             "kv_indptr",
             "positions",
         )
+        if self._pro_ring_slots is not None:
+            for phase in ("decode_metadata", "prefill_metadata"):
+                members[phase] = members.get(phase, ()) + ("pro_ring_base",)
         return members
+
+    def _pro_index_compress(self) -> bool:
+        """MiniMax-M3-Pro with its compressed index cache (``index_compress``)."""
+        if not self._has_pro_sparse_attention:
+            return False
+        from atom.model_ops.minimax_m3.pro_attn import variants
+
+        return variants().index_compress
+
+    def _stage_pro_ring(self, batch, running_bs: int, group, attn_metadata) -> None:
+        """Each batch row's first ring row (-1: none, a dummy run's and pad rows'),
+        counted into ``group`` and hung on ``attn_metadata.pro_ring_base``."""
+        if self._pro_ring_slots is None:
+            return
+        buf = self.model_runner.forward_vars["pro_ring_base"]
+        bs = min(batch.total_seqs_num, running_bs)
+        if batch.is_dummy_run or not bs:
+            buf.np[:running_bs] = -1
+        else:
+            self._pro_ring_slots.claim_bases(batch.req_ids[:bs], buf.np)
+            buf.np[bs:running_bs] = -1
+        group.set_counts({"pro_ring_base": running_bs})
+        attn_metadata.pro_ring_base = buf.gpu[:running_bs]
+        attn_metadata.pro_ring_rows = self._pro_ring_slots.num_slots * (
+            self._pro_ring_slots.rows_per_slot
+        )
+
+    def stage_prefill(
+        self, batch: ScheduledBatch, running_bs: int, running_tokens: int, group
+    ):
+        attn_metadata, positions = super().stage_prefill(
+            batch, running_bs, running_tokens, group
+        )
+        self._stage_pro_ring(batch, running_bs, group, attn_metadata)
+        return attn_metadata, positions
 
     def _ubatch_buffer_shapes(self) -> dict[str, tuple[int, ...]]:
         var = self.model_runner.forward_vars
@@ -499,6 +552,23 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         # addressed by the stage's.
         rows = self.row_counts().get(INDEX_ROWS, 0)
         index_dtype = config.index_cache_dtype
+        if self._pro_index_compress():
+            from atom.model_ops.minimax_m3.pro_kernels import GROUP
+
+            # vLLM's compressed index cache: a bf16 centroid of every GROUP keys, so a
+            # block's page is block_size / GROUP rows whatever --index-cache-dtype says
+            if self.block_size % GROUP or config.decode_context_parallel_size > 1:
+                raise ValueError(
+                    "the compressed index cache needs a block of whole groups of "
+                    f"{GROUP} and no DCP (block {self.block_size}, "
+                    f"DCP {config.decode_context_parallel_size})"
+                )
+            return _IndexCacheSpec(
+                rows,
+                (entry_tokens // GROUP * dim * 2,),
+                torch.bfloat16,
+                (-1, self.block_size // GROUP, dim),
+            )
         if index_dtype == "fp4":
             from atom.model_ops.minimax_m3.mxfp4_pages import (
                 PAGE_BYTES,
@@ -1109,6 +1179,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             min_seqlen_q=min_seqlen_q,
             **ctx,
         )
+        self._stage_pro_ring(batch, running_bs, group, attn_metadata)
         mrope_positions = self._build_mrope_decode_positions(
             batch, context_lens, group, running_tokens=running_tokens
         )
@@ -1247,6 +1318,11 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             max_seqlen_k=max_seqlen_k,
             **ctx_pa_ps,
         )
+        if self._pro_ring_slots is not None:
+            attn_metadata.pro_ring_base = var["pro_ring_base"].gpu[:bs]
+            attn_metadata.pro_ring_rows = self._pro_ring_slots.num_slots * (
+                self._pro_ring_slots.rows_per_slot
+            )
         if self._has_sparse_attention:
             seq_lens = attn_metadata.context_lens
             # Both plain decode (q==1) and eagle3 spec-verify (q==num_spec+1) use
