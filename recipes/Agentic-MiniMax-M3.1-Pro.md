@@ -75,6 +75,13 @@ same node and setup, 600 s:
 | + decode kernels: FlyDSL sparse decode with MXFP8 out, merged MXFP8 GEMM rows, MoE route glue, `index_split_decode` | 79.7% | **30.22** | **11254** | 1022 | 0.9424 |
 | + `index_compress` (compressed bf16 index cache, +17.7% KV blocks) | 83.2% measured phase (batch 1: 82.5%) | **34.43** | **11569** | 1055 | 0.9462 |
 
+With the full 237eada chat template and `--timeout-keep-alive 600` (same node, 600 s, AL 2.94):
+
+| Configuration | Prefix hit (measured phase) | P90 E2E-norm interactivity | tok/s/GPU | Requests |
+|---|---|---|---|---|
+| Batch 1 (807d48cd) | 69.8% | 22.37 | 11485 | 938 |
+| + `index_compress` (this recipe) | 74.6% | **31.34** | **12340** | 1024 |
+
 `index_split_decode` alone gives 29.10 / 10864; the decode kernels add the rest.
 
 An LMCache smoke on this configuration (util 0.73 so the pool is small; an 18.6k-token prompt is
@@ -103,6 +110,7 @@ Start a fresh server for each run.
 
 ```bash
 export MODEL_PATH="${MODEL_PATH:-/data/models/m3-pro}"
+export CHAT_TEMPLATE="${CHAT_TEMPLATE:-}"     # set to the 237eada chat_template.jinja if the snapshot ships the 1 KB stub (see below)
 export PORT="${PORT:-8000}"
 export CONC="${CONC:-64}"
 
@@ -142,8 +150,12 @@ python3 -m atom.entrypoints.openai_server \
   --num-speculative-tokens 7 \
   --spec-decode-acceptance-length 2.94 \
   --text-only \
+  --timeout-keep-alive 600 \
+  ${CHAT_TEMPLATE:+--chat-template "${CHAT_TEMPLATE}"} \
   2>&1 | tee "server-m31pro-agentx-c${CONC}.log"
 ```
+
+**Chat template.** Serve with the checkpoint's full M3.1-Pro template (revision 237eada, the one vLLM uses; it has the `thinking_mode` switch and defaults to thinking on). Snapshot 9d6169d5 has the same weights, config and tokenizer but ships a 1,165-byte stub `chat_template.jinja` that renders only the user messages, so AgentX prompts come out about 21% short; with that snapshot set `CHAT_TEMPLATE` to the 237eada file. `--timeout-keep-alive 600` keeps the server from closing pooled connections that aiperf (300 s pool) still reuses: with the default 5 s a warmup request can hit a closed socket and abort the run.
 
 Check the startup log:
 
