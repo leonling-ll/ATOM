@@ -1,597 +1,585 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-"""4-bit (NVFP4) lightning-indexer kernels for MiniMax-M3.1-Pro.
+"""Gluon block scorer for MiniMax-M3.1-Pro's NVFP4 index cache on gfx950.
 
-The index cache holds one NVFP4 page per 16-token block: e2m1 values with one e4m3 scale per
-16 elements, laid out ``[R x 64 B codes (low nibble = even element)][R x 8 B scales]``.
-``R = 16`` stores every token's key (1152 B per block); ``R = 4`` stores the block's 4
-softmax-pooled centroids, computed once when the block is written (288 B per block).
-The scorers also read the raw caches of the requirements' format list -- ``bf16`` / ``fp8``
-``[N, 16, 128]`` and ``bf16_centroid`` ``[N, 4, 128]`` -- with bf16 MFMAs, so the fused
-selection does not depend on the 4-bit format.
+Packed pages contain E2M1 codes and one E4M3 scale per 16 elements. Per-token
+pages hold 16 rows (1152 bytes); centroid pages hold four rows (288 bytes).
+``score`` quantizes bf16 queries to the same group-16 NVFP4 values;
+``score_bf16q`` uses bf16 queries directly.
 
-* ``write``      quantizes full blocks of bf16 index keys into their pages (per-token or
-                 centroid pages, or bf16 centroids);
-* ``score``      the block scores ``[T, nb]`` fp32 of ``pro_kernels.scores`` (pool4 / max,
-                 heads max; pins and ``-inf`` applied) read from a 4-bit cache;
-* ``score_lse``  the lse / lse reading (per-token pages only);
-* ``select``     the scores fused with the top-k: each token's ``k`` best blocks, without
-                 the ``[T, nb]`` score table.
+Per-token scoring softmax-pools each group of four keys using ``cq`` and
+``pool_temp``, then takes the maximum across groups and query heads. Centroid
+scoring takes the maximum across the four stored rows and query heads. Output
+is contiguous ``[T, nb]`` fp32: initial blocks are pinned to 1e30, local blocks
+to 1e29, and future blocks to -inf. Causal mode leaves future columns unwritten.
 
-q4k4 (requirement 4.1, the checkpoint's ``sparse_index_q4k4``): ``score``, ``score_lse``
-and ``select`` quantize the index q to NVFP4 in the kernel, by the keys' rule (UT:
-``PRO_NEW_INDEX_Q4=1``). The ``*_bf16q`` variants use q as given -- bf16, or q the prep
-already wrote in 4-bit (UT: ``PRO_NEW_INDEX_Q4`` unset).
+Keys load directly into MFMA B-operand registers. Query and key dimensions are
+permuted together: MFMA K index ``32*s + 8*c + e`` holds dimension
+``32*c + 8*s + e``, giving each lane a contiguous 16-byte key load. E2M1 codes
+are decoded at scale 1 by ``v_cvt_scalef32_pk_f16_fp4``; ``v_pk_mul_f16`` applies
+the E4M3 scale exactly. FP16 MFMA accumulates in fp32.
 
-MI350 has no NVFP4 MFMA (its FP4 MFMA takes MXFP4: an E8M0 scale per 32 elements), so the
-kernels dequantize to 16-bit values and run 16-bit MFMAs with fp32 accumulation. Every
-e2m1 value times its e4m3 scale has at most 6 significant bits and lies in [2^-10, 2688],
-so this is exact. On gfx950 ``v_cvt_scalef32_pk_f16_fp4`` converts a byte to 2 fp16 at
-scale 1 (it applies only a scale's exponent) and ``v_pk_mul_f16`` applies the e4m3 scale;
-elsewhere (``hw=False``) integer bit tricks produce bf16, the even and odd columns of q
-dotted with the low and high nibbles.
-
-Signatures follow the kernel requirements (``PRO_NEW_INDEX_SCORE`` / ``_WRITE`` /
-``_SELECT``):
-
-    score(iq, index_cache, block_tables, seq_id, positions, nb, cq, init, local, pool_temp)
-    write(keys, pages, cq, pool_temp, index_cache)
-    select(iq, index_cache, block_tables, seq_id, positions, nb, cq, init, local, pool_temp, k)
+Queries are loaded and quantized once per program. The register pipeline
+prefetches the next tile's keys/scales and the following tile's page-table
+entries while scoring the current tile.
 """
+
+from functools import lru_cache
 
 import torch
 import triton
-import triton.language as tl
+from triton.experimental import gluon
+from triton.experimental.gluon import language as gl
 
 PAGE = 16
-GROUP = 4  # tokens per centroid
-CENTROIDS = PAGE // GROUP
+CENTROIDS = 4
 IDX_HEADS = 16
 IDX_DIM = 128
-NVFP4_GROUP = 16
-CODE_BYTES = IDX_DIM // 2  # per row
-SCALE_BYTES = IDX_DIM // NVFP4_GROUP  # per row
-# jit'ed code may only read module globals that are constexpr
-CB = tl.constexpr(CODE_BYTES)
-SB = tl.constexpr(SCALE_BYTES)
-
-MODE_POOL4MAX = 0  # per-token pages: softmax-pool 4 groups of 4, max over them
-MODE_CENTROID = 1  # centroid pages: max over the block's 4 rows
-MODE_LSE = 2  # per-token pages: log-sum-exp over visible tokens, then over heads
+NUM_WARPS = 4
 
 
-def page_bytes(rows: int) -> int:
-    return rows * (CODE_BYTES + SCALE_BYTES)
+def page_bytes(rows):
+    """Bytes of a packed NVFP4 page, including group-16 E4M3 scales."""
+    return rows * (IDX_DIM // 2 + IDX_DIM // 16)
 
 
-RAW_DTYPES = (torch.bfloat16, torch.float8_e4m3fn)
+@lru_cache(maxsize=16)
+def _device_info(index):
+    props = torch.cuda.get_device_properties(index)
+    return props.multi_processor_count, getattr(props, "gcnArchName", "").split(":")[0]
 
 
-def _layout(ic: torch.Tensor):
-    """``(rows per block, raw)`` of an index cache: NVFP4 pages ``[N, 1152]`` (per-token) /
-    ``[N, 288]`` (centroids) uint8, or raw rows ``[N, 16 | 4, 128]`` bf16 / fp8 (the
-    ``bf16`` / ``fp8`` / ``bf16_centroid`` formats)."""
-    if ic.dtype == torch.uint8 and ic.dim() == 2:
-        if ic.shape[1] == page_bytes(PAGE):
-            return PAGE, False
-        if ic.shape[1] == page_bytes(CENTROIDS):
-            return CENTROIDS, False
-    if (
-        ic.dtype in RAW_DTYPES
-        and ic.dim() == 3
-        and ic.shape[1] in (PAGE, CENTROIDS)
-        and ic.shape[2] == IDX_DIM
-        and ic.stride(2) == 1
-        and ic.stride(1) == IDX_DIM
-    ):
-        return ic.shape[1], True
-    raise ValueError(f"not an index cache: {tuple(ic.shape)} {ic.dtype}")
+def is_supported(device=None):
+    """Whether ``device`` is a gfx950 GPU."""
+    device = torch.device("cuda" if device is None else device)
+    if device.type != "cuda" or not torch.cuda.is_available():
+        return False
+    index = torch.cuda.current_device() if device.index is None else device.index
+    return _device_info(index)[1] == "gfx950"
 
 
-def _rows_of(ic: torch.Tensor) -> int:
-    return _layout(ic)[0]
+def _rows_of(ic):
+    if ic.dtype == torch.uint8 and ic.ndim == 2 and ic.stride(1) == 1:
+        for rows in (PAGE, CENTROIDS):
+            if ic.shape[1] == page_bytes(rows) and ic.stride(0) == page_bytes(rows):
+                return rows
+    raise ValueError(
+        "index_cache must be contiguous NVFP4 uint8 pages [N,1152] or [N,288]"
+    )
 
 
-# ---------------------------------------------------------------------------- helpers --
-@triton.jit
-def _nvfp4_scale(amax):
-    """E4M3(clamp(amax / 6, 2^-9, 448)) as fp8 (NaN stays NaN)."""
-    s = amax / 6.0
-    s = tl.where(s < 0.001953125, 0.001953125, s)
-    s = tl.where(s > 448.0, 448.0, s)
-    return s.to(tl.float8e4nv)
-
-
-@triton.jit
-def _e2m1_code(a, s):
-    """Index of the e2m1 magnitude nearest ``a / s`` (ties to the smaller), from the
-    midpoints between magnitudes, as the reference counts them."""
-    c = (a > 0.25 * s).to(tl.int32)
-    c += (a > 0.75 * s).to(tl.int32)
-    c += (a > 1.25 * s).to(tl.int32)
-    c += (a > 1.75 * s).to(tl.int32)
-    c += (a > 2.5 * s).to(tl.int32)
-    c += (a > 3.5 * s).to(tl.int32)
-    c += (a > 5.0 * s).to(tl.int32)
-    return c
-
-
-@triton.jit
-def _fake_nvfp4(x, ROWS: tl.constexpr, D: tl.constexpr):
-    """fp32 ``[ROWS, D]`` through NVFP4 and back (exact scale x e2m1)."""
-    g = tl.reshape(x, (ROWS, D // 16, 16))
-    a = tl.abs(g)
-    s = _nvfp4_scale(tl.max(a, axis=2)).to(tl.float32)[:, :, None]
-    c = _e2m1_code(a, s).to(tl.float32)
-    mag = tl.where(c < 4.0, c * 0.5, tl.where(c < 6.0, c - 2.0, c * 2.0 - 8.0))
-    v = mag * s
-    return tl.reshape(tl.where(g < 0, -v, v), (ROWS, D))
-
-
-@triton.jit
-def _e2m1_raw(nib):
-    """e2m1 nibble (int32) -> its value / 2^14, exactly, through fp16 bits: the 3 magnitude
-    bits land on fp16's low exponent bits and top mantissa bit (0.5 becomes the subnormal
-    2^-15), the sign on fp16's sign."""
-    bits = ((nib & 8) << 12) | ((nib & 7) << 9)
-    return bits.to(tl.int16).to(tl.float16, bitcast=True).to(tl.float32)
-
-
-@triton.jit
-def _dequant_halves(codes, scales, R: tl.constexpr):
-    """codes ``[R, 64]`` uint8 and scales ``[R, 8]`` uint8 -> the even and the odd elements
-    ``[R, 64]`` bf16 (exact). Byte ``b`` of a row holds elements ``2b`` (low nibble) and
-    ``2b + 1``, both in scale group ``b // 8``."""
-    c = codes.to(tl.int32)
-    s = scales.to(tl.float8e4nv, bitcast=True).to(tl.float32) * 16384.0
-    s = tl.reshape(tl.broadcast_to(s[:, :, None], (R, 8, 8)), (R, 64))
-    lo = (_e2m1_raw(c & 15) * s).to(tl.bfloat16)
-    hi = (_e2m1_raw(c >> 4) * s).to(tl.bfloat16)
-    return lo, hi
-
-
-@triton.jit
-def _cvt_byte(word, sc2, SEL: tl.constexpr):
-    """gfx950: byte ``SEL`` of ``word`` (2 e2m1) -> 2 fp16 times the fp16 scale held twice
-    in ``sc2``. ``v_cvt_scalef32_pk_f16_fp4`` applies only the exponent of its scale, so it
-    converts at scale 1 and ``v_pk_mul_f16`` applies the e4m3 scale (exact in fp16)."""
+# ------------------------------------ helpers ------------------------------------------- 
+@gluon.jit
+def _cvt_byte(word, sc2, SEL: gl.constexpr):
+    """Byte ``SEL`` of ``word`` (2 e2m1) -> 2 fp16 times the fp16 scale held twice in
+    ``sc2``, as an int32."""
     if SEL == 0:
-        return tl.inline_asm_elementwise(
+        return gl.inline_asm_elementwise(
             "v_cvt_scalef32_pk_f16_fp4 $0, $1, 1.0\nv_pk_mul_f16 $0, $0, $2",
-            "=&v,v,v", [word, sc2], dtype=tl.int32, is_pure=True, pack=1)  # fmt: skip
+            "=&v,v,v", [word, sc2], dtype=gl.int32, is_pure=True, pack=1)  # fmt: skip
     elif SEL == 1:
-        return tl.inline_asm_elementwise(
+        return gl.inline_asm_elementwise(
             "v_cvt_scalef32_pk_f16_fp4 $0, $1, 1.0 op_sel:[1,0,0]\nv_pk_mul_f16 $0, $0, $2",
-            "=&v,v,v", [word, sc2], dtype=tl.int32, is_pure=True, pack=1)  # fmt: skip
+            "=&v,v,v", [word, sc2], dtype=gl.int32, is_pure=True, pack=1)  # fmt: skip
     elif SEL == 2:
-        return tl.inline_asm_elementwise(
+        return gl.inline_asm_elementwise(
             "v_cvt_scalef32_pk_f16_fp4 $0, $1, 1.0 op_sel:[0,1,0]\nv_pk_mul_f16 $0, $0, $2",
-            "=&v,v,v", [word, sc2], dtype=tl.int32, is_pure=True, pack=1)  # fmt: skip
+            "=&v,v,v", [word, sc2], dtype=gl.int32, is_pure=True, pack=1)  # fmt: skip
     else:
-        return tl.inline_asm_elementwise(
+        return gl.inline_asm_elementwise(
             "v_cvt_scalef32_pk_f16_fp4 $0, $1, 1.0 op_sel:[1,1,0]\nv_pk_mul_f16 $0, $0, $2",
-            "=&v,v,v", [word, sc2], dtype=tl.int32, is_pure=True, pack=1)  # fmt: skip
+            "=&v,v,v", [word, sc2], dtype=gl.int32, is_pure=True, pack=1)  # fmt: skip
 
 
-@triton.jit
+@gluon.jit
 def _lo16(p):
-    return p.to(tl.int16).to(tl.float16, bitcast=True)
+    return p.to(gl.int16).to(gl.float16, bitcast=True)
 
 
-@triton.jit
+@gluon.jit
 def _hi16(p):
-    return (p >> 16).to(tl.int16).to(tl.float16, bitcast=True)
+    return (p >> 16).to(gl.int16).to(gl.float16, bitcast=True)
 
 
-@triton.jit
-def _dequant_hw(words, scales, R: tl.constexpr):
-    """gfx950: codes ``[R, 16]`` int32 (4 bytes each) and scales ``[R, 8]`` uint8 -> the
-    keys ``[R, 128]`` fp16 in natural order (exact). Word ``w`` byte ``b`` holds elements
-    ``8w + 2b`` (low nibble) and ``8w + 2b + 1``; scale group ``w // 2``."""
-    s = scales.to(tl.float8e4nv, bitcast=True).to(tl.float16)
-    sb = s.to(tl.int16, bitcast=True).to(tl.int32) & 0xFFFF
-    sc2 = tl.reshape(tl.broadcast_to((sb | (sb << 16))[:, :, None], (R, 8, 2)), (R, 16))
-    p0 = _cvt_byte(words, sc2, 0)
-    p1 = _cvt_byte(words, sc2, 1)
-    p2 = _cvt_byte(words, sc2, 2)
-    p3 = _cvt_byte(words, sc2, 3)
-    # [R, 16, i, j] with byte b = 2i + j, then the nibble h last: element 8w + 2b + h
-    lo = tl.join(tl.join(_lo16(p0), _lo16(p2)), tl.join(_lo16(p1), _lo16(p3)))
-    hi = tl.join(tl.join(_hi16(p0), _hi16(p2)), tl.join(_hi16(p1), _hi16(p3)))
-    return tl.reshape(tl.join(lo, hi), (R, 128))
+@gluon.jit
+def _nvfp4_scale(amax):
+    s = amax / 6.0
+    s = gl.where(s < 0.001953125, 0.001953125, s)
+    s = gl.where(s > 448.0, 448.0, s)
+    return s.to(gl.float8e4nv)
 
 
-# ----------------------------------------------------------------------------- scores --
-@triton.jit
-def _prep_q(
-    iq_ptr,
-    s_iq_t,
-    s_iq_h,
-    cq_ptr,
-    t0,
-    T,
-    QT: tl.constexpr,
-    NI: tl.constexpr,
-    DI: tl.constexpr,
-    MODE: tl.constexpr,
-    Q4: tl.constexpr,
-    HW: tl.constexpr,
-    RAW: tl.constexpr,
-):
-    """The q tile's MFMA operands ``(qa, qb, ca, cb)``: bf16 (raw caches, ``RAW``) or fp16
-    (NVFP4 on gfx950, ``HW``) q ``[QT*16, DI]`` and ``index_compress_query`` as row 0 of a
-    16-row operand (``qb`` / ``cb`` unused); otherwise bf16 even / odd columns of each.
-    q4k4 (``Q4``): q through NVFP4 first."""
-    M: tl.constexpr = QT * NI
-    HALF: tl.constexpr = DI // 2
-    rm = tl.arange(0, M)
-    tm = t0 + rm // NI
-    d = tl.arange(0, DI)
-    q = tl.load(
-        iq_ptr
-        + tm[:, None].to(tl.int64) * s_iq_t
-        + (rm % NI)[:, None] * s_iq_h
-        + d[None, :],
-        mask=(tm < T)[:, None],
-        other=0.0,
-    ).to(tl.float32)
-    if Q4:
-        q = _fake_nvfp4(q, M, DI)
-    r16 = tl.arange(0, 16)[:, None]
-    if RAW:
-        qa = q.to(tl.bfloat16)
-        qb = qa
-        ca = qa
-        if MODE == 0:
-            cq = tl.load(cq_ptr + d).to(tl.float32)
-            ca = tl.where(r16 == 0, cq[None, :], 0.0).to(tl.bfloat16)
-        cb = ca
-    elif HW:
-        qa = q.to(tl.float16)
-        qb = qa
-        ca = qa
-        if MODE == 0:
-            cq = tl.load(cq_ptr + d).to(tl.float32)
-            ca = tl.where(r16 == 0, cq[None, :], 0.0).to(tl.float16)
-        cb = ca
-    else:
-        qe, qo = tl.split(tl.reshape(q, (M, HALF, 2)))
-        qa = qe.to(tl.bfloat16)
-        qb = qo.to(tl.bfloat16)
-        ca = qa
-        cb = qb
-        if MODE == 0:
-            cq = tl.reshape(tl.load(cq_ptr + d).to(tl.float32), (HALF, 2))
-            cqe, cqo = tl.split(cq)
-            ca = tl.where(r16 == 0, cqe[None, :], 0.0).to(tl.bfloat16)
-            cb = tl.where(r16 == 0, cqo[None, :], 0.0).to(tl.bfloat16)
-    return qa, qb, ca, cb
+@gluon.jit
+def _fake_nvfp4(x, ROWS: gl.constexpr, D: gl.constexpr):
+    """fp32 ``[ROWS, D]`` through NVFP4 and back (exact scale x e2m1; ties to the smaller)."""
+    g = gl.reshape(x, [ROWS, D // 16, 16])
+    a = gl.abs(g)
+    s = gl.expand_dims(_nvfp4_scale(gl.max(a, axis=2)).to(gl.float32), 2)
+    # Search the seven midpoints with three comparisons. Strict > keeps ties
+    # toward the smaller magnitude, as required by the reference quantizer.
+    high_bit = a > 1.75 * s
+    middle_bit = a > gl.where(high_bit, 3.5, 0.75) * s
+    low_threshold = gl.where(
+        high_bit,
+        gl.where(middle_bit, 5.0, 2.5),
+        gl.where(middle_bit, 1.25, 0.25),
+    )
+    low_bit = a > low_threshold * s
+    code = (high_bit.to(gl.int32) << 2) | (middle_bit.to(gl.int32) << 1)
+    code = code | low_bit.to(gl.int32)
+    c = code.to(gl.float32)
+    mag = gl.where(c < 4.0, c * 0.5, gl.where(c < 6.0, c - 2.0, c * 2.0 - 8.0))
+    v = mag * s
+    return gl.reshape(gl.where(g < 0, -v, v), [ROWS, D])
 
 
-@triton.jit
-def _tile_score(
-    j0,
-    seq,
-    qbmax,
-    qa,
-    qb,
-    ca,
-    cb,
-    ic_ptr,
-    s_ic,
-    bt_ptr,
-    s_bt,
-    NB,
-    pos_t,
-    qb_t,
-    sc,
-    pool_temp,
-    init_blocks,
-    local_blocks,
-    QT: tl.constexpr,
-    BB: tl.constexpr,
-    ROWS: tl.constexpr,
-    MODE: tl.constexpr,
-    HW: tl.constexpr,
-    RAW: tl.constexpr,
-    NI: tl.constexpr,
-    DI: tl.constexpr,
-):
-    """Scores ``[QT, BB]`` of blocks ``j0 .. j0 + BB - 1`` of sequence ``seq`` for the q tile:
-    pins applied, ``-inf`` past each token's own block (blocks past ``qbmax`` are not read)."""
-    M: tl.constexpr = QT * NI
-    R: tl.constexpr = BB * ROWS
-    jb = j0 + tl.arange(0, BB)
-    if j0 <= qbmax:
-        rr = tl.arange(0, R)
-        jr = j0 + rr // ROWS
-        live = (jr <= qbmax) & (jr < NB)
-        phys = tl.load(bt_ptr + seq * s_bt + jr, mask=live, other=0)
-        if RAW:  # bf16 / fp8 rows (fp8 -> bf16 is exact)
-            k = tl.load(
-                ic_ptr
-                + phys.to(tl.int64)[:, None] * s_ic
-                + (rr % ROWS)[:, None] * DI
-                + tl.arange(0, DI)[None, :],
-                mask=live[:, None],
-                other=0.0,
-            ).to(tl.bfloat16)
-            dots = tl.dot(qa, tl.trans(k))
-            if MODE == 0:
-                lg = tl.dot(ca, tl.trans(k))
-        elif HW:
-            row = ic_ptr + phys.to(tl.int64) * s_ic + (rr % ROWS) * CB
-            srow = ic_ptr + phys.to(tl.int64) * s_ic + ROWS * CB + (rr % ROWS) * SB
-            scales = tl.load(srow[:, None] + tl.arange(0, SB)[None, :], mask=live[:, None], other=0)
-            words = tl.load(
-                row.to(tl.pointer_type(tl.int32))[:, None] + tl.arange(0, CB // 4)[None, :],
-                mask=live[:, None],
-                other=0,
-            )
-            k16 = _dequant_hw(words, scales, R)
-            dots = tl.dot(qa, tl.trans(k16))
-            if MODE == 0:
-                lg = tl.dot(ca, tl.trans(k16))
-        else:
-            row = ic_ptr + phys.to(tl.int64) * s_ic + (rr % ROWS) * CB
-            srow = ic_ptr + phys.to(tl.int64) * s_ic + ROWS * CB + (rr % ROWS) * SB
-            scales = tl.load(srow[:, None] + tl.arange(0, SB)[None, :], mask=live[:, None], other=0)
-            codes = tl.load(
-                row[:, None] + tl.arange(0, CB)[None, :], mask=live[:, None], other=0
-            )
-            ke, ko = _dequant_halves(codes, scales, R)
-            dots = tl.dot(qa, tl.trans(ke)) + tl.dot(qb, tl.trans(ko))
-            if MODE == 0:
-                lg = tl.dot(ca, tl.trans(ke)) + tl.dot(cb, tl.trans(ko))
-        if MODE == 0:
-            # pool weights: softmax over each group of 4 (exp2 and a fast reciprocal: the
-            # IEEE divide costs more than the dequant here)
-            r16 = tl.arange(0, 16)[:, None]
-            lg = tl.sum(tl.where(r16 == 0, lg, 0.0), axis=0) * (pool_temp * 1.4426950408889634)
-            lg = tl.reshape(lg, (R // 4, 4))
-            e = tl.math.exp2(lg - tl.max(lg, axis=1)[:, None])
-            rs = tl.fdiv(1.0, tl.sum(e, axis=1), ieee_rounding=False)
-            w = tl.reshape(e * rs[:, None], (R,))
-            cent = tl.sum(tl.reshape(dots * w[None, :], (M, R // 4, 4)), axis=2)
-            bs = tl.max(tl.reshape(cent, (M, BB, 4)), axis=2)
-            score = tl.max(tl.reshape(bs, (QT, NI, BB)), axis=1) * sc
-        elif MODE == 1:
-            bs = tl.max(tl.reshape(dots, (M, BB, ROWS)), axis=2)
-            score = tl.max(tl.reshape(bs, (QT, NI, BB)), axis=1) * sc
-        else:
-            tokpos = jr * 16 + rr % 16
-            dm = tl.reshape(dots * sc, (QT, NI, R))
-            vis = tokpos[None, :] <= pos_t[:, None]
-            dm = tl.where(vis[:, None, :], dm, float("-inf"))
-            dm = tl.reshape(dm, (QT, NI, BB, ROWS))
-            mx = tl.max(dm, axis=3)
-            mx_s = tl.where(mx == float("-inf"), 0.0, mx)
-            bs = tl.log(tl.sum(tl.exp(dm - mx_s[:, :, :, None]), axis=3)) + mx_s
-            hm = tl.max(bs, axis=1)
-            hm_s = tl.where(hm == float("-inf"), 0.0, hm)
-            score = tl.log(tl.sum(tl.exp(bs - hm_s[:, None, :]), axis=1)) + hm_s
-    else:
-        score = tl.full((QT, BB), float("-inf"), tl.float32)
-    score = tl.where(jb[None, :] < init_blocks, 1e30, score)
-    score = tl.where(jb[None, :] >= qb_t[:, None] + 1 - local_blocks, 1e29, score)
-    return tl.where(jb[None, :] <= qb_t[:, None], score, float("-inf"))
+@gluon.jit
+def _k_permute(x, ROWS: gl.constexpr):
+    """``[ROWS, 128]`` in dim order -> MFMA K order (K index ``32 s + 8 c + e`` holds dim
+    ``32 c + 8 s + e``)."""
+    x = gl.reshape(x, [ROWS, 4, 4, 8])  # [rows, c, s, e]
+    x = gl.permute(x, [0, 2, 1, 3])  # [rows, s, c, e]
+    return gl.reshape(x, [ROWS, 128])
 
 
-@triton.jit
+@gluon.jit
+def _phys_rows(bt_ptr, s_bt, seq, j0, qbmax, NB, ROWS: gl.constexpr, R: gl.constexpr,
+               RL: gl.constexpr):  # fmt: skip
+    """Physical page of each of the tile's ``R`` cache rows (0 for rows not read) and the
+    live mask, in row layout ``RL``."""
+    rr = gl.arange(0, R, layout=RL)
+    jr = j0 + rr // ROWS
+    live = (jr <= qbmax) & (jr < NB)
+    phys = gl.amd.cdna4.buffer_load(bt_ptr, seq * s_bt + jr, mask=live, other=0)
+    return phys, live
+
+
+@gluon.jit
+def _load_tile(ic_ptr, icw_ptr, phys, live, ROWS: gl.constexpr, R: gl.constexpr,
+               WL3: gl.constexpr):  # fmt: skip
+    """The tile's words ``[R, 4 (c), 4 (s)]`` int32 (word ``4 c + s`` of each row) and the
+    matching e4m3 scale bytes, both in ``WL3``."""
+    rr = gl.arange(0, R, layout=gl.SliceLayout(1, gl.SliceLayout(2, WL3)))
+    cc = gl.arange(0, 4, layout=gl.SliceLayout(0, gl.SliceLayout(2, WL3)))
+    ss = gl.arange(0, 4, layout=gl.SliceLayout(0, gl.SliceLayout(1, WL3)))
+    r3 = gl.expand_dims(gl.expand_dims(rr % ROWS, 1), 2)
+    c3 = gl.expand_dims(gl.expand_dims(cc, 0), 2)
+    s3 = gl.expand_dims(gl.expand_dims(ss, 0), 1)
+    p3 = gl.expand_dims(
+        gl.expand_dims(
+            gl.convert_layout(phys, gl.SliceLayout(1, gl.SliceLayout(2, WL3))), 1
+        ),
+        2,
+    )
+    l3 = gl.expand_dims(
+        gl.expand_dims(
+            gl.convert_layout(live, gl.SliceLayout(1, gl.SliceLayout(2, WL3))), 1
+        ),
+        2,
+    )
+    m3 = l3 & (c3 >= 0) & (s3 >= 0)
+    S_IC: gl.constexpr = ROWS * 72  # bytes a page
+    woff = p3 * (S_IC // 4) + r3 * 16 + c3 * 4 + s3
+    words = gl.amd.cdna4.buffer_load(icw_ptr, woff, mask=m3, other=0)
+    soff = p3 * S_IC + ROWS * 64 + r3 * 8 + c3 * 2 + s3 // 2
+    scales = gl.amd.cdna4.buffer_load(ic_ptr, soff, mask=m3, other=0)
+    return words, scales
+
+
+@gluon.jit
+def _keys_b(words, scales, R: gl.constexpr, BL: gl.constexpr):
+    """Words + scales ``[R, 4, 4]`` -> the keys as the MFMA B operand ``[128, R]`` fp16 (K in
+    MFMA order), without moving data between lanes."""
+    s16 = scales.to(gl.float8e4nv, bitcast=True).to(gl.float16)
+    sb = s16.to(gl.int16, bitcast=True).to(gl.int32) & 0xFFFF
+    sc2 = sb | (sb << 16)
+    w2 = gl.reshape(gl.permute(words, [0, 2, 1]), [R, 16])  # word slot 4 s + c
+    s2 = gl.reshape(gl.permute(sc2, [0, 2, 1]), [R, 16])
+    p0 = _cvt_byte(w2, s2, 0)
+    p1 = _cvt_byte(w2, s2, 1)
+    p2 = _cvt_byte(w2, s2, 2)
+    p3 = _cvt_byte(w2, s2, 3)
+    lo = gl.join(gl.join(_lo16(p0), _lo16(p2)), gl.join(_lo16(p1), _lo16(p3)))
+    hi = gl.join(gl.join(_hi16(p0), _hi16(p2)), gl.join(_hi16(p1), _hi16(p3)))
+    k = gl.reshape(gl.join(lo, hi), [R, 128])  # [row, 8 (4 s + c) + 2 b + h]
+    return gl.convert_layout(gl.permute(k, [1, 0]), BL, assert_trivial=True)
+
+
+@gluon.jit
+def _split_s(x, R: gl.constexpr):
+    """``[R, 4, 4 (s)]`` -> its 4 ``[R, 4]`` slices s = 0 .. 3 (register splits)."""
+    x = gl.reshape(x, [R, 4, 2, 2])  # [R, c, s // 2, s % 2]
+    a, b = gl.split(x)  # s % 2 = 0 / 1
+    a0, a1 = gl.split(a)
+    b0, b1 = gl.split(b)
+    return a0, b0, a1, b1
+
+
+@gluon.jit
+def _keys_b_step(w, sc2, R: gl.constexpr, BL: gl.constexpr):
+    """One K step: words ``[R, 4 (c)]`` + scales -> the MFMA B operand ``[32, R]`` fp16 (K
+    index ``8 c + e``), without moving data between lanes."""
+    p0 = _cvt_byte(w, sc2, 0)
+    p1 = _cvt_byte(w, sc2, 1)
+    p2 = _cvt_byte(w, sc2, 2)
+    p3 = _cvt_byte(w, sc2, 3)
+    lo = gl.join(gl.join(_lo16(p0), _lo16(p2)), gl.join(_lo16(p1), _lo16(p3)))
+    hi = gl.join(gl.join(_hi16(p0), _hi16(p2)), gl.join(_hi16(p1), _hi16(p3)))
+    k = gl.reshape(gl.join(lo, hi), [R, 32])  # [row, 8 c + 2 b + h]
+    return gl.convert_layout(gl.permute(k, [1, 0]), BL, assert_trivial=True)
+
+
+@gluon.jit
+def _keys_b_steps(words, scales, R: gl.constexpr, BL: gl.constexpr):
+    """Words + scales ``[R, 4, 4]`` -> the 4 K steps' B operands ``[32, R]``."""
+    s16 = scales.to(gl.float8e4nv, bitcast=True).to(gl.float16)
+    sb = s16.to(gl.int16, bitcast=True).to(gl.int32) & 0xFFFF
+    w0, w1, w2, w3 = _split_s(words, R)
+    c0, c1, c2, c3 = _split_s(sb | (sb << 16), R)
+    return (_keys_b_step(w0, c0, R, BL), _keys_b_step(w1, c1, R, BL),
+            _keys_b_step(w2, c2, R, BL), _keys_b_step(w3, c3, R, BL))  # fmt: skip
+
+
+@gluon.jit
+def _dot_lds(smem, kb0, kb1, kb2, kb3, acc, AL: gl.constexpr):
+    """``acc`` + A x B over K = 128 in 4 steps, A's K slices read from shared memory."""
+    acc = gl.amd.cdna4.mfma(smem.slice(0, 32, 1).load(AL), kb0, acc)
+    acc = gl.amd.cdna4.mfma(smem.slice(32, 32, 1).load(AL), kb1, acc)
+    acc = gl.amd.cdna4.mfma(smem.slice(64, 32, 1).load(AL), kb2, acc)
+    return gl.amd.cdna4.mfma(smem.slice(96, 32, 1).load(AL), kb3, acc)
+
+
+# ----------------------------------------------------------------------------- kernel --
+@gluon.jit
 def _score_kernel(
     iq_ptr,
-    s_iq_t,
-    s_iq_h,
     ic_ptr,
-    s_ic,
     bt_ptr,
-    s_bt,
+    s_bt: gl.constexpr,
     seq_ptr,
     pos_ptr,
     cq_ptr,
     out_ptr,
-    s_out,
-    T,
-    NB,
-    FILL,
+    T: gl.constexpr,
+    NB: gl.constexpr,
+    FILL: gl.constexpr,
     sc,
     pool_temp,
-    init_blocks,
-    local_blocks,
-    CAUSAL: tl.constexpr,
-    QT: tl.constexpr,
-    BB: tl.constexpr,
-    ROWS: tl.constexpr,
-    MODE: tl.constexpr,
-    Q4: tl.constexpr,
-    HW: tl.constexpr,
-    RAW: tl.constexpr,
-    NI: tl.constexpr,
-    DI: tl.constexpr,
+    INIT: gl.constexpr,
+    LOCAL: gl.constexpr,
+    CAUSAL: gl.constexpr,
+    QT: gl.constexpr,
+    BB: gl.constexpr,
+    ROWS: gl.constexpr,
+    POOL: gl.constexpr,
+    Q4: gl.constexpr,
+    WL3: gl.constexpr,
+    WM: gl.constexpr,
+    PIPE: gl.constexpr,
+    QLDS: gl.constexpr,
+    SINGLE_SEQ: gl.constexpr,
 ):
-    """Program (q tile, ``pid_s`` of ``NS``): ``QT`` consecutive query tokens, ``BB`` blocks
-    (``BB * ROWS`` cache rows) per dot. The program strides over the tiles that hold the
-    tokens' causal blocks (tiles ``pid_s, pid_s + NS, ...``), so the work follows the
-    context, not ``NB`` (a CUDA graph's block-table width). Unless ``CAUSAL``, it then fills
-    its share ``[pid_s * FILL, +FILL)`` of the columns past those tiles with ``-inf``, in
-    wide stores. Tokens of the tile that belong to different sequences are handled one run
-    of equal ``seq_id`` at a time (tokens of a sequence are contiguous)."""
-    FW: tl.constexpr = 256  # -inf columns a store
-    t0 = tl.program_id(0) * QT
-    pid_s = tl.program_id(1)
-    ns = tl.num_programs(1)
-    qa, qb, ca, cb = _prep_q(iq_ptr, s_iq_t, s_iq_h, cq_ptr, t0, T, QT, NI, DI, MODE, Q4, HW, RAW)
-    tq = t0 + tl.arange(0, QT)
-    tval = tq < T
-    pos_t = tl.load(pos_ptr + tq, mask=tval, other=0)
-    seq_t = tl.load(seq_ptr + tq, mask=tval, other=-1)
-    qb_t = pos_t // 16
-    jt = tl.arange(0, BB)
-    for sub in range(QT):
-        t_sub = t0 + sub
-        if t_sub < T:
-            s_sub = tl.load(seq_ptr + t_sub)
-            prev = tl.load(seq_ptr + t_sub - 1, mask=sub > 0, other=-1)
-            if (sub == 0) | (s_sub != prev):
-                mine = tval & (seq_t == s_sub)
-                qbmax = tl.max(tl.where(mine, qb_t, -1), axis=0)
-                ntile = qbmax // BB + 1  # tiles holding the run's causal blocks
-                orow = out_ptr + tq[:, None].to(tl.int64) * s_out
-                for ti in range(pid_s, ntile, ns):
-                    j0 = ti * BB
-                    score = _tile_score(
-                        j0, s_sub, qbmax, qa, qb, ca, cb, ic_ptr, s_ic, bt_ptr, s_bt, NB,
-                        pos_t, qb_t, sc, pool_temp, init_blocks, local_blocks,
-                        QT, BB, ROWS, MODE, HW, RAW, NI, DI,
-                    )  # fmt: skip
-                    jb = j0 + jt
-                    tl.store(orow + jb[None, :], score, mask=mine[:, None] & (jb < NB)[None, :])
-                if not CAUSAL:
-                    f1 = tl.minimum(NB, (pid_s + 1) * FILL)
-                    neg = tl.full((QT, FW), float("-inf"), tl.float32)
-                    for c0 in range(tl.maximum(ntile * BB, pid_s * FILL), f1, FW):
-                        cols = c0 + tl.arange(0, FW)
-                        tl.store(orow + cols[None, :], neg, mask=mine[:, None] & (cols < f1)[None, :])
-
-
-# --------------------------------------------------------------- scores fused with top-k --
-KEY_NONE = tl.constexpr(-(1 << 63))
-KEY_NEGINF = tl.constexpr(-2139095041)  # _key's high word for a -inf score
-
-
-@triton.jit
-def _key(score, j):
-    """int64 keys ordering (score, -block): the fp32 bits made order-preserving as int32 in
-    the high word, ``2^31 - 1 - j`` in the low word, so equal scores rank the lower block
-    first."""
-    b = score.to(tl.int32, bitcast=True)
-    k32 = b ^ ((b >> 31) & 0x7FFFFFFF)
-    return (k32.to(tl.int64) << 32) | (0x7FFFFFFF - j).to(tl.int64)
-
-
-@triton.jit
-def _select_kernel(
-    iq_ptr,
-    s_iq_t,
-    s_iq_h,
-    ic_ptr,
-    s_ic,
-    bt_ptr,
-    s_bt,
-    seq_ptr,
-    pos_ptr,
-    cq_ptr,
-    out_ptr,
-    s_out_t,
-    T,
-    NB,
-    sc,
-    pool_temp,
-    init_blocks,
-    local_blocks,
-    FINAL: tl.constexpr,
-    K: tl.constexpr,
-    QT: tl.constexpr,
-    BB: tl.constexpr,
-    ROWS: tl.constexpr,
-    MODE: tl.constexpr,
-    Q4: tl.constexpr,
-    HW: tl.constexpr,
-    RAW: tl.constexpr,
-    NI: tl.constexpr,
-    DI: tl.constexpr,
-):
-    """Program (q tile, ``pid_s`` of ``NS``): strides over the tiles holding the tokens'
-    causal blocks (``pid_s, pid_s + NS, ...``; the work follows the context, not ``NB``) and
-    keeps each token's top-``K`` keys in registers -- ``K`` blocks are scored into a buffer,
-    then the buffer and the running top are reduced to the top ``K`` again. ``FINAL``
-    (``NS`` = 1): writes logical blocks ``[T, K]`` (-1 = unused); otherwise the keys
-    ``[T, NS, K]`` for ``_merge_kernel``. The ``[T, nb]`` scores never reach memory."""
-    CHT: tl.constexpr = K // BB  # tiles per chunk of K blocks
-    t0 = tl.program_id(0) * QT
-    pid_s = tl.program_id(1)
-    ns = tl.num_programs(1)
-    qa, qb, ca, cb = _prep_q(iq_ptr, s_iq_t, s_iq_h, cq_ptr, t0, T, QT, NI, DI, MODE, Q4, HW, RAW)
-    tq = t0 + tl.arange(0, QT)
-    tval = tq < T
-    pos_t = tl.load(pos_ptr + tq, mask=tval, other=0)
-    seq_t = tl.load(seq_ptr + tq, mask=tval, other=-1)
-    qb_t = pos_t // 16
-    jt = tl.arange(0, BB)
-    slot = tl.arange(0, CHT)[None, :, None]
-    for sub in range(QT):
-        t_sub = t0 + sub
-        if t_sub < T:
-            s_sub = tl.load(seq_ptr + t_sub)
-            prev = tl.load(seq_ptr + t_sub - 1, mask=sub > 0, other=-1)
-            if (sub == 0) | (s_sub != prev):
-                mine = tval & (seq_t == s_sub)
-                qbmax = tl.max(tl.where(mine, qb_t, -1), axis=0)
-                ntile = qbmax // BB + 1  # tiles holding the run's causal blocks
-                top = tl.full((QT, K), KEY_NONE, tl.int64)
-                for c in range(pid_s, ntile, ns * CHT):
-                    buf = tl.full((QT, CHT, BB), KEY_NONE, tl.int64)
-                    for ti in range(CHT):
-                        # past the causal tiles _tile_score reads nothing and gives -inf
-                        j0 = (c + ti * ns) * BB
-                        score = _tile_score(
-                            j0, s_sub, qbmax, qa, qb, ca, cb, ic_ptr, s_ic, bt_ptr, s_bt, NB,
-                            pos_t, qb_t, sc, pool_temp, init_blocks, local_blocks,
-                            QT, BB, ROWS, MODE, HW, RAW, NI, DI,
-                        )  # fmt: skip
-                        jb = j0 + jt
-                        key = _key(score, jb)
-                        buf = tl.where(slot == ti, key[:, None, :], buf)
-                    cand = tl.reshape(tl.join(top, tl.reshape(buf, (QT, K))), (QT, 2 * K))
-                    top = tl.topk(cand, K)
-                kk = tl.arange(0, K)
-                if FINAL:
-                    out = _decode(top)
-                else:
-                    out = top
-                tl.store(
-                    out_ptr + tq[:, None].to(tl.int64) * s_out_t + pid_s * K + kk[None, :],
-                    out,
-                    mask=mine[:, None],
-                )
-
-
-@triton.jit
-def _decode(top):
-    """Keys -> logical blocks (int32), -1 for an empty slot or a -inf score."""
-    hi = (top >> 32).to(tl.int32)
-    j = 0x7FFFFFFF - (top & 0x7FFFFFFF).to(tl.int32)
-    return tl.where(hi > KEY_NEGINF, j, -1)
-
-
-@triton.jit
-def _merge_kernel(cand_ptr, sel_ptr, NS, K: tl.constexpr, NS2: tl.constexpr):
-    """Per token: the top ``K`` of its ``NS`` ranges' keys ``[NS, K]`` -> logical blocks."""
-    t = tl.program_id(0)
-    r = tl.arange(0, NS2)[:, None]
-    kk = tl.arange(0, K)[None, :]
-    keys = tl.load(
-        cand_ptr + t.to(tl.int64) * NS * K + r * K + kk, mask=r < NS, other=KEY_NONE
+    NI: gl.constexpr = 16
+    DI: gl.constexpr = 128
+    M: gl.constexpr = QT * NI
+    R: gl.constexpr = BB * ROWS
+    FW: gl.constexpr = 256
+    MFMA: gl.constexpr = gl.amd.AMDMFMALayout(
+        version=4,
+        instr_shape=[16, 16, 32],
+        transposed=True,
+        warps_per_cta=[WM, 4 // WM],
     )
-    top = tl.topk(tl.reshape(keys, (NS2 * K,)), K)
-    tl.store(sel_ptr + t.to(tl.int64) * K + tl.arange(0, K), _decode(top))
+    AL: gl.constexpr = gl.DotOperandLayout(operand_index=0, parent=MFMA, k_width=8)
+    BL: gl.constexpr = gl.DotOperandLayout(operand_index=1, parent=MFMA, k_width=8)
+    QL: gl.constexpr = gl.BlockedLayout([1, 8], [4, 16], [4, 1], [1, 0])
+    SL: gl.constexpr = gl.BlockedLayout(
+        [1, 1], [1, 64], [1, 4], [1, 0]
+    )  # [QT, BB] scores
+    FL: gl.constexpr = gl.BlockedLayout(
+        [1, 4], [1, 64], [1, 4], [1, 0]
+    )  # [QT, FW] -inf fill
+    RL: gl.constexpr = gl.SliceLayout(1, gl.SliceLayout(2, WL3))
+
+    t0 = gl.program_id(0) * QT
+    pid_s = gl.program_id(1)
+    ns = gl.num_programs(1)
+    icw_ptr = ic_ptr.to(gl.pointer_type(gl.int32), bitcast=True)
+
+    # q tile -> fp32 (q4k4: NVFP4 by 16 consecutive dims) -> MFMA K order -> fp16 A operand.
+    # Loaded once in a blocked layout and redistributed: the A operand is replicated over the
+    # 4 warps (they split N), so reading it in place would load q 4 times.
+    rm = gl.arange(0, M, layout=gl.SliceLayout(1, QL))
+    dd = gl.arange(0, DI, layout=gl.SliceLayout(0, QL))
+    tm = t0 + rm // NI
+    qmask = gl.expand_dims(tm < T, 1) & gl.expand_dims(dd >= 0, 0)
+    qoff = gl.expand_dims(
+        tm.to(gl.int64) * (NI * DI) + (rm % NI) * DI, 1
+    ) + gl.expand_dims(dd, 0)
+    q = gl.load(iq_ptr + qoff, mask=qmask, other=0.0).to(gl.float32)
+    if Q4:
+        q = _fake_nvfp4(q, M, DI)
+    if QLDS:
+        # multi-row q tiles: q lives in shared memory and each K step reads its slice, so
+        # the A operand (copied in all 4 warps) does not hold 128 registers a lane
+        SHQ: gl.constexpr = gl.amd.cdna4.compute_efficient_padded_shared_layout(
+            AL, [M, DI], gl.float16
+        )
+        smem_q = gl.allocate_shared_memory(gl.float16, [M, DI], SHQ)
+        smem_q.store(_k_permute(q, M).to(gl.float16))
+    else:
+        qa = gl.convert_layout(_k_permute(q, M).to(gl.float16), AL)
+    # MFMA K index k = 32 s + 8 c + e holds dim 32 c + 8 s + e
+    ka = gl.arange(0, DI, layout=gl.SliceLayout(0, AL))
+    dperm = gl.max_contiguous(
+        gl.multiple_of(32 * ((ka // 8) % 4) + 8 * (ka // 32) + ka % 8, 8), 8
+    )
+    if POOL:
+        # index_compress_query in all 16 rows: every row of the logits dot is the same, so
+        # each lane holds its key rows' logits without a cross-lane extraction
+        r16 = gl.arange(0, 16, layout=gl.SliceLayout(1, AL))
+        ca = gl.load(cq_ptr + gl.expand_dims(r16 * 0, 1) + gl.expand_dims(dperm, 0)).to(
+            gl.float16
+        )
+        if QLDS:
+            SHC: gl.constexpr = gl.SwizzledSharedLayout(
+                8, 1, 8, order=[1, 0]
+            )  # 16 rows: no padded layout
+            smem_c = gl.allocate_shared_memory(gl.float16, [16, DI], SHC)
+            smem_c.store(ca)
+
+    tq = t0 + gl.arange(0, QT, layout=gl.SliceLayout(1, SL))
+    tval = tq < T
+    pos_t = gl.load(pos_ptr + tq, mask=tval, other=0)
+    if SINGLE_SEQ:
+        # A one-row table can only be indexed by sequence zero. Specializing this
+        # metadata removes the sequence scan and its live scalar state for bs1.
+        seq_t = gl.full([QT], 0, gl.int32, layout=gl.SliceLayout(1, SL))
+    else:
+        seq_t = gl.load(seq_ptr + tq, mask=tval, other=-1)
+    qb_t = pos_t // 16
+    jt = gl.arange(0, BB, layout=gl.SliceLayout(0, SL))
+    orow = out_ptr + gl.expand_dims(tq.to(gl.int64) * NB, 1)
+    zero_acc = gl.zeros([M, R], gl.float32, layout=MFMA)
+
+    # Visit the tile's distinct sequence ids once, including non-contiguous ids. With
+    # SINGLE_SEQ this becomes one pass; otherwise the scan depends on device data and
+    # remains valid when seq_id changes during CUDA-graph replay.
+    big = 2147483647
+    s_lo = gl.min(gl.where(tval, seq_t, big), axis=0)
+    s_hi = gl.max(gl.where(tval, seq_t, -1), axis=0)
+    s_sub = s_lo
+    while s_sub <= s_hi:
+        mine = tval & (seq_t == s_sub)
+        qbmax = gl.max(gl.where(mine, qb_t, -1), axis=0)
+        ntile = qbmax // BB + 1
+        # PIPE: tile i scored while tile i+1's keys and tile i+2's pages load
+        if PIPE:
+            ph, lv = _phys_rows(bt_ptr, s_bt, s_sub, pid_s * BB, qbmax, NB, ROWS, R, RL)
+            w_c, s_c = _load_tile(ic_ptr, icw_ptr, ph, lv, ROWS, R, WL3)
+            ph_n, lv_n = _phys_rows(
+                bt_ptr, s_bt, s_sub, (pid_s + ns) * BB, qbmax, NB, ROWS, R, RL
+            )
+        for ti in range(pid_s, ntile, ns):
+            if PIPE:
+                w_n, s_n = _load_tile(ic_ptr, icw_ptr, ph_n, lv_n, ROWS, R, WL3)
+                ph_n, lv_n = _phys_rows(
+                    bt_ptr, s_bt, s_sub, (ti + 2 * ns) * BB, qbmax, NB, ROWS, R, RL
+                )
+            else:
+                ph, lv = _phys_rows(
+                    bt_ptr, s_bt, s_sub, ti * BB, qbmax, NB, ROWS, R, RL
+                )
+                w_c, s_c = _load_tile(ic_ptr, icw_ptr, ph, lv, ROWS, R, WL3)
+            if QLDS:
+                kb0, kb1, kb2, kb3 = _keys_b_steps(w_c, s_c, R, BL)
+                dots = _dot_lds(smem_q, kb0, kb1, kb2, kb3, zero_acc, AL)  # [M, R]
+            else:
+                kb = _keys_b(w_c, s_c, R, BL)
+                dots = gl.amd.cdna4.mfma(qa, kb, zero_acc)  # [M, R]
+            if POOL:
+                if QLDS:
+                    lg = _dot_lds(
+                        smem_c,
+                        kb0,
+                        kb1,
+                        kb2,
+                        kb3,
+                        gl.zeros([16, R], gl.float32, layout=MFMA),
+                        AL,
+                    )
+                else:
+                    lg = gl.amd.cdna4.mfma(
+                        ca, kb, gl.zeros([16, R], gl.float32, layout=MFMA)
+                    )
+                lg = gl.reshape(lg * (pool_temp * 1.4426950408889634), [16, R // 4, 4])
+                e = gl.exp2(lg - gl.expand_dims(gl.max(lg, axis=2), 2))
+                den = gl.sum(e, axis=2)
+                rs = gl.fdiv(gl.full(den.shape, 1.0, gl.float32, layout=den.type.layout), den,
+                             ieee_rounding=False)  # fmt: skip
+                w = gl.reshape(e * gl.expand_dims(rs, 2), [16, R])  # same in every row
+                if QT == 1:
+                    dw = dots * gl.convert_layout(w, MFMA)
+                else:
+                    d3 = gl.reshape(dots, [QT, NI, R])
+                    w3 = gl.convert_layout(w, gl.SliceLayout(0, d3.type.layout))
+                    dw = gl.reshape(d3 * gl.expand_dims(w3, 0), [M, R])
+                cent = gl.sum(gl.reshape(dw, [M, R // 4, 4]), axis=2)
+                bs = gl.max(gl.reshape(cent, [M, BB, 4]), axis=2)
+            else:
+                bs = gl.max(gl.reshape(dots, [M, BB, ROWS]), axis=2)
+            score = (
+                gl.convert_layout(gl.max(gl.reshape(bs, [QT, NI, BB]), axis=1), SL) * sc
+            )
+            jb = ti * BB + jt
+            jb2 = gl.expand_dims(jb, 0)
+            qb2 = gl.expand_dims(qb_t, 1)
+            score = gl.where(jb2 < INIT, 1e30, score)
+            score = gl.where(jb2 >= qb2 + 1 - LOCAL, 1e29, score)
+            score = gl.where(jb2 <= qb2, score, float("-inf"))
+            gl.store(orow + jb2, score, mask=gl.expand_dims(mine, 1) & (jb2 < NB))
+            if PIPE:
+                w_c = w_n
+                s_c = s_n
+        if not CAUSAL:
+            f1 = gl.minimum(NB, (pid_s + 1) * FILL)
+            neg = gl.full([QT, FW], float("-inf"), gl.float32, layout=FL)
+            tqf = t0 + gl.arange(0, QT, layout=gl.SliceLayout(1, FL))
+            minef = gl.convert_layout(mine, gl.SliceLayout(1, FL))
+            orowf = out_ptr + gl.expand_dims(tqf.to(gl.int64) * NB, 1)
+            for c0 in range(gl.maximum(ntile * BB, pid_s * FILL), f1, FW):
+                cols = gl.expand_dims(
+                    c0 + gl.arange(0, FW, layout=gl.SliceLayout(0, FL)), 0
+                )
+                gl.store(orowf + cols, neg, mask=gl.expand_dims(minef, 1) & (cols < f1))
+        if SINGLE_SEQ:
+            s_sub = big
+        else:
+            s_sub = gl.min(gl.where(tval & (seq_t > s_sub), seq_t, big), axis=0)
 
 
-_DEV = {}
+# ------------------------------------------------------------------------------- host --
+@lru_cache(maxsize=16)
+def _words_layout(r, wm=1):
+    """``[R, 4 (c), 4 (s)]`` words as the MFMA B operand holds them (``wm`` x ``4 // wm``
+    warps, M x N): rows over lanes 0-3, then the N warps, then registers; c over lanes
+    4-5; s over registers (16 contiguous bytes a lane). Warps along M hold copies.
+
+    Cache this shape metadata: constructing a DistributedLinearLayout unwraps all its
+    nested bases and otherwise adds about 13 us to every eager scorer call.
+    """
+    assert r in (64, 128) and wm in (1, 2, 4), (r, wm)
+    wn = 4 // wm
+    row_bits = [
+        16 << i for i in range((r // 16).bit_length() - 1)
+    ]  # rows past lanes 0-3
+    n_warp = row_bits[: wn.bit_length() - 1]
+    warp = [[b, 0, 0] for b in n_warp] + [[0, 0, 0]] * (wm.bit_length() - 1)
+    reg = [[0, 0, 1], [0, 0, 2]] + [[b, 0, 0] for b in row_bits[len(n_warp) :]]
+    return gl.DistributedLinearLayout(
+        reg_bases=reg,
+        lane_bases=[[1, 0, 0], [2, 0, 0], [4, 0, 0], [8, 0, 0], [0, 1, 0], [0, 2, 0]],
+        warp_bases=warp,
+        block_bases=[],
+        shape=[r, 4, 4],
+    )
 
 
-def _dev_info(device):
-    """(CU count, gfx950?) of ``device``, cached."""
-    idx = device.index if device.index is not None else torch.cuda.current_device()
-    if idx not in _DEV:
-        p = torch.cuda.get_device_properties(idx)
-        _DEV[idx] = (p.multi_processor_count, getattr(p, "gcnArchName", "").startswith("gfx950"))
-    return _DEV[idx]
+def _score(iq, ic, block_tables, seq_id, positions, nb, cq, init, local, pool_temp, q4,
+           qt=None, bb=None, waves=None, causal=False, index_scale=1.0, wm=1, pipe=None,
+           qlds=False):  # fmt: skip
+    if not is_supported(iq.device):
+        raise RuntimeError("NVFP4 index scorer requires gfx950")
+    index = torch.cuda.current_device() if iq.device.index is None else iq.device.index
+    cus = _device_info(index)[0]
+    rows = _rows_of(ic)
+    t = iq.shape[0]
+    if (
+        iq.dtype != torch.bfloat16
+        or iq.shape[1:] != (IDX_HEADS, IDX_DIM)
+        or not iq.is_contiguous()
+    ):
+        raise ValueError("iq must be contiguous bf16 [T,16,128]")
+    if nb < 0 or block_tables.ndim != 2 or block_tables.shape[1] < nb:
+        raise ValueError("block_tables must have shape [B, >= nb], with nb >= 0")
+    if block_tables.dtype != torch.int32 or block_tables.stride(1) != 1:
+        raise ValueError("block_tables must be int32 with contiguous columns")
+    for name, value in (("seq_id", seq_id), ("positions", positions)):
+        if (
+            value.dtype != torch.int32
+            or value.shape != (t,)
+            or not value.is_contiguous()
+        ):
+            raise ValueError(f"{name} must be contiguous int32 [T]")
+    if rows == PAGE and (
+        cq is None or cq.shape != (IDX_DIM,) or not cq.is_contiguous()
+    ):
+        raise ValueError("per-token pages require contiguous cq [128]")
+    for value in (ic, block_tables, seq_id, positions, cq):
+        if value is not None and value.device != iq.device:
+            raise ValueError("all scorer tensors must be on the same device")
+    out = torch.empty(t, nb, dtype=torch.float32, device=iq.device)
+    if t == 0 or nb == 0:
+        return out
+    if qt is None:
+        qt = 1 if t <= 64 else 8
+    if qt not in (1, 2, 4, 8):
+        raise ValueError("qt must be one of 1, 2, 4, 8")
+    if wm not in (1, 2, 4):
+        raise ValueError("wm must be one of 1, 2, 4")
+    if bb is None:
+        bb = (8 if qt <= 4 else 4) if rows == PAGE else 16
+        if rows == PAGE and t == 1 and qt == 1 and nb <= 1024 and not q4:
+            # Short bs1 decode benefits from more, smaller programs. q4 keeps the
+            # larger tile to amortize its per-program query quantization.
+            bb = 4
+    if bb * rows not in (64, 128):
+        raise ValueError("bb must form a tile of 64 or 128 cache rows")
+    if waves is None:
+        waves = 2 if qt > 1 else 4
+    nq = triton.cdiv(t, qt)
+    if not isinstance(waves, int) or waves <= 0:
+        raise ValueError("waves must be a positive integer")
+    nsplit = max(1, min(triton.cdiv(nb, bb), triton.cdiv(waves * cus, nq)))
+    if pipe is None:
+        # Each program can consume at most one tile in this launch, so preloading
+        # subsequent tiles only adds masked loads and loop state.
+        pipe = nsplit * bb < nb
+    _score_kernel[(nq, nsplit)](
+        iq,
+        ic,
+        block_tables,
+        block_tables.stride(0),
+        seq_id,
+        positions,
+        cq if cq is not None else iq,
+        out,
+        t,
+        nb,
+        triton.cdiv(nb, nsplit),
+        index_scale,
+        pool_temp,
+        INIT=init,
+        LOCAL=local,
+        CAUSAL=causal,
+        QT=qt,
+        BB=bb,
+        ROWS=rows,
+        POOL=rows == PAGE,
+        Q4=q4,
+        WL3=_words_layout(bb * rows, wm),
+        WM=wm,
+        PIPE=pipe,
+        SINGLE_SEQ=block_tables.shape[0] == 1,
+        QLDS=bool(qlds),  # q from shared memory: fewer registers, but slower on MI350
+        num_warps=NUM_WARPS,
+    )
+    return out
 
 
-def _score(
+def score(
     iq,
-    ic,
+    index_cache,
     block_tables,
     seq_id,
     positions,
@@ -600,269 +588,26 @@ def _score(
     init,
     local,
     pool_temp,
-    mode,
-    q4,
-    qt=None,
-    bb=None,
-    waves=None,
-    num_warps=4,
-    hw=None,
-    causal=False,
-    index_scale=1.0,
+    **kw,
 ):
-    """``causal``: leave the columns past each token's own block unwritten (a selection
-    that reads only the causal blocks needs no more). ``index_scale``: the scores' scale
-    (``ProVariants.index_scale``)."""
-    rows, raw = _layout(ic)
-    if mode == MODE_CENTROID:
-        assert rows == CENTROIDS, "centroid scores need a centroid cache"
-    else:
-        assert rows == PAGE, "this reading needs per-token pages"
-    t = iq.shape[0]
-    assert iq.shape[1:] == (IDX_HEADS, IDX_DIM) and iq.stride(-1) == 1
-    out = torch.empty(t, nb, dtype=torch.float32, device=iq.device)
-    if t == 0 or nb == 0:
-        return out
-    if qt is None:
-        qt = 1 if t <= 64 else 8
-    if bb is None:
-        # per-token pages: 8 blocks a dot for q tiles of up to 4 rows (decode, k3 verify),
-        # 4 for 8-row tiles (k7 verify, prefill) -- measured on MI350
-        bb = (8 if qt <= 4 else 4) if rows == PAGE else 16
-    if waves is None:
-        # programs a CU: a multi-row q tile (verify, prefill) costs more to set up, so give
-        # each program more tiles (measured on #67's verify points, MI350)
-        waves = 2 if qt > 1 else 4
-    nq = triton.cdiv(t, qt)
-    tiles = triton.cdiv(nb, bb)
-    cus, gfx950 = _dev_info(iq.device)
-    if hw is None:
-        hw = gfx950
-    nsplit = max(1, min(tiles, triton.cdiv(waves * cus, nq)))
-    _score_kernel[(nq, nsplit)](
-        iq,
-        iq.stride(0),
-        iq.stride(1),
-        ic,
-        ic.stride(0),
-        block_tables,
-        block_tables.stride(0),
-        seq_id,
-        positions,
-        cq if cq is not None else iq,
-        out,
-        out.stride(0),
-        t,
-        nb,
-        triton.cdiv(nb, nsplit),
-        index_scale * (IDX_DIM**-0.5 if mode == MODE_LSE else 1.0),
-        pool_temp,
-        init,
-        local,
-        CAUSAL=causal,
-        QT=qt,
-        BB=bb,
-        ROWS=rows,
-        MODE=mode,
-        Q4=q4,
-        HW=hw,
-        RAW=raw,
-        NI=IDX_HEADS,
-        DI=IDX_DIM,
-        num_warps=num_warps,
-    )
-    return out
-
-
-def _mode(ic):
-    return MODE_POOL4MAX if _rows_of(ic) == PAGE else MODE_CENTROID
-
-
-def score(iq, index_cache, block_tables, seq_id, positions, nb, cq, init, local, pool_temp, **kw):
-    """Block scores ``[T, nb]`` fp32 from an NVFP4 cache, q4k4 (the checkpoint's
-    ``sparse_index_q4k4``): the index q goes through NVFP4 in the kernel, by the same rule
-    as the keys. pool4 / max from per-token pages, or max over the 4 centroids of centroid
-    pages; heads max; pins and ``-inf`` applied. UT: ``PRO_NEW_INDEX_Q4=1``."""
+    """Score NVFP4 keys after group-16 NVFP4 query quantization."""
     return _score(iq, index_cache, block_tables, seq_id, positions, nb, cq, init, local,
-                  pool_temp, _mode(index_cache), True, **kw)  # fmt: skip
+                  pool_temp, True, **kw)  # fmt: skip
 
 
-def score_bf16q(iq, index_cache, block_tables, seq_id, positions, nb, cq, init, local, pool_temp, **kw):
-    """``score`` with the index q used as given (bf16, or already 4-bit from the prep).
-    UT: ``PRO_NEW_INDEX_Q4`` unset."""
-    return _score(iq, index_cache, block_tables, seq_id, positions, nb, cq, init, local,
-                  pool_temp, _mode(index_cache), False, **kw)  # fmt: skip
-
-
-def score_lse(iq, index_cache, block_tables, seq_id, positions, nb, cq, init, local, pool_temp, **kw):
-    """The lse / lse reading from per-token pages, q4k4: log-sum-exp of a block's visible
-    token dots / sqrt(128), then over the heads. UT: ``PRO_NEW_INDEX_Q4=1``."""
-    return _score(iq, index_cache, block_tables, seq_id, positions, nb, cq, init, local,
-                  pool_temp, MODE_LSE, True, **kw)  # fmt: skip
-
-
-def score_lse_bf16q(iq, index_cache, block_tables, seq_id, positions, nb, cq, init, local, pool_temp, **kw):
-    """``score_lse`` with the index q used as given. UT: ``PRO_NEW_INDEX_Q4`` unset."""
-    return _score(iq, index_cache, block_tables, seq_id, positions, nb, cq, init, local,
-                  pool_temp, MODE_LSE, False, **kw)  # fmt: skip
-
-
-def _select(iq, ic, block_tables, seq_id, positions, nb, cq, init, local, pool_temp, k, q4,
-            qt=None, bb=None, splits=None, waves=2, num_warps=4, hw=None,
-            index_scale=1.0):  # fmt: skip
-    rows, raw = _layout(ic)
-    mode = MODE_POOL4MAX if rows == PAGE else MODE_CENTROID
-    t = iq.shape[0]
-    assert iq.shape[1:] == (IDX_HEADS, IDX_DIM) and iq.stride(-1) == 1
-    assert k & (k - 1) == 0, "k must be a power of two"
-    sel = torch.empty(t, k, dtype=torch.int32, device=iq.device)
-    if t == 0:
-        return sel
-    if qt is None:
-        qt = 1 if t <= 64 else 8
-    if bb is None:
-        bb = 4 if rows == PAGE else 16
-    bb = min(bb, k)
-    cus, gfx950 = _dev_info(iq.device)
-    if hw is None:
-        hw = gfx950
-    nq = triton.cdiv(t, qt)
-    if splits is None:  # enough programs for the GPU, at most 16 strided parts to merge
-        splits = max(1, min(16, triton.cdiv(waves * cus, nq), triton.cdiv(nb, k)))
-    final = splits == 1
-    out = sel if final else torch.empty(t, splits, k, dtype=torch.int64, device=iq.device)
-    _select_kernel[(nq, splits)](
-        iq,
-        iq.stride(0),
-        iq.stride(1),
-        ic,
-        ic.stride(0),
-        block_tables,
-        block_tables.stride(0),
-        seq_id,
-        positions,
-        cq if cq is not None else iq,
-        out,
-        out.stride(0),
-        t,
-        nb,
-        index_scale,
-        pool_temp,
-        init,
-        local,
-        FINAL=final,
-        K=k,
-        QT=qt,
-        BB=bb,
-        ROWS=rows,
-        MODE=mode,
-        Q4=q4,
-        HW=hw,
-        RAW=raw,
-        NI=IDX_HEADS,
-        DI=IDX_DIM,
-        num_warps=num_warps,
-    )
-    if not final:
-        _merge_kernel[(t,)](out, sel, splits, K=k, NS2=triton.next_power_of_2(splits))
-    return sel
-
-
-def select(iq, index_cache, block_tables, seq_id, positions, nb, cq, init, local, pool_temp, k, **kw):
-    """Scores fused with the top-k, q4k4: each token's ``k`` best causal blocks as logical
-    block indices ``[T, k]`` int32 (-1 = unused; equal scores: the lower block), without
-    writing the ``[T, nb]`` scores. Programs split the blocks into at most 16 ranges when the
-    q tiles alone do not fill the GPU; ``_merge_kernel`` then reduces their
-    ``[T, ranges, k]`` keys. UT: ``PRO_NEW_INDEX_Q4=1``."""
-    return _select(iq, index_cache, block_tables, seq_id, positions, nb, cq, init, local,
-                   pool_temp, k, True, **kw)  # fmt: skip
-
-
-def select_bf16q(iq, index_cache, block_tables, seq_id, positions, nb, cq, init, local, pool_temp, k, **kw):
-    """``select`` with the index q used as given. UT: ``PRO_NEW_INDEX_Q4`` unset."""
-    return _select(iq, index_cache, block_tables, seq_id, positions, nb, cq, init, local,
-                   pool_temp, k, False, **kw)  # fmt: skip
-
-
-# ------------------------------------------------------------------------------ write --
-@triton.jit
-def _write_kernel(
-    keys_ptr,
-    pages_ptr,
-    cq_ptr,
-    ic_ptr,
-    s_ic,
+def score_bf16q(
+    iq,
+    index_cache,
+    block_tables,
+    seq_id,
+    positions,
+    nb,
+    cq,
+    init,
+    local,
     pool_temp,
-    ROWS: tl.constexpr,
-    BF16_OUT: tl.constexpr,
-    DI: tl.constexpr,
+    **kw,
 ):
-    """One full block: its 16 keys -> per-token NVFP4 rows, or its 4 softmax-pooled
-    centroids -> NVFP4 rows or bf16."""
-    p = tl.program_id(0)
-    page = tl.load(pages_ptr + p).to(tl.int64)
-    r = tl.arange(0, 16)
-    d = tl.arange(0, DI)
-    k = tl.load(keys_ptr + p.to(tl.int64) * (16 * DI) + r[:, None] * DI + d[None, :])
-    k = k.to(tl.float32)
-    if ROWS == 4:
-        cq = tl.load(cq_ptr + d).to(tl.float32)
-        lg = tl.reshape(tl.sum(k * cq[None, :], axis=1) * pool_temp, (4, 4))
-        e = tl.exp(lg - tl.max(lg, axis=1)[:, None])
-        w = e / tl.sum(e, axis=1)[:, None]
-        x = tl.sum(tl.reshape(k, (4, 4, DI)) * w[:, :, None], axis=1)
-    else:
-        x = k
-    base = ic_ptr + page * s_ic
-    ro = tl.arange(0, ROWS)
-    if BF16_OUT:
-        tl.store(base + ro[:, None] * DI + d[None, :], x.to(tl.bfloat16))
-    else:
-        g = tl.reshape(x, (ROWS, DI // 16, 16))
-        a = tl.abs(g)
-        s8 = _nvfp4_scale(tl.max(a, axis=2))
-        c = _e2m1_code(a, s8.to(tl.float32)[:, :, None])
-        nib = tl.reshape(c | ((g < 0).to(tl.int32) << 3), (ROWS, DI // 2, 2))
-        lo, hi = tl.split(nib)
-        cb = tl.arange(0, DI // 2)
-        tl.store(base + ro[:, None] * (DI // 2) + cb[None, :], (lo | (hi << 4)).to(tl.uint8))
-        gb = tl.arange(0, DI // 16)
-        tl.store(
-            base + ROWS * (DI // 2) + ro[:, None] * (DI // 16) + gb[None, :],
-            s8.to(tl.uint8, bitcast=True),
-        )
-
-
-def write(keys, pages, cq, pool_temp, index_cache):
-    """Write full blocks: ``keys [P, 16, 128]`` bf16 into physical pages ``pages [P]`` of
-    ``index_cache``: NVFP4 per-token pages ``[N, 1152]``, NVFP4 centroid pages
-    ``[N, 288]``, bf16 centroids ``[N, 4, 128]``, or the keys themselves into a bf16 / fp8
-    ``[N, 16, 128]`` cache (fp8: clamped to its range, no scale)."""
-    if index_cache.dtype in RAW_DTYPES and index_cache.shape[1] == PAGE:
-        v = keys.float()
-        if index_cache.dtype != torch.bfloat16:
-            fmax = torch.finfo(index_cache.dtype).max
-            v = v.clamp(-fmax, fmax)
-        index_cache[pages.long()] = v.to(index_cache.dtype)
-        return
-    if index_cache.dtype == torch.bfloat16:
-        assert index_cache.shape[1:] == (CENTROIDS, IDX_DIM)
-        rows, bf16_out = CENTROIDS, True
-    else:
-        rows, bf16_out = _rows_of(index_cache), False
-    p = keys.shape[0]
-    if p == 0:
-        return
-    keys = keys.contiguous()
-    _write_kernel[(p,)](
-        keys,
-        pages,
-        cq,
-        index_cache,
-        index_cache.stride(0),
-        pool_temp,
-        ROWS=rows,
-        BF16_OUT=bf16_out,
-        DI=IDX_DIM,
-        num_warps=4,
-    )
+    """Score NVFP4 keys using bf16 queries directly."""
+    return _score(iq, index_cache, block_tables, seq_id, positions, nb, cq, init, local,
+                  pool_temp, False, **kw)  # fmt: skip
