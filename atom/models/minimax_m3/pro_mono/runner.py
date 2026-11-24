@@ -21,9 +21,10 @@ The lookahead goes where ``ProLookaheadState.put`` would put it
 (``ffn_out`` in its ABI) and the segment skips production's MoE; a "norm"
 build hands its (x, x8) to production's MoE instead. Switching is this one
 constant. An "ffn" build reads each layer's FFN weights through ``moe_w``, a
-device table of their addresses (``layout.MOE_WEIGHTS`` order) made once at
-bind time, and stages the routed mids (and, W4A4, x as MXFP4) in ``plain``
-(and, A16W4, the K halves' gate / up partials in ``scratch``).
+device table of their addresses and the layer's work-queue word
+(``layout.MOE_TABLE`` order) made once, past the scratch allocation, and
+stages the routed mids (and, W4A4, x as MXFP4) in ``plain`` (and, A16W4, the
+K halves' gate / up partials in ``scratch``).
 
 Steps: ``begin_step`` (the mailboxes zeroed, the peer fence) once a forward, at
 its first MoE layer, on the current stream, so a decode graph records it.
@@ -41,7 +42,7 @@ on from mono's.
 """
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import torch
 from aiter.dist.parallel_state import (
@@ -61,6 +62,7 @@ from atom.models.minimax_m3.pro_mono.layout import (
     P1Build,
     peer_bytes,
     plain_bytes,
+    queue_word_offset,
     scratch_bytes,
     scratch_layout,
 )
@@ -112,11 +114,12 @@ LOOKAHEAD_OUTPUTS = ("la8", "la8s")
 class MonoLayer:
     """A bound MoE layer: its operands, the layer whose indexer reads its
     lookahead (None: no reader), the device table of its FFN operands'
-    addresses (``moe_w``) and its build's kind."""
+    addresses and its queue word (``moe_w``; None until the scratch is
+    allocated) and its build's kind."""
 
     w: ProMoeLayer
     reader: int | None
-    moe_w: torch.Tensor
+    moe_w: torch.Tensor | None
 
     @property
     def kind(self) -> tuple:
@@ -152,6 +155,9 @@ class ProMonoRunner:
         self.debug = envs.ATOM_MONO_DEBUG
         bind_agreed(lambda: self._bind(layers, state), group)
         self._allocate(group)
+        for lid, lw in self.layers.items():
+            queue = self.scratch.data_ptr() + queue_word_offset(self.scratch_key, lid)
+            self.layers[lid] = replace(lw, moe_w=moe_table(lw.w, self.dev, queue))
         self.builds = WidthBuilds(
             self._build_width,
             lambda built: [(launch, ABI) for launch in built.values()],
@@ -184,7 +190,7 @@ class ProMonoRunner:
                 )
             ahead = state.norms[reader] if reader is not None else None
             w = bind_layer(layer, DIMS, self.rank, ahead)
-            self.layers[lid] = MonoLayer(w, reader, moe_table(w, self.dev))
+            self.layers[lid] = MonoLayer(w, reader, None)
         if not self.layers:
             raise MonoUnsupported("no MoE layer")
         self.first = min(self.layers)
@@ -196,6 +202,7 @@ class ProMonoRunner:
         self.peers, self._finalizer = owned_peer_buffer(
             self, peer_bytes(), group, self.rank, DIMS.tp, self.dev
         )
+        self.scratch_key = key
         self.scratch = uncached_bytes(scratch_bytes(key), self.dev)
         self.plain = uncached_bytes(plain_bytes(key), self.dev)
         self.diag = (
@@ -334,12 +341,13 @@ class ProMonoRunner:
         raise_if_given_up(WHAT, self.rank, rows, waits, self.mailboxes)
 
 
-def moe_table(w: ProMoeLayer, dev: torch.device) -> torch.Tensor:
-    """The kernel's ``moe_w``: ``w``'s FFN operand addresses, i64 in
-    ``layout.MOE_WEIGHTS`` order (the tensors are the model's parameters, so
-    the addresses hold for the runner's life)."""
+def moe_table(w: ProMoeLayer, dev: torch.device, queue: int) -> torch.Tensor:
+    """The kernel's ``moe_w``: ``w``'s FFN operand addresses, then the
+    layer's queue word ``queue``, i64 in ``layout.MOE_TABLE`` order (the
+    tensors are the model's parameters and the word is in the runner's
+    scratch, so the addresses hold for the runner's life)."""
     return torch.tensor(
-        [getattr(w, name).data_ptr() for name in MOE_WEIGHTS],
+        [getattr(w, name).data_ptr() for name in MOE_WEIGHTS] + [queue],
         dtype=torch.int64,
         device=dev,
     )

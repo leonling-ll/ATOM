@@ -526,6 +526,7 @@ def build(key: P1Build):
         cand: fx.Array[fx.Int32, 2 * slots, 16]
         csig: fx.Array[fx.Float32, slots, 16]
         scan: fx.Array[fx.Int32, WAVES, 16]
+        claim: fx.Array[fx.Int32, 4, 16]
 
     @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
     def p1_layer(
@@ -609,7 +610,7 @@ def build(key: P1Build):
                 "smsc": fl.smsc.ptr,
                 "contrib": fl.contrib.ptr, "cand": fl.cand.ptr,
                 "csig": fl.csig.ptr, "scan": fl.scan.ptr,
-                "nvalid": nvalid,
+                "claim": fl.claim.ptr, "nvalid": nvalid,
                 "rt": {
                     "route": fl.route.ptr, "mask": fl.mask.ptr,
                     "slot": fl.slot.ptr, "expert": fl.expert.ptr,

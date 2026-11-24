@@ -211,8 +211,10 @@ def _worker(rank, port, queue, done, inputs):
             "w2": routed["w2"], "s2": routed["s2"], "w_sgu": shared["w_sgu"],
             "s_sgu": shared["s_sgu"], "w_sd": shared["w_sd"], "s_sd": shared["s_sd"],
         }  # fmt: skip
+        addrs = {n: t.data_ptr() for n, t in table.items()}
+        addrs["queue"] = scratch.data_ptr() + L.queue_word_offset(keys[0], LAYER)
         moe_w = torch.tensor(
-            [table[n].data_ptr() for n in L.MOE_WEIGHTS], dtype=torch.int64, device=dev
+            [addrs[n] for n in L.MOE_TABLE], dtype=torch.int64, device=dev
         )
         deq = {}
 

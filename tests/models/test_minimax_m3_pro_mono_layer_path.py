@@ -8,7 +8,7 @@
 * a MoE layer the route takes: the attention stops before o_proj and the
   runner's segment returns the layer's (FFN partial, residual);
 * the launch (``ProMonoRunner.launch``, the compiled kernel faked): every
-  ABI argument by name, the layer's ``moe_w`` table in ``MOE_WEIGHTS`` order;
+  ABI argument by name, the layer's ``moe_w`` table in ``MOE_TABLE`` order;
 * the segment (``ProMonoRunner.segment``, its launch faked): the lookahead in
   ``resid_in[L + 2]`` as MXFP8, production's MoE on the kernel's (x, x8) under
   ``upto = "norm"`` and none when the build writes the FFN; check mode runs
@@ -285,25 +285,33 @@ def _bound():
 
 
 def test_moe_table_holds_the_operands_in_the_kernels_order():
-    from atom.models.minimax_m3.pro_mono.layout import MOE_WEIGHTS
+    from atom.models.minimax_m3.pro_mono.layout import MOE_TABLE, MOE_WEIGHTS
 
     w = _bound()
-    table = runner_mod.moe_table(w, torch.device("cpu"))
+    table = runner_mod.moe_table(w, torch.device("cpu"), 12345)
     assert table.dtype == torch.int64
-    assert table.tolist() == [getattr(w, n).data_ptr() for n in MOE_WEIGHTS]
-    assert len(set(table.tolist())) == len(MOE_WEIGHTS)
+    want = [getattr(w, n).data_ptr() for n in MOE_WEIGHTS] + [12345]
+    assert table.tolist() == want and len(want) == len(MOE_TABLE)
+    assert MOE_TABLE[-1] == "queue" and len(set(table.tolist())) == len(MOE_TABLE)
 
 
 @pytest.mark.parametrize("reader", [6, None])
 def test_launch_passes_every_abi_argument(monkeypatch, reader):
-    from atom.models.minimax_m3.pro_mono.layout import DIMS, HIDDEN
+    from atom.models.minimax_m3.pro_mono.layout import (
+        DIMS,
+        HIDDEN,
+        P1Build,
+        queue_word_offset,
+    )
 
     w = _bound()
     r = runner_mod.ProMonoRunner.__new__(runner_mod.ProMonoRunner)
     r.debug, r.rank, r.first, r.last = False, 3, 4, 4
-    table = runner_mod.moe_table(w, torch.device("cpu"))
-    r.layers = {4: runner_mod.MonoLayer(w=w, reader=reader, moe_w=table)}
+    r.scratch_key = P1Build(tokens=1, upto="ffn")
     r.scratch = torch.zeros(16, dtype=torch.uint8)
+    queue = r.scratch.data_ptr() + queue_word_offset(r.scratch_key, 4)
+    table = runner_mod.moe_table(w, torch.device("cpu"), queue)
+    r.layers = {4: runner_mod.MonoLayer(w=w, reader=reader, moe_w=table)}
     r.plain = torch.zeros(32, dtype=torch.uint8)
     r.peers = SimpleNamespace(addresses=torch.zeros(8, dtype=torch.int64))
     steps = []

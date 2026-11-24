@@ -124,19 +124,23 @@ def test_ffn_regions_are_disjoint_and_sized(debug, act):
     assert (L.smid_pair(t, L.INTER_S - 2) + 1) * 8 == s["smid"][1]
     assert s["ugf"][1] == L.max_u(MAX_ROWS_LAYOUT) * L.UG_GROUPS * 8
     assert s["xrdy"][1] == L.NT * 8
-    # A16W4's K-half partials: two pairs a (pick row, mid column), last, so
-    # every other region sits where the other formats' do
+    # A16W4's K-half partials: two pairs a (pick row, mid column), the last
+    # pairs (only the queue words past them), so every other pair region sits
+    # where the other formats' do
+    pairs = {k: v for k, v in s.items() if k != "queue"}
     if act == "bf16":
         assert (L.ugp_pair(MAX_ROWS_LAYOUT * L.TOPK - 1, L.UG_GROUPS - 1, 31) + 2) * (
             8
         ) == s["ugp"][1]
-        assert max(o for o, _ in s.values()) == s["ugp"][0]
+        assert max(o for o, _ in pairs.values()) == s["ugp"][0]
     else:
         assert "ugp" not in s
     other = L.scratch_layout(
         L.P1Build(tokens=MAX_ROWS, upto="ffn", debug=debug, routed_act="fp4")
     )
-    assert {k: v for k, v in s.items() if k != "ugp"} == other
+    assert {k: v for k, v in pairs.items() if k != "ugp"} == {
+        k: v for k, v in other.items() if k != "queue"
+    }
     p = L.plain_layout(key)
     if act == "fp4":
         assert p["x4"][1] == MAX_ROWS_LAYOUT * HIDDEN // 2
@@ -156,6 +160,176 @@ def test_ffn_regions_are_disjoint_and_sized(debug, act):
     # a norm build has none of them
     norm = L.P1Build(tokens=MAX_ROWS)
     assert L.plain_layout(norm) == {} and "route" not in L.scratch_layout(norm)
+
+
+@pytest.mark.parametrize("act", ROUTED_ACTS)
+def test_the_queue_words_are_their_own_and_zeroed_with_the_step(act):
+    """A launch tag's queue words (one a task list: A16W4 two, the kernel's
+    list h at the first + 4 h) lie in ``scratch`` (the step's zeroing clears
+    them) past every tagged pair, apart for every layer the runner launches."""
+    key = L.P1Build(tokens=1, upto="ffn", routed_act=act)
+    lay = L.scratch_layout(key)
+    q0, qn = lay["queue"]
+    assert all(o + n <= q0 for name, (o, n) in lay.items() if name != "queue")
+    lists = L.ug_split(act)
+    words = [
+        L.queue_word_offset(key, layer) + 4 * h
+        for layer in range(L.LAYERS)
+        for h in range(lists)
+    ]
+    assert len(set(words)) == L.LAYERS * lists
+    assert min(words) >= q0 and max(words) + 4 <= q0 + qn <= L.scratch_bytes(key)
+    with pytest.raises(ValueError):
+        L.queue_word_offset(key, L.LAYERS)
+    assert L.MOE_TABLE == L.MOE_WEIGHTS + ("queue",)
+    assert "queue" not in L.scratch_layout(L.P1Build(tokens=1))
+
+
+def test_only_a_one_row_build_places_its_routed_tasks():
+    """A 1-row build takes no queue claim (they cost its layer 2.5 us on GPU,
+    v1tuned_1123T1524): its union's ug tasks fit the first round, so placing
+    them balances nothing less, and the placed down tasks (CTA d mod BLOCKS)
+    cover all of them. Every wider build takes its tasks from the queue."""
+    assert not L.queued(1)
+    assert all(L.queued(s) for s in range(2, MAX_ROWS + 1))
+    assert L.max_u(1) * L.UG_GROUPS * L.ug_split("bf16") <= BLOCKS
+    assert sorted(
+        b + BLOCKS * i
+        for b in range(BLOCKS)
+        for i in range(-(-L.DOWN_TASKS // BLOCKS))
+        if b + BLOCKS * i < L.DOWN_TASKS
+    ) == list(range(L.DOWN_TASKS))
+
+
+@pytest.mark.parametrize("act", ROUTED_ACTS)
+def test_the_task_lists_place_one_entry_a_cta(act):
+    """Each task list's first round is placed one entry a CTA (A16W4: list h,
+    every CTA of it a half-h CTA, the half it stages); the lists' down tasks
+    are every down task once."""
+    lists, per = L.ug_split(act), L.list_ctas(act)
+    assert lists * per == BLOCKS
+    placed = [L.task_list(bid, act) for bid in range(BLOCKS)]
+    assert sorted(placed) == [(h, k) for h in range(lists) for k in range(per)]
+    for bid, (h, k) in enumerate(placed):
+        # A16W4: the CTA's placed task 2 k + h (``first_ug``) is pair k's half h
+        assert L.first_ug(bid) == lists * k + h
+    for ug in (0, 7, 80):
+        downs = [
+            L.list_down(ug + j, ug, h, act)
+            for h in range(lists)
+            for j in range(-(-L.DOWN_TASKS // lists))
+        ]
+        assert sorted(d for d in downs if d < L.DOWN_TASKS) == list(range(L.DOWN_TASKS))
+
+
+def _run_lists(act, nu, queued, seed):
+    """A model of ``ffn.run_ug`` / ``ffn.run_down``'s schedule. A CTA's loop
+    iteration is two steps: first (never blocking) it claims the list entry
+    after next and publishes its previous ug task's flag; then it waits where
+    the kernel waits -- an A16W4 half-0 task for its pair's half-1 partials
+    -- and finishes the task. Before its first down task a CTA waits for
+    every pair's flag. CTAs step in a random order. Returns the tasks run in
+    order; raises on a deadlock (no CTA can step)."""
+    import random
+
+    rnd = random.Random(seed)
+    lists, per = L.ug_split(act), L.list_ctas(act)
+    ug = nu * L.UG_GROUPS
+    counts = [0] * lists
+    partial, flag, ran = set(), set(), []
+
+    def claim(h):
+        counts[h] += 1
+        return per + counts[h] - 1
+
+    ctas = []
+    for bid in range(BLOCKS):
+        h, k0 = L.task_list(bid, act)
+        held = [k0, claim(h)] if queued else [k0, k0 + per]
+        ctas.append({"h": h, "held": held, "prev": None, "mid": False, "down": 0})
+
+    def step(c):
+        """One step of CTA c, or False where it blocks."""
+        h, k = c["h"], c["held"][0]
+        if k >= ug and c["down"] == 0:
+            # run_down's wait_ug, the ug loop's last flag out before it
+            if len(flag) < ug:
+                return False
+            c["down"] = 1
+            return True
+        if not c["mid"]:
+            c["held"].append(claim(h) if queued else c["held"][-1] + per)
+            if c["prev"] is not None:
+                flag.add(c["prev"])
+                c["prev"] = None
+            c["mid"] = True
+            return True
+        if k < ug and lists == 2 and h == 0 and k not in partial:
+            return False
+        c["mid"] = False
+        c["held"].pop(0)
+        if k >= ug:
+            ran.append(("down", L.list_down(k, ug, h, act)))
+            return True
+        ran.append(("ug", h, k))
+        if lists == 2 and h == 1:
+            partial.add(k)
+        else:
+            c["prev"] = k
+        if c["held"][0] >= ug and c["prev"] is not None:
+            # the loop's end publishes the last flag
+            flag.add(c["prev"])
+            c["prev"] = None
+        return True
+
+    def done(c):
+        k = c["held"][0]
+        if k < ug or c["mid"]:
+            return False
+        # a placed build's down tasks are CTA d mod BLOCKS's (not modelled)
+        return not queued or L.list_down(k, ug, c["h"], act) >= L.DOWN_TASKS
+
+    while True:
+        live = [c for c in ctas if not done(c)]
+        if not live:
+            break
+        rnd.shuffle(live)
+        # a random subset steps (every one of them: no short cut), else all
+        stepped = [step(c) for c in live[: rnd.randint(1, len(live))]]
+        if not any(stepped) and not any([step(c) for c in live]):  # noqa: C419
+            raise RuntimeError(f"deadlock: {len(ran)} tasks run")
+    return ran
+
+
+@pytest.mark.parametrize("act", ROUTED_ACTS)
+@pytest.mark.parametrize("nu", [1, 4, 13, 48])
+def test_the_queued_lists_run_every_task_once_and_never_deadlock(act, nu):
+    """With claims a task ahead and CTAs at any relative speed, every ug task
+    (A16W4: every pair's two halves) and every down task runs once, and no
+    wait blocks for good: a half-1 task waits for nothing and runs on a
+    half-1 CTA, so the half-0 waits end (``layout.task_lists``)."""
+    lists = L.ug_split(act)
+    for seed in range(3):
+        ran = _run_lists(act, nu, True, seed)
+        ugs = [r for r in ran if r[0] == "ug"]
+        assert sorted(ugs) == sorted(
+            ("ug", h, k) for h in range(lists) for k in range(nu * L.UG_GROUPS)
+        )
+        assert sorted(r[1] for r in ran if r[0] == "down") == list(range(L.DOWN_TASKS))
+
+
+@pytest.mark.parametrize("act", ROUTED_ACTS)
+def test_a_placed_one_row_build_runs_every_ug_task_once(act):
+    """The 1-row build's placed lists (no claim): every ug task once, in one
+    round, without a deadlock (its down tasks are CTA d mod BLOCKS's)."""
+    nu = L.max_u(1)
+    lists = L.ug_split(act)
+    assert nu * L.UG_GROUPS <= L.list_ctas(act)
+    for seed in range(3):
+        ran = _run_lists(act, nu, False, seed)
+        assert sorted(r for r in ran if r[0] == "ug") == sorted(
+            ("ug", h, k) for h in range(lists) for k in range(nu * L.UG_GROUPS)
+        )
 
 
 def test_ffn_build_key_and_contract_table():
@@ -212,7 +386,7 @@ def test_ffn_lds_fits_at_the_widest_build(act):
         s * xs_row + s * L.OSC_ROW + WAVES * 64 * 4 + L.O_ROWS * s + 2 * 11
         + x4l + xsl + s * L.SMSC_WORDS
         + s * L.TOPK * L.DOWN_ROWS + s * 2 * L.TOPK + 2 * EXPERTS
-        + 2 * L.max_u(s) + 1 + s * L.TOPK + 3 * (128 + 16) + WAVES
+        + 2 * L.max_u(s) + 1 + s * L.TOPK + 3 * (128 + 16) + WAVES + 4
     )  # fmt: skip
     assert 4 * words <= LDS_BYTES
     if act == "bf16":
@@ -256,29 +430,6 @@ def test_a16w4_operands_follow_the_w13_and_w2_tiles():
     for g, col in itertools.product(range(L.UG_GROUPS), range(0, L.UG_COLS, 2)):
         assert 2 * L.interb_word(0, g, col) == L.UG_COLS * g + col
     assert L.interb_word(1, 0, 0) == L.INTERB_WORDS == L.INTER_V // 2
-
-
-@pytest.mark.parametrize("nu", [1, 4, 13, 64])
-def test_a16w4_tasks_split_k_halves_over_ctas(nu):
-    """Task 2 p + h of A16W4 is ug pair p's K half h: every task is one CTA's,
-    a CTA's tasks (``BLOCKS`` apart) are all of one half, so a pair's two
-    halves are on two CTAs -- and the half-0 task's wait for the half-1 task's
-    partials never waits on a later task of its own CTA."""
-    total = nu * L.UG_GROUPS * L.ug_split("bf16")
-    owner = {}
-    for bid in range(BLOCKS):
-        task = L.first_ug(bid)
-        halves = set()
-        while task < total:
-            assert task not in owner
-            owner[task] = bid
-            halves.add(task % 2)
-            task += BLOCKS
-        assert len(halves) <= 1 and halves <= {L.first_ug(bid) & 1}
-    assert sorted(owner) == list(range(total))
-    for p in range(nu * L.UG_GROUPS):
-        assert owner[2 * p] != owner[2 * p + 1]
-    assert L.ug_split("fp8") == L.ug_split("fp4") == 1
 
 
 # ------------------------------------------------------------ the reference

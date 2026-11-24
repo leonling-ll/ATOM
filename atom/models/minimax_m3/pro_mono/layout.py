@@ -36,14 +36,23 @@ build's the bf16 x)::
     union   every CTA: ``route`` -> the union U of the real rows' experts and
             their picks (LDS), the routed B operand (x4, x8, or A16W4 the
             CTA's K half of the bf16 x) -> LDS
-    ug      |U| x UG_GROUPS tasks round-robin: 32 gate + 32 up rows of an
+    ug      |U| x UG_GROUPS tasks, the first round placed and the rest from
+            the launch's work queue (``MOE_TABLE``), each CTA's weights
+            streaming from one task into the next: 32 gate + 32 up rows of an
             expert (MXFP4) against its picks -> SwiGLU-OAI -> bf16 -> MXFP4
             (W4A4), MXFP8 (W4A8) or bf16 (A16W4) mid rows (plain ``inter`` /
             ``isc``, a task's ``ugf`` flag). A16W4 splits each task over the
-            K halves (``ug_split``): the half-1 task sends its fp32 gate / up
-            partials (``ugp``), the half-0 task adds them to its own and
-            finishes the task
-    down    DOWN_TASKS (16 hidden rows): w2 of every expert of U against its
+            K halves (``ug_split``), a task list and a queue word a half, a
+            CTA's tasks all of its half (``task_lists``): the half-1 task
+            sends its fp32 gate / up partials (``ugp``), the half-0 task adds
+            them to its own and finishes the task
+    down    DOWN_TASKS (16 hidden rows), the task list's entries past the ug
+            tasks (the same queue: a CTA that drew fewer or faster ug tasks
+            takes more down tasks, so the 448 fill no rounds of their own;
+            A16W4 deals them to its two lists alternately; a 1-row build
+            places ug and down tasks round-robin, ``queued``), each CTA's
+            next task's first w2 batch in flight under the one before; every
+            ug flag polled once: w2 of every expert of U against its
             picks' mids -> bf16(w acc) a pick, summed in top-k order -> bf16;
             the shared down (MXFP8 of ``smid``) -> bf16; bf16(routed + shared)
             -> ``ffn_out`` [S, 7168], this rank's FFN partial (a padding
@@ -56,6 +65,7 @@ Every peer region is sized for ``MAX_ROWS_LAYOUT`` rows whatever the build's
 token count, so a wider build changes no offset.
 """
 
+import functools
 from dataclasses import dataclass, field
 
 from atom.models.minimax_m3.pro_mono.config import (
@@ -63,6 +73,7 @@ from atom.models.minimax_m3.pro_mono.config import (
     EPS,
     EXPERTS,
     HIDDEN,
+    LAYERS,
     MAX_ROWS,
     MAX_ROWS_LAYOUT,
     MX_GROUP,
@@ -198,17 +209,57 @@ UG_FIRST_CTA = SH0 + SH_TASKS
 
 
 def first_ug(bid):
-    """CTA ``bid``'s first ug task (its next ones ``BLOCKS`` apart; ints or
-    traced values)."""
+    """CTA ``bid``'s placed ug task, an index of the step's first round (one a
+    CTA, index 0 on ``UG_FIRST_CTA``; ints or traced values). A16W4: index
+    2 p + h is ug pair p's K half h."""
     return (bid + (BLOCKS - UG_FIRST_CTA)) & (BLOCKS - 1)
 
 
+# A step's routed tasks, per CTA (``ffn.run_ug`` / ``ffn.run_down``): a task
+# list, its entries k the union's ug pairs (k < |U| x UG_GROUPS) then down
+# tasks. W4A4 / W4A8 have one list; A16W4 one a K half (``ug_split``): list h
+# is half h of every pair, and its CTAs stage only that half of x. A list's
+# first round (``list_ctas`` entries) is placed, a CTA each (``task_list``);
+# a queued build (``queued``) takes the later entries from the list's queue
+# word, a narrow one takes every ``list_ctas``-th.
+#
+# Why A16W4's half-0 tasks, which wait for their pair's half-1 partials, never
+# deadlock: a half-1 task waits for nothing (x is staged before any ug task),
+# and the half-1 tasks are list 1's, whose CTAs run no half-0 task; so every
+# half-1 task a CTA claims (or is placed) ends, however many tasks every CTA
+# holds claimed ahead, and the half-0 waits end with them. A down task waits
+# for every pair's flag: the half-0 tasks, which end. One list in claim order
+# (a pair's half 1 before its half 0) would also be deadlock-free, but a CTA
+# could then draw either half and would have to stage x's other half (as many
+# bytes as the task's weights) in between.
+
+
+def list_ctas(act: str) -> int:
+    """The CTAs of a task list: BLOCKS / ``ug_split``."""
+    return BLOCKS // ug_split(act)
+
+
+def task_list(bid, act: str):
+    """CTA ``bid``'s (task list, placed entry): A16W4 (``first_ug`` % 2, its
+    K half; ``first_ug`` / 2, its pair), else (0, ``first_ug``); ints or
+    traced values."""
+    t = first_ug(bid)
+    if ug_split(act) == 2:
+        return t & 1, t >> 1
+    return 0, t
+
+
+def list_down(k, ug_tasks, lst, act: str):
+    """The down task of list ``lst``'s entry k past its ``ug_tasks`` ug ones:
+    A16W4's two lists take every other down task (list h: h, h + 2, ..)."""
+    return (k - ug_tasks) * ug_split(act) + lst
+
+
 assert UG_GROUPS * UG_COLS == INTER_V and INTER_V % 128 == 0
-# A16W4: a CTA's ug tasks are all of one K half (tasks a CTA apart are
-# ``BLOCKS`` apart) and a quarter's steps start on an even step (two steps a
-# w13 scale word)
+# A16W4: a CTA's ug tasks are all of one K half (its task list's) and a
+# quarter's steps start on an even step (two steps a w13 scale word)
 assert BLOCKS % 2 == 0 and W13_Q % 2 == 0 and 2 * W13_Q == W13_HALF
-assert R_KLEN == 1024 and SH0 + SH_TASKS <= RT0 and DOWN_TASKS <= 2 * BLOCKS
+assert R_KLEN == 1024 and SH0 + SH_TASKS <= RT0
 assert UG_COLS * MAX_ROWS <= THREADS and SH_ROWS * MAX_ROWS <= THREADS
 
 
@@ -276,6 +327,12 @@ ABI_NAMES = (
 MOE_WEIGHTS = (
     "w_gate", "bias", "w13", "s13", "w2", "s2", "w_sgu", "s_sgu", "w_sd", "s_sd",
 )  # fmt: skip
+# ``moe_w``'s entries: the weights, then the layer's work-queue word
+# (``queue_word_offset`` into the runner's ``scratch``, so the step's zeroing
+# clears it). In the table, not a kernel argument: an argument's SGPRs are
+# held from the kernel's start, and the 2-pass all-reduce builds had none to
+# spare.
+MOE_TABLE = MOE_WEIGHTS + ("queue",)
 
 
 @dataclass(frozen=True)
@@ -405,7 +462,46 @@ def scratch_layout(key: P1Build) -> dict:
             *((("ugp", L * TOPK * UG_GROUPS * UG_COLS * 2),) if bf16 else ()),
         )
         lay |= pair_layout(items, align=16, start=start)
+        # the work queues: an i32 count a task list and launch tag, plain words
+        # in a region no pair shares (the step's zeroing clears them with the
+        # pairs)
+        end = max(o + n for o, n in lay.values())
+        words = QUEUE_TAGS * ug_split(key.routed_act)
+        lay |= byte_layout((("queue", words * 4),), start=end)
     return lay
+
+
+# the routed stage's work queues (``ffn.run_ug`` then ``ffn.run_down``): an
+# i32 a task list (A16W4: two, list order) and launch tag (``Mailbox``: layer
+# + 1), counting the list's ug / down tasks taken past its first round
+QUEUE_TAGS = LAYERS + 1
+# a narrower build places its routed tasks instead (``queued``)
+QUEUE_MIN_ROWS = 2
+
+
+def queued(tokens: int) -> bool:
+    """Whether a ``tokens``-row FFN build takes its routed tasks past the
+    first round from the launch's queue, or places them as before the queue:
+    list entry k on the CTA ``task_list`` puts it at, k + ``list_ctas`` on
+    the same one, down task d on CTA d mod BLOCKS (no atomic). At one row the
+    union (|U| <= 4: 80 ug pairs, a list's) fits the first round, nothing is
+    left to balance, and the queue's claims, an agent-scope atomic every CTA
+    on one word, cost the layer 2.5 us (v1tuned_1123T1524, W4A4 kernel slope
+    32.94 -> 35.42 us, the ug stage's median CTA 0.1 -> 3.9 us)."""
+    return tokens >= QUEUE_MIN_ROWS
+
+
+@functools.cache
+def queue_word_offset(key: P1Build, layer: int) -> int:
+    """The byte offset in ``scratch`` of launch ``layer``'s first queue word
+    (its task lists' words follow it, ``ug_split`` of them): computed on the
+    host and handed to the kernel in its ``moe_w`` table (``MOE_TABLE``;
+    ``atom.mono.device.queue``: never ``tag * 4`` inside a kernel; the kernel
+    adds only its list's 4 h)."""
+    if not 0 <= layer < LAYERS:
+        raise ValueError(f"layer {layer} outside 0 .. {LAYERS - 1}")
+    words = ug_split(key.routed_act)
+    return scratch_layout(key)["queue"][0] + (layer + 1) * words * 4
 
 
 def scratch_bytes(key: P1Build) -> int:
