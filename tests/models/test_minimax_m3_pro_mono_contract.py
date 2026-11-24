@@ -19,6 +19,12 @@ from atom.mono.plan.trace import Space
 
 # one row, one 8-row DSpark k7 verify, and the widest build (two token passes)
 ROWS = (1, 8, 16)
+# the routed planes' width an FFN build bakes: Pro's at pad_align 128
+INTER_R = 640
+
+
+def _ir(upto):
+    return INTER_R if upto == "ffn" else 0
 
 
 @pytest.fixture(scope="module")
@@ -38,13 +44,21 @@ BUILDS = [("norm", "bf16"), ("ffn", "bf16"), ("ffn", "fp8"), ("ffn", "fp4")]
 @pytest.mark.parametrize("lookahead", [True, False])
 def test_the_layer_kernel_holds(arch, rows, lookahead, upto, act):
     contract.check_build(
-        P1Build(tokens=rows, upto=upto, lookahead=lookahead, routed_act=act)
+        P1Build(
+            tokens=rows,
+            upto=upto,
+            lookahead=lookahead,
+            routed_act=act,
+            inter_r=_ir(upto),
+        )
     )
 
 
 @pytest.mark.parametrize("upto, act", BUILDS)
 def test_the_debug_build_holds(arch, upto, act):
-    contract.check_build(P1Build(tokens=16, upto=upto, debug=True, routed_act=act))
+    contract.check_build(
+        P1Build(tokens=16, upto=upto, debug=True, routed_act=act, inter_r=_ir(upto))
+    )
 
 
 # the FFN builds whose norm runs two passes with a partial one (an SGPR peak:
@@ -53,7 +67,9 @@ def test_the_debug_build_holds(arch, upto, act):
 @pytest.mark.parametrize("rows", [9, 13])
 def test_the_ffn_builds_past_one_pass_hold(arch, rows, act):
     contract.check_build(
-        P1Build(tokens=rows, upto="ffn", lookahead=True, routed_act=act)
+        P1Build(
+            tokens=rows, upto="ffn", inter_r=INTER_R, lookahead=True, routed_act=act
+        )
     )
 
 
@@ -71,7 +87,7 @@ def traced_ffn(arch):
     from atom.models.minimax_m3.pro_mono.kernels.layer import ABI
     from atom.mono.runtime.compile import trace
 
-    key = P1Build(tokens=8, upto="ffn")
+    key = P1Build(tokens=8, upto="ffn", inter_r=INTER_R)
     return key, trace(contract.build_layer(key), ABI)
 
 

@@ -572,6 +572,7 @@ def build(key: P1Build):
             "put": mb.put, "put_bf": mb.put_bf, "put_words": mb.put_words,
             "poll": mb.poll, "stamp": lambda k: stamp(tl_on, tls, tid, k),
             "ffn_on": ffn_on, "routed_act": key.routed_act,
+            "planes": key.planes if ffn_on else None,
         }  # fmt: skip
         if const_expr(ffn_on):
             # the norm writes MXFP4 x to ``plain`` (one buffer resource over

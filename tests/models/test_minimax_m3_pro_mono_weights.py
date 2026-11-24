@@ -28,6 +28,8 @@ from atom.models.minimax_m3.pro_mono.weights import bind_layer
 from atom.mono.runtime.consensus import MonoUnsupported
 
 DIMS = ProDims(8)
+# ``MiniMaxM3MoE``'s pad_align for Pro (f69c3744): a rank's 640 stays unpadded
+PRO_PAD_ALIGN = 128
 
 
 def _param(shape, dtype, device="cpu", shuffled=False):
@@ -53,8 +55,11 @@ def _norm():
     )
 
 
-def _experts():
+def _experts(inter_r=640):
+    """The routed experts as the loader leaves them at ``inter_r`` (640: Pro's
+    pad_align 128; 768: the default 256): w2's scale groups padded to 8."""
     meta = "meta"
+    s2_cols = -(-inter_r // 32 // 8) * 8
     return SimpleNamespace(
         top_k=4,
         num_fused_shared_experts=0,
@@ -63,16 +68,17 @@ def _experts():
             fp8_activations=False,
             hidden_pad=0,
             intermediate_pad=0,
+            intermediate_size=inter_r,
         ),
         w13_swizzle_layout=None,
-        w13_weight=_param((EXPERTS, 1536, 3584), torch.uint8, meta, True),
-        w13_weight_scale=_param((EXPERTS * 1536, 224), torch.uint8, meta),
-        w2_weight=_param((EXPERTS, HIDDEN, 384), torch.uint8, meta, True),
-        w2_weight_scale=_param((EXPERTS * HIDDEN, 24), torch.uint8, meta),
+        w13_weight=_param((EXPERTS, 2 * inter_r, 3584), torch.uint8, meta, True),
+        w13_weight_scale=_param((EXPERTS * 2 * inter_r, 224), torch.uint8, meta),
+        w2_weight=_param((EXPERTS, HIDDEN, inter_r // 2), torch.uint8, meta, True),
+        w2_weight_scale=_param((EXPERTS * HIDDEN, s2_cols), torch.uint8, meta),
     )
 
 
-def _layer(layer_id=10):
+def _layer(layer_id=10, inter_r=640):
     gate = SimpleNamespace(weight=_param((EXPERTS, HIDDEN), torch.bfloat16), bias=None)
     gate.weight.data.copy_(
         torch.arange(EXPERTS, dtype=torch.bfloat16)[:, None].expand(EXPERTS, HIDDEN)
@@ -85,7 +91,7 @@ def _layer(layer_id=10):
         block_sparse_moe=SimpleNamespace(
             gate=gate,
             e_score_correction_bias=_param((EXPERTS,), torch.float32),
-            experts=_experts(),
+            experts=_experts(inter_r),
             shared_experts=SimpleNamespace(
                 gate_up_proj=_mxfp8_linear(1280, HIDDEN),
                 down_proj=_mxfp8_linear(HIDDEN, 640),
@@ -132,6 +138,18 @@ def test_binds_production_storage_in_place(layer, rank):
     ids = torch.arange(EXPERTS, dtype=torch.bfloat16)[48 * rank : 48 * rank + 48]
     assert torch.equal(b.w_gate[:, 0], ids)
     assert (b.eps, b.eps_ahead) == (1e-6, 1e-6)
+
+
+@pytest.mark.parametrize("inter_r", [640, 768])
+def test_binds_the_width_the_loader_padded_to(inter_r):
+    """The planes' width is read off the loaded method
+    (``intermediate_size``), not assumed: Pro's 640 and the default pad's 768
+    bind, each with its own plane sizes."""
+    b = bind_layer(_layer(inter_r=inter_r), DIMS, 2)
+    assert b.planes.inter_r == inter_r
+    assert b.w13.shape == (EXPERTS, 2 * inter_r, HIDDEN // 2)
+    assert b.w2.shape == (EXPERTS, HIDDEN, inter_r // 2)
+    assert b.s2.shape == (EXPERTS * HIDDEN, b.planes.w2_scale_cols)
 
 
 def test_no_lookahead_reader(layer):
@@ -187,7 +205,7 @@ def _breaks():
             lambda m: setattr(
                 ex(m),
                 "w13_weight",
-                _param((EXPERTS, 1536, 7168), torch.float8_e4m3fn, "meta", True),
+                _param((EXPERTS, 1280, 7168), torch.float8_e4m3fn, "meta", True),
             ),
             "w13: torch.float8_e4m3fn",
         ),
@@ -206,13 +224,40 @@ def _breaks():
         ),
         (lambda m: unshuffle(ex(m).w2_weight), "not preshuffled"),
         (
-            # an unpadded routed intermediate (640, not 768)
+            # w2 at the 256 pad's 768 while the loader says 640
             lambda m: setattr(
                 ex(m),
                 "w2_weight",
-                _param((EXPERTS, HIDDEN, 320), torch.uint8, "meta", True),
+                _param((EXPERTS, HIDDEN, 384), torch.uint8, "meta", True),
             ),
             "w2:",
+        ),
+        (
+            # w2's 20 scale groups not padded to shuffle_scale's 24
+            lambda m: setattr(
+                ex(m),
+                "w2_weight_scale",
+                _param((EXPERTS * HIDDEN, 20), torch.uint8, "meta"),
+            ),
+            "w2 scale:",
+        ),
+        (
+            # w13 at the 768 rows while the loader says 640 (the refusal on
+            # the base before this port, the other way round)
+            lambda m: setattr(
+                ex(m),
+                "w13_weight",
+                _param((EXPERTS, 1536, 3584), torch.uint8, "meta", True),
+            ),
+            r"w13: torch.uint8 \(384, 1536, 3584\), expected \(384, 1280, 3584\)",
+        ),
+        (
+            lambda m: delattr(ex(m).quant_method, "intermediate_size"),
+            "routed intermediate None",
+        ),
+        (
+            lambda m: setattr(ex(m).quant_method, "intermediate_size", 600),
+            "routed intermediate 600",
         ),
         (
             lambda m: setattr(m.block_sparse_moe, "shared_experts", None),
@@ -364,13 +409,14 @@ def _quantize(weight, **_kwargs):
     return q.view(dtypes.fp4x2), s.view(dtypes.fp8_e8m0)
 
 
-def _expected(src, e):
-    """Expert e's logical planes as production must hold them: (w13 bytes
-    [1536, 3584], w13 codes [1536, 224], w2 bytes [7168, 384], w2 codes
-    [7168, 24]), the pad zero bytes and code 0."""
+def _expected(src, e, pad):
+    """Expert e's logical planes as production must hold them at the loaded
+    width ``pad``: (w13 bytes [2 pad, 3584], w13 codes [2 pad, 224], w2 bytes
+    [7168, pad / 2], w2 codes [7168, pad / 32]), any pad zero bytes and code
+    0."""
     from atom.quantization.quark.utils import dequantize_nvfp4
 
-    inter, pad = DIMS.inter_valid, DIMS.inter_r
+    inter = DIMS.inter_valid
 
     def mx(w, s, s2):
         q, c = _quantize(dequantize_nvfp4(w.contiguous(), s.contiguous(), s2))
@@ -390,15 +436,18 @@ def _expected(src, e):
     return w13, c13, w2, c2
 
 
-@pytest.fixture(scope="module")
-def produced():
-    """Two experts converted and laid out by production: (the experts module,
-    its NVFP4 source)."""
+@pytest.fixture(scope="module", params=[PRO_PAD_ALIGN, None], ids=["pad128", "pad256"])
+def produced(request):
+    """Two experts converted and laid out by production at Pro's pad_align
+    (128: the 640 unpadded) and at the method's default (256: 768): (the
+    experts module, its NVFP4 source)."""
     with pytest.MonkeyPatch.context() as mp:
         moe_mod = _production(mp)
         mp.setattr(moe_mod, "quant_weight_online", _quantize)
         source, target = _specs()
         experts = _Experts(moe_mod, 2, source, target)
+        # what FusedMoE(pad_align=...) sets (``MiniMaxM3MoE``)
+        experts.pad_align_override = request.param
         src = {
             "w13": experts.w13_weight.data.clone(),
             "s13": experts.w13_weight_scale.data.clone(),
@@ -420,9 +469,10 @@ def _bind_routed(experts, monkeypatch, count):
 
 def test_binds_the_planes_production_converts(produced, monkeypatch):
     """The four planes FusedMoE's NVFP4 -> MXFP4 conversion and gfx950 prep
-    leave, bound in place, read back (shared unshuffles) as the conversion
-    wrote them: gate / up at rows 0 / 768, w2's K 640 .. 768 zero bytes and
-    zero codes."""
+    leave, bound in place at the width the loader padded to, read back
+    (shared unshuffles) as the conversion wrote them: gate / up at rows 0 /
+    inter_r, any pad (w2's K 640 .. 768 at the 256 pad) zero bytes and zero
+    codes."""
     from atom.mono.weights.layer import (
         _unshuffle_linear_scale,
         _unshuffle_linear_weight,
@@ -430,8 +480,11 @@ def test_binds_the_planes_production_converts(produced, monkeypatch):
 
     experts, src = produced
     method = experts.quant_method
-    assert (method.intermediate_size, method.intermediate_pad) == (DIMS.inter_r, 0)
-    w13, s13, w2, s2 = _bind_routed(experts, monkeypatch, 2)
+    pad = method.intermediate_size
+    want_pad = 640 if experts.pad_align_override == PRO_PAD_ALIGN else 768
+    assert (pad, method.intermediate_pad) == (want_pad, 0)
+    w13, s13, w2, s2, planes = _bind_routed(experts, monkeypatch, 2)
+    assert planes.inter_r == pad
     for got, param in (
         (w13, experts.w13_weight),
         (s13, experts.w13_weight_scale),
@@ -444,13 +497,11 @@ def test_binds_the_planes_production_converts(produced, monkeypatch):
     got13 = _unshuffle_linear_weight(w13)
     got2 = _unshuffle_linear_weight(w2)
     gotc13 = _unshuffle_linear_scale(
-        s13, experts=2, rows=DIMS.w13_rows, groups=DIMS.w13_scale_cols
+        s13, experts=2, rows=planes.w13_rows, groups=HIDDEN // 32
     )
-    gotc2 = _unshuffle_linear_scale(
-        s2, experts=2, rows=HIDDEN, groups=DIMS.w2_scale_cols
-    )
+    gotc2 = _unshuffle_linear_scale(s2, experts=2, rows=HIDDEN, groups=pad // 32)
     for e in range(2):
-        want13, wantc13, want2, wantc2 = _expected(src, e)
+        want13, wantc13, want2, wantc2 = _expected(src, e, pad)
         assert torch.equal(got13[e], want13)
         assert torch.equal(gotc13[e], wantc13)
         assert torch.equal(got2[e], want2)
@@ -466,19 +517,21 @@ def test_the_kernels_addressing_reads_the_production_planes(produced, monkeypatc
     from atom.mono.device.mx import scale_index
 
     experts, src = produced
-    w13, s13, w2, s2 = _bind_routed(experts, monkeypatch, 2)
-    pad = DIMS.inter_r
+    w13, s13, w2, s2, routed = _bind_routed(experts, monkeypatch, 2)
+    pad = routed.inter_r
     planes = (
         # (plane, scale, rows, K, expected bytes, expected codes)
-        (w13, s13, 2 * pad, HIDDEN, 0, 1),
-        (w2, s2, HIDDEN, pad, 2, 3),
+        (w13, s13, 2 * pad, HIDDEN, 0, 1, routed.w13_scale_cols),
+        (w2, s2, HIDDEN, pad, 2, 3, routed.w2_scale_cols),
     )
     e = 1
-    want = _expected(src, e)
-    for w, s, rows, k, wi, ci in planes:
+    want = _expected(src, e, pad)
+    for w, s, rows, k, wi, ci, cols in planes:
         flat = w.reshape(-1)
         base = e * rows * k // 2
-        for rg in (0, 39, 40, 47, 48, 87, rows // 16 - 1):
+        for rg in (0, 39, 40, 41, 47, 48, 79, 80, 87, rows // 16 - 1):
+            if rg >= rows // 16:
+                continue
             for st in (0, k // 128 - 1):
                 for lane in (0, 5, 16, 63):
                     dw = rg * (2 * k) + st * 256 + lane * 4
@@ -491,7 +544,7 @@ def test_the_kernels_addressing_reads_the_production_planes(produced, monkeypatc
             if r >= rows:
                 continue
             for c in (0, 5, groups - 4, groups - 1):
-                si = scale_index(e * rows + r, c, groups)
+                si = scale_index(e * rows + r, c, cols)
                 assert s.reshape(-1)[si] == want[ci][r, c], (rows, r, c)
 
 
@@ -506,6 +559,7 @@ def test_binds_the_full_layer_production_lays_out(monkeypatch):
     layer = _layer()
     experts = _Experts(moe_mod, 1, *_specs())
     method = moe_mod.Mxfp4MoEMethod(target, experts.moe_config)
+    method.pad_align = PRO_PAD_ALIGN  # FusedMoE's pad_align_override for Pro
     with torch.device("meta"):
         method.create_weights(
             experts,
@@ -521,7 +575,9 @@ def test_binds_the_full_layer_production_lays_out(monkeypatch):
     method.process_weights_after_loading(experts)
     layer.block_sparse_moe.experts = experts
     b = bind_layer(layer, DIMS, 5)
-    assert b.w13.shape == (EXPERTS, DIMS.w13_rows, HIDDEN // 2)
-    assert b.s13.shape == (EXPERTS * DIMS.w13_rows, DIMS.w13_scale_cols)
-    assert b.w2.shape == (EXPERTS, HIDDEN, DIMS.inter_r // 2)
-    assert b.s2.shape == (EXPERTS * HIDDEN, DIMS.w2_scale_cols)
+    # 640 a rank, no pad; w2's 20 scale groups shuffled as 24
+    assert b.planes.inter_r == 640 and b.planes.w2_scale_cols == 24
+    assert b.w13.shape == (EXPERTS, 1280, HIDDEN // 2)
+    assert b.s13.shape == (EXPERTS * 1280, HIDDEN // 32)
+    assert b.w2.shape == (EXPERTS, HIDDEN, 320)
+    assert b.s2.shape == (EXPERTS * HIDDEN, 24)

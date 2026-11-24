@@ -49,11 +49,18 @@ from atom.models.minimax_m3.pro_mono.config import (
     HIDDEN,
     MAX_ROWS,
     MAX_ROWS_LAYOUT,
+    RoutedPlanes,
 )
 from atom.mono.plan.execution import BLOCKS, LDS_BYTES, THREADS, WAVES
 from atom.mono.plan.trace import Space
 
 NARROW = {"h": 1024, "i_valid": 96, "i_pad": 128, "e": 16, "i_sh": 96}
+# the routed planes' width an FFN build bakes: Pro's at pad_align 128
+# (MiniMaxM3MoE), no pad
+INTER_R = 640
+# the loaded widths the addressing is checked at: Pro's, and the default
+# pad_align 256's (the up block and w2's K stride move, the code doesn't)
+LOADED_WIDTHS = (640, 768)
 
 
 # ------------------------------------------------------------ the layout
@@ -67,14 +74,13 @@ def test_ffn_geometry():
         1024,
         21,
     )
-    assert (L.INTER_V, L.INTER_R, L.UG_GROUPS, L.W13_HALF, L.W2_STEPS) == (
-        640, 768, 20, 28, 5,
-    )  # fmt: skip
+    assert (L.INTER_V, L.UG_GROUPS, L.W13_HALF, L.W2_STEPS) == (640, 20, 28, 5)
     assert (L.INTER_S, L.SH_TASKS, L.SH_CPW, L.SD_STEPS, L.DOWN_TASKS) == (
         640, 80, 7, 5, 448,
     )  # fmt: skip
-    # the pad is whole MXFP4 blocks: skipping it skips whole zero blocks
-    assert L.INTER_V % 32 == 0 and L.INTER_R % 32 == 0
+    # any pad is whole MXFP4 blocks: skipping it skips whole zero blocks
+    assert L.INTER_V % 32 == 0
+    assert all(w % 32 == 0 for w in LOADED_WIDTHS)
     # a ug task: 4 row groups x 2 K halves, one a wave (A16W4: a task a K
     # half, its waves 4 row groups x 2 K quarters)
     assert 4 * 2 == WAVES and 2 * L.W13_HALF * 128 == HIDDEN
@@ -111,7 +117,9 @@ def _spans(lay):
 @pytest.mark.parametrize("act", ROUTED_ACTS)
 @pytest.mark.parametrize("debug", [False, True])
 def test_ffn_regions_are_disjoint_and_sized(debug, act):
-    key = L.P1Build(tokens=MAX_ROWS, upto="ffn", debug=debug, routed_act=act)
+    key = L.P1Build(
+        tokens=MAX_ROWS, upto="ffn", inter_r=INTER_R, debug=debug, routed_act=act
+    )
     for lay in (L.scratch_layout(key), L.plain_layout(key)):
         spans = _spans(lay)
         for (o1, n1), (o2, _) in itertools.pairwise(spans):
@@ -136,7 +144,9 @@ def test_ffn_regions_are_disjoint_and_sized(debug, act):
     else:
         assert "ugp" not in s
     other = L.scratch_layout(
-        L.P1Build(tokens=MAX_ROWS, upto="ffn", debug=debug, routed_act="fp4")
+        L.P1Build(
+            tokens=MAX_ROWS, upto="ffn", inter_r=INTER_R, debug=debug, routed_act="fp4"
+        )
     )
     assert {k: v for k, v in pairs.items() if k != "ugp"} == {
         k: v for k, v in other.items() if k != "queue"
@@ -167,7 +177,7 @@ def test_the_queue_words_are_their_own_and_zeroed_with_the_step(act):
     """A launch tag's queue words (one a task list: A16W4 two, the kernel's
     list h at the first + 4 h) lie in ``scratch`` (the step's zeroing clears
     them) past every tagged pair, apart for every layer the runner launches."""
-    key = L.P1Build(tokens=1, upto="ffn", routed_act=act)
+    key = L.P1Build(tokens=1, upto="ffn", inter_r=INTER_R, routed_act=act)
     lay = L.scratch_layout(key)
     q0, qn = lay["queue"]
     assert all(o + n <= q0 for name, (o, n) in lay.items() if name != "queue")
@@ -333,7 +343,7 @@ def test_a_placed_one_row_build_runs_every_ug_task_once(act):
 
 
 def test_ffn_build_key_and_contract_table():
-    key = L.P1Build(tokens=1, upto="ffn")
+    key = L.P1Build(tokens=1, upto="ffn", inter_r=INTER_R)
     assert key.upto == "ffn"
     with pytest.raises(ValueError):
         L.P1Build(tokens=1, upto="moe")
@@ -341,12 +351,21 @@ def test_ffn_build_key_and_contract_table():
     assert key.routed_act == L.ROUTED_ACT_DEFAULT == "bf16"
     assert set(L.ROUTED_ACTS) == {"fp4", "fp8", "bf16"}
     with pytest.raises(ValueError):
-        L.P1Build(tokens=1, upto="ffn", routed_act="fp16")
+        L.P1Build(tokens=1, upto="ffn", inter_r=INTER_R, routed_act="fp16")
     from atom.mono.plan.build_key import symbol_params
 
     assert symbol_params(key)["ra"] == "bf16"
+    # the routed planes' loaded width names the kernel too (``sym`` "ir"): an
+    # FFN build needs one the kernel can address, a norm build has none
+    assert symbol_params(key)["ir"] == INTER_R and key.planes.inter_r == INTER_R
+    assert symbol_params(L.P1Build(tokens=1, upto="ffn", inter_r=768))["ir"] == 768
+    for bad in (0, 600, 656):
+        with pytest.raises(ValueError):
+            L.P1Build(tokens=1, upto="ffn", inter_r=bad)
+    with pytest.raises(ValueError):
+        L.P1Build(tokens=1, inter_r=INTER_R)
     for act in ("fp4", "fp8"):
-        k = L.P1Build(tokens=1, upto="ffn", routed_act=act)
+        k = L.P1Build(tokens=1, upto="ffn", inter_r=INTER_R, routed_act=act)
         assert symbol_params(k)["ra"] == act
         # no K-half hand-off outside A16W4
         assert {d.name for d in L.decls(k)} == set(L.REGIONS) - {"ugp"}
@@ -675,15 +694,19 @@ def _sample_lanes():
     return (0, 5, 16, 31, 47, 63)
 
 
-def test_fp4_tile_addressing_matches_aiters_shuffle():
+@pytest.mark.parametrize("inter_r", LOADED_WIDTHS)
+def test_fp4_tile_addressing_matches_aiters_shuffle(inter_r):
     """``fp4_tile_dword`` (the kernel's w13 / w2 loads) against the loader's
-    (16, 16) shuffle of an expert's plane: lane l holds row 16 rg + l % 16,
-    k 128 st + 32 (l / 16) .. + 32."""
+    (16, 16) shuffle of an expert's plane at the loaded width: lane l holds
+    row 16 rg + l % 16, k 128 st + 32 (l / 16) .. + 32; the up block starts
+    at row group ``w13_up_group`` (row ``inter_r``)."""
     pytest.importorskip("aiter")
     from aiter.ops.shuffle import shuffle_weight
 
+    planes = RoutedPlanes(inter_r)
+    assert L.w13_up_group(planes) * 16 == inter_r
     g = torch.Generator().manual_seed(0)
-    for rows, k in ((2 * L.INTER_R, HIDDEN), (HIDDEN, L.INTER_R)):
+    for rows, k in ((planes.w13_rows, HIDDEN), (HIDDEN, inter_r)):
         b = torch.randint(0, 256, (2, rows, k // 2), generator=g, dtype=torch.uint8)
         sw = shuffle_weight(b, layout=(16, 16)).contiguous().view(-1)
         for rg, st, lane in itertools.product(
@@ -695,28 +718,37 @@ def test_fp4_tile_addressing_matches_aiters_shuffle():
             assert torch.equal(sw[4 * dw : 4 * dw + 16], want[c0 : c0 + 16])
 
 
-def test_routed_scale_addressing_matches_aiters_shuffle():
+@pytest.mark.parametrize("inter_r", LOADED_WIDTHS)
+def test_routed_scale_addressing_matches_aiters_shuffle(inter_r):
     """``w13_scale_word`` / ``w2_scale_word`` and the byte the kernel takes,
-    against ``shuffle_scale`` of the whole plane (every expert's rows)."""
+    against ``shuffle_scale`` of the whole plane (every expert's rows) at the
+    loaded width; at 640 w2's 20 groups are shuffled as 24 (the tile pad)."""
     pytest.importorskip("aiter")
     from aiter.ops.shuffle import shuffle_scale
 
+    planes = RoutedPlanes(inter_r)
     g = torch.Generator().manual_seed(1)
-    rows13, cols13 = 2 * L.INTER_R, HIDDEN // 32
+    rows13, cols13 = planes.w13_rows, HIDDEN // 32
     c13 = torch.randint(0, 256, (3 * rows13, cols13), generator=g, dtype=torch.uint8)
     s13 = shuffle_scale(c13).contiguous().view(-1)
+    up = L.w13_up_group(planes)
     for e, rg, st, lane in itertools.product(
-        (0, 2), (0, 1, 2 * 40 + 1, rows13 // 16 - 1), (0, 1, 54, 55), _sample_lanes()
+        (0, 2),
+        (0, 1, up - 1, up, up + 1, rows13 // 16 - 1),
+        (0, 1, 54, 55),
+        _sample_lanes(),
     ):
-        byte = 4 * L.w13_scale_word(e, rg, st, lane) + (st % 2) * 2 + rg % 2
+        byte = 4 * L.w13_scale_word(planes, e, rg, st, lane) + (st % 2) * 2 + rg % 2
         assert s13[byte] == c13[e * rows13 + 16 * rg + lane % 16, 4 * st + lane // 16]
-    cols2 = L.INTER_R // 32
-    c2 = torch.randint(0, 256, (2 * HIDDEN, cols2), generator=g, dtype=torch.uint8)
-    s2 = shuffle_scale(c2).contiguous().view(-1)
+    cols2 = inter_r // 32
+    c2 = torch.randint(0, 256, (3 * HIDDEN, cols2), generator=g, dtype=torch.uint8)
+    s2 = shuffle_scale(c2).contiguous()
+    assert s2.shape == (3 * HIDDEN, planes.w2_scale_cols)
+    s2 = s2.view(-1)
     for e, rgd, st, lane in itertools.product(
-        (0, 1), (0, 1, 7, L.DOWN_TASKS - 1), range(L.W2_STEPS), _sample_lanes()
+        (0, 2), (0, 1, 7, L.DOWN_TASKS - 1), range(L.W2_STEPS), _sample_lanes()
     ):
-        word = L.w2_scale_word(e, rgd // 2, st // 2, lane)
+        word = L.w2_scale_word(planes, e, rgd // 2, st // 2, lane)
         byte = 4 * word + (st % 2) * 2 + rgd % 2
         assert s2[byte] == c2[e * HIDDEN + 16 * rgd + lane % 16, 4 * st + lane // 16]
 
