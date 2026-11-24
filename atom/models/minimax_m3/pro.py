@@ -46,6 +46,7 @@ from atom.model_ops.linear import (
 )
 from atom.model_ops.minimax_m3.pro_attn import ProSparseAttentionImpl, variants
 from atom.model_ops.utils import atom_parameter
+from atom.models.minimax_m3 import moe_route_glue
 from atom.models.minimax_m3.model import (
     MiniMaxM3DecoderLayer,
     MiniMaxM3SparseForCausalLM,
@@ -442,6 +443,23 @@ class MiniMaxM3ProDecoderLayer(MiniMaxM3DecoderLayer):
             ),
         )
         ffn = self.block_sparse_moe if self.is_moe_layer else self.mlp
+        if (
+            self.is_moe_layer
+            and v.moe_route_glue
+            and mx_norm
+            and moe_route_glue.applies(ffn, hidden_states.shape[0])
+            and _native_a8(ffn.shared_experts.gate_up_proj)  # it reads the MXFP8 copy
+        ):
+            # all-reduce + norm (+ MXFP8 copy) + router + top-k + sort in one launch
+            r = moe_route_glue.route(
+                hidden_states, residual, self.post_attention_layernorm, ffn
+            )
+            residual = r["residual_out"]
+            state.put(self.layer_num, r["normed"], residual)
+            hidden_states = ffn.forward_glue(r, quant_down=True)
+            if aux_hidden_state is not None:
+                return hidden_states, residual, aux_hidden_state
+            return hidden_states, residual
         # the MoE's router and routed experts read the bf16 output; its shared expert
         # (or the dense MLP) can read the MXFP8 one
         ffn_gate_up = (
@@ -514,6 +532,11 @@ class MiniMaxM3ProForCausalLM(MiniMaxM3SparseForCausalLM):
             prefix=prefix,
             layer_type=partial(MiniMaxM3ProDecoderLayer, state=ProLookaheadState(text)),
         )
+        if variants().moe_route_glue:
+            # the op's IPC buffers: collective, and before any decode graph is captured
+            moe_route_glue.build(
+                text.hidden_size, text.num_local_experts, text.num_experts_per_tok
+            )
 
 
 class MiniMaxM3ProForConditionalGenerationTextOnly(

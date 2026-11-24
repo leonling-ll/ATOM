@@ -167,6 +167,11 @@ class ProVariants:
     # group32 FP8 GEMM (``pro.py``). Off under ``diag``; the norms keep the unfused path on
     # an aiter without the MXFP8 norm outputs.
     fuse_mxfp8_quant: bool = True
+    # A MoE layer's post-attention all-reduce, norm (+ MXFP8 copy), router, sigmoid
+    # top-k and moe_sorting as one aiter launch (``models/minimax_m3/moe_route_glue``),
+    # up to 512 rows; six launches a MoE layer fewer. Read when the model is built
+    # (the op's IPC buffers) and at each forward.
+    moe_route_glue: bool = False
     # Prefill indexer split over the TP ranks: each rank scores and selects only its share
     # of a long prefill's rows (``row_split_index``), then the page tables are all-gathered.
     # Every row is computed as before, so the selection is the same bit for bit. Needs the

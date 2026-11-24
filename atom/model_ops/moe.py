@@ -2208,6 +2208,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         scheduled_tokens_gpu: torch.Tensor | None = None,
         shared_add: torch.Tensor | None = None,
         shared_ready: torch.cuda.Event | None = None,
+        routed_output: torch.Tensor | None = None,
     ) -> torch.Tensor:
         # ATOM_USE_TRITON_MOE_DECODE splits the two kernels by phase: the weights
         # sit in the FlyDSL layout, so prefill falls through to the FlyDSL tail
@@ -2258,6 +2259,14 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             raise RuntimeError(
                 "a shared output to add reached an expert path without a combine "
                 "that adds it"
+            )
+        # `routed_output` (FusedMoE.forward_routed): the caller-zeroed buffer its
+        # registered presort names; only the plain aiter fused_moe takes it.
+        if routed_output is not None and (
+            use_triton_now or self.fused_experts is not None or self.use_triton_ep
+        ):
+            raise RuntimeError(
+                "a presorted output reached an expert path that sorts itself"
             )
 
         if use_triton_now:
@@ -2540,6 +2549,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 # writes the output in the model dtype, not x's.
                 a1_scale = x_scale
                 moe_extra_args["dtype"] = self.moe.in_dtype
+            if routed_output is not None:
+                moe_extra_args["output"] = routed_output
             return fused_moe(
                 x,
                 layer.w13_weight,
@@ -5545,6 +5556,42 @@ class FusedMoE(torch.nn.Module):
             self.layer_name,
         )
 
+    def takes_presorted(self, rows: int) -> bool:
+        """Whether `forward_routed` can run this layer's experts on a `rows`-row step:
+        the plain aiter fused_moe of the MXFP4 method (no modular kernel, no Triton
+        experts), on a step no other backend takes, with no gather before the
+        experts or reduction after them."""
+        method = self.quant_method
+        if not isinstance(method, Mxfp4MoEMethod) or method.fused_experts is not None:
+            return False
+        if method.use_triton or method.use_triton_ep or method.is_gfx1250:
+            return False
+        backend = self._comm_fused_moe
+        if backend is not None and backend.supports(rows):
+            return False
+        if self.sp_mega_moe is not None and self.sp_mega_moe.runs(rows):
+            return False
+        parallel = self.moe_parallel_config
+        if self.reduce_results or parallel.pcp_merge or parallel.dp_logical_ratio > 1:
+            return False
+        return get_dp_group().world_size == 1
+
+    def forward_routed(
+        self,
+        hidden_states: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        routed_output: torch.Tensor,
+    ) -> torch.Tensor:
+        """The experts on routing computed outside (`takes_presorted` must hold): the
+        single-group path of `forward_impl` after `select_experts`. `topk_weights`
+        carry the routed scale. The caller registers the sort of these routes
+        (aiter ``register_presorted_moe``) and passes the zeroed buffer it names as
+        `routed_output`; aiter sorts itself if the registration does not match."""
+        return self._run_experts(
+            hidden_states, topk_weights, topk_ids, routed_output=routed_output
+        )
+
     def combine_accepts_shared(self, rows: int) -> bool:
         """Whether this layer's routed combine adds a shared-expert output
         (`forward_maybe_comm_fused`'s ``shared_ready``) on a `rows`-row step:
@@ -5632,6 +5679,7 @@ class FusedMoE(torch.nn.Module):
         gathered: bool = False,
         shared_add: torch.Tensor | None = None,
         shared_ready: torch.cuda.Event | None = None,
+        routed_output: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """The experts on the routed rows (`x_scale`: they are in the method's
         `routed_rows_wire` already), still on logical experts: placed on the
@@ -5673,12 +5721,15 @@ class FusedMoE(torch.nn.Module):
         topk_weights, topk_ids = self.quant_method.place_experts(
             self, topk_weights, topk_ids, gathered
         )
-        # Only Mxfp4MoEMethod takes a shared output (combine_accepts_shared).
+        # Only Mxfp4MoEMethod takes a shared output (combine_accepts_shared) or a
+        # presorted output (forward_routed).
         shared_kwargs = (
             {}
             if shared_add is None
             else {"shared_add": shared_add, "shared_ready": shared_ready}
         )
+        if routed_output is not None:
+            shared_kwargs["routed_output"] = routed_output
         output = self.quant_method.apply(
             layer=self,
             x=hidden_states,
