@@ -10,7 +10,7 @@ The configuration uses:
 - native GPU prefix caching plus LMCache CPU offload
 - cache-aware admission in the scheduler
 - DSpark speculative decoding (the checkpoint's draft), 7 tokens, synthetic acceptance at Pro's
-  golden AL, 2.94 (the CONC 64 table below ran at 4.0)
+  golden AL, 2.94 (thinking enabled; the CONC 64 table below ran at 4.0)
 - the SemiAnalysis Weka AgentX workload (AIPerf scenario `inferencex-agentx-mvp`)
 
 Related guides: [`MiniMax-M3-Pro.md`](MiniMax-M3-Pro.md) (generic serving, kernels, GSM8K and
@@ -34,6 +34,11 @@ points of that. Every setting below is there to enlarge the cache or to keep it 
 | `--gpu-memory-utilization 0.95` | Possible once the two above are in; 0.87 was the old ceiling. |
 | `ATOM_CACHE_AWARE_ADMISSION=1` | Among the first 128 waiting requests, admits those whose prefix is still in HBM first; a request waiting longer than `ATOM_CACHE_AWARE_MAX_WAIT_S` (120 s) goes first regardless. |
 | LMCache, 184 GiB a rank | Keeps evicted prefixes in host memory (~7.5M tokens for the server). |
+| `--text-only` | Builds and loads no vision tower, projector or patch merger (1.8 GiB of weights a GPU); image requests get a 400. AgentX is text only. |
+| `AITER_REUSE_IDENTICAL_COMM_GROUPS=1` | At TP8 aiter's `ep` group has the same ranks as `tp`; this makes it reuse `tp`'s custom all-reduce instead of building a second one (~2.5 GiB a GPU). |
+| `GPTOSS_SWIGLU_MXFP4_BF16_BOUND=1040` | Keeps the routed MoE's activations in bf16 (a16w4) for steps below 1040 rows. aiter's default of 256 switches DSpark verify steps (sequences × 8 rows) to MXFP4 activations, which costs about 0.01 GSM8K (see Accuracy). Prefill chunks stay a4w4. |
+| `"index_compress": true` | Stores the index cache as one bf16 centroid per 4 tokens (vLLM's compressed index): +17.7% KV blocks, indexer scoring ~4× faster, GSM8K 0.9462; c64 P90 30.22 → 34.43, 11,254 → 11,569 tok/s/GPU. Every switch that changes numerics, with its measured accuracy, is in [`MiniMax-M3.1-Pro-Accuracy-Switches.md`](MiniMax-M3.1-Pro-Accuracy-Switches.md). |
+| `ATOM_CUSTOM_AR_POOL_BYTES=134217728` | Sizes aiter's custom all-reduce pool to 128 MiB (routing unchanged: twice the 64 MiB AR cutoff), and token-id broadcasts and post-KV barriers no longer make torch build its own RCCL communicator (~2.4 GiB, one of them after KV sizing). Non-torch memory 9.44 -> 5.31 GB, +7.3% KV blocks. |
 
 ## Measured (CONC 64 proxy)
 
@@ -49,10 +54,43 @@ server's over the whole run, warmup included; with LMCache it counts GPU and CPU
 | + pad_align 128 | 67.4 GiB | 2.50M | 30.9% | 4.22 | 6654 | 621 |
 | + cache-aware admission | 67.4 GiB | 2.50M | 73.1% | 4.56 | 6862 | 638 |
 | + LMCache 184 GiB a rank | 67.4 GiB | 2.50M + CPU | 77.4% | **30.57** | **10915** | 995 |
+| pad_align 128 row + `--text-only` + comm-group reuse (no admission, no LMCache) | 74.8 GiB | 2.77M | 43.3% | 11.44 | 8585 | 778 |
+| All of the above together, **3600 s** | 74.8 GiB | 2.77M + CPU | 78.1% | **28.88** | **11047** | 5505 |
+| All of the above + `GPTOSS_SWIGLU_MXFP4_BF16_BOUND=1040`, 600 s | 74.8 GiB | 2.83M + CPU | 79.4% | 27.84 | 10910 | 983 |
 
-No request failed in any row. In the last row LMCache loaded 10.3M tokens back with no failed
-load, and nothing was preempted. GSM8K (64-shot, one run, real DSpark acceptance) with streaming
-quant and pad_align 128 is 0.9424.
+The 3600 s run held a 77-81% hit ratio and almost no waiting requests in every 10-minute slice,
+with 50.8M tokens loaded back from LMCache and no failed load; one request failed on a client-side
+disconnect. The bound-1040 row is within run-to-run noise of the others (the same configuration
+gave 30.57 / 10915 in one 600 s run and 28.88 / 11047 over 3600 s).
+
+No request failed in any row. In the LMCache row LMCache loaded 10.3M tokens back with no failed
+load, and nothing was preempted. The last row branches off the pad_align 128 row; the launch
+below turns everything on at once, a combination not yet measured as a whole. GSM8K (64-shot,
+one run, real DSpark acceptance) with streaming quant and pad_align 128 is 0.9424.
+
+The rows above force acceptance 4.0. At the golden AL (2.94 for k=7, thinking enabled), on the
+same node and setup, 600 s:
+
+| Configuration | Prefix hit | P90 E2E-norm interactivity | tok/s/GPU | Requests | GSM8K |
+|---|---|---|---|---|---|
+| All of the above + bound 1040 | 78.7% | 21.51 | 9562 | 869 | 0.9393 |
+| + decode kernels: FlyDSL sparse decode with MXFP8 out, merged MXFP8 GEMM rows, MoE route glue, `index_split_decode` | 79.7% | **30.22** | **11254** | 1022 | 0.9424 |
+| + `index_compress` (compressed bf16 index cache, +17.7% KV blocks) | 83.2% measured phase (batch 1: 82.5%) | **34.43** | **11569** | 1055 | 0.9462 |
+
+With the full 237eada chat template and `--timeout-keep-alive 600` (same node, 600 s, AL 2.94):
+
+| Configuration | Prefix hit (measured phase) | P90 E2E-norm interactivity | tok/s/GPU | Requests |
+|---|---|---|---|---|
+| Batch 1 (807d48cd) | 69.8% | 22.37 | 11485 | 938 |
+| + `index_compress` (this recipe) | 74.6% | **31.34** | **12340** | 1024 |
+
+Shared communicator and 128 MiB AR pool (`ATOM_CUSTOM_AR_POOL_BYTES`), same-node A/B on a second node (LMCache 140 GiB, Pro template, 600 s): KV blocks 203,438 -> 218,199, P90 21.25 -> **24.71** (+16%), 11,479 -> **11,861** tok/s/GPU (+3.3%), 0 failed, no VRAM step after KV sizing.
+
+`index_split_decode` alone gives 29.10 / 10864; the decode kernels add the rest.
+
+An LMCache smoke on this configuration (util 0.73 so the pool is small; an 18.6k-token prompt is
+pushed out of HBM by 14 fillers and asked again) gets the same answers both times, with 18432
+tokens loaded from the CPU tier and the re-ask's TTFT down from 2.85 s to 0.20 s.
 
 ## Validated configuration
 
@@ -60,13 +98,14 @@ quant and pad_align 128 is 0.9424.
 |---|---|
 | Hardware | 8×MI355X (`gfx950`) |
 | ATOM | `yuhua/m3.1-pro` (this recipe's commit) |
-| aiter | aiter-M3 `hatwu/m3.1-pro-infx` at `a26613a8a` (with the inter-640 MoE rows, `[Config] [Tuning] [gfx950] MiniMax-M3.1-Pro MXFP4 MoE rows at inter 640`, the FlyDSL fp8 sparse prefill, and from `b85ce1a27` the op the `ar_fused_rows` / `moe_tail_ar` variants need, off here) |
+| aiter | aiter-M3 `hatwu/m3.1-pro-infx` at `a26613a8a` (with the inter-640 MoE rows, `[Config] [Tuning] [gfx950] MiniMax-M3.1-Pro MXFP4 MoE rows at inter 640`, the FlyDSL fp8 sparse prefill, and from `b85ce1a27` the op the `ar_fused_rows` / `moe_tail_ar` variants need, off here); `yuhua/m3.1-pro` adds the a16w4 rows at 256/512/1024 tokens, the MXFP8 GEMM rows and `moe_route_glue`. Those rows are built in: do not list `best/tune3/new_rows.csv` or other copies in `AITER_CONFIG_FMOE` (duplicate rows abort startup) |
 | Parallelism | TP8, DCP=1 |
 | KV cache | FP8, K only, `--block-size 16`; index cache FP8 |
 | Prefix cache | on |
 | CPU offload | LMCache, 184 GiB a rank, chunk 256 |
-| Speculative decoding | DSpark, 7 tokens, synthetic acceptance length 2.94 (the CONC 64 table ran at 4.0) |
+| Speculative decoding | DSpark, 7 tokens, synthetic acceptance length 2.94 (golden AL, thinking enabled; the CONC 64 table ran at 4.0) |
 | Prefill | 16384-token chunks; prefill attention on aiter's FlyDSL `minimax_m3_fp8_sparse_prefill` (amd-kernels-day0's kernel, ported into aiter-M3 `hatwu/m3.1-pro-infx` at `a26613a8a`) when the aiter build has it, otherwise the Triton kernel. `amd_kernels` is never installed. |
+| Decode attention | from 24 rows, amd-kernels-day0's FlyDSL sparse decode with an MXFP8 output for `o_proj`, when its `amd_kernels` package imports; otherwise aiter |
 | `max-num-seqs` | 2 × CONC (128) |
 
 ## 0. Build aiter-M3 into the container
@@ -108,15 +147,19 @@ Start a fresh server for each run.
 
 ```bash
 export MODEL_PATH="${MODEL_PATH:-/data/models/m3-pro}"
+export CHAT_TEMPLATE="${CHAT_TEMPLATE:-}"     # set to the 237eada chat_template.jinja if the snapshot ships the 1 KB stub (see below)
 export PORT="${PORT:-8000}"
 export CONC="${CONC:-64}"
 
 export AITER_LOG_LEVEL=WARNING
 unset AITER_CUSTOM_AR_DISABLE_LAMPORT          # ar_lamport_rows needs the Lamport path
-export ATOM_M3PRO_VARIANTS='{"kernels": true, "attn": "aiter", "topk": "split", "prep": "aiter", "index_split": true, "score_tq": 8, "ar_lamport_rows": 16, "k_only": true, "k_plain_fp8": true, "prefill_attn": "day0"}'
+export ATOM_M3PRO_VARIANTS='{"kernels": true, "attn": "aiter", "topk": "split", "prep": "aiter", "index_split": true, "score_tq": 8, "ar_lamport_rows": 16, "k_only": true, "k_plain_fp8": true, "prefill_attn": "day0", "index_split_decode": 64, "moe_route_glue": true, "index_compress": true}'
 export ATOM_WARMUP_TOKENS=auto
 export ATOM_ONLINE_QUANT_STREAMING=1
 export ATOM_CACHE_AWARE_ADMISSION=1
+export AITER_REUSE_IDENTICAL_COMM_GROUPS=1
+export ATOM_CUSTOM_AR_POOL_BYTES=134217728   # 128 MiB custom all-reduce pool (non-torch 9.4 -> 5.3 GB)
+export GPTOSS_SWIGLU_MXFP4_BF16_BOUND=1040     # bf16 MoE activations up to 128 seqs x 8 verify rows
 
 # LMCache CPU offload
 export ATOM_KV_OFFLOAD=lmcache
@@ -145,21 +188,36 @@ python3 -m atom.entrypoints.openai_server \
   --method dspark \
   --num-speculative-tokens 7 \
   --spec-decode-acceptance-length 2.94 \
+  --text-only \
+  --timeout-keep-alive 600 \
+  ${CHAT_TEMPLATE:+--chat-template "${CHAT_TEMPLATE}"} \
   2>&1 | tee "server-m31pro-agentx-c${CONC}.log"
 ```
 
+**Chat template.** Serve with the checkpoint's full M3.1-Pro template (revision 237eada, the one vLLM uses; it has the `thinking_mode` switch and defaults to thinking on). Snapshot 9d6169d5 has the same weights, config and tokenizer but ships a 1,165-byte stub `chat_template.jinja` that renders only the user messages, so AgentX prompts come out about 21% short; with that snapshot set `CHAT_TEMPLATE` to the 237eada file. `--timeout-keep-alive 600` keeps the server from closing pooled connections that aiperf (300 s pool) still reuses: with the default 5 s a warmup request can hit a closed socket and abort the run.
+
 Check the startup log:
 
-- `Memory budget: ... available_for_kv=67.43GB ... num_kvcache_blocks=156002`. A pool near 35 GB
-  means pad_align 128 is not in; near 11 GB, streaming quant is not on.
+- `Memory budget: ... available_for_kv=74.81GB ... num_kvcache_blocks=173069` (67.43 GB without
+  `--text-only` and the comm-group reuse). A pool near 35 GB means pad_align 128 is not in; near
+  11 GB, streaming quant is not on.
 - One `Creating LMCacheEngine` line per rank with `'max_local_cpu_size': 184.0`.
 
 ### Host memory for LMCache
 
-184 GiB a rank pins about 1.5 TB of host memory. On a node where the NUMA node behind GPUs 0-3
-is short of free memory (page cache from the checkpoint counts), ranks 0-3 can stall in LMCache's
-CPU backend setup and the server never becomes ready. Drop the checkpoint from the page cache
-before starting, or lower `LMCACHE_MAX_LOCAL_CPU_SIZE`.
+Each rank pins its whole LMCache pool (184 GiB, about 198 GB) from the NUMA node it runs on, so
+each node has to supply four ranks' pools, about 790 GB, after the model has loaded. When a node
+is short (page cache from the checkpoint and memory a previous server is still releasing both
+count), the pinning slows down without bound: those ranks stop after `NUMA mapping None`, never
+log `Created backend: LocalCPUBackend`, and the server never becomes ready, with no error. This
+has been seen on two nodes, including a second start right after a successful one. Until the
+launcher handles it:
+
+- make sure the previous server's processes are gone and each NUMA node has more free memory
+  than 4 × `LMCACHE_MAX_LOCAL_CPU_SIZE` (`numactl -H`) before starting;
+- drop the checkpoint from the page cache before starting;
+- lower `LMCACHE_MAX_LOCAL_CPU_SIZE` on hosts with less memory per node;
+- if a start isn't ready within about 15 minutes, stop it and start again.
 
 ### Synthetic acceptance
 
@@ -255,6 +313,28 @@ lm_eval --model local-completions \
 The gate is 0.94; one run has a standard error of about 0.0066, so a single run at 0.933 or above
 is within noise.
 
+### Why `GPTOSS_SWIGLU_MXFP4_BF16_BOUND=1040`
+
+aiter runs the routed MoE with bf16 activations below 256 rows and MXFP4 activations from 256
+rows up. A DSpark verify step is (sequences × 8) rows, so at 32 concurrent requests every verify
+step crosses 256, while plain decode never does. GSM8K, one run each, DSpark k7 at real
+acceptance unless noted:
+
+| Configuration | GSM8K |
+|---|---|
+| DSpark off (4 runs) | 0.936-0.942 |
+| DSpark on, default bound 256 (5 runs) | 0.926-0.937, mean ~0.930 |
+| DSpark off, 256 concurrent, so plain decode reaches 256 rows | 0.9287 |
+| DSpark on, bound 520 (verify in bf16, prefill a4w4) | 0.9462 |
+| DSpark on, bound 1000000 (prefill in bf16 too) | 0.9484 |
+| DSpark on, bound 1040 with the 256/512/1024-row a16w4 rows | 0.9393 |
+
+The drop follows the MoE activation format, not DSpark: verify-row block selection, the
+acceptance rule and attention precision (fp8 or bf16, aiter or Triton) were each ruled out.
+Prefill stays a4w4: bf16 prefill gains nothing measurable and runs the MoE 2.6-3.8× slower.
+The bound only changes activation precision and leaves the weights as shipped. At CONC 64 most
+verify steps are 129-256 rows, where tuned a16w4 is within 3-5% of a4w4 per MoE layer.
+
 ## InferenceX rules this configuration keeps
 
 - Online quantization touches only the routed experts (`*.experts`, NVFP4 to MXFP4). Attention,
@@ -267,8 +347,7 @@ is within noise.
 ## Not covered yet
 
 - Other concurrencies: only CONC 64 has been measured with these settings.
-- A 3600 s run; the table above is 600 s.
-- LMCache correctness on this configuration (answers served from the CPU tier compared with a
-  fresh prefill); the GSM8K above ran without offload.
+- A 3600 s run with `GPTOSS_SWIGLU_MXFP4_BF16_BOUND=1040`; the 3600 s row above is without it.
+- The intermittent LMCache start hang (see Host memory for LMCache) is not fixed in the launcher.
 - DCP=8, which shards the target's K and index K over the eight GPUs (about 4.9× the cached
   tokens with the DSpark draft unsharded), is being brought up and is not part of this recipe.

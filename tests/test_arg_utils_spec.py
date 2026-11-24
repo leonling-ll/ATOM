@@ -409,3 +409,12 @@ class TestKVOffloadEnv:
         )
         with pytest.raises(ValueError, match="ATOM_KV_OFFLOAD is off"):
             self._kv()
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_text_only_cli_reaches_engine_kwargs(enabled):
+    parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
+    args = EngineArgs.from_cli_args(
+        parser.parse_args(["--text-only"] if enabled else [])
+    )
+    assert args._get_engine_kwargs()["text_only"] is enabled
