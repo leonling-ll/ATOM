@@ -243,6 +243,43 @@ later chunk of a chunked prefill. Checked on the kernel path with fp8 caches, wi
   scores within run-to-run noise of the same prompts without prefix caching (40 questions turn
   wrong, 51 turn right). Stock GSM8K, whose few-shot examples differ per question, hits almost nothing.
 
+The checks above ran on the separate K and V caches. For the K-only cache the Agentic recipe
+(`Agentic-MiniMax-M3.1-Pro.md`) serves, with day0 prefill, the indexer split over the ranks and the
+FlyDSL / aiter decode, three checks cover hits:
+
+* `tests/test_minimax_m3_pro_prefix_hit.py`: a request admitted through the block manager's prefix walk
+  (a full hit, a half hit) prefills only its uncached rows. It must select the blocks a cold prefill
+  selects, write the same cache bytes for its new tokens, leave the shared blocks untouched and give the
+  same attention output, and so must a chunked cold prefill and a rejected, then accepted, k = 7 verify
+  after a hit. Without a GPU the small variants run in Triton's interpreter; the served variants need a
+  GPU, `amd_kernels` on `PYTHONPATH` and an aiter whose `pa_decode_gluon` takes `value_rows`.
+  `tests/test_scheduler_spec_prefix_publish.py` checks that DSpark decode publishes a block only once
+  all of its KV is final.
+* `scripts/m31pro/pfx_probe.py probe` against a running server (started as the Agentic recipe does,
+  without LMCache and without `--spec-decode-acceptance-length`): key / value questions over 32k and 64k
+  lists, each request served from the cache (`hit`, `half`, and `turn2` on blocks that decode published)
+  against the same token ids prefilled cold, at concurrency 1 and 8. It passes when every answer is
+  right and hits part from their cold twins only at near-ties, at most 2 more often than two cold runs
+  part from each other.
+
+  ```bash
+  python3 scripts/m31pro/pfx_probe.py probe --port 8000 --model "${MODEL_PATH}" --out probe.jsonl --lengths 32000
+  ```
+* GSM8K behind one shared 64-shot prefix (`scripts/m31pro/lm_eval_tasks/gsm8k_pfx.yaml`), on one server
+  with prefix caching and one with `--no-enable_prefix_caching`, then the paired comparison (exact
+  McNemar on the questions that flip, the cached share and the acceptance length from `/metrics`):
+
+  ```bash
+  python3 scripts/m31pro/pfx_probe.py snapshot --port 8000 --out before.json
+  lm_eval --model local-completions \
+    --model_args "model=${MODEL_PATH},tokenizer=${MODEL_PATH},base_url=http://127.0.0.1:8000/v1/completions,num_concurrent=16,max_retries=3,tokenized_requests=False,trust_remote_code=True" \
+    --include_path scripts/m31pro/lm_eval_tasks --tasks gsm8k_pfx --num_fewshot 64 --log_samples --output_path on
+  python3 scripts/m31pro/pfx_probe.py snapshot --port 8000 --out after.json
+  # the same against the server without prefix caching (--output_path off), then
+  python3 scripts/m31pro/pfx_probe.py pair --on on/*/samples_gsm8k_pfx_*.jsonl \
+    --off off/*/samples_gsm8k_pfx_*.jsonl --on-metrics before.json after.json
+  ```
+
 ## CPU KV offload
 
 Prefix blocks evicted from HBM can be kept in host DRAM and loaded back instead of recomputed, through
