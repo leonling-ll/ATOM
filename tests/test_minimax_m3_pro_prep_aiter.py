@@ -5,11 +5,12 @@ against the Triton ``prep`` and the torch reference, on a GPU.
 Both kernels get the same raw rows, Pro's own YaRN rope (x48 of 24576, theta 5e5, rotary
 64; the "hf" magnitude ratio) and caches pre-filled with garbage, over TP head counts 16 /
 128, bf16 / fp8 KV and index caches, decode and prefill token counts, padding slots (-1)
-and positions past 24576. Checked: q / index q, the K / V / index-K rows and fp8 scales the
-caches received, and that nothing else in the caches changed.
+and positions past 24576, and the recipe's K-only plain fp8 cache. Checked: q / index q, the
+K / V / index-K rows and fp8 scales the caches received, and that nothing else in the caches
+changed.
 
     pytest -q tests/test_minimax_m3_pro_prep_aiter.py
-    python tests/test_minimax_m3_pro_prep_aiter.py --bench [--heads 16] [--kv fp8]
+    python tests/test_minimax_m3_pro_prep_aiter.py --bench [--heads 16] [--kv fp8] [--k-only]
 """
 
 from __future__ import annotations
@@ -88,7 +89,10 @@ class Case:
         slot_dtype=torch.int64,
         pad=0.15,
         seed=0,
+        k_only=False,
     ):
+        """``k_only``: the recipe's K-only row cache (``ProKOnlyLayout``: x = 256, no V), an
+        fp8 one a plain cast (``k_plain_fp8``: ``prep``'s ``k_unit``)."""
         g = torch.Generator().manual_seed(seed)
         self.t, self.heads = t, heads
         rn = lambda *s: (torch.randn(*s, generator=g) * 2).to(DT).to(DEV)
@@ -107,9 +111,12 @@ class Case:
         self.slot = slot.to(slot_dtype).to(DEV)
         self.pos = torch.randint(0, MAXPOS, (t,), generator=g).to(DEV)
         self.fp8 = kv == "fp8"
+        self.k_unit = k_only and self.fp8
         kvdt = FP8 if self.fp8 else DT
         x = 16 if self.fp8 else 8
-        self.kc4 = _garbage((nblk, D // x, PG, x), kvdt, g)
+        kx = D if k_only else x
+        self.kc4 = _garbage((nblk, D // kx, PG, kx), kvdt, g)
+        write_v = write_v and not k_only
         self.vc4 = _garbage((nblk, PG // x, D, x), kvdt, g) if write_v else None
         self.ks = _garbage((nblk, 1, PG), torch.float32, g) if self.fp8 else None
         self.vs = _garbage((nblk, 1, PG), torch.float32, g) if self.fp8 else None
@@ -143,6 +150,7 @@ class Case:
             vc4=vc4,
             k_scale=ks,
             v_scale=vs,
+            k_unit=self.k_unit,
         )
         torch.cuda.synchronize()
         return SimpleNamespace(q=q, iq=iq, kc4=kc4, vc4=vc4, ks=ks, vs=vs, ic=ic)
@@ -275,7 +283,7 @@ def check_vs_ref(c: Case, r, what):
     rd = c.read(r)
     k = ref.k[rd.tok]
     if c.fp8:
-        k, _ = K.quant_fp8_rows(k, FP8)
+        k, _ = K.quant_fp8_rows(k, FP8, plain=c.k_unit)
     _close(rd.k, k.to(rd.k.dtype), f"{what} K vs torch")
     ik = ref.ik[rd.tok]
     ik = (
@@ -349,6 +357,32 @@ def test_int32_positions_and_slots_equal_int64():
         assert torch.equal(_raw(getattr(a, name)), _raw(getattr(b, name))), name
 
 
+@pytest.mark.parametrize("ic", ["bf16", "fp8"])
+@pytest.mark.parametrize("t", [1, 8, 16, 24, 64, 1031])
+def test_k_only_plain_fp8_matches_triton(t, ic):
+    """The recipe's K-only plain fp8 cache (``k_plain_fp8``), packed rows as the model passes
+    them: aiter's ``kv_unit_scale`` writes the bytes of Triton's ``k_unit`` -- K codes, the
+    1.0 scales, index K -- at decode row counts, within ``_close`` at prefill sizes."""
+    if not K.aiter_prep_available(k_unit=True):
+        pytest.skip("this aiter's fused_qk_norm_rope_cache_mqa has no kv_unit_scale")
+    c = Case(t, 16, "fp8", ic, packed=True, seed=t + 11, k_only=True)
+    got, want = c.run(K.prep_aiter), c.run(K.prep)
+    check_untouched(c, got, "aiter")
+    check_untouched(c, want, "triton")
+    check_vs_ref(c, got, "aiter")
+    rg, rw = c.read(got), c.read(want)
+    assert torch.equal(rg.ks, torch.ones_like(rg.ks)), "k_scale is not 1.0"
+    for name in ("q", "iq"):
+        a, b = getattr(got, name), getattr(want, name)
+        print(f"[frac] t={t} ic={ic} {name}: {(a != b).float().mean().item():.3e}")
+    if t <= 64:
+        for name in ("k", "ks", "ik"):
+            a, b = _raw(getattr(rg, name)), _raw(getattr(rw, name))
+            print(f"[frac] t={t} ic={ic} {name}: {(a != b).float().mean().item():.3e}")
+            assert torch.equal(a, b), f"{name} differs from Triton's"
+    compare(c, got, want, "aiter vs triton (K-only plain fp8)")
+
+
 def test_all_padding_writes_nothing():
     c = Case(9, 16, "fp8", "fp8", pad=1.1, seed=8)
     got = c.run(K.prep_aiter)
@@ -389,14 +423,15 @@ def _time(fn, iters):
     return eager, s.elapsed_time(e) * 1e3 / (reps * per_graph)
 
 
-def bench(heads, kv, ic, tokens, iters):
+def bench(heads, kv, ic, tokens, iters, k_only=False):
     cos, sin, ratio = tables()
+    layout = ", K-only (packed rows)" if k_only else ""
     print(
-        f"heads {heads}, KV cache {kv}, index cache {ic}  (us per call: eager / in a CUDA graph)"
+        f"heads {heads}, KV cache {kv}{layout}, index cache {ic}  (us per call: eager / in a CUDA graph)"
     )
     print(f"{'tokens':>7} {'triton':>17} {'aiter':>17} {'speedup(graph)':>15}")
     for t in tokens:
-        c = Case(t, heads, kv, ic, pad=0.0, seed=t)
+        c = Case(t, heads, kv, ic, packed=k_only, pad=0.0, seed=t, k_only=k_only)
         kc4, vc4, ks, vs, icc = c.caches()
         args = (
             c.qkv,
@@ -414,7 +449,7 @@ def bench(heads, kv, ic, tokens, iters):
             icc,
             heads,
         )
-        kw = {"vc4": vc4, "k_scale": ks, "v_scale": vs}
+        kw = {"vc4": vc4, "k_scale": ks, "v_scale": vs, "k_unit": c.k_unit}
         te, tg = _time(functools.partial(K.prep, *args, **kw), iters)
         ae, ag = _time(functools.partial(K.prep_aiter, *args, **kw), iters)
         print(f"{t:>7} {te:>8.1f} /{tg:>7.1f} {ae:>8.1f} /{ag:>7.1f} {tg / ag:>14.2f}x")
@@ -428,8 +463,14 @@ if __name__ == "__main__":
     ap.add_argument("--ic", default="bf16", choices=["bf16", "fp8"])
     ap.add_argument("--tokens", default="1,4,16,64,256,1024,4096,16384")
     ap.add_argument("--iters", type=int, default=200)
+    ap.add_argument(
+        "--k-only",
+        action="store_true",
+        help="the recipe's K-only cache (plain fp8 with --kv fp8), packed rows",
+    )
     a = ap.parse_args()
     if a.bench:
-        bench(a.heads, a.kv, a.ic, [int(x) for x in a.tokens.split(",")], a.iters)
+        tokens = [int(x) for x in a.tokens.split(",")]
+        bench(a.heads, a.kv, a.ic, tokens, a.iters, a.k_only)
     else:
         raise SystemExit(pytest.main([__file__, "-q"]))
