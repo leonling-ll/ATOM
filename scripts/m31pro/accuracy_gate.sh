@@ -2,8 +2,9 @@
 # MiniMax-M3.1-Pro accuracy gate: GSM8K 64-shot, all 1319 questions; passes when the
 # flexible-extract score plus its standard error reaches M31PRO_THRESHOLD.
 #
-# Launches the server exactly as the GSM8K section of recipes/MiniMax-M3-Pro.md does
-# (TP8 kernel path, fp8 KV cache, bf16 index cache, prefix caching off, no DSpark), runs
+# Launches the server as the GSM8K section of recipes/MiniMax-M3-Pro.md does
+# (TP8 kernel path, fp8 KV cache, bf16 index cache, prefix caching off, no DSpark), plus
+# the 128 MiB all-reduce pool of the recipe's fast configuration, runs
 # that section's lm-eval command, stops the server and judges the flexible-extract score,
 # the column the recipe's baseline is quoted in.
 #
@@ -19,7 +20,10 @@
 #   M31PRO_LIMIT      run only the first N questions; the verdict then gates nothing
 #   M31PRO_READY_S    seconds to wait for the server (default 3600)
 #   M31PRO_GPU_WAIT_S seconds to wait for memory a previous run is freeing (default 300)
+#   M31PRO_GPU_MEM_UTIL --gpu-memory-utilization (default 0.94, the recipe's)
+#   ATOM_CUSTOM_AR_POOL_BYTES custom all-reduce input pool (default 134217728, the recipe's)
 #
+# Arguments other than --check are added to the server's launch line.
 # `accuracy_gate.sh --check DIR` only judges the lm-eval results already under DIR.
 # nightly.sh sources this file for its server and GSM8K helpers.
 
@@ -62,6 +66,7 @@ start_server() {
     AITER_LOG_LEVEL="${AITER_LOG_LEVEL:-WARNING}" \
         AITER_QUICK_REDUCE_QUANTIZATION=NONE \
         AITER_CUSTOM_AR_DISABLE_LAMPORT=1 \
+        ATOM_CUSTOM_AR_POOL_BYTES="${ATOM_CUSTOM_AR_POOL_BYTES:-134217728}" \
         ATOM_M3PRO_VARIANTS='{"kernels": true, "attn": "aiter", "topk": "fused"}' \
         setsid python -m atom.entrypoints.openai_server \
         --model "$M31PRO_MODEL" \
@@ -71,7 +76,7 @@ start_server() {
         --max-model-len 16384 \
         --max-num-seqs 16 \
         --max-num-batched-tokens 16384 \
-        --gpu-memory-utilization 0.85 \
+        --gpu-memory-utilization "${M31PRO_GPU_MEM_UTIL:-0.94}" \
         --block-size 16 \
         --kv_cache_dtype fp8 \
         --index-cache-dtype bf16 \
@@ -149,7 +154,7 @@ main() {
         return
     fi
     trap stop_server EXIT
-    start_server gate || return 1
+    start_server gate "$@" || return 1
     run_gsm8k gate || {
         echo "ERROR: lm_eval failed" >&2
         return 1

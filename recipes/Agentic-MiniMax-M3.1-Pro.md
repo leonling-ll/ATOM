@@ -9,7 +9,8 @@ The configuration uses:
 - FP8 K-only KV cache and FP8 index cache, `--block-size 16`
 - native GPU prefix caching plus LMCache CPU offload
 - cache-aware admission in the scheduler
-- DSpark speculative decoding (the checkpoint's draft), 7 tokens, synthetic acceptance 4.0
+- DSpark speculative decoding (the checkpoint's draft), 7 tokens, synthetic acceptance at Pro's
+  golden AL, 2.94 (the CONC 64 table below ran at 4.0)
 - the SemiAnalysis Weka AgentX workload (AIPerf scenario `inferencex-agentx-mvp`)
 
 Related guides: [`MiniMax-M3-Pro.md`](MiniMax-M3-Pro.md) (generic serving, kernels, GSM8K and
@@ -64,9 +65,42 @@ quant and pad_align 128 is 0.9424.
 | KV cache | FP8, K only, `--block-size 16`; index cache FP8 |
 | Prefix cache | on |
 | CPU offload | LMCache, 184 GiB a rank, chunk 256 |
-| Speculative decoding | DSpark, 7 tokens, synthetic acceptance length 4.0 |
+| Speculative decoding | DSpark, 7 tokens, synthetic acceptance length 2.94 (the CONC 64 table ran at 4.0) |
 | Prefill | 16384-token chunks; prefill attention on aiter's FlyDSL `minimax_m3_fp8_sparse_prefill` (amd-kernels-day0's kernel, ported into aiter-M3 `hatwu/m3.1-pro-infx` at `a26613a8a`) when the aiter build has it, otherwise the Triton kernel. `amd_kernels` is never installed. |
 | `max-num-seqs` | 2 × CONC (128) |
+
+## 0. Build aiter-M3 into the container
+
+The launch below needs aiter-M3 `hatwu/m3.1-pro-infx` at `a26613a8a` (`zhuyuhua-v/aiter-M3`): on the image's own aiter
+the server falls back on three paths, each named in its log:
+
+| Fallback | Log line |
+|---|---|
+| Triton decode attention on the K-only cache (no `value_rows` in `pa_decode_gluon`) | `triton attention, K-only` |
+| FlyDSL heuristic MoE configs at inter 640 | `no tuned FlyDSL config ... using heuristic FlyDSL fallback` |
+| MXFP8 activation quantization not fused | `aiter MXFP8 norms False, all-reduce MXFP8 epilogue False` |
+
+Build it inside the run container, from the image's aiter checkout, and keep that container for
+the runs (the build lives in its filesystem):
+
+```bash
+# a clone or bundle of zhuyuhua-v/aiter-M3 is in /w (the node has no access to the private repo)
+cd /app/aiter-test
+base=$(git rev-parse HEAD)
+git fetch /w/aiter-M3.bundle '+refs/heads/*:refs/m3/*'
+git checkout --detach a26613a8a                # aiter-M3 hatwu/m3.1-pro-infx
+git log -1 --format='aiter %H'                  # record it with the results
+```
+
+Then rebuild the JIT modules whose sources, headers, `rocm_ops.hpp` macros or
+`optCompilerConfig.json` entries differ between `$base` and the checkout, one at a time in one
+process (`aiter.jit.core.rm_module`, `clear_build`, then `build_module` with
+`get_args_of_build(module)`), so that eight TP ranks do not race the builds at startup.
+Python-only changes need no rebuild. Skip the mha backward modules (`module_mha_bwd`,
+`module_mha_varlen_bwd`, `libmha_bwd`): they are training kernels the server never calls, and
+`module_mha_bwd` fails to compile on `rocm/atom-dev:nightly_202611201604`. Only remove the
+HipKittens MLA modules (`module_hk_*`, MI3xx only). The first server log should contain none
+of the log lines in the table above.
 
 ## 1. Start the ATOM server
 
@@ -109,7 +143,7 @@ python3 -m atom.entrypoints.openai_server \
   --online_quant_config '{"layer_quant_config": {"*.experts": "mxfp4"}}' \
   --method dspark \
   --num-speculative-tokens 7 \
-  --spec-decode-acceptance-length 4.0 \
+  --spec-decode-acceptance-length 2.94 \
   2>&1 | tee "server-m31pro-agentx-c${CONC}.log"
 ```
 
@@ -128,9 +162,14 @@ before starting, or lower `LMCACHE_MAX_LOCAL_CPU_SIZE`.
 
 ### Synthetic acceptance
 
-`--spec-decode-acceptance-length 4.0` is the InferenceX synthetic acceptance override: the
+`--spec-decode-acceptance-length` is the InferenceX synthetic acceptance override: the
 DSpark draft still runs, and the flag decides how many draft tokens are committed. It is
 **performance-only**; output text is replaced by `synthetic` tokens. Drop it for any accuracy run.
+
+InferenceX takes the value from the model's golden AL curve for the served thinking mode and the
+draft length. Pro's thinking-on curve (InferenceX's golden AL file for minimax-m3.1-pro) is 2.94 at
+7 draft tokens; `scripts/m31pro/proxy_bench.sh` holds the whole curve and picks the value for its
+`SPEC_TOKENS`. There is no thinking-off curve yet.
 
 ## 2. Run the AgentX profile
 

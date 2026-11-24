@@ -10,8 +10,10 @@
 # Run it inside the ATOM image (aiperf from agentx-harness on PATH) with this
 # tree importable, under the node's end-to-end lock. It
 #   1. writes the session subset (trace_subset.py) to OUT_DIR/traces,
-#   2. starts the server with the Pro recipe's fast configuration plus DSpark
-#      at SPEC_TOKENS draft tokens and a forced acceptance length,
+#   2. starts the server with the Pro recipe's fast configuration (RECIPE=pro)
+#      or the Agentic recipe's launch (RECIPE=agentic), plus DSpark at
+#      SPEC_TOKENS draft tokens and a forced acceptance length: Pro's golden AL
+#      for that draft length unless ACCEPT_LENGTH is set,
 #   3. replays the subset at concurrency CONC for DURATION seconds,
 #   4. stops the server and prints, from aiperf's per-request records, the
 #      90th-percentile E2E-normalized interactivity, tok/s/GPU, the failed
@@ -26,18 +28,26 @@
 #   MAX_CONTEXT      session cap, input + output tokens [131072]
 #   NUM_SESSIONS     sessions kept [64]
 #   DURATION         replay seconds; aiperf's scenario floor is 900 [900]
-#   ACCEPT_LENGTH    forced DSpark acceptance length [4.0]
 #   SPEC_TOKENS      DSpark draft tokens per step; 0 serves without the draft [7]
+#   THINKING         thinking mode whose golden AL curve applies [thinking_on]
+#   ACCEPT_LENGTH    forced DSpark acceptance length [the golden AL of
+#                    SPEC_TOKENS and THINKING; refused where there is none]
+#   RECIPE           pro: recipes/MiniMax-M3-Pro.md's fast configuration;
+#                    agentic: recipes/Agentic-MiniMax-M3.1-Pro.md's launch,
+#                    CPU KV offload included [pro]
 #   MAX_NUM_SEQS     [16 below CONC 8, else 2 x CONC]
 #   MAX_MODEL_LEN    [MAX_CONTEXT + 1024: room for the chat template]
 #   PORT             server port [8300]
-#   GPU_MEM_UTIL     --gpu-memory-utilization [0.94]
+#   GPU_MEM_UTIL     --gpu-memory-utilization [pro 0.94, agentic 0.95]
 #   SERVER_EXTRA     more server flags, split on spaces, e.g. --load_dummy=xavier []
-#   ATOM_CUSTOM_AR_POOL_BYTES  custom all-reduce input pool [134217728]
-#   ATOM_M3PRO_VARIANTS  Pro attention variants
-#                    [{"kernels": true, "attn": "aiter", "topk": "fused"}]
-#   The server inherits the rest of the environment, so CPU offload's LMCACHE_*
-#   settings go there and its --kv-transfer-config in SERVER_EXTRA.
+#   ATOM_CUSTOM_AR_POOL_BYTES  custom all-reduce input pool [pro 134217728;
+#                    agentic unset, aiter's default, as the recipe launches]
+#   ATOM_M3PRO_VARIANTS  Pro attention variants [RECIPE's]
+#   PROXY_DRY_RUN    1: print the acceptance length, the server environment and
+#                    flags, and exit before anything runs
+#   With RECIPE=pro the server inherits the rest of the environment, so CPU
+#   offload's LMCACHE_* settings go there and its --kv-transfer-config in
+#   SERVER_EXTRA. Quick all-reduce is off in every run.
 
 set -euo pipefail
 
@@ -52,8 +62,9 @@ SEED="${SEED:-42}"
 MAX_CONTEXT="${MAX_CONTEXT:-131072}"
 NUM_SESSIONS="${NUM_SESSIONS:-64}"
 DURATION="${DURATION:-900}"
-ACCEPT_LENGTH="${ACCEPT_LENGTH:-4.0}"
 SPEC_TOKENS="${SPEC_TOKENS:-7}"
+THINKING="${THINKING:-thinking_on}"
+RECIPE="${RECIPE:-pro}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-$((MAX_CONTEXT + 1024))}"
 PORT="${PORT:-8300}"
 TP=8
@@ -61,16 +72,92 @@ if [ -z "${MAX_NUM_SEQS:-}" ]; then
     MAX_NUM_SEQS=$((2 * CONC))
     [ "$MAX_NUM_SEQS" -ge 16 ] || MAX_NUM_SEQS=16
 fi
+
+# golden_al K THINKING: MiniMax-M3.1-Pro's golden acceptance length for the
+# bundled DSpark draft at K draft tokens, from InferenceX's golden AL file for
+# minimax-m3.1-pro (Inferact/moo, moo-tracking, infx/golden_al_distribution).
+# Only the thinking_on curve exists; anything else is refused.
+golden_al() {
+    if [ "$2" != thinking_on ]; then
+        echo "proxy_bench: no golden AL curve for $2; set ACCEPT_LENGTH" >&2
+        return 1
+    fi
+    case "$1" in
+    1) echo 1.75 ;;
+    2) echo 2.23 ;;
+    3) echo 2.53 ;;
+    4) echo 2.71 ;;
+    5) echo 2.89 ;;
+    6) echo 2.94 ;;
+    7) echo 2.94 ;;
+    *)
+        echo "proxy_bench: no golden AL for $1 draft tokens; set ACCEPT_LENGTH" >&2
+        return 1
+        ;;
+    esac
+}
+
 read -r -a server_extra <<<"${SERVER_EXTRA:-}"
 spec_args=()
 if [ "$SPEC_TOKENS" -gt 0 ]; then
+    ACCEPT_LENGTH="${ACCEPT_LENGTH:-$(golden_al "$SPEC_TOKENS" "$THINKING")}" || exit 1
     spec_args=(--method dspark --num-speculative-tokens "$SPEC_TOKENS"
         --spec-decode-acceptance-length "$ACCEPT_LENGTH")
 fi
 SERVER_LOG=/app/logs_claude/atom_server.log
 
+# --- server environment and flags ---
+export AITER_LOG_LEVEL=WARNING
+export AITER_QUICK_REDUCE_QUANTIZATION=NONE
+export KV_CACHE_DTYPE=fp8
+case "$RECIPE" in
+pro)
+    export AITER_CUSTOM_AR_DISABLE_LAMPORT=1
+    export ATOM_CUSTOM_AR_POOL_BYTES="${ATOM_CUSTOM_AR_POOL_BYTES:-134217728}"
+    default_variants='{"kernels": true, "attn": "aiter", "topk": "fused"}'
+    export GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.94}"
+    ;;
+agentic)
+    # ar_lamport_rows needs the Lamport path.
+    unset AITER_CUSTOM_AR_DISABLE_LAMPORT
+    default_variants='{"kernels": true, "attn": "aiter", "topk": "split", "prep": "aiter", "index_split": true, "score_tq": 8, "ar_lamport_rows": 16, "k_only": true, "k_plain_fp8": true, "prefill_attn": "day0"}'
+    export GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.95}"
+    export ATOM_WARMUP_TOKENS=auto
+    export ATOM_ONLINE_QUANT_STREAMING=1
+    export ATOM_CACHE_AWARE_ADMISSION=1
+    export ATOM_KV_OFFLOAD=lmcache
+    export LMCACHE_LOCAL_CPU=True
+    export LMCACHE_MAX_LOCAL_CPU_SIZE=184
+    export LMCACHE_CHUNK_SIZE=256
+    export PYTHONHASHSEED=0
+    ;;
+*)
+    echo "proxy_bench: RECIPE must be pro or agentic, not $RECIPE" >&2
+    exit 1
+    ;;
+esac
+export ATOM_M3PRO_VARIANTS="${ATOM_M3PRO_VARIANTS:-$default_variants}"
+export MAX_NUM_SEQS
+server_args=(--trust-remote-code
+    --max-model-len "$MAX_MODEL_LEN"
+    --max-num-batched-tokens 16384
+    --block-size 16
+    --index-cache-dtype fp8
+    --level 0
+    --online_quant_config '{"layer_quant_config": {"*.experts": "mxfp4"}}'
+    "${spec_args[@]}" "${server_extra[@]}")
+
+if [ "${PROXY_DRY_RUN:-0}" = 1 ]; then
+    echo "acceptance_length=${ACCEPT_LENGTH:-none}"
+    env | grep -E '^(ATOM_|AITER_|LMCACHE_|PYTHONHASHSEED=|GPU_MEM_UTIL=|KV_CACHE_DTYPE=|MAX_NUM_SEQS=)' | sort
+    printf 'server_args:'
+    printf ' %q' "${server_args[@]}"
+    echo
+    exit 0
+fi
+
 mkdir -p "$OUT_DIR" "$(dirname "$SERVER_LOG")"
-echo "proxy_bench: CONC=$CONC out=$OUT_DIR model=$MODEL"
+echo "proxy_bench: CONC=$CONC RECIPE=$RECIPE AL=${ACCEPT_LENGTH:-none} out=$OUT_DIR model=$MODEL"
 python3 -c 'import atom, sys; print("atom from", atom.__file__)'
 
 # --- 1. session subset ---
@@ -80,15 +167,9 @@ subset_args=(--out "$OUT_DIR/traces" --seed "$SEED" --max-context "$MAX_CONTEXT"
 python3 "$HERE/trace_subset.py" "${subset_args[@]}"
 NUM_TRACES=$(find "$OUT_DIR/traces" -maxdepth 1 -name '*.json' | wc -l)
 
-# --- 2. server: the recipe's fast configuration, DSpark (SPEC_TOKENS), forced AL ---
-export AITER_LOG_LEVEL=WARNING
-export AITER_CUSTOM_AR_DISABLE_LAMPORT=1
-export ATOM_CUSTOM_AR_POOL_BYTES="${ATOM_CUSTOM_AR_POOL_BYTES:-134217728}"
-default_variants='{"kernels": true, "attn": "aiter", "topk": "fused"}'
-export ATOM_M3PRO_VARIANTS="${ATOM_M3PRO_VARIANTS:-$default_variants}"
-export KV_CACHE_DTYPE=fp8
-export GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.94}"
-export MAX_NUM_SEQS
+# --- 2. server: RECIPE's launch, DSpark (SPEC_TOKENS), forced AL ---
+# A compile cache left by other code fails silently after a code change.
+rm -rf "$HOME"/.cache/atom/*
 
 stop_server() {
     bash "$REPO/scripts/stop_atom_server.sh" || true
@@ -96,15 +177,7 @@ stop_server() {
 }
 trap stop_server EXIT
 
-bash "$REPO/scripts/start_atom_server.sh" "$MODEL" "$TP" "$PORT" \
-    --trust-remote-code \
-    --max-model-len "$MAX_MODEL_LEN" \
-    --max-num-batched-tokens 16384 \
-    --block-size 16 \
-    --index-cache-dtype fp8 \
-    --level 0 \
-    --online_quant_config '{"layer_quant_config": {"*.experts": "mxfp4"}}' \
-    "${spec_args[@]}" "${server_extra[@]}"
+bash "$REPO/scripts/start_atom_server.sh" "$MODEL" "$TP" "$PORT" "${server_args[@]}"
 # start_atom_server.sh stops waiting after two minutes; loading Pro takes longer.
 bash "$REPO/scripts/wait_server_ready.sh" "$PORT" 60 30 "$SERVER_LOG"
 

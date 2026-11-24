@@ -4,6 +4,7 @@
 """The Pro accuracy gate's verdict on lm-eval's gsm8k results file."""
 
 import json
+import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -46,3 +47,35 @@ def test_gate_fails_without_results(tmp_path):
         ["bash", str(GATE), "--check", str(tmp_path)], check=False, text=True
     )
     assert done.returncode != 0
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash")
+def test_gate_passes_its_arguments_to_the_server(tmp_path):
+    # setsid stands in for the server launch: it records its arguments and stays up
+    # until the stubbed stop_server kills it; curl reports the server ready at once.
+    stubs = tmp_path / "bin"
+    stubs.mkdir()
+    (stubs / "setsid").write_text('#!/bin/bash\necho "launch: $*"\nexec sleep 30\n')
+    (stubs / "curl").write_text("#!/bin/bash\nexit 0\n")
+    for stub in stubs.iterdir():
+        stub.chmod(0o755)
+    script = (
+        f'source "{GATE}"\n'
+        "gpus_free() { :; }\n"
+        "run_gsm8k() { :; }\n"
+        "check_gsm8k() { :; }\n"
+        'stop_server() { [ -z "$SERVER_PID" ] || kill "$SERVER_PID"; SERVER_PID=""; }\n'
+        "main --max-num-seqs 32 --extra-flag\n"
+    )
+    env = dict(
+        os.environ,
+        PATH=f"{stubs}{os.pathsep}{os.environ['PATH']}",
+        HOME=str(tmp_path),
+        M31PRO_OUT=str(tmp_path / "out"),
+    )
+    done = subprocess.run(
+        ["bash", "-c", script], env=env, check=False, capture_output=True, text=True
+    )
+    assert done.returncode == 0, done.stdout + done.stderr
+    launch = (tmp_path / "out" / "gate" / "server.log").read_text()
+    assert launch.rstrip().endswith("--max-num-seqs 32 --extra-flag"), launch
