@@ -47,6 +47,7 @@ from atom.model_ops.layernorm import (
 )
 from atom.model_ops.minimax_m3.pro_attn import variants
 from atom.model_ops.minimax_m3.pro_kernels import attention_aiter
+from atom.models.dspark_draft import linear_out
 from atom.models.minimax_m3.dspark import (
     M3DSparkAttention,
     M3DSparkDecoderLayer,
@@ -181,6 +182,20 @@ class MiniMaxM3ProDSpark(MiniMaxM3DSpark):
             return super().block_final_norm(hidden, residual)
         hidden, _ = fused_allreduce_gemma_rms_norm(hidden, residual, self.final_norm)
         return hidden
+
+    def project_context_mxfp8(self, taps):
+        """``hidden_norm`` writes the context K/V GEMM's MXFP8 input itself
+        (the bytes ``quantize_fp8`` of its bf16 output gives) where the layers
+        run the fused epilogues."""
+        if not self.layers[0].fused_epilogues:
+            return super().project_context_mxfp8(taps)
+        _, xq, xs, _ = gemma_rms_norm_mxfp8(
+            linear_out(self.fc(self.concat_taps(taps))),
+            None,
+            self.hidden_norm,
+            write_bf16=False,
+        )
+        return xq, xs
 
     weights_mapper: ClassVar[WeightsMapper] = _DraftTensorsOnly()
     # Drafts its trained block (`dspark_block_size`, 7) whole when
