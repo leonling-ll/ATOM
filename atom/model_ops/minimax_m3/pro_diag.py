@@ -37,11 +37,11 @@ import json
 import logging
 import os
 import re
-import tempfile
 
 import torch
 
 from atom.model_ops.layernorm import GemmaRMSNorm
+from atom.model_ops.minimax_m3.pro_attn import diag_path
 
 logger = logging.getLogger("atom")
 
@@ -385,9 +385,5 @@ def collect(impl, q, k, positions, raw, cu, ctx, v, grid=None) -> None:
         rec["kl_betas"] = KL_BETAS
         rec["kl_uniform"] = _kl(mbar, valid.float() / nvalid.clamp(min=1).unsqueeze(-1))
     if rank == 0:
-        d = os.environ.get(
-            "ATOM_M3PRO_DIAG_DIR", os.path.join(tempfile.gettempdir(), "m3pro_diag")
-        )
-        os.makedirs(d, exist_ok=True)
-        with open(os.path.join(d, f"{v.diag_tag}.jsonl"), "a") as f:
+        with open(diag_path(f"{v.diag_tag}.jsonl"), "a") as f:
             f.write(json.dumps(rec) + "\n")

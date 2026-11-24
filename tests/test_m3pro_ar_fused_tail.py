@@ -111,7 +111,7 @@ def test_tp1_adds_the_addend_before_the_norm(load, monkeypatch, fused_rows):
     layernorm = load("atom.model_ops.layernorm")
     seen = []
 
-    def norm_mx(x, residual, norm, write_bf16=True):
+    def norm_mx(x, residual, norm, write_bf16=True, q_out=None, q_scale_out=None):
         seen.append(x)
         return x, "q", "s", residual
 
@@ -151,6 +151,27 @@ def test_other_calls_add_first_and_keep_their_route(tp_ar, rows, declines):
     # the route below the Lamport op gets the bf16 sum, as the MoE's own add makes it
     assert torch.equal(tp_ar.calls[-1][1], x + add)
     assert torch.equal(res_out, _ar_ref(x + add, res))
+
+
+def test_fused_rows_write_the_callers_mxfp8_rows(tp_ar, monkeypatch):
+    # the decode front's ring slot (q_out / q_scale_out) holds the one-launch op's bytes,
+    # so the front GEMM reads them where the input norm was asked to write
+    x, res = _rows(4, seed=1), _rows(4, seed=2)
+    q = torch.randint(0, 256, (4, 64), dtype=torch.uint8)
+    q_scale = torch.randint(0, 256, (4, 2), dtype=torch.uint8)
+
+    def one_launch(hidden_states, residual, norm, addend):
+        return hidden_states, q, q_scale, residual
+
+    monkeypatch.setattr(tp_ar.layernorm, "_lamport_ar_on", lambda: True)
+    monkeypatch.setattr(tp_ar.layernorm, "_lamport_fused_ar_rms_norm_mxfp8", one_launch)
+    q_out = torch.zeros(4, 64, dtype=torch.uint8)
+    q_scale_out = torch.zeros(4, 2, dtype=torch.uint8)
+    _, got_q, got_s, _ = tp_ar.layernorm.fused_allreduce_gemma_rms_norm_mxfp8(
+        x, res, _NORM, 16, 16, q_out=q_out, q_scale_out=q_scale_out
+    )
+    assert got_q is q_out and got_s is q_scale_out
+    assert torch.equal(q_out, q) and torch.equal(q_scale_out, q_scale)
 
 
 def test_fused_rows_off_never_calls_the_lamport_op(tp_ar):
@@ -194,11 +215,19 @@ def test_moe_hands_over_routed_and_shared_which_sum_to_its_output(load):
 
 
 class _Attn(nn.Module):
-    qk_proj = index_qk_proj = None
+    # bf16 projections: no one front GEMM over the ring (front stays None)
+    qkv_proj = SimpleNamespace(runs_bf16=True)
 
     def forward(
-        self, positions, hidden_states, hidden_states_scale, index_src, diag_srcs
+        self,
+        positions,
+        hidden_states,
+        hidden_states_scale,
+        index_src,
+        diag_srcs,
+        front=None,
     ):
+        assert front is None
         return hidden_states * 0.5
 
 
@@ -207,12 +236,21 @@ def _layers(load, monkeypatch, num_layers=3, end_layer=None):
     pro_attn = load("atom.model_ops.minimax_m3.pro_attn")
     seen = []
 
-    def ar_norm_mx(x, residual, norm, lamport_rows=0, fused_rows=0, addend=None):
+    def ar_norm_mx(
+        x,
+        residual,
+        norm,
+        lamport_rows=0,
+        fused_rows=0,
+        addend=None,
+        q_out=None,
+        q_scale_out=None,
+    ):
         seen.append((norm.layer, addend))
         h = _ar_ref(x if addend is None else x + addend, residual)
         return h, h, torch.ones(h.shape[0], 2), h
 
-    def norm_mx(x, residual, norm, write_bf16=True):
+    def norm_mx(x, residual, norm, write_bf16=True, q_out=None, q_scale_out=None):
         return None, x, "s", None
 
     monkeypatch.setattr(pro, "fused_allreduce_gemma_rms_norm_mxfp8", ar_norm_mx)
