@@ -48,6 +48,7 @@ The fast configuration (kernel path, decode graphs, FP8 KV and index caches):
 
 ```bash
 export AITER_CUSTOM_AR_DISABLE_LAMPORT=1
+export ATOM_CUSTOM_AR_POOL_BYTES=134217728
 export ATOM_M3PRO_VARIANTS='{"kernels": true, "attn": "aiter", "topk": "split"}'
 
 python -m atom.entrypoints.openai_server \
@@ -74,6 +75,9 @@ draft. For the torch reference, leave `ATOM_M3PRO_VARIANTS` unset, add `--enforc
   post-load conversion leaves no holes in the allocator (before, about 40 GB per GPU stayed stranded
   and 0.88 or more failed at the first NCCL barrier). `ATOM_ONLINE_QUANT_STREAMING=1` avoids them
   another way, by converting while loading; see [`Agentic-MiniMax-M3.1-Pro.md`](Agentic-MiniMax-M3.1-Pro.md).
+* `ATOM_CUSTOM_AR_POOL_BYTES=134217728` gives the custom all-reduce a 128 MiB input pool instead of
+  aiter's 1 GiB: about 2.6 GiB less per GPU before the KV pool is sized, and every all-reduce Pro
+  sends still fits ([`docs/environment_variables.md`](../docs/environment_variables.md#communicator-memory)).
 * `--block-size 16` and `--level 0` are required. Decode graphs need the kernel path: the torch
   path reads the sequence lengths back to the host, raises if a capture reaches it, and runs with
   `--enforce-eager`.
