@@ -33,9 +33,10 @@ build's the bf16 x)::
     route   S CTAs from RT0, token t (a real row: t < ``nvalid``'s count):
             sigmoid, top-4 of sigmoid + bias, the 4 unbiased sigmoids
             renormalized x 2.0 -> ``route``
-    union   every CTA: ``route`` -> the union U of the real rows' experts and
-            their picks (LDS), the routed B operand (x4, x8, or A16W4 the
-            CTA's K half of the bf16 x) -> LDS
+    union   every CTA: the routed B operand (x4, x8, or A16W4 the CTA's K
+            half of the bf16 x) -> LDS, staged while the route is in flight;
+            then ``route`` -> the union U of the real rows' experts and their
+            picks (LDS)
     ug      |U| x UG_GROUPS tasks, the first round placed and the rest from
             the launch's work queue (``MOE_TABLE``), each CTA's weights
             streaming from one task into the next: 32 gate + 32 up rows of an

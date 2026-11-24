@@ -928,15 +928,12 @@ def run_ug(c, bid, nu):
     total = nu * UG_GROUPS
     last = total - 1
     task = c["k0"]
-    # the claim before the loads: its return waits behind none of them
-    got = take_ahead(c) if q else fx.Int32(0)
     t0 = fx.min(task, last)
     live0 = task < total
     parts = range(len(ug_parts(c)))
     ops = [ug_loads(c, t0, p, live0) for p in parts]
-    if const_expr(q):
-        put_claim(c, got)
-        gpu.barrier()
+    # the first claim was taken and stored before the route's poll
+    # (``run_ffn``), its LDS word past ``load_route``'s barriers
     nxt = read_claim(c) if q else task + per
     if const_expr(q):
         # every thread has read it before the loop's first claim lands there
@@ -1532,16 +1529,26 @@ def run_ffn(c, bid):
     lst, c["k0"] = task_list(bid, c["routed_act"])
     if const_expr(bf16_routed(c)):
         c["ugh"] = lst
-    nu = load_route(c)
-    load_xb(c)
-    c["stamp"](7)
-    enter_stage("ug")
-    # the routed and shared planes' bases, loaded once: a load in a task
-    # loop would wait (``vmcnt`` in issue order) for every weight load in
-    # flight
+    # What needs no route goes out before the route's poll, while the route
+    # is in flight (every CTA waits there for the route CTAs): the routed and
+    # shared planes' bases (loaded once: a load in a task loop would wait,
+    # ``vmcnt`` in issue order, for every weight load in flight), the first
+    # claim of the list's queue word (``run_ug``) and the routed B operands
+    # (x is in at the norm, the route an all-gather of the logits later).
+    # After the route's poll, the union alone is left before the first ug
+    # weights go out; before, the x poll, x's loads, the table's load and the
+    # claim's atomic (every CTA of a list on one word at once) came between.
     c |= {n: weight(c, n) for n in ("w13", "s13", "w2", "s2", "w_sd", "s_sd", "queue")}
     # the list's queue word: the launch's words are one a list, in list order
     c["qword"] = c["queue"] + fx.Int64(lst) * 4 if bf16_routed(c) else c["queue"]
+    got = take_ahead(c) if queued(s) else fx.Int32(0)
+    load_xb(c)
+    if const_expr(queued(s)):
+        # read past ``load_route``'s barriers (``run_ug``)
+        put_claim(c, got)
+    nu = load_route(c)
+    c["stamp"](7)
+    enter_stage("ug")
     task, nxt = run_ug(c, bid, nu)
     c["stamp"](8)
     enter_stage("down")
