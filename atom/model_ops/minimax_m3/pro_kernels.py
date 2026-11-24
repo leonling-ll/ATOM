@@ -1324,7 +1324,9 @@ def scores(
     assert tiled or not nv, "NVFP4 index pages: the tiled scorer only"
     assert not (tq and nv), "NVFP4 index pages: score_tq unsupported"
     if bb is None:
-        bb = 4 if tiled and t <= 16 else 8
+        # 4 rows a centroid block: 16 blocks a 64-row tile, 1.4-1.5x over 8 on MI355X decode
+        # verify (the same scores bit for bit; opt/topk.md round7)
+        bb = 16 if block_mode == BLOCK_CENTROID else 4 if tiled and t <= 16 else 8
     if tq:
         assert tq & (tq - 1) == 0, tq
         _score_qtile_kernel[(triton.cdiv(t, tq), triton.cdiv(nb, bb))](

@@ -523,7 +523,7 @@ class TestCompressedIndex:
         args = (c.iq, ic_c, c.bt, c.seq, c.pos, nb, None, 2, 3, 0.1)
         kw = {"block_mode": K.BLOCK_CENTROID, "head_mode": head_mode}
         runs = {}
-        for bb in (4, 8):
+        for bb in (4, 8, None):  # None: the centroid default, 16
             for causal_on in (False, True):
                 runs[("tile", bb, causal_on)] = K.scores(
                     *args, **kw, bb=bb, causal=causal_on
