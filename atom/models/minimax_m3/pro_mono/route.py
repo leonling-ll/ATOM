@@ -84,7 +84,8 @@ def variants_refusal(v, mx_norm: bool) -> str | None:
             f"day0_decode_rows {v.day0_decode_rows} within {v.mono_ffn_rows}",
         ),
         (
-            rows_refusal(v.mono_ffn_rows) is not None or v.ar_fused_rows <= 0,
+            rows_refusal(v.mono_ffn_rows, v.mono_routed_act) is not None
+            or v.ar_fused_rows <= 0,
             f"ar_fused_rows {v.ar_fused_rows} overlaps 1 .. {v.mono_ffn_rows}",
         ),
     ]
