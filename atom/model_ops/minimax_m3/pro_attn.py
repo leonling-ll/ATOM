@@ -193,6 +193,7 @@ class ProVariants:
     # The score_tq kernel (prefill, speculative verify) leaves the tiles past a program's
     # rows unwritten instead of -inf, as the selections that read only causal blocks allow
     # (fused / split / aiter): its cost follows the context, not the block table's width.
+    # Always so in decode / verify graphs of up to pro_kernels.QTILE_ROWS rows.
     score_tq_causal: bool = False
     # vLLM's compressed index cache: every 4 index keys softmax-pooled into one bf16 row
     # (ic_c [pages, 4, 128]), written after prep; the scorer reads those rows only.
@@ -1266,8 +1267,14 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
                 head_mode=head_mode,
                 pool_temp=v.pool_scale,
                 # torch.topk reads the whole width; the others only each token's causal
-                # blocks (the score_tq kernel only with score_tq_causal)
-                causal=v.topk != "torch" and (v.score_tq_causal or tq == 0),
+                # blocks (the score_tq kernel: in a decode / verify graph of up to
+                # QTILE_ROWS rows, elsewhere with score_tq_causal)
+                causal=v.topk != "torch"
+                and (
+                    v.score_tq_causal
+                    or tq == 0
+                    or (static and rq.shape[0] <= pro_kernels.QTILE_ROWS)
+                ),
                 tq=tq,
             )
         # select_rows_split matches select_rows bit for bit; its cost follows the context
