@@ -6,6 +6,8 @@ Packed pages contain E2M1 codes and one E4M3 scale per 16 elements. Per-token
 pages hold 16 rows (1152 bytes); centroid pages hold four rows (288 bytes).
 ``score`` quantizes bf16 queries to the same group-16 NVFP4 values;
 ``score_bf16q`` uses bf16 queries directly.
+``tq`` is the number of query-token rows grouped per program; each query row
+contains 16 index heads. ``tq=0`` selects single-row scoring, like ``tq=1``.
 
 Per-token scoring softmax-pools each group of four keys using ``cq`` and
 ``pool_temp``, then takes the maximum across groups and query heads. Centroid
@@ -19,9 +21,12 @@ permuted together: MFMA K index ``32*s + 8*c + e`` holds dimension
 are decoded at scale 1 by ``v_cvt_scalef32_pk_f16_fp4``; ``v_pk_mul_f16`` applies
 the E4M3 scale exactly. FP16 MFMA accumulates in fp32.
 
-Queries are loaded and quantized once per program. The register pipeline
+Queries are loaded and quantized once per program. Single-tile decode programs
+issue their first key loads during query quantization. The register pipeline
 prefetches the next tile's keys/scales and the following tile's page-table
-entries while scoring the current tile.
+entries while scoring the current tile. Multi-query tiles stage queries once
+in padded shared memory before retaining their MFMA operands in registers.
+Native maxima use non-IEEE mode; denormal handling remains IEEE.
 """
 
 from functools import lru_cache
@@ -68,7 +73,7 @@ def _rows_of(ic):
     )
 
 
-# ------------------------------------ helpers ------------------------------------------- 
+# ------------------------------------ helpers -------------------------------------------
 @gluon.jit
 def _cvt_byte(word, sc2, SEL: gl.constexpr):
     """Byte ``SEL`` of ``word`` (2 e2m1) -> 2 fp16 times the fp16 scale held twice in
@@ -111,26 +116,38 @@ def _nvfp4_scale(amax):
 
 @gluon.jit
 def _fake_nvfp4(x, ROWS: gl.constexpr, D: gl.constexpr):
-    """fp32 ``[ROWS, D]`` through NVFP4 and back (exact scale x e2m1; ties to the smaller)."""
+    """Quantize bf16 queries promoted to fp32 and return restored fp16 values."""
     g = gl.reshape(x, [ROWS, D // 16, 16])
     a = gl.abs(g)
     s = gl.expand_dims(_nvfp4_scale(gl.max(a, axis=2)).to(gl.float32), 2)
-    # Search the seven midpoints with three comparisons. Strict > keeps ties
-    # toward the smaller magnitude, as required by the reference quantizer.
-    high_bit = a > 1.75 * s
-    middle_bit = a > gl.where(high_bit, 3.5, 0.75) * s
-    low_threshold = gl.where(
-        high_bit,
-        gl.where(middle_bit, 5.0, 2.5),
-        gl.where(middle_bit, 1.25, 0.25),
+    # BF16 midpoint products are exact and adjacent magnitudes differ by at
+    # least 1/256. With a reciprocal within two ULPs, an eight-ULP bias toward
+    # zero keeps midpoint ties on the smaller code without crossing non-ties.
+    inv_scale = gl.inline_asm_elementwise(
+        "v_rcp_f32 $0, $1", "=v,v", [s], dtype=gl.float32, is_pure=True, pack=1
     )
-    low_bit = a > low_threshold * s
-    code = (high_bit.to(gl.int32) << 2) | (middle_bit.to(gl.int32) << 1)
-    code = code | low_bit.to(gl.int32)
-    c = code.to(gl.float32)
-    mag = gl.where(c < 4.0, c * 0.5, gl.where(c < 6.0, c - 2.0, c * 2.0 - 8.0))
-    v = mag * s
-    return gl.reshape(gl.where(g < 0, -v, v), [ROWS, D])
+    normalized = a * inv_scale
+    normalized_bits = normalized.to(gl.uint32, bitcast=True)
+    normalized_bits = gl.maximum(normalized_bits, 8) - 8
+    normalized = normalized_bits.to(gl.float32, bitcast=True)
+    even, odd = gl.split(gl.reshape(normalized, [ROWS, D // 16, 8, 2]))
+    packed = gl.inline_asm_elementwise(
+        "v_cvt_scalef32_pk_fp4_f32 $0, $1, $2, $3",
+        "=v,v,v,v",
+        [even, odd, 1.0],
+        dtype=gl.int32,
+        is_pure=True,
+        pack=1,
+    )
+    neg_even, neg_odd = gl.split(
+        gl.reshape((g < 0).to(gl.int32), [ROWS, D // 16, 8, 2])
+    )
+    packed = packed | (neg_even << 3) | (neg_odd << 7)
+    sb = s.to(gl.float16).to(gl.int16, bitcast=True).to(gl.int32) & 0xFFFF
+    sc2 = gl.convert_layout(sb | (sb << 16), packed.type.layout)
+    sc2 = sc2 + gl.full(packed.shape, 0, gl.int32, layout=packed.type.layout)
+    restored = _cvt_byte(packed, sc2, 0)
+    return gl.reshape(gl.join(_lo16(restored), _hi16(restored)), [ROWS, D])
 
 
 @gluon.jit
@@ -156,7 +173,7 @@ def _phys_rows(bt_ptr, s_bt, seq, j0, qbmax, NB, ROWS: gl.constexpr, R: gl.const
 
 @gluon.jit
 def _load_tile(ic_ptr, icw_ptr, phys, live, ROWS: gl.constexpr, R: gl.constexpr,
-               WL3: gl.constexpr):  # fmt: skip
+               WL3: gl.constexpr, BIG_IC: gl.constexpr):  # fmt: skip
     """The tile's words ``[R, 4 (c), 4 (s)]`` int32 (word ``4 c + s`` of each row) and the
     matching e4m3 scale bytes, both in ``WL3``."""
     rr = gl.arange(0, R, layout=gl.SliceLayout(1, gl.SliceLayout(2, WL3)))
@@ -179,10 +196,17 @@ def _load_tile(ic_ptr, icw_ptr, phys, live, ROWS: gl.constexpr, R: gl.constexpr,
     )
     m3 = l3 & (c3 >= 0) & (s3 >= 0)
     S_IC: gl.constexpr = ROWS * 72  # bytes a page
-    woff = p3 * (S_IC // 4) + r3 * 16 + c3 * 4 + s3
-    words = gl.amd.cdna4.buffer_load(icw_ptr, woff, mask=m3, other=0)
-    soff = p3 * S_IC + ROWS * 64 + r3 * 8 + c3 * 2 + s3 // 2
-    scales = gl.amd.cdna4.buffer_load(ic_ptr, soff, mask=m3, other=0)
+    if BIG_IC:
+        p64 = p3.to(gl.int64)
+        woff = p64 * (S_IC // 4) + r3 * 16 + c3 * 4 + s3
+        words = gl.load(icw_ptr + woff, mask=m3, other=0)
+        soff = p64 * S_IC + ROWS * 64 + r3 * 8 + c3 * 2 + s3 // 2
+        scales = gl.load(ic_ptr + soff, mask=m3, other=0)
+    else:
+        woff = p3 * (S_IC // 4) + r3 * 16 + c3 * 4 + s3
+        words = gl.amd.cdna4.buffer_load(icw_ptr, woff, mask=m3, other=0)
+        soff = p3 * S_IC + ROWS * 64 + r3 * 8 + c3 * 2 + s3 // 2
+        scales = gl.amd.cdna4.buffer_load(ic_ptr, soff, mask=m3, other=0)
     return words, scales
 
 
@@ -205,50 +229,6 @@ def _keys_b(words, scales, R: gl.constexpr, BL: gl.constexpr):
     return gl.convert_layout(gl.permute(k, [1, 0]), BL, assert_trivial=True)
 
 
-@gluon.jit
-def _split_s(x, R: gl.constexpr):
-    """``[R, 4, 4 (s)]`` -> its 4 ``[R, 4]`` slices s = 0 .. 3 (register splits)."""
-    x = gl.reshape(x, [R, 4, 2, 2])  # [R, c, s // 2, s % 2]
-    a, b = gl.split(x)  # s % 2 = 0 / 1
-    a0, a1 = gl.split(a)
-    b0, b1 = gl.split(b)
-    return a0, b0, a1, b1
-
-
-@gluon.jit
-def _keys_b_step(w, sc2, R: gl.constexpr, BL: gl.constexpr):
-    """One K step: words ``[R, 4 (c)]`` + scales -> the MFMA B operand ``[32, R]`` fp16 (K
-    index ``8 c + e``), without moving data between lanes."""
-    p0 = _cvt_byte(w, sc2, 0)
-    p1 = _cvt_byte(w, sc2, 1)
-    p2 = _cvt_byte(w, sc2, 2)
-    p3 = _cvt_byte(w, sc2, 3)
-    lo = gl.join(gl.join(_lo16(p0), _lo16(p2)), gl.join(_lo16(p1), _lo16(p3)))
-    hi = gl.join(gl.join(_hi16(p0), _hi16(p2)), gl.join(_hi16(p1), _hi16(p3)))
-    k = gl.reshape(gl.join(lo, hi), [R, 32])  # [row, 8 c + 2 b + h]
-    return gl.convert_layout(gl.permute(k, [1, 0]), BL, assert_trivial=True)
-
-
-@gluon.jit
-def _keys_b_steps(words, scales, R: gl.constexpr, BL: gl.constexpr):
-    """Words + scales ``[R, 4, 4]`` -> the 4 K steps' B operands ``[32, R]``."""
-    s16 = scales.to(gl.float8e4nv, bitcast=True).to(gl.float16)
-    sb = s16.to(gl.int16, bitcast=True).to(gl.int32) & 0xFFFF
-    w0, w1, w2, w3 = _split_s(words, R)
-    c0, c1, c2, c3 = _split_s(sb | (sb << 16), R)
-    return (_keys_b_step(w0, c0, R, BL), _keys_b_step(w1, c1, R, BL),
-            _keys_b_step(w2, c2, R, BL), _keys_b_step(w3, c3, R, BL))  # fmt: skip
-
-
-@gluon.jit
-def _dot_lds(smem, kb0, kb1, kb2, kb3, acc, AL: gl.constexpr):
-    """``acc`` + A x B over K = 128 in 4 steps, A's K slices read from shared memory."""
-    acc = gl.amd.cdna4.mfma(smem.slice(0, 32, 1).load(AL), kb0, acc)
-    acc = gl.amd.cdna4.mfma(smem.slice(32, 32, 1).load(AL), kb1, acc)
-    acc = gl.amd.cdna4.mfma(smem.slice(64, 32, 1).load(AL), kb2, acc)
-    return gl.amd.cdna4.mfma(smem.slice(96, 32, 1).load(AL), kb3, acc)
-
-
 # ----------------------------------------------------------------------------- kernel --
 @gluon.jit
 def _score_kernel(
@@ -268,7 +248,7 @@ def _score_kernel(
     INIT: gl.constexpr,
     LOCAL: gl.constexpr,
     CAUSAL: gl.constexpr,
-    QT: gl.constexpr,
+    TQ: gl.constexpr,
     BB: gl.constexpr,
     ROWS: gl.constexpr,
     POOL: gl.constexpr,
@@ -276,12 +256,15 @@ def _score_kernel(
     WL3: gl.constexpr,
     WM: gl.constexpr,
     PIPE: gl.constexpr,
-    QLDS: gl.constexpr,
     SINGLE_SEQ: gl.constexpr,
+    NSPLIT: gl.constexpr,
+    BIG_IC: gl.constexpr,
+    FLAT_MAX: gl.constexpr,
+    FIRST_TILE: gl.constexpr,
 ):
     NI: gl.constexpr = 16
     DI: gl.constexpr = 128
-    M: gl.constexpr = QT * NI
+    M: gl.constexpr = TQ * NI
     R: gl.constexpr = BB * ROWS
     FW: gl.constexpr = 256
     MFMA: gl.constexpr = gl.amd.AMDMFMALayout(
@@ -295,16 +278,28 @@ def _score_kernel(
     QL: gl.constexpr = gl.BlockedLayout([1, 8], [4, 16], [4, 1], [1, 0])
     SL: gl.constexpr = gl.BlockedLayout(
         [1, 1], [1, 64], [1, 4], [1, 0]
-    )  # [QT, BB] scores
+    )  # [TQ, BB] scores
     FL: gl.constexpr = gl.BlockedLayout(
         [1, 4], [1, 64], [1, 4], [1, 0]
-    )  # [QT, FW] -inf fill
+    )  # [TQ, FW] -inf fill
     RL: gl.constexpr = gl.SliceLayout(1, gl.SliceLayout(2, WL3))
 
-    t0 = gl.program_id(0) * QT
+    t0 = gl.program_id(0) * TQ
     pid_s = gl.program_id(1)
-    ns = gl.num_programs(1)
+    ns = NSPLIT
     icw_ptr = ic_ptr.to(gl.pointer_type(gl.int32), bitcast=True)
+
+    if FIRST_TILE:
+        q_rows = t0 + gl.arange(0, TQ, layout=gl.SliceLayout(1, SL))
+        tval = q_rows < T
+        pos_t = gl.load(pos_ptr + q_rows, mask=tval, other=0)
+        if SINGLE_SEQ:
+            # A one-row table can only be indexed by sequence zero. Specializing this
+            # metadata removes the sequence scan and its live scalar state for bs1.
+            seq_t = gl.full([TQ], 0, gl.int32, layout=gl.SliceLayout(1, SL))
+        else:
+            seq_t = gl.load(seq_ptr + q_rows, mask=tval, other=-1)
+        qb_t = pos_t // 16
 
     # q tile -> fp32 (q4k4: NVFP4 by 16 consecutive dims) -> MFMA K order -> fp16 A operand.
     # Loaded once in a blocked layout and redistributed: the A operand is replicated over the
@@ -316,17 +311,35 @@ def _score_kernel(
     qoff = gl.expand_dims(
         tm.to(gl.int64) * (NI * DI) + (rm % NI) * DI, 1
     ) + gl.expand_dims(dd, 0)
-    q = gl.load(iq_ptr + qoff, mask=qmask, other=0.0).to(gl.float32)
+    if FIRST_TILE:
+        # Issue Q first so its wait leaves the later key loads outstanding.
+        q_raw = gl.load(iq_ptr + qoff, mask=qmask, other=0.0)
+        qb_first = gl.max(gl.where(tval, qb_t, -1), axis=0)
+        ph_first, lv_first = _phys_rows(
+            bt_ptr, s_bt, 0, pid_s * BB, qb_first, NB, ROWS, R, RL
+        )
+        w_first, s_first = _load_tile(
+            ic_ptr, icw_ptr, ph_first, lv_first, ROWS, R, WL3, BIG_IC
+        )
+        gl.amd.hint.sched_barrier()
+        q = q_raw.to(gl.float32)
+    else:
+        q = gl.load(iq_ptr + qoff, mask=qmask, other=0.0).to(gl.float32)
     if Q4:
         q = _fake_nvfp4(q, M, DI)
-    if QLDS:
-        # multi-row q tiles: q lives in shared memory and each K step reads its slice, so
-        # the A operand (copied in all 4 warps) does not hold 128 registers a lane
-        SHQ: gl.constexpr = gl.amd.cdna4.compute_efficient_padded_shared_layout(
+    if TQ > 1:
+        SHP_AUTO: gl.constexpr = gl.amd.cdna4.compute_efficient_padded_shared_layout(
             AL, [M, DI], gl.float16
         )
-        smem_q = gl.allocate_shared_memory(gl.float16, [M, DI], SHQ)
-        smem_q.store(_k_permute(q, M).to(gl.float16))
+        if SHP_AUTO is None:
+            SHP: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
+                [[128, 8]], [M, DI], [1, 0]
+            )
+        else:
+            SHP: gl.constexpr = SHP_AUTO
+        qp = gl.allocate_shared_memory(gl.float16, [M, DI], SHP)
+        qp.store(_k_permute(q, M).to(gl.float16))
+        qa = qp.load(AL)
     else:
         qa = gl.convert_layout(_k_permute(q, M).to(gl.float16), AL)
     # MFMA K index k = 32 s + 8 c + e holds dim 32 c + 8 s + e
@@ -341,25 +354,20 @@ def _score_kernel(
         ca = gl.load(cq_ptr + gl.expand_dims(r16 * 0, 1) + gl.expand_dims(dperm, 0)).to(
             gl.float16
         )
-        if QLDS:
-            SHC: gl.constexpr = gl.SwizzledSharedLayout(
-                8, 1, 8, order=[1, 0]
-            )  # 16 rows: no padded layout
-            smem_c = gl.allocate_shared_memory(gl.float16, [16, DI], SHC)
-            smem_c.store(ca)
 
-    tq = t0 + gl.arange(0, QT, layout=gl.SliceLayout(1, SL))
-    tval = tq < T
-    pos_t = gl.load(pos_ptr + tq, mask=tval, other=0)
-    if SINGLE_SEQ:
-        # A one-row table can only be indexed by sequence zero. Specializing this
-        # metadata removes the sequence scan and its live scalar state for bs1.
-        seq_t = gl.full([QT], 0, gl.int32, layout=gl.SliceLayout(1, SL))
-    else:
-        seq_t = gl.load(seq_ptr + tq, mask=tval, other=-1)
-    qb_t = pos_t // 16
+    if not FIRST_TILE:
+        q_rows = t0 + gl.arange(0, TQ, layout=gl.SliceLayout(1, SL))
+        tval = q_rows < T
+        pos_t = gl.load(pos_ptr + q_rows, mask=tval, other=0)
+        if SINGLE_SEQ:
+            # A one-row table can only be indexed by sequence zero. Specializing this
+            # metadata removes the sequence scan and its live scalar state for bs1.
+            seq_t = gl.full([TQ], 0, gl.int32, layout=gl.SliceLayout(1, SL))
+        else:
+            seq_t = gl.load(seq_ptr + q_rows, mask=tval, other=-1)
+        qb_t = pos_t // 16
     jt = gl.arange(0, BB, layout=gl.SliceLayout(0, SL))
-    orow = out_ptr + gl.expand_dims(tq.to(gl.int64) * NB, 1)
+    orow = out_ptr + gl.expand_dims(q_rows.to(gl.int64) * NB, 1)
     zero_acc = gl.zeros([M, R], gl.float32, layout=MFMA)
 
     # Visit the tile's distinct sequence ids once, including non-contiguous ids. With
@@ -375,62 +383,73 @@ def _score_kernel(
         ntile = qbmax // BB + 1
         # PIPE: tile i scored while tile i+1's keys and tile i+2's pages load
         if PIPE:
-            ph, lv = _phys_rows(bt_ptr, s_bt, s_sub, pid_s * BB, qbmax, NB, ROWS, R, RL)
-            w_c, s_c = _load_tile(ic_ptr, icw_ptr, ph, lv, ROWS, R, WL3)
+            if FIRST_TILE:
+                w_c, s_c = w_first, s_first
+            else:
+                ph, lv = _phys_rows(
+                    bt_ptr, s_bt, s_sub, pid_s * BB, qbmax, NB, ROWS, R, RL
+                )
+                w_c, s_c = _load_tile(ic_ptr, icw_ptr, ph, lv, ROWS, R, WL3, BIG_IC)
             ph_n, lv_n = _phys_rows(
                 bt_ptr, s_bt, s_sub, (pid_s + ns) * BB, qbmax, NB, ROWS, R, RL
             )
         for ti in range(pid_s, ntile, ns):
             if PIPE:
-                w_n, s_n = _load_tile(ic_ptr, icw_ptr, ph_n, lv_n, ROWS, R, WL3)
+                w_n, s_n = _load_tile(ic_ptr, icw_ptr, ph_n, lv_n, ROWS, R, WL3, BIG_IC)
                 ph_n, lv_n = _phys_rows(
                     bt_ptr, s_bt, s_sub, (ti + 2 * ns) * BB, qbmax, NB, ROWS, R, RL
                 )
             else:
-                ph, lv = _phys_rows(
-                    bt_ptr, s_bt, s_sub, ti * BB, qbmax, NB, ROWS, R, RL
-                )
-                w_c, s_c = _load_tile(ic_ptr, icw_ptr, ph, lv, ROWS, R, WL3)
-            if QLDS:
-                kb0, kb1, kb2, kb3 = _keys_b_steps(w_c, s_c, R, BL)
-                dots = _dot_lds(smem_q, kb0, kb1, kb2, kb3, zero_acc, AL)  # [M, R]
-            else:
-                kb = _keys_b(w_c, s_c, R, BL)
-                dots = gl.amd.cdna4.mfma(qa, kb, zero_acc)  # [M, R]
-            if POOL:
-                if QLDS:
-                    lg = _dot_lds(
-                        smem_c,
-                        kb0,
-                        kb1,
-                        kb2,
-                        kb3,
-                        gl.zeros([16, R], gl.float32, layout=MFMA),
-                        AL,
-                    )
+                if FIRST_TILE:
+                    w_c, s_c = w_first, s_first
                 else:
-                    lg = gl.amd.cdna4.mfma(
-                        ca, kb, gl.zeros([16, R], gl.float32, layout=MFMA)
+                    ph, lv = _phys_rows(
+                        bt_ptr, s_bt, s_sub, ti * BB, qbmax, NB, ROWS, R, RL
                     )
+                    w_c, s_c = _load_tile(ic_ptr, icw_ptr, ph, lv, ROWS, R, WL3, BIG_IC)
+            kb = _keys_b(w_c, s_c, R, BL)
+            dots = gl.amd.cdna4.mfma(qa, kb, zero_acc)  # [M, R]
+            if POOL:
+                lg = gl.amd.cdna4.mfma(
+                    ca, kb, gl.zeros([16, R], gl.float32, layout=MFMA)
+                )
                 lg = gl.reshape(lg * (pool_temp * 1.4426950408889634), [16, R // 4, 4])
                 e = gl.exp2(lg - gl.expand_dims(gl.max(lg, axis=2), 2))
                 den = gl.sum(e, axis=2)
                 rs = gl.fdiv(gl.full(den.shape, 1.0, gl.float32, layout=den.type.layout), den,
                              ieee_rounding=False)  # fmt: skip
                 w = gl.reshape(e * gl.expand_dims(rs, 2), [16, R])  # same in every row
-                if QT == 1:
+                if TQ == 1:
                     dw = dots * gl.convert_layout(w, MFMA)
                 else:
-                    d3 = gl.reshape(dots, [QT, NI, R])
+                    d3 = gl.reshape(dots, [TQ, NI, R])
                     w3 = gl.convert_layout(w, gl.SliceLayout(0, d3.type.layout))
                     dw = gl.reshape(d3 * gl.expand_dims(w3, 0), [M, R])
                 cent = gl.sum(gl.reshape(dw, [M, R // 4, 4]), axis=2)
-                bs = gl.max(gl.reshape(cent, [M, BB, 4]), axis=2)
+                if FLAT_MAX:
+                    all_cent = gl.permute(
+                        gl.reshape(cent, [TQ, NI, BB, 4]), [0, 2, 3, 1]
+                    )
+                    block_score = gl.max(gl.reshape(all_cent, [TQ, BB, 4 * NI]), axis=2)
+                else:
+                    bs = gl.max(gl.reshape(cent, [M, BB, 4]), axis=2)
             else:
-                bs = gl.max(gl.reshape(dots, [M, BB, ROWS]), axis=2)
-            score = (
-                gl.convert_layout(gl.max(gl.reshape(bs, [QT, NI, BB]), axis=1), SL) * sc
-            )
+                if FLAT_MAX:
+                    all_rows = gl.permute(
+                        gl.reshape(dots, [TQ, NI, BB, ROWS]), [0, 2, 3, 1]
+                    )
+                    block_score = gl.max(
+                        gl.reshape(all_rows, [TQ, BB, ROWS * NI]), axis=2
+                    )
+                else:
+                    bs = gl.max(gl.reshape(dots, [M, BB, ROWS]), axis=2)
+            if FLAT_MAX:
+                score = gl.convert_layout(block_score, SL) * sc
+            else:
+                score = (
+                    gl.convert_layout(gl.max(gl.reshape(bs, [TQ, NI, BB]), axis=1), SL)
+                    * sc
+                )
             jb = ti * BB + jt
             jb2 = gl.expand_dims(jb, 0)
             qb2 = gl.expand_dims(qb_t, 1)
@@ -443,10 +462,10 @@ def _score_kernel(
                 s_c = s_n
         if not CAUSAL:
             f1 = gl.minimum(NB, (pid_s + 1) * FILL)
-            neg = gl.full([QT, FW], float("-inf"), gl.float32, layout=FL)
-            tqf = t0 + gl.arange(0, QT, layout=gl.SliceLayout(1, FL))
+            neg = gl.full([TQ, FW], float("-inf"), gl.float32, layout=FL)
+            q_fill_rows = t0 + gl.arange(0, TQ, layout=gl.SliceLayout(1, FL))
             minef = gl.convert_layout(mine, gl.SliceLayout(1, FL))
-            orowf = out_ptr + gl.expand_dims(tqf.to(gl.int64) * NB, 1)
+            orowf = out_ptr + gl.expand_dims(q_fill_rows.to(gl.int64) * NB, 1)
             for c0 in range(gl.maximum(ntile * BB, pid_s * FILL), f1, FW):
                 cols = gl.expand_dims(
                     c0 + gl.arange(0, FW, layout=gl.SliceLayout(0, FL)), 0
@@ -486,8 +505,8 @@ def _words_layout(r, wm=1):
 
 
 def _score(iq, ic, block_tables, seq_id, positions, nb, cq, init, local, pool_temp, q4,
-           qt=None, bb=None, waves=None, causal=False, index_scale=1.0, wm=1, pipe=None,
-           qlds=False):  # fmt: skip
+           tq=None, bb=None, waves=None, causal=False, index_scale=1.0, wm=1,
+           pipe=None):  # fmt: skip
     if not is_supported(iq.device):
         raise RuntimeError("NVFP4 index scorer requires gfx950")
     index = torch.cuda.current_device() if iq.device.index is None else iq.device.index
@@ -521,23 +540,24 @@ def _score(iq, ic, block_tables, seq_id, positions, nb, cq, init, local, pool_te
     out = torch.empty(t, nb, dtype=torch.float32, device=iq.device)
     if t == 0 or nb == 0:
         return out
-    if qt is None:
-        qt = 1 if t <= 64 else 8
-    if qt not in (1, 2, 4, 8):
-        raise ValueError("qt must be one of 1, 2, 4, 8")
+    if tq is None:
+        tq = 1 if t <= 64 else 8
+    elif tq == 0:
+        tq = 1
+    if tq not in (1, 2, 4, 8):
+        raise ValueError("tq must be one of 0, 1, 2, 4, 8")
     if wm not in (1, 2, 4):
         raise ValueError("wm must be one of 1, 2, 4")
     if bb is None:
-        bb = (8 if qt <= 4 else 4) if rows == PAGE else 16
-        if rows == PAGE and t == 1 and qt == 1 and nb <= 1024 and not q4:
-            # Short bs1 decode benefits from more, smaller programs. q4 keeps the
-            # larger tile to amortize its per-program query quantization.
+        bb = (8 if tq <= 4 else 4) if rows == PAGE else 16
+        if rows == PAGE and t == 1 and tq == 1 and nb <= 1024:
+            # Short bs1 decode benefits from more, smaller programs.
             bb = 4
     if bb * rows not in (64, 128):
         raise ValueError("bb must form a tile of 64 or 128 cache rows")
     if waves is None:
-        waves = 2 if qt > 1 else 4
-    nq = triton.cdiv(t, qt)
+        waves = 2 if tq > 1 else 4
+    nq = triton.cdiv(t, tq)
     if not isinstance(waves, int) or waves <= 0:
         raise ValueError("waves must be a positive integer")
     nsplit = max(1, min(triton.cdiv(nb, bb), triton.cdiv(waves * cus, nq)))
@@ -562,7 +582,7 @@ def _score(iq, ic, block_tables, seq_id, positions, nb, cq, init, local, pool_te
         INIT=init,
         LOCAL=local,
         CAUSAL=causal,
-        QT=qt,
+        TQ=tq,
         BB=bb,
         ROWS=rows,
         POOL=rows == PAGE,
@@ -571,8 +591,32 @@ def _score(iq, ic, block_tables, seq_id, positions, nb, cq, init, local, pool_te
         WM=wm,
         PIPE=pipe,
         SINGLE_SEQ=block_tables.shape[0] == 1,
-        QLDS=bool(qlds),  # q from shared memory: fewer registers, but slower on MI350
+        NSPLIT=nsplit,
+        BIG_IC=ic.numel() > 2**32,
+        FIRST_TILE=(
+            rows == PAGE
+            and block_tables.shape[0] == 1
+            and wm == 1
+            and (
+                (tq == 1 and not pipe and nsplit * bb >= nb)
+                or (
+                    q4
+                    and t == tq
+                    and tq in (4, 8)
+                    and nb <= (8192 if tq == 4 else 4096)
+                    and bb == (8 if tq == 4 else 4)
+                )
+            )
+        ),
+        FLAT_MAX=(
+            rows == PAGE
+            and block_tables.shape[0] == 1
+            and t <= 8
+            and wm == 1
+            and ((tq == 4 and bb == 8) or (tq == 8 and bb == 4 and nb <= 4096))
+        ),
         num_warps=NUM_WARPS,
+        llvm_fn_attrs="amdgpu-ieee=false",
     )
     return out
 
@@ -590,7 +634,7 @@ def score(
     pool_temp,
     **kw,
 ):
-    """Score NVFP4 keys after group-16 NVFP4 query quantization."""
+    """Score NVFP4 keys after group-16 query quantization, grouping ``tq`` rows."""
     return _score(iq, index_cache, block_tables, seq_id, positions, nb, cq, init, local,
                   pool_temp, True, **kw)  # fmt: skip
 
@@ -608,6 +652,6 @@ def score_bf16q(
     pool_temp,
     **kw,
 ):
-    """Score NVFP4 keys using bf16 queries directly."""
+    """Score NVFP4 keys using bf16 queries directly, grouping ``tq`` rows."""
     return _score(iq, index_cache, block_tables, seq_id, positions, nb, cq, init, local,
                   pool_temp, False, **kw)  # fmt: skip
