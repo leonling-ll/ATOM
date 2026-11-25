@@ -7,6 +7,7 @@ numerics, and SpeculativeConfig DSpark detection/routing.
 
 import importlib
 import inspect
+import os
 import types
 from contextlib import nullcontext
 
@@ -2471,6 +2472,7 @@ def _paged_proposer(
         p.model = types.SimpleNamespace(
             window_size=None,
             block_attention_is_mla=True,
+            builds_paged_block=False,
             kv_pool_spec=None,
         )
     n_cols = max_model_len // block_size
@@ -2815,58 +2817,6 @@ def test_staged_anchors_clamp_the_id_and_zero_the_pad(scheduled_bs):
     assert anchor_positions.tolist() == [6, 15, 27, 39][:scheduled_bs] + pad
 
 
-def test_page16_table_expands_every_page_into_its_eight_sub_pages():
-    """MiniMax-M3.1 DSpark block rows read a page-16 table built from the
-    page-128 block table: page p -> 8p .. 8p+7, in column order."""
-    import torch
-
-    from atom.models.minimax_m3.dspark import _page16_table
-
-    bt = torch.tensor([[0, 1, 0], [5, 7, 2]], dtype=torch.int32)
-    out = torch.full((2, 24), -1, dtype=torch.int32)
-    _page16_table(bt, out, torch.arange(8, dtype=torch.int32))
-    expect = (bt.repeat_interleave(8, dim=1) * 8) + torch.arange(8).repeat(3)
-    assert torch.equal(out, expect.to(torch.int32))
-
-
-@pytest.mark.parametrize("window", [0, 35])
-def test_window_rows_start_each_row_at_its_own_window(window):
-    """Each MiniMax-M3.1 DSpark block row starts at the page-16 holding the
-    first key of ITS window (position - window + 1), not one start shared by
-    the block, and not moved by the allocation cap on the request's length.
-    Pad rows repeat the last real anchor and read from their first page."""
-    import torch
-
-    from atom.models.minimax_m3.dspark import _window_rows
-
-    P, T, rb = 32, 3, 2
-    bt16_flat = torch.arange((rb + 1) * P, dtype=torch.int32)
-    # Request 0 is capped at 98 of its 100 keys; request 1 is padding.
-    ctx_eff = torch.tensor([98, 8], dtype=torch.int32)
-    positions = torch.tensor([97, 98, 99, 99, 99, 99])
-    row_req = torch.arange(rb).repeat_interleave(T)
-    tables = torch.empty(rb * T, P, dtype=torch.int32)
-    lens = torch.empty(rb * T, dtype=torch.int32)
-    _window_rows(
-        bt16_flat,
-        ctx_eff,
-        positions,
-        row_req,
-        window,
-        T,
-        torch.empty(rb * T, dtype=torch.int64),
-        tables,
-        lens,
-    )
-    # Window starts 63, 64, 65 -> page-16s 3, 4, 4.
-    start16 = [3, 4, 4] if window else [0, 0, 0]
-    expect_lens = [98 - 16 * s for s in start16] + [8, 8, 8]
-    assert lens.tolist() == expect_lens
-    for row, s in enumerate(start16 + [0, 0, 0]):
-        first = row_req[row].item() * P + s
-        assert tables[row].tolist() == list(range(first, first + P))
-
-
 @pytest.mark.parametrize("tp", [1, 2])
 def test_minimax_m31_dspark_refuses_tp_below_its_kv_heads(monkeypatch, tp):
     """The MiniMax-M3.1 draft decodes its block per row with one KV head per
@@ -3198,13 +3148,22 @@ def test_the_proposer_drops_padded_target_rows(pooled):
 # The two non-MLA block drafts: the K3 GQA draft under DCP 8, whose entry is
 # `block_size * 8` and whose pool is outside the DCP group, and MiniMax-M3.1,
 # which refuses DCP. `caps_in_place`: the GQA draft caps `ctx_lens` itself,
-# M3.1 caps its per-row lengths and leaves `ctx_lens` as the proposer built it.
+# M3.1 caps its per-row lengths and leaves `ctx_lens` as it built it, in one
+# Triton launch (`dspark_block_meta`): a GPU, or TRITON_INTERPRET=1.
 _NON_MLA_DRAFTS = [
     pytest.param(
         "atom.models.kimi_k3_dspark_gqa", "KimiK3DSparkGQA", 8, True, id="k3_gqa"
     ),
     pytest.param(
-        "atom.models.minimax_m3.dspark", "MiniMaxM3DSpark", 1, False, id="minimax_m31"
+        "atom.models.minimax_m3.dspark",
+        "MiniMaxM3DSpark",
+        1,
+        False,
+        id="minimax_m31",
+        marks=pytest.mark.skipif(
+            not torch.cuda.is_available() and os.environ.get("TRITON_INTERPRET") != "1",
+            reason="dspark_block_meta is a Triton kernel",
+        ),
     ),
 ]
 
@@ -3213,8 +3172,8 @@ _NON_MLA_DRAFTS = [
 def test_non_mla_block_drafts_skip_the_csr_and_the_mla_plan(
     monkeypatch, module, cls_name, dcp, caps_in_place
 ):
-    """The real `_build_paged_block_metadata` and `prepare_paged_block` of a
-    built non-MLA block draft.
+    """The real `_build_paged_block_metadata` and `prepare_paged_block` (or
+    `build_paged_block`) of a built non-MLA block draft.
 
     The slots are at the draft's entry width, in global terms, and the pad row
     reads one block. The draft drops the writes past each request's allocation

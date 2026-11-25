@@ -315,3 +315,120 @@ def test_sharded_step_writes_its_embed_column_in_place():
             embed_out=block[:, k],
         )
     assert torch.equal(block, torch.stack(fresh, dim=1))
+
+
+class _LockstepTp:
+    """One rank's view of a TP group whose other ranks run in lockstep: each
+    `all_gather` of this rank's `(max, id)` pack is answered with every other
+    rank's pack for the same block position, computed off their own LM-head
+    shards from the ids the block has gathered so far."""
+
+    def __init__(self, rank, shard_logits, anchors, w1, w2):
+        self.rank, self.world_size = rank, len(shard_logits)
+        self._logits, self._w1, self._w2 = shard_logits, w1, w2
+        self._prev, self.calls = anchors.clone(), 0
+
+    def all_gather(self, packed, dim, use_custom):
+        from atom.model_ops.dspark_markov_argmax import _launch, argmax_gather
+
+        assert dim == 0
+        packs = []
+        for j, logits in enumerate(self._logits):
+            pack = torch.empty_like(packed)
+            scratch = torch.empty_like(self._prev)
+            base = logits[:, self.calls]
+            _launch(
+                base, self._prev, self._w1, self._w2, scratch, j * base.shape[1], pack
+            )
+            if j == self.rank:
+                # the rank under test reduced its own shard to the same pair
+                assert torch.equal(packed, pack), self.calls
+            packs.append(pack)
+        gathered = torch.cat(packs)
+        argmax_gather(gathered.view(self.world_size, -1, 2), self._prev)
+        self.calls += 1
+        return gathered
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")
+@pytest.mark.parametrize("tie", [False, True])
+@pytest.mark.parametrize("bs", [1, 4])
+def test_m3_draft_samples_its_block_off_the_vocab_shard(monkeypatch, bs, tie):
+    """MiniMax-M3.1 / M3-Pro's draft under TP8 at Pro's vocab and Markov rank:
+    the block sampled off each rank's LM-head shard (no logits all-gather) has
+    the whole-vocab head's ids and confidences, bit for bit. The whole-vocab
+    head's logits are the all-gather of the same per-shard GEMMs, as
+    `ParallelLMHead.forward` produces them; it is what a head of TP 1 runs.
+    With ``tie``, every position's maximum is tied between an id of the first
+    shard and one of the last, and the lower id wins."""
+    from aiter.dist import parallel_state
+    from aiter.tuned_gemm import tgemm
+    from torch import nn
+
+    from atom.models.dspark_draft import DSparkConfidenceHead, DSparkMarkovHead
+    from atom.models.minimax_m3 import dspark as m3_dspark
+
+    tp, vocab, rank, hidden_size, T = 8, 200064, 256, 1024, 7
+    shard = vocab // tp  # 25008: not a multiple of the V tile
+    torch.manual_seed(bs)
+    kw = {"dtype": torch.bfloat16, "device": "cuda"}
+    weight = torch.randn(vocab, hidden_size, **kw) * 0.05
+    hidden = torch.randn(bs * T, hidden_size, **kw)
+    anchors = torch.randint(0, vocab, (bs,), dtype=torch.int32, device="cuda")
+    monkeypatch.setenv("ATOM_DSPARK_FUSED_MARKOV_SAMPLE", "1")
+    markov = DSparkMarkovHead(vocab, rank).to(**kw)
+    confidence = DSparkConfidenceHead(hidden_size, rank, bias=True).to(**kw)
+    with torch.no_grad():
+        markov.markov_w1.weight.normal_(std=0.5)
+        markov.markov_w2.weight.normal_(std=0.5)
+        confidence.proj.weight.normal_(std=0.02)
+        confidence.proj.bias.normal_()
+    w1, w2 = markov.markov_w1.weight, markov.markov_w2.weight
+    if tie:
+        # One hidden row everywhere, and two vocab rows, at the same column of
+        # the first and the last shard, that copy it: their logits, the same
+        # GEMM at the same column, dwarf every other, and their Markov rows
+        # are equal, so each position's maximum is a tie between them.
+        low = 12345
+        high = (tp - 1) * shard + low
+        hidden = hidden[:1].expand(bs * T, -1).contiguous()
+        with torch.no_grad():
+            weight[low] = weight[high] = hidden[0]
+            w2[high] = w2[low]
+    shard_w = [weight[j * shard : (j + 1) * shard] for j in range(tp)]
+    shard_logits = [tgemm.mm(hidden, w).view(bs, T, -1) for w in shard_w]
+
+    class _Head:
+        """A rank's `ParallelLMHead`: its shard, and the gathered logits."""
+
+        bias = None
+
+        def __init__(self, r, tp_size=tp):
+            self.weight, self.vocab_start_idx = shard_w[r], r * shard
+            self.tp_size = tp_size
+
+        def __call__(self, x):
+            return torch.cat([tgemm.mm(x, w) for w in shard_w], dim=-1)
+
+    def draft_on(head):
+        draft = m3_dspark.MiniMaxM3DSpark.__new__(m3_dspark.MiniMaxM3DSpark)
+        nn.Module.__init__(draft)
+        draft.lm_head = head
+        draft.markov_head, draft.confidence_head = markov, confidence
+        return draft
+
+    group = _LockstepTp(0, shard_logits, anchors, w1, w2)
+    monkeypatch.setattr(parallel_state, "get_tp_group", lambda: group)
+    ref_ids, ref_conf = draft_on(_Head(0, tp_size=1)).head_and_sample(
+        hidden, anchors, T
+    )
+    assert group.calls == 0  # the whole-vocab head: nothing crossed ranks
+    if tie:
+        assert torch.equal(shard_logits[0][..., low], shard_logits[-1][..., low])
+        assert ref_ids.eq(low).all()
+    for r in (0, 3, tp - 1):
+        group = _LockstepTp(r, shard_logits, anchors, w1, w2)
+        ids, conf = draft_on(_Head(r)).head_and_sample(hidden, anchors, T)
+        assert group.calls == T
+        assert torch.equal(ids, ref_ids), r
+        assert torch.equal(conf, ref_conf), r

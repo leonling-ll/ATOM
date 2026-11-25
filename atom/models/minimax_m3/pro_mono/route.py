@@ -54,7 +54,18 @@ def variants_refusal(v, mx_norm: bool) -> str | None:
     the attention's output as bf16: below the day0 decode the layers it takes
     get bf16 (``MiniMaxM3ProAttention.forward_core``), but the day0 decode
     hands o_proj E4M3 rows from ``day0_decode_rows`` rows, so it must start
-    above the row limit."""
+    above the row limit. ``ar_fused_rows`` sends production's AR #1 of 1 ..
+    ``ar_fused_rows`` rows to the one-launch two-shot Lamport kernel (the
+    fused 1-stage kernel's bytes, not the Lamport all-reduce's sum and norm),
+    so any positive value refuses, as a short ``ar_lamport_rows`` does.
+
+    Served as they are: ``moe_tail_ar`` (a mono layer hands on the summed FFN
+    partial and leaves no tail; an earlier layer's tail is added by the input
+    all-reduce, outside the segment), ``moe_two_stream_rows`` (production's
+    MoE on two streams gives the same bytes; a mono layer runs none of it
+    under the "ffn" build), ``moe_decode`` "day0" (it picks production's
+    routed-expert kernel for the layers mono does not take; mono's routed
+    experts and their fp32 top-k-order combine are its own either way)."""
     checks = [
         (not v.diag, "the diag variant"),
         (v.fuse_mxfp8_quant, "fuse_mxfp8_quant off"),
@@ -71,6 +82,11 @@ def variants_refusal(v, mx_norm: bool) -> str | None:
             rows_refusal(v.mono_ffn_rows, v.mono_routed_act) is not None
             or not 0 < v.day0_decode_rows <= v.mono_ffn_rows,
             f"day0_decode_rows {v.day0_decode_rows} within {v.mono_ffn_rows}",
+        ),
+        (
+            rows_refusal(v.mono_ffn_rows, v.mono_routed_act) is not None
+            or v.ar_fused_rows <= 0,
+            f"ar_fused_rows {v.ar_fused_rows} overlaps 1 .. {v.mono_ffn_rows}",
         ),
     ]
     return next((why for ok, why in checks if not ok), None)
@@ -112,8 +128,7 @@ class ProMonoRoute:
         )
         if not self.rows:
             if v.mono_ffn_rows:
-                # this rank's own refusal names the cause; the latch's would
-                # only say it latched 0
+                # this rank's refused variant, not the 0 it latched for it
                 logger.warning("%s off: %s", WHAT, refused or why)
             self._mono.enabled = False
             return

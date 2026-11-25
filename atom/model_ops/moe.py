@@ -3636,6 +3636,10 @@ class FusedMoE(torch.nn.Module):
         quant_config: Quantization configure.
     """
 
+    # Attached by MiniMax-M3-Pro under its ``moe_decode`` variant
+    # (``fused_moe/pro_experts_decode.py``).
+    pro_decode_experts = None
+
     # Set in __init__ for a shared expert staged into its fused slot.
     shared_expert_staging: SharedExpertStaging | None = None
 
@@ -5874,6 +5878,12 @@ class FusedMoE(torch.nn.Module):
             hidden_states.shape[0]
         ):
             return self.sp_mega_moe.forward(self, hidden_states, router_logits)
+        if (
+            self.pro_decode_experts is not None
+            and shared_add is None
+            and self.pro_decode_experts.runs(self, hidden_states)
+        ):
+            return self.pro_decode_experts.forward(self, hidden_states, router_logits)
 
         if get_dp_group().world_size > 1:
             return self.forward_impl_graph(

@@ -25,6 +25,7 @@ import textwrap
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 SERVER_SCRIPT = (
     Path(__file__).resolve().parents[1] / ".github/scripts/atomesh/pd_server_atom.sh"
@@ -104,6 +105,13 @@ def free_port():
         return sock.getsockname()[1]
 
 
+def master_port():
+    # Owner, metadata and metrics ports all sit in 50000-50300; keep clear.
+    while 50000 <= (port := free_port()) <= 50300:
+        pass
+    return port
+
+
 def prefixed_lines(stdout, prefix):
     """``<prefix>NAME=value`` lines as a dict, values kept verbatim."""
     return dict(
@@ -135,7 +143,7 @@ class MooncakeStoreTest(unittest.TestCase):
             (device / "ports/1/state").write_text("4: ACTIVE\n")
             (device / "device").mkdir()
             (device / "device/numa_node").write_text(f"{index // 4}\n")
-        self.master_port = free_port()
+        self.master_port = master_port()
         self.calls = self.root / "calls"
         self.calls.touch()
         self.path = f"{self.bin_dir}:{os.environ['PATH']}"
@@ -510,6 +518,12 @@ done
                     "plan_mooncake_store_pools\n", expect_rc=2, **env
                 )
                 self.assertIn(message, result.stderr)
+
+    def test_master_port_stays_out_of_the_owner_range(self):
+        with mock.patch.dict(
+            globals(), free_port=mock.Mock(side_effect=[50153, 40000])
+        ):
+            self.assertEqual(master_port(), 40000)
 
     def test_store_ports_must_fit_the_tcp_range_and_not_collide(self):
         # Pool p's master, metadata and metrics ports are 50051, 50180 and

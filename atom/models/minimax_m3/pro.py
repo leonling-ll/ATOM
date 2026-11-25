@@ -145,6 +145,12 @@ class ProLookaheadState:
         self.index_linears: dict[int, tuple[nn.Module, ...]] = {}
         self.resid_in: dict[int, torch.Tensor | tuple[torch.Tensor, torch.Tensor]] = {}
         self._ring: tuple[torch.Tensor, torch.Tensor] | None = None
+        # ``moe_tail_ar``: the shared-expert output a MoE layer left for the next layer's
+        # input all-reduce to add, taken (and cleared) by that layer. ``end_layer``: one
+        # past this pipeline stage's last layer, which adds its own (the model sets it;
+        # the layer count until then, and without it every layer adds its own)
+        self.end_layer = int(getattr(config, "num_hidden_layers", 0) or 0)
+        self.moe_tail: torch.Tensor | None = None
 
     def front_rows(
         self, reader: int, rows: int, like: torch.Tensor
@@ -213,6 +219,10 @@ class ProLookaheadState:
         if written_at(index_src, q[rows:], q_scale[rows:]):
             return front
         return None
+
+    def take_moe_tail(self) -> torch.Tensor | None:
+        tail, self.moe_tail = self.moe_tail, None
+        return tail
 
     @staticmethod
     def _normed(norm: GemmaRMSNorm, x: torch.Tensor) -> torch.Tensor:
@@ -601,6 +611,7 @@ class MiniMaxM3ProDecoderLayer(MiniMaxM3DecoderLayer):
         )
         x_out = (None, None) if front is None else (front[0][:rows], front[1][:rows])
         hidden_states_scale = None
+        moe_tail = state.take_moe_tail()
         if residual is None:
             residual = hidden_states
             if fuse_attn_in:
@@ -621,13 +632,15 @@ class MiniMaxM3ProDecoderLayer(MiniMaxM3DecoderLayer):
                     residual,
                     self.input_layernorm,
                     v.ar_lamport_rows,
+                    v.ar_fused_rows,
+                    addend=moe_tail,
                     q_out=x_out[0],
                     q_scale_out=x_out[1],
                 )
             )
         else:
             hidden_states, residual = fused_allreduce_gemma_rms_norm(
-                hidden_states, residual, self.input_layernorm
+                hidden_states, residual, self.input_layernorm, addend=moe_tail
             )
         aux_hidden_state = residual.clone() if capture_aux else None
 
@@ -672,18 +685,30 @@ class MiniMaxM3ProDecoderLayer(MiniMaxM3DecoderLayer):
                 o, residual, v, mx_norm
             )
             del o
-            hidden_states = self._ffn(x, x8, x8_scale, fuse, routes)
+            hidden_states = self._ffn(
+                x, x8, x8_scale, fuse, routes, v=v, hand_tail=True
+            )
         if aux_hidden_state is not None:
             return hidden_states, residual, aux_hidden_state
         return hidden_states, residual
 
     def _segment(self, hidden_states, residual, v, mx_norm: bool, fuse: bool):
         """Production's post-attention segment on o_proj's output (``forward``'s
-        two steps): ``(ffn_out, residual, x, x8, x8_scale)``."""
+        two steps): ``(ffn_out, residual, x, x8, x8_scale)``. ``ffn_out`` is the
+        summed FFN partial under ``moe_tail_ar`` too, and no tail is left: it is
+        check mode's reference for the mono kernel's, whose output the forward
+        goes on from (a tail left here would be added a second time by the next
+        layer's input all-reduce)."""
         x, x8, x8_scale, residual, routes = self._post_attention(
             hidden_states, residual, v, mx_norm
         )
-        return self._ffn(x, x8, x8_scale, fuse, routes), residual, x, x8, x8_scale
+        return (
+            self._ffn(x, x8, x8_scale, fuse, routes, v=v),
+            residual,
+            x,
+            x8,
+            x8_scale,
+        )
 
     def _post_attention(self, hidden_states, residual, v, mx_norm: bool):
         """AR #1 + the post-attention norm and the lookahead put, as
@@ -727,6 +752,7 @@ class MiniMaxM3ProDecoderLayer(MiniMaxM3DecoderLayer):
                 residual,
                 self.post_attention_layernorm,
                 v.ar_lamport_rows,
+                v.ar_fused_rows,
             )
         hidden_states, residual = fused_allreduce_gemma_rms_norm(
             hidden_states, residual, self.post_attention_layernorm
@@ -734,21 +760,49 @@ class MiniMaxM3ProDecoderLayer(MiniMaxM3DecoderLayer):
         return hidden_states, None, None, residual
 
     def _ffn(
-        self, hidden_states, ffn_x, ffn_x_scale, fuse: bool, routes=None
+        self,
+        hidden_states,
+        ffn_x,
+        ffn_x_scale,
+        fuse: bool,
+        routes=None,
+        *,
+        v=None,
+        hand_tail: bool = False,
     ) -> torch.Tensor:
         """The FFN (its TP partial) on the post-attention norm's outputs, or on
-        ``moe_route_glue``'s ``routes``."""
+        ``moe_route_glue``'s ``routes``. ``hand_tail`` (production's forward
+        alone): under ``moe_tail_ar`` a MoE layer before this stage's last
+        returns its routed output and leaves the shared one in
+        ``ProLookaheadState.moe_tail`` for the next layer's input all-reduce;
+        every other caller (check mode's reference, a mono "norm" build) gets
+        the summed partial and leaves no tail. ``v``: the forward's variants
+        (read here when not given)."""
+        v = variants() if v is None else v
         ffn = self.block_sparse_moe if self.is_moe_layer else self.mlp
         if routes is not None:
             return ffn.forward_glue(routes, quant_down=True)
         if not fuse:
             return ffn(hidden_states)
         if self.is_moe_layer:
-            return ffn(
+            state = self._pro_state
+            # the next layer's input all-reduce adds the shared output
+            defer = (
+                hand_tail
+                and v.moe_tail_ar
+                and ffn.shared_experts is not None
+                and self.layer_num + 1 < state.end_layer
+            )
+            out = ffn(
                 hidden_states,
                 shared_input=None if ffn_x is None else (ffn_x, ffn_x_scale),
                 quant_down=True,
+                defer_shared=defer,
+                two_streams=0 < hidden_states.shape[0] <= v.moe_two_stream_rows,
             )
+            if defer:
+                out, state.moe_tail = out
+            return out
         if ffn_x is not None:
             return ffn(ffn_x, ffn_x_scale, quant_down=True)
         return ffn(hidden_states, quant_down=True)
@@ -805,6 +859,7 @@ class MiniMaxM3ProForCausalLM(MiniMaxM3SparseForCausalLM):
             prefix=prefix,
             layer_type=partial(MiniMaxM3ProDecoderLayer, state=state, mono=mono),
         )
+        state.end_layer = self.model.end_layer
         if variants().moe_route_glue:
             # the op's IPC buffers: collective, and before any decode graph is captured
             moe_route_glue.build(

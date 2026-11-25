@@ -31,6 +31,11 @@ def _variants(**over):
         "ar_lamport_rows": 16,
         "mono_routed_act": "bf16",
         "day0_decode_rows": 24,
+        "ar_fused_rows": 0,
+        # read by production's segment, not the route (served as they are)
+        "moe_tail_ar": False,
+        "moe_two_stream_rows": 0,
+        "moe_decode": "aiter",
     }
     fields.update(over)
     return SimpleNamespace(**fields)
@@ -183,6 +188,9 @@ def test_a_failed_runner_turns_it_off_for_good(monkeypatch):
         # the day0 decode hands o_proj E4M3 rows from day0_decode_rows rows on
         ({"day0_decode_rows": 16}, "day0_decode_rows 16 within 16"),
         ({"day0_decode_rows": 1}, "day0_decode_rows 1 within 16"),
+        # AR #1 from 1 row up on the one-launch kernel, not the Lamport sum + norm
+        ({"ar_fused_rows": 128}, "ar_fused_rows 128 overlaps 1 .. 16"),
+        ({"ar_fused_rows": 1}, "ar_fused_rows 1 overlaps 1 .. 16"),
     ],
 )
 def test_variants_the_hand_off_cannot_serve_latch_off(monkeypatch, caplog, over, why):
@@ -204,6 +212,32 @@ def test_a_day0_decode_above_the_row_limit_or_off_is_served(monkeypatch, day0, r
     assert variants_refusal(_variants(**over), True) is None
     h = Harness(monkeypatch, **over)
     assert h.take(rows) is h.runner and h.route.rows == rows
+
+
+def test_a_refused_variant_is_logged_with_its_reason(monkeypatch, caplog):
+    import logging
+
+    h = Harness(monkeypatch, ar_fused_rows=128)
+    with caplog.at_level(logging.WARNING, logger=route_mod.logger.name):
+        assert h.take(1) is None
+    assert "off: ar_fused_rows 128 overlaps 1 .. 16" in caplog.text
+
+
+@pytest.mark.parametrize(
+    "over",
+    [
+        {"moe_tail_ar": True},
+        {"moe_two_stream_rows": 64},
+        {"moe_decode": "day0"},
+        {"moe_tail_ar": True, "moe_two_stream_rows": 64, "moe_decode": "day0"},
+    ],
+)
+def test_variants_the_segment_serves_as_they_are(monkeypatch, over):
+    """``moe_tail_ar``, the two-stream MoE and the day0 routed experts change
+    production's FFN, which a mono layer does not run (``variants_refusal``)."""
+    assert variants_refusal(_variants(**over), True) is None
+    h = Harness(monkeypatch, **over)
+    assert h.take(1) is h.runner and h.route.rows == 16
 
 
 def test_a_bad_row_limit_is_left_to_the_latch():
