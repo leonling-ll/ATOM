@@ -256,16 +256,17 @@ class ProVariants:
     day0_decode_mxfp8: bool = True
     # Mono decode phase 1 (``models/minimax_m3/pro_mono``): the most graph rows a decode /
     # verify forward may have for its MoE layers' o_proj .. FFN segment to run as one
-    # persistent kernel; 0 (default) off, at most ``pro_mono.config.MAX_ROWS``. Wider
+    # persistent kernel; 0 turns it off, at most ``pro_mono.config.max_rows``. Wider
     # forwards keep production's segment (``moe_route_glue`` where it is on). The layers
-    # mono takes get the decode attention's output as bf16; a ``day0_decode_rows`` at or
-    # below the limit (its epilogue writes E4M3) turns mono off. Latched once, at the
-    # first forward (``pro_mono.route``, agreed over the TP group): a later edit of the
-    # file does not change it. Off by default until its acceptance gates pass with it
-    # on (accuracy: the
-    # exposure and official GSM8K 3-run means, AIME26 avg@16 >= 0.95 twice,
-    # retrieval 40/40; speed: a faster measured layer and >= 10% proxy TPOT at c1/c4).
-    mono_ffn_rows: int = 0
+    # mono takes get the decode attention's output as bf16. On where the deployment and
+    # the variants allow it (``pro_mono.config.config_refusal``,
+    # ``pro_mono.route.variants_refusal``: TP8 with FlyDSL, the Lamport AR #1 up to
+    # these rows, the MXFP8 norms and the resid_in lookahead, a ``day0_decode_rows``
+    # above the limit); elsewhere it logs why and production serves. Latched once, at
+    # the first forward (``pro_mono.route``, agreed over the TP group): a later edit of
+    # the file does not change it. The accuracy it was turned on with (A16W4, the
+    # Agentic recipe's variants) is in recipes/MiniMax-M3.1-Pro-Accuracy-Switches.md.
+    mono_ffn_rows: int = 16
     # The mono FFN's routed experts' activations: "bf16" (A16W4: bf16 x and mids against
     # the MXFP4 experts dequantized in the kernel, production's a16w4 numerics at these
     # widths), "fp8" (W4A8: the norm's MXFP8 x and MXFP8 mids, gfx950's f8f6f4 MFMA) or

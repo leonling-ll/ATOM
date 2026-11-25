@@ -193,11 +193,16 @@ def test_a_failed_runner_turns_it_off_for_good(monkeypatch):
         ({"ar_fused_rows": 1}, "ar_fused_rows 1 overlaps 1 .. 16"),
     ],
 )
-def test_variants_the_hand_off_cannot_serve_latch_off(monkeypatch, over, why):
+def test_variants_the_hand_off_cannot_serve_latch_off(monkeypatch, caplog, over, why):
+    import logging
+
     assert variants_refusal(_variants(**over), True) == why
     h = Harness(monkeypatch, **over)
-    assert h.take(1) is None
+    with caplog.at_level(logging.WARNING, logger=route_mod.logger.name):
+        assert h.take(1) is None
     assert h.created == 0 and h.route.rows == 0
+    # the off line names the refusal, not the 0 it latched
+    assert f"mono FFN off: {why}" in caplog.text
 
 
 @pytest.mark.parametrize("day0, rows", [(24, 16), (17, 16), (0, 16), (9, 8)])
@@ -299,6 +304,48 @@ def test_check_mode_is_latched_from_the_environment(monkeypatch):
     assert h.take(1) is h.runner and h.route.check
     monkeypatch.setattr(route_mod.envs, "ATOM_MONO_CHECK", False)
     assert h.route.check
+
+
+# recipes/Agentic-MiniMax-M3.1-Pro.md's ATOM_M3PRO_VARIANTS, which name no mono key
+AGENTIC_VARIANTS = {
+    "kernels": True, "attn": "aiter", "topk": "split", "prep": "aiter",
+    "index_split": True, "score_tq": 8, "ar_lamport_rows": 16, "k_only": True,
+    "k_plain_fp8": True, "prefill_attn": "day0", "index_split_decode": 64,
+    "moe_route_glue": True, "index_compress": True,
+}  # fmt: skip
+# recipes/MiniMax-M3-Pro.md's kernel launch: no Lamport AR #1 rows
+GENERIC_VARIANTS = {"kernels": True, "attn": "aiter", "topk": "split"}
+
+
+def _parsed(obj):
+    """``obj`` as ``ATOM_M3PRO_VARIANTS`` parses it, ``ProVariants``' own
+    defaults filling every field it does not name."""
+    pro_attn = pytest.importorskip(
+        "atom.model_ops.minimax_m3.pro_attn",
+        reason="pro_attn needs aiter, including aiter.ops.triton.fused_kv_cache",
+    )
+    return pro_attn._parse_variants(obj)
+
+
+def test_the_agentic_recipe_runs_mono_a16w4_up_to_16_rows_by_default(monkeypatch):
+    h = Harness(monkeypatch)
+    h.v = _parsed(AGENTIC_VARIANTS)
+    assert h.take(1) is h.runner and h.take(16) is h.runner
+    assert h.take(17) is None
+    assert (h.route.rows, h.route.routed_act) == (16, "bf16")
+
+
+def test_a_launch_without_the_lamport_rows_keeps_production_and_says_why(
+    monkeypatch, caplog
+):
+    import logging
+
+    h = Harness(monkeypatch)
+    h.v = _parsed(GENERIC_VARIANTS)
+    with caplog.at_level(logging.WARNING, logger=route_mod.logger.name):
+        assert h.take(1) is None
+    assert h.created == 0 and h.route.rows == 0
+    assert "off: ar_lamport_rows 0 below 16" in caplog.text
 
 
 def _state(ahead=2, start=2, layers=68):

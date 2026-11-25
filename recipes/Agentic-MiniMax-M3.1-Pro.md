@@ -113,6 +113,7 @@ tokens loaded from the CPU tier and the re-ask's TTFT down from 2.85 s to 0.20 s
 | Prefill | 16384-token chunks; prefill attention on aiter's FlyDSL `minimax_m3_fp8_sparse_prefill` (amd-kernels-day0's kernel, ported into aiter-M3 `hatwu/m3.1-pro-infx` at `a26613a8a`) when the aiter build has it, otherwise the Triton kernel. `amd_kernels` is never installed. |
 | Decode attention | from 24 rows, amd-kernels-day0's FlyDSL sparse decode with an MXFP8 output for `o_proj`, when its `amd_kernels` package imports; otherwise aiter |
 | Decode front | up to 16 rows (`ar_lamport_rows`), a layer's q, k, index q and index k come from one MXFP8 GEMM over `[x; lookahead input]`; above it, two GEMMs |
+| MoE layers at ≤ 16 rows | mono decode (`mono_ffn_rows` 16, the default): a decode or verify forward of at most 16 rows runs each MoE layer's `o_proj` through its FFN partial as one persistent FlyDSL kernel, with A16W4 routed experts (bf16 activations, the same MXFP4 weights). Needs FlyDSL, the Lamport all-reduce (`ar_lamport_rows` 16) and the day0 decode starting above 16 rows (`day0_decode_rows` 24); without them production serves those layers. Mono sums its all-reduce in the Lamport kernel's order, so a launch with `ar_fused_rows` above 0 runs with mono off (`mono FFN off: ar_fused_rows N overlaps 1 .. 16`): the CONC 32 launch (`"ar_fused_rows": 128`) is one. The small-concurrency launch (`RECIPE=agentic_sc`, Small concurrency below) keeps `ar_fused_rows` at 0 (unset), as these variants do |
 | `max-num-seqs` | 2 × CONC (128) |
 
 ## 0. Build aiter-M3 into the container
@@ -210,6 +211,9 @@ Check the startup log:
   `--text-only` and the comm-group reuse). A pool near 35 GB means pad_align 128 is not in; near
   11 GB, streaming quant is not on.
 - One `Creating LMCacheEngine` line per rank with `'max_local_cpu_size': 184.0`.
+- After the first request, one `MiniMax-M3.1-Pro mono FFN: forwards of 1 .. 16 rows, routed experts
+  A16W4` line per rank. A `MiniMax-M3.1-Pro mono FFN off: <why>` line means mono is off and
+  production serves every MoE layer.
 
 ### Host memory for LMCache
 
