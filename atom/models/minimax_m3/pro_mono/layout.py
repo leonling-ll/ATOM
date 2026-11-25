@@ -26,12 +26,12 @@ MXFP4 for the routed experts, a W4A8 build's routed experts read x8, an A16W4
 build's the bf16 x)::
 
     router  R_TASKS CTAs from R0: this rank's 48 router rows (3 row groups x
-            R_PARTS K slices) against bf16 x; part 0 adds the parts in order,
-            fp32 -> every rank's ``rlog`` (an all-gather of the 384 logits)
+            R_PARTS K slices) against bf16 x; each part's fp32 partial ->
+            every rank's ``rlog`` (an all-gather of the 384 logits' parts)
     shared  SH_TASKS CTAs from SH0: 8 gate + 8 up rows of the MXFP8 shared
             gate_up against x8 -> bf16 g, u -> SwiGLU-OAI -> bf16 -> ``smid``
     route   S CTAs from RT0, token t (a real row: t < ``nvalid``'s count):
-            sigmoid, top-4 of sigmoid + bias, the 4 unbiased sigmoids
+            the parts added in order (fp32), sigmoid, top-4 of sigmoid + bias, the 4 unbiased sigmoids
             renormalized x 2.0 -> ``route``
     union   every CTA: the routed B operand (x4, x8, or A16W4 the CTA's K
             half of the bf16 x) -> LDS, staged while the route is in flight;
@@ -500,7 +500,8 @@ class P1Build:
 #      this rank owns
 # ag   [token][column] bf16 pairs: the owners' sums
 # agsq [task][token] two words a cell (sum of squares over f32 v, over bf16 v)
-# rlog [src rank][token][its 48 experts] the router logits (f32)
+# rlog [src rank][token][router part][its 48 experts] the router logits'
+#      K-slice partials (f32), added in part order by the route
 
 
 def rs_pair(src, t, col_in_own):
@@ -518,10 +519,10 @@ def agsq_pair(task, t):
     return (task * MAX_ROWS_LAYOUT + t) * 2
 
 
-def rlog_pair(src, t, e_in_rank):
-    """``rlog``'s pair of rank ``src``'s logit of its expert ``e_in_rank``,
-    token ``t``."""
-    return (src * MAX_ROWS_LAYOUT + t) * E_RANK + e_in_rank
+def rlog_pair(src, t, part, e_in_rank):
+    """``rlog``'s pair of rank ``src``'s K-slice ``part`` partial of its
+    expert ``e_in_rank``'s logit, token ``t``."""
+    return ((src * MAX_ROWS_LAYOUT + t) * R_PARTS + part) * E_RANK + e_in_rank
 
 
 def peer_items():
@@ -530,7 +531,7 @@ def peer_items():
         ("rs", TP * L * OWN // 2),
         ("ag", L * HIDDEN // 2),
         ("agsq", NT * L * 2),
-        ("rlog", TP * L * E_RANK),
+        ("rlog", TP * L * R_PARTS * E_RANK),
     )
 
 
@@ -548,16 +549,11 @@ def peer_bytes() -> int:
 # ---------------------------------------------------------- scratch regions
 # Tagged pairs at device scope (one GPU), a FFN build's only:
 # xrdy  [AR task] a norm CTA's x / x8 / x4 columns are stored
-# rpart [router task][token][row] a router K slice's f32 partial (parts > 0)
 # route [token][8] the picks' experts, then their weights (f32), top-k order
 # ugf   [ug task] a task's mid rows are stored (A16W4: a K-half pair's)
 # smid  [token][shared mid column] bf16 pairs
 # ugp   (A16W4) [K slice 1 ..][pick row][ug group][mid column] the half-1
 #       (quarter 1 to 3) tasks' f32 gate and up partials, two pairs a cell
-
-
-def rpart_pair(task, t, r):
-    return (task * MAX_ROWS_LAYOUT + t) * R_ROWS + r
 
 
 def route_pair(t, k):
@@ -595,7 +591,6 @@ def scratch_layout(key: P1Build) -> dict:
         start = max((o + n for o, n in lay.values()), default=0)
         items = (
             ("xrdy", NT),
-            ("rpart", R_TASKS * L * R_ROWS),
             ("route", L * 2 * TOPK),
             ("ugf", max_u(L) * UG_GROUPS),
             ("smid", L * INTER_S // 2),
@@ -687,7 +682,7 @@ def plain_bytes(key: P1Build) -> int:
 
 
 NORM_REGIONS = ("rs", "ag", "agsq")
-FFN_REGIONS = ("xrdy", "rpart", "rlog", "route", "ugf", "smid", "ugp")
+FFN_REGIONS = ("xrdy", "rlog", "route", "ugf", "smid", "ugp")
 # every region a build may touch: a debug record names its region by its
 # index here (``region_ids``)
 REGIONS = NORM_REGIONS + FFN_REGIONS
@@ -703,8 +698,6 @@ def decls(key: P1Build) -> list[RegionDecl]:
     if key.upto == "ffn":
         out += [
             RegionDecl("xrdy", Space.SCRATCH, "norm"),
-            # part 0 of a router task polls its other parts
-            RegionDecl("rpart", Space.SCRATCH, "router", exchange=True),
             RegionDecl("rlog", Space.PEER, "router"),
             RegionDecl("route", Space.SCRATCH, "route"),
             RegionDecl("ugf", Space.SCRATCH, "ug"),

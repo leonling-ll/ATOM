@@ -323,10 +323,15 @@ def _worker(rank, port, queue, done, inputs, ties):
             rec = rec.view(s, 2 * TOPK, 2)[..., 0]
             picks = rec[:, :TOPK].long()
             weights = rec[:, TOPK:].contiguous().view(torch.float32)
-            n = TP * L.MAX_ROWS_LAYOUT * L.E_RANK * 8
+            n = TP * L.MAX_ROWS_LAYOUT * L.R_PARTS * L.E_RANK * 8
             rl = peers.bytes[rlog_at : rlog_at + n].view(torch.int32)
-            rl = rl.view(TP, L.MAX_ROWS_LAYOUT, L.E_RANK, 2)[:, :s, :, 0]
-            logits = rl.contiguous().view(torch.float32).permute(1, 0, 2).reshape(s, -1)
+            rl = rl.view(TP, L.MAX_ROWS_LAYOUT, L.R_PARTS, L.E_RANK, 2)[:, :s, ..., 0]
+            parts = rl.contiguous().view(torch.float32)
+            # the K-slice partials added in part order, fp32, as the route adds
+            logits = parts[:, :, 0]
+            for p in range(1, L.R_PARTS):
+                logits = logits + parts[:, :, p]
+            logits = logits.permute(1, 0, 2).reshape(s, -1)
             ref = route_reference(x, w_gate, bias)[0].cpu()
             bound = logit_bound(x, w_gate).cpu()
             logits = logits.cpu()
