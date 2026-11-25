@@ -69,7 +69,7 @@ def test_events_are_polled_without_waiting_and_reused_only_after_completion():
     with metrics.measure(batch(prefill=1, decode=1)):
         pass
     assert tuple(metrics.pending[-1][:2]) == reused
-    for start, end, _ in metrics.pending:
+    for start, end, *_ in metrics.pending:
         start.ready = end.ready = True
     snapshot = histogram_values_by_name(metrics)
     assert len(metrics.pending) == 0
@@ -83,11 +83,11 @@ def test_poll_checks_only_the_unfinished_head_of_a_full_queue():
     for _ in range(256):
         with metrics.measure(batch()):
             pass
-    for index, (start, end, _) in enumerate(metrics.pending):
+    for index, (start, end, *_) in enumerate(metrics.pending):
         start.ready = end.ready = index > 0
         end.queries = 0
     metrics.poll()
-    assert [end.queries for _, end, _ in metrics.pending] == [1] + [0] * 255
+    assert [end.queries for _, end, *_ in metrics.pending] == [1] + [0] * 255
     assert not metrics.free
     assert histogram_values(metrics.steps)["sum"] == 0
 
@@ -226,7 +226,7 @@ def prefill_batch(*chunks, decode=0):
 
 
 def complete_event(metrics, index=0, milliseconds=8):
-    start, end, _ = metrics.pending[index]
+    start, end, *_ = metrics.pending[index]
     start.duration_ms = milliseconds
     start.ready = end.ready = True
 
@@ -253,6 +253,10 @@ def test_step_buckets_pool_prefill_decode_and_mixed_batches():
         4,
     ]
     assert values["sum"] == pytest.approx(800.0205)
+    # the steps carrying prefill tokens again on their own: all but the decode one
+    prefill = histogram_values(metrics.prefill_steps)
+    assert dict(prefill["buckets"])[float("inf")] == 3
+    assert prefill["sum"] == pytest.approx(800.0125)
 
 
 def test_request_sum_waits_for_every_chunk_even_if_last_event_finishes_first():

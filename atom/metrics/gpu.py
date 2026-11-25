@@ -54,6 +54,13 @@ class GPUForwardMetrics:
             buckets=LATENCY_BUCKETS,
             registry=registry,
         ).labels(**labels)
+        self.prefill_steps = Histogram(
+            "atom:gpu_prefill_forward_seconds",
+            "The atom:gpu_forward_seconds steps that carry prefill tokens (prefill-only or mixed); the rest are decode / verify steps.",
+            labels,
+            buckets=LATENCY_BUCKETS,
+            registry=registry,
+        ).labels(**labels)
         self.prefill_requests = Histogram(
             "atom:prefill_request_gpu_forward_seconds",
             "Per-worker sum of participating batch device durations across a request's initial local prefill chunks; once after all chunks complete, not exclusive request compute time.",
@@ -96,7 +103,7 @@ class GPUForwardMetrics:
         # Stop at the first unfinished event instead of scanning the backlog.
         # Other streams may finish sooner; their samples wait for the head.
         while self.pending:
-            start, end, requests = self.pending[0]
+            start, end, requests, prefill = self.pending[0]
             if not end.query():
                 break
             self.pending.popleft()
@@ -113,6 +120,8 @@ class GPUForwardMetrics:
                 self.free.append((start, end))
                 continue
             self.steps.observe(seconds)
+            if prefill:
+                self.prefill_steps.observe(seconds)
             for state in requests:
                 state.pending -= 1
                 if not state.valid:
@@ -152,7 +161,8 @@ class GPUForwardMetrics:
             # when the next forward reuses it.
             self.free.append((start, end))
             raise
-        self.pending.append((start, end, requests))
+        prefill = bool(getattr(batch, "total_seqs_num_prefill", 0))
+        self.pending.append((start, end, requests, prefill))
 
 
 def record_gpu_forward(func):
