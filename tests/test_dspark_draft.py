@@ -67,10 +67,17 @@ def test_allocation_cap_masks_writes_past_each_rows_allocation(host_staging, uni
 
 
 def test_minimax_m31_dspark_caps_the_rows_but_not_ctx_lens(host_staging):
-    """MiniMax-M3.1's block rows read at most the allocation; the proposer's
-    `ctx_lens` (`attn_metadata.context_lens`) is left as it built it."""
+    """MiniMax-M3.1's block rows read at most the allocation, and the writes
+    past it are dropped; `ctx_lens` (`attn_metadata.context_lens`) is the
+    uncapped anchor + 1 + T."""
+    import os
+
     import torch
 
+    if not torch.cuda.is_available() and os.environ.get("TRITON_INTERPRET") != "1":
+        pytest.skip(
+            "dspark_block_meta is a Triton kernel: a GPU, or TRITON_INTERPRET=1"
+        )
     m3_dspark = pytest.importorskip(
         "atom.models.minimax_m3.dspark",
         reason="the MiniMax-M3.1 draft imports aiter at module load",
@@ -78,17 +85,25 @@ def test_minimax_m31_dspark_caps_the_rows_but_not_ctx_lens(host_staging):
     )
     MiniMaxM3DSpark = m3_dspark.MiniMaxM3DSpark
 
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    i64 = {"dtype": torch.int64, "device": device}
     draft = MiniMaxM3DSpark.__new__(MiniMaxM3DSpark)
-    draft.max_num_seqs, draft._bt16 = 4, None
+    draft.max_num_seqs, draft._block_rows_p = 4, None
     draft.sliding_window = 0
     T = 3
-    pos = torch.tensor([[126, 127, 128], [5, 6, 7], [1, 2, 3]])
-    slots = torch.tensor([[10, 11, 12], [20, 21, 22], [-1, -1, -1]])
-    ctx = torch.tensor([129, 8, 1 + T], dtype=torch.int32)
+    pos = torch.full((3, T), -5, **i64)
+    slots = torch.full((3 * T,), -5, **i64)
+    ctx = torch.full((3,), -5, dtype=torch.int32, device=device)
     md = types.SimpleNamespace()
-    block_tables = torch.tensor([[3, 0], [4, 5], [0, 0]], dtype=torch.int32)
-    draft.prepare_paged_block(md, block_tables, pos, slots, ctx, [1, 2], 2, 128)
-    assert slots.tolist() == [[10, 11, -1], [20, 21, 22], [-1, -1, -1]]
+    block_tables = torch.tensor(
+        [[3, 0], [4, 5], [0, 0]], dtype=torch.int32, device=device
+    )
+    anchors = torch.tensor([125, 4, 0], **i64)
+    draft.build_paged_block(
+        md, block_tables, anchors, pos, slots, ctx, [1, 2], 2, 128, 1 + T
+    )
+    assert pos.tolist() == [[126, 127, 128], [5, 6, 7], [1, 2, 3]]
+    assert slots.tolist() == [510, 511, -1, 517, 518, 519, -1, -1, -1]
     assert ctx.tolist() == [129, 8, 1 + T]
     assert md.dspark_ctx_rows.tolist() == [128] * T + [8] * T + [1 + T] * T
 

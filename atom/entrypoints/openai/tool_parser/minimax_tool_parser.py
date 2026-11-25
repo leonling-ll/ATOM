@@ -16,6 +16,12 @@ Unlike DSML, parameters are named by the TAG itself (``<city>Paris</city>``),
 not a ``name="..."`` attribute. Values: schema type wins, else JSON, else raw
 string.
 
+A nested value is spelled out as elements, each tag again behind the
+ns_token, the way the chat template's ``to_xml`` renders a call in the
+history: an object as one element per key, an array as ``<item>`` elements::
+
+    ]<]minimax[>[<tags>]<]minimax[>[<item>a]<]minimax[>[</item>]<]minimax[>[</tags>
+
 The ns_token is *not* stripped first, though this said so long after the code
 stopped doing it: parsing a copy with it deleted made every offset meaningless
 against the bytes that arrived.
@@ -83,6 +89,101 @@ _PARAM_RE = re.compile(
     re.DOTALL,
 )
 _FIRST_TAG_RE = re.compile(r"^" + _NS + r"<([\w-]+)>")
+# The model now and then writes the ns_token twice in a row, before a tag or
+# before a closer; between elements, any run of them reads as one.
+_ELEMENT_RE = re.compile(r"\s*((?:" + re.escape(MINIMAX_NS) + r")+)?<([\w-]+)>")
+_ELEMENTS_TAIL_RE = re.compile(r"(?:\s|" + re.escape(MINIMAX_NS) + r")*\Z")
+_CONTAINER_TYPES = ("object", "array")
+
+
+def _element_end(text: str, name: str, start: int) -> tuple[int, int] | None:
+    """Where the element whose ``<name>`` opener ends at ``start`` closes: the
+    end of its value and the end of its closer, or ``None`` if it does not.
+
+    Depth-aware, because an array of arrays nests ``<item>`` in ``<item>``.
+    """
+    depth = 1
+    tag = re.compile(r"<(/?)" + re.escape(name) + r">")  # re caches it
+    for m in tag.finditer(text, start):
+        depth += -1 if m.group(1) else 1
+        if depth == 0:
+            close = m.start()
+            value_end = close
+            if text.endswith(MINIMAX_NS, 0, close):
+                value_end -= len(MINIMAX_NS)
+            return value_end, m.end()
+    return None
+
+
+def _elements(text: str) -> tuple[list[tuple[str, str]], bool] | None:
+    """``text`` as a run of complete elements, ``(tag, value)`` each, and
+    whether every tag carried the ns_token; ``None`` when anything else is
+    in it, so a value is only taken apart when all of it is markup."""
+    out: list[tuple[str, str]] = []
+    prefixed = True
+    pos = 0
+    while not _ELEMENTS_TAIL_RE.match(text, pos):
+        m = _ELEMENT_RE.match(text, pos)
+        if m is None:
+            return None
+        end = _element_end(text, m.group(2), m.end())
+        if end is None:
+            return None
+        out.append((m.group(2), text[m.end() : end[0]]))
+        prefixed = prefixed and m.group(1) is not None
+        pos = end[1]
+    return (out, prefixed) if out else None
+
+
+def _schema_type(schema: Any) -> Any:
+    """The declared type, the first non-null one of a type list."""
+    t = schema.get("type") if isinstance(schema, dict) else None
+    if isinstance(t, list):
+        t = next((x for x in t if x != "null"), None)
+    return t
+
+
+def _decode_value(raw: str, schema: Any) -> Any:
+    """One parameter value, nested elements included, typed by its schema.
+
+    Elements are taken apart when the schema declares an object or an array,
+    or, with no type declared, when they carry the ns_token as the trained
+    format writes them; a string-typed value stays the text it arrived as.
+    """
+    ptype = _schema_type(schema)
+    if ptype in _CONTAINER_TYPES and not raw.strip():
+        return [] if ptype == "array" else {}  # `to_xml` renders these as nothing
+    parsed = _elements(raw) if ptype is None or ptype in _CONTAINER_TYPES else None
+    if parsed is not None and (ptype in _CONTAINER_TYPES or parsed[1]):
+        elements = parsed[0]
+        schema = schema if isinstance(schema, dict) else {}
+        as_list = ptype == "array" or (
+            ptype is None and all(tag == "item" for tag, _ in elements)
+        )
+        if as_list:
+            return [_decode_value(v, schema.get("items")) for _, v in elements]
+        props = schema.get("properties") or {}
+        return {tag: _decode_value(v, props.get(tag)) for tag, v in elements}
+    return coerce_json_or_raw(raw, ptype)
+
+
+def _params(body: str) -> list[tuple[str, str]]:
+    """The invoke body's parameters as ``(name, raw value)``.
+
+    A closed parameter runs to its own closer, past any nested elements; an
+    unclosed one ends where `_PARAM_RE` ends it.
+    """
+    out: list[tuple[str, str]] = []
+    pos = 0
+    while (pm := _PARAM_RE.search(body, pos)) is not None:
+        end = _element_end(body, pm.group(1), pm.start(2))
+        if end is None:
+            out.append((pm.group(1), pm.group(2)))
+            pos = pm.end()
+        else:
+            out.append((pm.group(1), body[pm.start(2) : end[0]]))
+            pos = end[1]
+    return out
 
 
 def _is_truncated_call(
@@ -192,11 +293,10 @@ class MiniMaxParser(ToolCallParser):
             ):
                 continue
             types = param_types.get(name, {})
+            schemas = getattr(param_types, "schemas", {}).get(name, {})
             args: dict[str, Any] = {}
-            for pm in _PARAM_RE.finditer(body):
-                k = pm.group(1).strip()
-                if k:
-                    args[k] = coerce_json_or_raw(pm.group(2), types.get(k))
+            for k, raw in _params(body):
+                args[k] = _decode_value(raw, schemas.get(k) or {"type": types.get(k)})
             spans.append(
                 (cls.markup_begin(region, m.start()), cls.markup_end(region, m.end()))
             )

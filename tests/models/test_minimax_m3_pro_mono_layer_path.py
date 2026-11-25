@@ -59,11 +59,12 @@ def rec(monkeypatch):
     monkeypatch.setattr(pro_attn, "_variants", ProVariants(ar_lamport_rows=16))
     monkeypatch.setattr(pro, "_aiter_mx_norm", lambda: True)
 
-    def ar_norm(hidden, residual, norm):
+    def ar_norm(hidden, residual, norm, addend=None):
+        assert addend is None  # moe_tail_ar is off here
         r.calls.append("ar_in")
         return hidden + residual, residual + 1
 
-    def ar_norm_mx(hidden, residual, norm, lamport_rows):
+    def ar_norm_mx(hidden, residual, norm, lamport_rows, fused_rows=0):
         r.calls.append(("ar_mx", lamport_rows))
         h_mid = hidden + residual
         return h_mid * 2, h_mid * 3, h_mid * 4, h_mid
@@ -85,6 +86,8 @@ def _layer(rec, moe=True, route=None):
         put=lambda lid, x, res: rec.calls.append(("put", lid)),
         front_input=pro.ProLookaheadState.front_input,
         resid_in={},
+        take_moe_tail=lambda: None,
+        end_layer=68,
     )
     layer._pro_state = state
     layer._mono = route
@@ -109,7 +112,15 @@ def _layer(rec, moe=True, route=None):
 
     layer.self_attn = Attn()
 
-    def ffn(x, *args, shared_input=None, quant_down=False):
+    def ffn(
+        x,
+        *args,
+        shared_input=None,
+        quant_down=False,
+        defer_shared=False,
+        two_streams=False,
+    ):
+        assert not (defer_shared or two_streams)  # both off here
         rec.calls.append(("ffn", shared_input is not None, quant_down))
         rec.live_in_ffn = [
             name
