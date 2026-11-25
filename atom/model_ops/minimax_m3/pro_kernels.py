@@ -2196,6 +2196,8 @@ def _select_merge_kernel(
 # allocated in a capture there. A caller that captures first must replay that graph before
 # any other use of the stream's counters.
 _split_buffers: dict[tuple, list[torch.Tensor]] = {}
+# the (device, constants) whose wide span kernel ``select_rows_split`` has compiled
+_wide_warmed: set[tuple] = set()
 
 
 def _split_buffer(kind, numel, dtype, device):
@@ -2252,7 +2254,7 @@ def select_rows_split(
         fused = True
     part = _split_buffer("part", t * parts * k, torch.int64, dev)
     count = _split_buffer("count", t, torch.int32, dev)
-    _select_split_kernel[(t, parts)](
+    args = (
         score,
         score.stride(0),
         block_tables,
@@ -2266,6 +2268,8 @@ def select_rows_split(
         part,
         count,
         nb,
+    )
+    meta = dict(
         SPAN=span,
         K=k,
         CHUNK=chunk,
@@ -2273,9 +2277,16 @@ def select_rows_split(
         FUSED=fused,
         IS_HIP=dev.type == "cuda" and torch.version.hip is not None,
         LOGICAL=logical,
-        WIDE=span > chunk,
         num_warps=num_warps,
     )
+    _select_split_kernel[(t, parts)](*args, WIDE=span > chunk, **meta)
+    warm = (dev, k, chunk, fused, logical, num_warps)
+    if span <= chunk and warm not in _wide_warmed:
+        # the first one-chunk launch of these constants (the startup warmup's forwards
+        # and graph captures) also compiles, without running, the wide kernel: its
+        # first use is a long prefill, which a compile would stall for seconds
+        _wide_warmed.add(warm)
+        _select_split_kernel.warmup(*args, WIDE=True, grid=(t, parts), **meta)
     if not fused and parts > 1:
         _select_merge_kernel[(t,)](
             block_tables,
