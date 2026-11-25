@@ -178,11 +178,17 @@ def test_random_scores_match_the_reference(rps, seqs, ctx):
 @pytest.mark.parametrize("rps,seqs", [(8, 1), (8, 3), (4, 3)])
 def test_scores_do_not_depend_on_the_programs(rps, seqs):
     # however many programs stride over a row tile's tiles, a causal block's score is the
-    # one-tile-a-program launch's, bit for bit
+    # same bit for bit; one program a tile (no stride: the fp32 pool logits) agrees to
+    # fp32 rounding and picks the same blocks
     c = _case(rps, seqs, CTXS[-1], exact=False, pad=True)
     causal = _causal(c)
     full = _scores(c, causal=False)
-    tiles = -(-WIDTH // (4 if len(c.pos) <= 16 else 8))
-    for programs in (1, 2, 7, None, tiles):
+    one = _scores(c, causal=True, programs=1)
+    for programs in (2, 7, None):
         got = _scores(c, causal=True, programs=programs)
-        assert torch.equal(got[causal], full[causal]), programs
+        assert torch.equal(got[causal], one[causal]), programs
+    flat = _scores(c, causal=True, programs=WIDTH)  # at least a program a tile
+    assert torch.equal(flat[causal], full[causal])
+    assert torch.allclose(one[causal], full[causal], rtol=1e-5, atol=1e-5)
+    want = K.select_logical(full, c.pos, TOPK, split=True)
+    assert torch.equal(K.select_logical(one, c.pos, TOPK, split=True), want)
