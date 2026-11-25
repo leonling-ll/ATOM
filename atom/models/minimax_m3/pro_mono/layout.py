@@ -21,12 +21,14 @@ Stages, in program order (one launch a MoE layer and rank, ``BLOCKS`` CTAs of
 
 ``upto = "norm"`` ends there and writes x and x8 to HBM, where the
 production MoE reads them. ``upto = "ffn"`` goes on to the rank's FFN partial
-(the norm CTAs flag their columns, ``xrdy``; a W4A4 build's also write x as
+(the norm CTAs flag their columns, ``xrdy``, and put the bf16 x as tagged
+pairs for the router, ``xr``; a W4A4 build's also write x as
 MXFP4 for the routed experts, a W4A8 build's routed experts read x8, an A16W4
 build's the bf16 x)::
 
     router  R_TASKS CTAs from R0: this rank's 48 router rows (3 row groups x
-            R_PARTS K slices) against bf16 x; each part's fp32 partial ->
+            R_PARTS K slices) against bf16 x (its K slice polled from
+            ``xr``); each part's fp32 partial ->
             every rank's ``rlog`` (an all-gather of the 384 logits' parts)
     shared  SH_TASKS CTAs from SH0: 8 gate + 8 up rows of the MXFP8 shared
             gate_up against x8 -> bf16 g, u -> SwiGLU-OAI -> bf16 -> ``smid``
