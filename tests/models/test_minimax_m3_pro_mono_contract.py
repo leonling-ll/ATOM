@@ -131,3 +131,15 @@ def test_a_wrong_ffn_declaration_is_caught(traced_ffn, wrong, msg):
     ]
     with pytest.raises(ContractError, match=msg):
         check(rec, bad)
+
+
+def test_the_ffn_stages_x_before_it_polls_the_route(traced_ffn):
+    """``ffn.run_ffn``: every CTA stages the routed B operands (``load_xb``,
+    behind its poll of the norm CTAs' ``xrdy``) before it polls ``route``, so
+    the staging runs while the route is in flight and only the union is left
+    between the route and the first ug weights."""
+    _, rec = traced_ffn
+    polls = [a.region for a in rec.accesses if a.stage == "union" and a.kind == "poll"]
+    assert "xrdy" in polls and "route" in polls, polls
+    last_x = max(i for i, r in enumerate(polls) if r == "xrdy")
+    assert last_x < polls.index("route"), polls
