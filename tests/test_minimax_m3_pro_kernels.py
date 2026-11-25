@@ -2273,6 +2273,7 @@ class TestDay0Decode:
             slot_mapping=torch.zeros(n, dtype=torch.long),
             block_tables=torch.zeros(6, 16, dtype=torch.int32),
             cu_seqlens_q=torch.arange(0, 25, 4, dtype=torch.int32),
+            max_seqlen_q=4,
         )
         layer = SimpleNamespace(k_cache=torch.zeros(1, 1, 1, PG, D, dtype=FP8))
         fwd = SimpleNamespace(
@@ -2327,6 +2328,7 @@ class TestDay0Decode:
             slot_mapping=torch.zeros(n, dtype=torch.long),
             block_tables=torch.zeros(6, 16, dtype=torch.int32),
             cu_seqlens_q=torch.arange(0, 25, 4, dtype=torch.int32),
+            max_seqlen_q=4,
         )
         layer = SimpleNamespace(k_cache=torch.zeros(1, 1, 1, 32, D, dtype=FP8))
         fwd = SimpleNamespace(
