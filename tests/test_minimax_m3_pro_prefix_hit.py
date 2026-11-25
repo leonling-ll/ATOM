@@ -24,8 +24,9 @@ were, and give A's attention output within ``test_minimax_m3_pro_kernels._close`
 Without a GPU the kernels run in Triton's interpreter (the small variants); the served
 variants (top-128 over contexts past 128 blocks, day0 prefill, the compressed index
 cache, aiter's K-only decode, FlyDSL's sparse decode, the indexer split over 8 emulated
-ranks; and day0 prefill after hits at 32k and 64k) need a GPU and the packages they run
-on. ``-k "not long"`` leaves the 32k / 64k cases out (the slowest).
+ranks; and day0 prefill and FlyDSL's sparse decode after hits at 32k and 64k) need a GPU
+and the packages they run on. ``-k "not long"`` leaves the 32k / 64k cases out (the
+slowest).
 """
 
 from __future__ import annotations
@@ -149,10 +150,18 @@ VARIANTS = {
         {**SERVED, "day0_decode_rows": 0},
         {"needs": ("day0",), "pre": "attention_day0", "ver": "attention"},
     ),
+    # two requests verify 16 rows, below the default day0_decode_rows (24): the FlyDSL
+    # decode starts at 16 here, so this verify runs it at 32k / 64k (day0_prefill_long's
+    # verify is Triton's)
     "index_split8_long": (
         LONG,
         KONLY8,
-        {**SERVED, "index_split": True, "index_split_decode": 64},
+        {
+            **SERVED,
+            "index_split": True,
+            "index_split_decode": 64,
+            "day0_decode_rows": 2 * NV,
+        },
         {
             "needs": ("day0", "day0_decode"),
             "pre": "attention_day0",
