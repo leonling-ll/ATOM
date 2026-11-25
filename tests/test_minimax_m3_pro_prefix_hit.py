@@ -24,7 +24,8 @@ were, and give A's attention output within ``test_minimax_m3_pro_kernels._close`
 Without a GPU the kernels run in Triton's interpreter (the small variants); the served
 variants (top-128 over contexts past 128 blocks, day0 prefill, the compressed index
 cache, aiter's K-only decode, FlyDSL's sparse decode, the indexer split over 8 emulated
-ranks) need a GPU and the packages they run on.
+ranks; and day0 prefill after hits at 32k and 64k) need a GPU and the packages they run
+on. ``-k "not long"`` leaves the 32k / 64k cases out (the slowest).
 """
 
 from __future__ import annotations
@@ -65,6 +66,9 @@ K8 = [1600, 1024, 2048, 1056, 2400, 1040, 1200, 2000]
 BIG2 = {"lens": L8[:2], "keep": K8[:2], "topk": K.TOPK}
 BIG3 = {"lens": L8[:3], "keep": K8[:3], "topk": K.TOPK}
 BIG8 = {"lens": L8, "keep": K8, "topk": K.TOPK}
+# Served contexts: hits at 32k and 64k, so the prefill's first new row sits that far in
+# (the first length is whole blocks: a full hit recomputes its last block only).
+LONG = {"lens": [34816, 66577], "keep": [32768, 65536], "topk": K.TOPK}
 
 KONLY8 = {"k_only": True, "kv": FP8, "ic": FP8}  # what the Agentic recipe serves
 SERVED = {
@@ -130,6 +134,23 @@ VARIANTS = {
     ),
     "index_split8": (
         BIG8,
+        KONLY8,
+        {**SERVED, "index_split": True, "index_split_decode": 64},
+        {
+            "needs": ("day0", "day0_decode"),
+            "pre": "attention_day0",
+            "ver": "attention_day0_decode",
+            "ranks": 8,
+        },
+    ),
+    "day0_prefill_long": (
+        LONG,
+        KONLY8,
+        {**SERVED, "day0_decode_rows": 0},
+        {"needs": ("day0",), "pre": "attention_day0", "ver": "attention"},
+    ),
+    "index_split8_long": (
+        LONG,
         KONLY8,
         {**SERVED, "index_split": True, "index_split_decode": 64},
         {
