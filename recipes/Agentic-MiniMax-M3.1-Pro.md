@@ -355,7 +355,7 @@ export ATOM_TOKEN_GRAPH_SIZES=256,512,1024,2048,3072,4096
 
 # KV offload to the LMCache server
 export ATOM_KV_OFFLOAD=lmcache_mp
-export ATOM_KV_OFFLOAD_EXTRA_CONFIG="{\"lmcache.mp.host\": \"tcp://127.0.0.1\", \"lmcache.mp.port\": ${LMCACHE_PORT}, \"lmcache.mp.tp_rank_collapse\": \"auto\"}"
+export ATOM_KV_OFFLOAD_EXTRA_CONFIG="{\"lmcache.mp.host\": \"tcp://127.0.0.1\", \"lmcache.mp.port\": ${LMCACHE_PORT}, \"lmcache.mp.tp_rank_collapse\": \"auto\", \"lmcache.mp.transfer_deadline_s\": 120}"
 export LMCACHE_CHUNK_SIZE=256
 export OFFLOAD_MAX_PENDING_SAVES=32
 export OFFLOAD_MP_SAVE_SAME_STEP=1
@@ -402,6 +402,7 @@ What the settings beyond section 1 do:
 | `OFFLOAD_MP_SAVE_SAME_STEP=1` | Submits a prefill chunk's save once the step that computed it has finished its forward, instead of at the next step. |
 | `OFFLOAD_MIN_LOAD_TOKENS=2048` | Loads CPU-tier hits from 2048 tokens; shorter ones are recomputed. `lmcache_mp`'s default is 8192. |
 | `OFFLOAD_MP_TRANSFER_THREAD=1` | The TP workers submit transfers from a thread instead of the forward thread. |
+| `lmcache.mp.transfer_deadline_s` 120 | ATOM stops the engine when an LMCache MP load or save stays open past this deadline, 30 s by default. At CONC 64 a 65k-118k-token retrieve occasionally takes 13-23 s instead of tens of ms, and loads queued behind it passed 30 s in three runs. |
 
 Check the startup log: `num_kvcache_blocks` near 217,600 (`available_for_kv` near 80 GB) on every
 rank, and the `ATOM_KV_OFFLOAD` line with `"lmcache.mp.tp_rank_collapse": "auto"`. The client needs
