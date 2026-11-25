@@ -56,6 +56,7 @@ from atom.model_ops.minimax_m3.pro_attn import (
     refresh_variants,
     variants,
 )
+from atom.model_ops.rejection_sampler import SyntheticVerifyHead
 from atom.model_ops.utils import atom_parameter
 from atom.models.minimax_m3 import moe_route_glue
 from atom.models.minimax_m3.model import (
@@ -68,8 +69,15 @@ from atom.models.minimax_m3.pro_mono.config import config_refusal
 from atom.models.minimax_m3.pro_mono.route import ProMonoRoute
 from atom.models.minimax_m3.pro_mono.runner import ProMonoRunner
 from atom.models.minimax_m3.vl import MiniMaxM3SparseForConditionalGenerationVL
+from atom.utils.forward_context import get_forward_context
 
 logger = logging.getLogger("atom")
+
+# Requests up to which a decode forward verifies inside itself (``compute_head``):
+# the small-concurrency range (CONC 1-16). A wider forward keeps the runner's
+# logits path, so a recorded forward holds at most 16 x (k + 1) logits rows and
+# 16 noise rows in the graph pool.
+HEAD_MAX_REQUESTS = 16
 
 # Rows up to which a layer's q, k, index q and index k come from one GEMM over
 # ``[x; indexer input]`` (2 x rows): at 8 rows one 16-row MFMA tile holds both halves.
@@ -865,6 +873,9 @@ class MiniMaxM3ProForCausalLM(MiniMaxM3SparseForCausalLM):
             moe_route_glue.build(
                 text.hidden_size, text.num_local_experts, text.num_experts_per_tok
             )
+        # The forced-acceptance verify head (``bind_verify_head``); None: the
+        # runner's logits path.
+        self._verify_head = None
         v = refresh_variants(force=True)
         if v.expert_count and get_tensor_model_parallel_rank() == 0:
             enable_expert_count(
@@ -875,6 +886,53 @@ class MiniMaxM3ProForCausalLM(MiniMaxM3SparseForCausalLM):
                 ],
                 diag_path(f"{v.diag_tag}_experts.jsonl"),
             )
+
+    # The head's bonus draws race the whole vocabulary at the request's
+    # temperature: a step with a top-p below 1 takes the logits path
+    # (``ModelRunner._head_ids_serve``).
+    head_draws_top_p: ClassVar[bool] = False
+
+    def bind_verify_head(
+        self, forward_vars, num_spec_steps: int, synthetic_acceptance_rates
+    ) -> None:
+        """Under forced acceptance (``--spec-decode-acceptance-length`` /
+        ``-rate``), verify a decode forward of at most ``HEAD_MAX_REQUESTS``
+        requests inside it (``compute_head``), reading the step's input ids and
+        temperatures from the runner's ``forward_vars``. Under real acceptance
+        the runner's logits path verifies, as before."""
+        if synthetic_acceptance_rates is None:
+            return
+        self._head_input_ids = forward_vars["input_ids"].gpu
+        self._head_temperatures = forward_vars["temperatures"].gpu
+        self._verify_head = SyntheticVerifyHead(
+            num_spec_steps,
+            synthetic_acceptance_rates,
+            self._head_input_ids.device,
+        )
+
+    def compute_head(self, hidden_states: torch.Tensor):
+        """The head output of the forward that just ran
+        (``ModelRunner._head_output``, recorded with a captured decode): for a
+        decode forward of full draft spans under forced acceptance, its output
+        ids [requests, k + 1] and verdict [3, requests]
+        (``SyntheticVerifyHead``); else None (the runner's logits)."""
+        head = self._verify_head
+        if head is None:
+            return None
+        context = get_forward_context().context
+        if context is None or context.is_prefill or context.is_draft:
+            return None
+        requests = context.running_bs
+        rows = hidden_states.shape[0]
+        if not 0 < requests <= HEAD_MAX_REQUESTS or rows != requests * (
+            head.num_spec_steps + 1
+        ):
+            return None
+        return head(
+            self.compute_logits(hidden_states),
+            self._head_input_ids[:rows],
+            self._head_temperatures[:requests],
+        )
 
 
 class MiniMaxM3ProForConditionalGenerationTextOnly(
@@ -899,6 +957,14 @@ class MiniMaxM3ProForConditionalGenerationTextOnly(
         self.make_empty_intermediate_tensors = (
             self.language_model.make_empty_intermediate_tensors
         )
+
+    head_draws_top_p = MiniMaxM3ProForCausalLM.head_draws_top_p
+
+    def bind_verify_head(self, *args) -> None:
+        self.language_model.bind_verify_head(*args)
+
+    def compute_head(self, hidden_states: torch.Tensor):
+        return self.language_model.compute_head(hidden_states)
 
 
 class MiniMaxM3ProForConditionalGenerationVL(

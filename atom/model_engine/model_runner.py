@@ -1051,6 +1051,19 @@ class ModelRunner:
         )
         self._served = None
         self._init_forward_vars_ring()
+        # A head that verifies inside the forward reads the step's input ids and
+        # temperatures (`prepare_sample`) from the one forward_vars set.
+        bind_verify_head = getattr(self.model, "bind_verify_head", None)
+        if (
+            bind_verify_head is not None
+            and len(self._fv_ring) == 1
+            and getattr(self, "rejection_sampler", None) is not None
+        ):
+            bind_verify_head(
+                self.forward_vars,
+                self.drafter.mtp_k,
+                self.rejection_sampler.synthetic_acceptance_rates,
+            )
         self._init_h2d_publication()
         self.forward_done_event = torch.cuda.Event()
         initialize_eplb_runtime(self)
@@ -3438,7 +3451,9 @@ class ModelRunner:
         for, and its rows all greedy or all sampled from temperature and top-p
         alone. ATOM's verify of such a sampled step is sample-and-match; a
         head that gives ids draws each such row from the (T, top_p) its
-        model's builder published with the step."""
+        model's builder published with the step, or, for a model whose head
+        draws at T alone (`head_draws_top_p` False), from T where every top-p
+        is 1."""
         spec = get_forward_context().spec_decode_metadata
         if (
             spec is None
@@ -3467,6 +3482,10 @@ class ModelRunner:
             (temperatures > SAMPLER_EPS).all()
             and (batch.top_ks[:bs] == -1).all()
             and not (noise is not None and noise.any())
+            and (
+                getattr(self.model, "head_draws_top_p", True)
+                or (batch.top_ps[:bs] >= 1.0).all()
+            )
         )
 
     def flush_pp_send(self) -> bool:

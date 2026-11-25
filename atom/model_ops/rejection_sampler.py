@@ -2,8 +2,10 @@ import torch
 import triton
 import triton.language as tl
 from aiter import topk_select
+from aiter.ops.triton.fusions.fused_mixed_sample import fused_mixed_sample
 from torch import nn
 
+from atom.model_ops.sampler import SAMPLER_EPS
 from atom.model_ops.spec_sampling.ratio_verify import (
     RatioVerifyInputs,
     _ratio_sample,
@@ -47,6 +49,9 @@ _SYNTHETIC_COND_CACHE: dict[tuple[tuple[float, ...], torch.device], torch.Tensor
 _SYNTHETIC_RNG_BASE_SEED = 0x5EED
 # One generator per device, kept alive so the draw costs a kernel and nothing else.
 _SYNTHETIC_GENERATORS: dict[torch.device, torch.Generator] = {}
+# The bonus draws' Philox seed base in a verify head (`SyntheticVerifyHead`): apart
+# from the uniforms' (`_SYNTHETIC_RNG_BASE_SEED`), so no draw repeats another's.
+_HEAD_NOISE_BASE_SEED = _SYNTHETIC_RNG_BASE_SEED + (1 << 32)
 
 
 def _synthetic_generator(device: torch.device) -> torch.Generator:
@@ -202,6 +207,149 @@ class RejectionSampler(nn.Module):
         if self.synthetic_acceptance_rates is not None:
             self._synthetic_step += 1
         return output_token_ids
+
+
+class SyntheticVerifyHead:
+    """A forced-acceptance verify inside the forward (a model's `compute_head`):
+    the output ids and verdict `rejection_sample` gives on its synthetic path,
+    from the forward's logits rows, on buffers a CUDA graph can record.
+
+    The forward's rows are ``requests`` x (``num_spec_steps`` + 1), each request
+    verifying the full draft span: its drafts' rows, then its bonus row. The
+    kernels are the logits path's: the lowest-id argmax of every row
+    (`topk_select`, tie="low"), the bonus row's pick at the request's
+    temperature (`fused_mixed_sample`, the sampler's independent-noise race; a
+    row at or below `SAMPLER_EPS` takes the argmax) and
+    `rejection_synthetic_sample_kernel`.
+
+    Its draws come from a device step counter the head itself advances once a
+    forward, with no host seed: a replay draws anew, and every TP rank, running
+    the same forwards on the same logits, draws the same uniforms and the same
+    bonus noise. The uniforms keep the seed formula of the logits path
+    (`_SYNTHETIC_RNG_BASE_SEED` + step) but not its stream (Triton's Philox, not
+    torch's), so the accept pattern changes and its distribution does not.
+    """
+
+    def __init__(
+        self,
+        num_spec_steps: int,
+        synthetic_acceptance_rates,
+        device: torch.device,
+    ):
+        self.num_spec_steps = num_spec_steps
+        self.cond_rates = _get_synthetic_cond_rates(
+            tuple(synthetic_acceptance_rates), torch.device(device)
+        )
+        # The forwards this head has drawn for (`_head_uniform_kernel` bumps it).
+        self.step = torch.zeros(1, dtype=torch.int64, device=device)
+        self._layouts: dict[int, tuple[torch.Tensor, ...]] = {}
+
+    def layout(self, requests: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """The spec-decode indices of ``requests`` full spans (as the drafter
+        lays a step out): cu_num_draft_tokens, target_logits_indices,
+        bonus_logits_indices. Built once per width, so a recorded forward reads
+        tensors that outlive it."""
+        found = self._layouts.get(requests)
+        if found is None:
+            k, device = self.num_spec_steps, self.step.device
+            rows = torch.arange(requests * (k + 1), dtype=torch.int32, device=device)
+            rows = rows.view(requests, k + 1)
+            found = (
+                torch.arange(1, requests + 1, dtype=torch.int32, device=device) * k,
+                rows[:, :k].contiguous().view(-1),
+                rows[:, k].contiguous(),
+            )
+            self._layouts[requests] = found
+        return found
+
+    def __call__(
+        self,
+        # [requests * (num_spec_steps + 1), vocab]: the forward's logits
+        logits: torch.Tensor,
+        # the forward's input ids (a draft follows the row that verifies it)
+        input_ids: torch.Tensor,
+        # [requests]: each request's temperature, clamped to `SAMPLER_EPS`
+        temperatures: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        k = self.num_spec_steps
+        rows, vocab = logits.shape
+        requests = rows // (k + 1)
+        assert rows == requests * (k + 1) and input_ids.shape[0] >= rows
+        cu_num_draft_tokens, target_rows, bonus_rows = self.layout(requests)
+        device = logits.device
+        # every row's argmax; the drafts' rows are the target picks
+        argmax = topk_select(logits, 1, tie="low")[1].view(requests, k + 1)
+        target_argmax = argmax[:, :k].contiguous().view(-1)
+        # the bonus rows, in place (the race reads rows at any stride)
+        bonus_logits = logits.view(requests, k + 1, vocab)[:, k]
+        noise = torch.empty((requests, vocab), dtype=torch.float32, device=device)
+        _head_noise_kernel[(requests, triton.cdiv(vocab, _HEAD_NOISE_BLOCK))](
+            noise,
+            self.step,
+            vocab,
+            _HEAD_NOISE_BASE_SEED,
+            BLOCK=_HEAD_NOISE_BLOCK,
+        )
+        bonus = fused_mixed_sample(
+            bonus_logits,
+            noise,
+            temperatures[:requests],
+            eps=SAMPLER_EPS,
+            greedy_eps=SAMPLER_EPS,
+        )
+        draws = requests * k
+        uniform = torch.empty(draws, dtype=torch.float32, device=device)
+        # after the noise kernel on the stream: it advances the step both read
+        _head_uniform_kernel[(1,)](
+            uniform,
+            self.step,
+            draws,
+            _SYNTHETIC_RNG_BASE_SEED,
+            BLOCK=triton.next_power_of_2(draws),
+        )
+        output_token_ids = torch.empty(
+            (requests, k + 1), dtype=torch.int32, device=device
+        )
+        verdict = torch.empty((3, requests), dtype=torch.int32, device=device)
+        rejection_synthetic_sample_kernel[(requests,)](
+            output_token_ids,
+            verdict,
+            cu_num_draft_tokens,
+            input_ids,
+            target_rows,
+            target_argmax,
+            bonus,
+            bonus_rows,
+            uniform,
+            self.cond_rates,
+            k,
+            num_warps=1,
+        )
+        return output_token_ids, verdict
+
+
+_HEAD_NOISE_BLOCK = 4096
+
+
+@triton.jit
+def _head_noise_kernel(noise_ptr, step_ptr, vocab, seed_base, BLOCK: tl.constexpr):
+    """Exp(1) noise [requests, vocab] for the bonus race, from the head's step."""
+    row = tl.program_id(0)
+    cols = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    mask = cols < vocab
+    seed = seed_base + tl.load(step_ptr)
+    u = tl.rand(seed, row * vocab + cols)
+    tl.store(noise_ptr + row * vocab + cols, -tl.log(1.0 - u), mask=mask)
+
+
+@triton.jit
+def _head_uniform_kernel(uniform_ptr, step_ptr, n, seed_base, BLOCK: tl.constexpr):
+    """U(0, 1) [n] for the synthetic verdict from the head's step, then the
+    next step (one program: nothing else reads the step after it)."""
+    offs = tl.arange(0, BLOCK)
+    step = tl.load(step_ptr)
+    tl.store(uniform_ptr + offs, tl.rand(seed_base + step, offs), mask=offs < n)
+    tl.store(step_ptr, step + 1)
 
 
 def rejection_sample(
