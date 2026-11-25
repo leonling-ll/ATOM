@@ -297,6 +297,75 @@ later chunk of a chunked prefill. Checked on the kernel path with fp8 caches, wi
   scores within run-to-run noise of the same prompts without prefix caching (40 questions turn
   wrong, 51 turn right). Stock GSM8K, whose few-shot examples differ per question, hits almost nothing.
 
+The checks above ran on the separate K and V caches. For the K-only cache the Agentic recipe
+(`Agentic-MiniMax-M3.1-Pro.md`) serves, with day0 prefill, the compressed index cache, the indexer
+split over the ranks and the FlyDSL / aiter decode, three checks cover hits:
+
+* `tests/test_minimax_m3_pro_prefix_hit.py`: a request admitted through the block manager's prefix walk
+  (a full hit, a half hit) prefills only its uncached rows. It must select the blocks a cold prefill
+  selects, write the same cache bytes for its new tokens, leave the shared blocks untouched and give the
+  same attention output within bf16 tolerance, and so must a chunked cold prefill and a rejected, then
+  accepted, k = 7 verify after a hit. Without a GPU the small variants run in Triton's interpreter; the
+  served variants need a GPU, `amd_kernels` on `PYTHONPATH` and an aiter whose `pa_decode_gluon` takes
+  `value_rows`.
+  `tests/test_scheduler_spec_prefix_publish.py` checks that DSpark decode publishes a block only once
+  all of its KV is final.
+* `scripts/m31pro/pfx_probe.py probe` against a running server (started as the Agentic recipe does,
+  without LMCache and without `--spec-decode-acceptance-length`): key / value questions over 32k and 64k
+  lists, each request served from the cache (`hit`, `half`, and `turn2` on blocks that decode published)
+  against the same token ids prefilled cold, at concurrency 1 and 8. Greedy decoding here is not
+  reproducible (a prompt sent cold twice parts after its answer, at confident tokens), so hits are
+  judged against two cold runs of the same prompts: it passes when every answer is right, every hit's
+  answer equals its cold twin's, and per phase the divergences and the off-tie ones stay within the
+  cold-vs-cold floor of the same run, length and concurrency (+2, +2), and the largest logprob gap
+  before them within the largest cold-vs-cold gap of all the runs judged together (+0.25): one
+  run's floor of that gap swings with its noise (0.23-0.49 in one run, up to 1.30 in another).
+  `judge` re-judges the logs of two runs together.
+
+  ```bash
+  python3 scripts/m31pro/pfx_probe.py probe --port 8000 --model "${MODEL_PATH}" --out probe.jsonl --lengths 32000
+  python3 scripts/m31pro/pfx_probe.py judge --run a/probe.jsonl --run b/probe.jsonl
+  ```
+* GSM8K behind one shared 64-shot prefix (`scripts/m31pro/lm_eval_tasks/gsm8k_pfx.yaml`), on one server
+  with prefix caching and one with `--no-enable_prefix_caching`, then the paired comparison (exact
+  McNemar on the questions that flip, the cached share and the acceptance length from `/metrics`):
+
+  ```bash
+  python3 scripts/m31pro/pfx_probe.py snapshot --port 8000 --out before.json
+  lm_eval --model local-completions \
+    --model_args "model=${MODEL_PATH},tokenizer=${MODEL_PATH},base_url=http://127.0.0.1:8000/v1/completions,num_concurrent=16,max_retries=3,tokenized_requests=False,trust_remote_code=True" \
+    --include_path scripts/m31pro/lm_eval_tasks --tasks gsm8k_pfx --num_fewshot 64 --log_samples --output_path on
+  python3 scripts/m31pro/pfx_probe.py snapshot --port 8000 --out after.json
+  # the same against the server without prefix caching (--output_path off), then
+  python3 scripts/m31pro/pfx_probe.py pair --on on/*/samples_gsm8k_pfx_*.jsonl \
+    --off off/*/samples_gsm8k_pfx_*.jsonl --on-metrics before.json after.json
+  ```
+
+Results (MI355X TP8):
+
+* The hit test passes on one MI355X with every GPU variant, the 32k and 64k hits included.
+* The probe at 05f18899, two runs of the same prompts (one with
+  `ATOM_TOKEN_GRAPH_SIZES=256,512,1024,2048`, one without) judged together: every warm phase's largest
+  logprob gap is within the 1.30 floor + 0.25 (at most 1.12). Three cells exceed the divergence or
+  answer checks; a chunk-matched comparison at 250dcb03
+  ([#66](https://github.com/zhuyuhua-v/ATOM-M3/issues/66#issuecomment-7168136893)) reads them as
+  run-to-run noise, not a hit-path effect. In every layer where two cold prefills of a prompt are bitwise
+  equal (layers 0-4; from layer 5 on they already differ), a hit is bitwise equal to a cold prefill
+  chunked at the hit boundary in attention output on every row and in the prefix K, scale and index
+  pages. The selection checksum compared logical block ids only on chunks of 16 rows or fewer, where it
+  is equal through layer 6, as between two cold prefills. On chunks of 17 rows or more the hook recorded
+  physical page ids, so equal selection there is inferred from the bitwise-equal attention output and
+  from a control of two cold prefills, without a hit, that shows the same page-id difference. No launch
+  wrote a shared page, and the first-token logprob gap of a hit against cold is within the gap of cold
+  against cold. That run prefilled over cached pages with Triton and aiter's paged attention; the hit
+  test covers the day0 prefill over cached pages.
+* gsm8k_pfx at 5812c071, both servers with the Agentic variants without `ATOM_TOKEN_GRAPH_SIZES`: 0.9325
+  with prefix caching, 0.9196 without, 34 questions right to wrong and 51 wrong to right (McNemar
+  p 0.082), cached share 0.993, measured AL 4.10 on both (golden 2.94). Both are below `pair`'s absolute
+  0.94 bar, and the fixed 64-shot set is the harder prompt: on one tree (d502c42f) and server, standard
+  GSM8K scored 0.9462 and 0.9424, gsm8k_pfx 0.9310 and 0.9318
+  ([#66](https://github.com/zhuyuhua-v/ATOM-M3/issues/66#issuecomment-7162771310)).
+
 ## CPU KV offload
 
 Prefix blocks evicted from HBM can be kept in host DRAM and loaded back instead of recomputed, through
