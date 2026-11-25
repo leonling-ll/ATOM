@@ -237,6 +237,10 @@ class ProVariants:
     # the same inputs: the same bytes. It pays with ``moe_tail_ar`` (no add after the
     # join); 0 turns it off.
     moe_two_stream_rows: int = 0
+    # ``moe_route_glue``'s path hands its shared output to the next layer's input
+    # all-reduce as ``moe_tail_ar`` does, and its route op also writes the lookahead
+    # norm's MXFP8 rows (where its aiter takes a lookahead weight): two launches fewer.
+    moe_glue_fold: bool = False
     # The K-only cache (``ProKOnlyLayout``): one 256-wide row a token, V read from its tail,
     # no V cache (776 -> 520 B a token and layer with an fp8 KV and a bf16 index cache).
     # The attention is then the Triton one. Read once, when the layers are built: the
