@@ -11,6 +11,10 @@ so no rank's partial and no residual is drowned by another row or input.
 What must hold:
 * every rank writes the same bytes (they read the same gathered sums and sums of
   squares) -- bit for bit;
+* the lookahead written into a ring slot's rows ``[S, 2S)`` (where
+  ``ProMonoRunner.launch`` points it: ``ProLookaheadState.lookahead_rows``) is
+  the bytes the same launch writes to its own tensors, and nothing else in the
+  ring changes;
 * (x8, x8s) is MXFP8 of the stored x, bit for bit; la8 is the lookahead norm of
   the stored h_mid within one e4m3 step;
 * residual_mid, x, x8 and la8 match the reference row by row (``BOUNDS``: the
@@ -119,17 +123,8 @@ def _worker(rank, port, queue, done, inputs):
         s_o = shuffle_mxfp8_bpreshuffle_scale(ws.to(dev)).contiguous()
         results = []
         w_post, w_ahead = (t.to(dev) for t in _norm_weights())
-        for key, launch, (core, res) in zip(keys, launches, inputs):
-            s = key.tokens
-            core, res = core.to(dev), res.to(dev)
-            out = {
-                "h_mid": torch.zeros(s, HIDDEN, dtype=torch.bfloat16, device=dev),
-                "x": torch.zeros(s, HIDDEN, dtype=torch.bfloat16, device=dev),
-                "x8": torch.zeros(s, HIDDEN, dtype=torch.uint8, device=dev),
-                "x8s": torch.zeros(s, HIDDEN // 32, dtype=torch.uint8, device=dev),
-                "la8": torch.zeros(s, HIDDEN, dtype=torch.uint8, device=dev),
-                "la8s": torch.zeros(s, HIDDEN // 32, dtype=torch.uint8, device=dev),
-            }
+
+        def step(launch, core, res, out):
             args = ABI.pack(
                 {
                     "core": core.data_ptr(), "w_o": w_o.data_ptr(),
@@ -146,9 +141,42 @@ def _worker(rank, port, queue, done, inputs):
             mbx.begin_step()
             _run_compiled(launch, *args, torch.cuda.current_stream())
             torch.cuda.synchronize()
-            waits = given_up_waits(diag, region_namer(L.REGIONS))
-            waits += [f"fence: rank {r}" for r in mbx.missing_ranks()]
+            return given_up_waits(diag, region_namer(L.REGIONS)) + [
+                f"fence: rank {r}" for r in mbx.missing_ranks()
+            ]
+
+        for key, launch, (core, res) in zip(keys, launches, inputs):
+            s = key.tokens
+            core, res = core.to(dev), res.to(dev)
+            out = {
+                "h_mid": torch.zeros(s, HIDDEN, dtype=torch.bfloat16, device=dev),
+                "x": torch.zeros(s, HIDDEN, dtype=torch.bfloat16, device=dev),
+                "x8": torch.zeros(s, HIDDEN, dtype=torch.uint8, device=dev),
+                "x8s": torch.zeros(s, HIDDEN // 32, dtype=torch.uint8, device=dev),
+                "la8": torch.zeros(s, HIDDEN, dtype=torch.uint8, device=dev),
+                "la8s": torch.zeros(s, HIDDEN // 32, dtype=torch.uint8, device=dev),
+            }
+
+            waits = step(launch, core, res, out)
             got = {k: v.cpu() for k, v in out.items()}
+            if key.lookahead:
+                # again with the lookahead into slot 1's rows [s, 2s) of a ring
+                # (ProLookaheadState's: 3 slots of 2 x 16 rows), filled around them
+                ring = (
+                    torch.full((3, 32, HIDDEN), 0x55, dtype=torch.uint8, device=dev),
+                    torch.full((3, 32, HIDDEN // 32), 0x66, dtype=torch.uint8, device=dev),
+                )  # fmt: skip
+                waits += step(
+                    launch,
+                    core,
+                    res,
+                    {
+                        **out,
+                        "la8": ring[0][1, s : 2 * s],
+                        "la8s": ring[1][1, s : 2 * s],
+                    },
+                )
+                got["ring_q"], got["ring_s"] = ring[0].cpu(), ring[1].cpu()
             got["x8"] = got["x8"].view(torch.float8_e4m3fn)
             got["la8"] = got["la8"].view(torch.float8_e4m3fn)
             if not key.lookahead:
@@ -225,6 +253,19 @@ def test_every_rank_writes_the_same_bytes(ranks):
                 assert torch.equal(
                     v.view(torch.uint8), got[k].view(torch.uint8)
                 ), f"rows {s} lookahead {la}: rank {rank}'s {k} differs from rank 0's"
+
+
+def test_the_lookahead_into_ring_rows_is_the_own_tensors_bytes(ranks):
+    for rank, results in ranks.items():
+        for s, la, _, got in results:
+            if not la:
+                continue
+            want_q = torch.full((3, 32, HIDDEN), 0x55, dtype=torch.uint8)
+            want_s = torch.full((3, 32, HIDDEN // 32), 0x66, dtype=torch.uint8)
+            want_q[1, s : 2 * s] = got["la8"].view(torch.uint8)
+            want_s[1, s : 2 * s] = got["la8s"]
+            assert torch.equal(got["ring_q"], want_q), f"rank {rank} rows {s}: la8"
+            assert torch.equal(got["ring_s"], want_s), f"rank {rank} rows {s}: la8s"
 
 
 @pytest.mark.parametrize("case", range(len(CASES)))
