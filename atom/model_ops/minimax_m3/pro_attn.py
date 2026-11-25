@@ -186,9 +186,10 @@ class ProVariants:
     # index q is computed; kept so variants files that set it still parse.
     index_split_proj: bool = True
     # Decode / speculative-verify indexer split over the TP ranks: in a graph of at least
-    # this many rows (0: off), a multiple of the TP size, on aiter's page tables, each rank
-    # scores and selects one contiguous share of the rows and the [page table | ctx] rows are
-    # all-gathered back in order. Bit for bit the same selection, an eighth of the work.
+    # this many rows (0: off), on aiter's page tables, each rank scores and selects one
+    # contiguous share of ceil(sequences / TP) whole sequences (the last shares short or
+    # empty, padded to the same rows) and the [page table | ctx] rows are all-gathered
+    # back in order, cut to the graph's rows. Bit for bit the same selection.
     index_split_decode: int = 0
     # The score_tq kernel (prefill, speculative verify) leaves the tiles past a program's
     # rows unwritten instead of -inf, as the selections that read only causal blocks allow
@@ -198,6 +199,10 @@ class ProVariants:
     # vLLM's compressed index cache: every 4 index keys softmax-pooled into one bf16 row
     # (ic_c [pages, 4, 128]), written after prep; the scorer reads those rows only.
     index_compress: bool = False
+    # ... and a decode / verify graph whose requests hold at most 13 rows each (k <= 12)
+    # pools and stores the ring in one launch instead of two: the same bytes. Read from
+    # the graph's shape, so a captured graph keeps the launches it recorded.
+    index_compress_fused: bool = False
     # Prefill and speculative-verify scores take ``score_tq`` rows per program (a power of
     # two; 0: one): the rows of a sequence read each tile of block keys once, one dot for
     # all their query heads. A plain decode (one row a sequence) keeps one.
@@ -233,6 +238,10 @@ class ProVariants:
     # the same inputs: the same bytes. It pays with ``moe_tail_ar`` (no add after the
     # join); 0 turns it off.
     moe_two_stream_rows: int = 0
+    # ``moe_route_glue``'s path hands its shared output to the next layer's input
+    # all-reduce as ``moe_tail_ar`` does, and its route op also writes the lookahead
+    # norm's MXFP8 rows (where its aiter takes a lookahead weight): two launches fewer.
+    moe_glue_fold: bool = False
     # The K-only cache (``ProKOnlyLayout``): one 256-wide row a token, V read from its tail,
     # no V cache (776 -> 520 B a token and layer with an fp8 KV and a bf16 index cache).
     # The attention is then the Triton one. Read once, when the layers are built: the
@@ -248,9 +257,10 @@ class ProVariants:
     # has it, else "triton").
     prefill_attn: str = "triton"
     # Decode / verify batches of at least this many rows attend with amd-kernels-day0's FlyDSL
-    # sparse decode (day0#4, one workgroup a row: ahead of the paged attention from ~24 rows)
-    # on the K-only plain fp8 cache, the picks select_logical's; 0: off. Without the package
-    # (or day0#4 in it) the batch keeps the other attention.
+    # sparse decode as ported into aiter, aiter.ops.flydsl's minimax_m3_fp8_sparse_decode
+    # (one workgroup a row: ahead of the paged attention from ~24 rows), on the K-only plain
+    # fp8 cache, the picks select_logical's; 0: off. With an aiter that lacks it the batch
+    # keeps the other attention.
     day0_decode_rows: int = 24
     # ... and its epilogue writes o_proj's MXFP8 input (E4M3 + E8M0 of the bf16-rounded rows,
     # quantize_fp8's bytes) where o_proj is a native group32 FP8 GEMM: no separate quant.
@@ -286,6 +296,12 @@ class ProVariants:
     # ``fused_moe/pro_experts_decode.py``), "aiter" where this aiter lacks it. Read once,
     # when the layers are built: a captured graph keeps the kernels it recorded.
     moe_decode: str = "aiter"
+    # qk_proj and index_qk_proj in one launch, each on its own input (the indexer's may be
+    # the lookahead): aiter's ``gemm_a8w8_blockscale_bpreshuffle_pair``, which runs both
+    # GEMMs' column blocks in one grid where aiter's small-M MXFP8 kernel has a row for
+    # the pair at the step's rows, and the two GEMMs in turn elsewhere. Native MXFP8
+    # (1x32, preshuffled) weights only; an aiter without it keeps the two GEMMs.
+    qk_pair: bool = False
 
 
 # Below it, on an fp8 index cache, Triton's query-blocked scores are as fast or faster
@@ -835,9 +851,10 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
         )
 
     def _day0_decode(self, v: ProVariants, n: int, reqs: int, fp8: bool) -> bool:
-        """amd-kernels-day0's FlyDSL sparse decode for a decode / verify batch of ``n`` rows
-        over ``reqs`` requests: from ``day0_decode_rows`` rows, on the K-only plain fp8 cache,
-        rows request-major (``n`` a multiple of ``reqs``). The shapes alone decide (graph-safe).
+        """aiter's FlyDSL sparse decode for a decode / verify batch of ``n`` rows over
+        ``reqs`` requests: from ``day0_decode_rows`` rows, on the K-only plain fp8 cache of
+        whole 16-token blocks a page, rows request-major (``n`` a multiple of ``reqs``). The
+        shapes alone decide (graph-safe).
         """
         return (
             0 < v.day0_decode_rows <= n
@@ -848,6 +865,7 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
             and v.topk in ("fused", "split")
             and self.num_heads == 16
             and self.topk == pro_kernels.TOPK
+            and self.page % pro_kernels.PAGE == 0
             and reqs > 0
             and n % reqs == 0
             and pro_kernels.day0_decode_available()
@@ -981,6 +999,23 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
             md._m3pro_dev = cached = (capturing, seq)
         return cached[1]
 
+    @staticmethod
+    def _day0_lens(md, n: int, positions):
+        """The day0 decode's request lengths (``day0_decode_seq_lens``) of a decode / verify
+        batch of ``n`` rows, once a forward for all layers, cached per capture state as
+        ``_device_meta`` is."""
+        capturing = (
+            torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
+        )
+        reqs = md.block_tables.shape[0]
+        cached = getattr(md, "_m3pro_day0_lens", None)
+        if cached is None or cached[0] != capturing or cached[1].shape[0] != reqs:
+            lens = pro_kernels.day0_decode_seq_lens(
+                positions[:n], md.slot_mapping[:n], n // reqs
+            )
+            md._m3pro_day0_lens = cached = (capturing, lens)
+        return cached[1]
+
     def _kernel_attention(
         self,
         qkv,
@@ -998,6 +1033,8 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
         mx_scale=None,
         dsplit=None,
         ring=None,
+        max_rows=0,
+        day0_lens=None,
     ):
         """The whole layer in four launches (``prep`` / ``scores`` + top-k / ``attention``).
 
@@ -1010,9 +1047,13 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
         rows only (the other rows' index q may be unset). ``mx_scale`` ``[n, H x 192 / 32]``
         uint8 (with ``out`` E4M3): the decode attention writes o_proj's MXFP8 input
         (``_mxfp8_out``). ``dsplit``:
-        a decode's ``(first, end)`` rows this rank selects (``decode_split``). ``ring``:
+        a decode's ``(first, end[, share])`` rows this rank selects into a share of
+        ``share`` rows (default ``end - first``) it all-gathers (``decode_split``). ``ring``:
         ``(each batch row's first ring row, the ring rows)`` of the compressed index cache
         (``index_compress``; ``ic`` is then its ``[pages, 4, 128]`` centroids).
+        ``max_rows``: a bound on any sequence's rows, 0 when none (``compress_insert``).
+        ``day0_lens``: the day0 decode's request lengths (``_day0_lens``), else computed
+        in the call.
         """
         kc4 = layer.k_cache[:, 0]
         vc4 = None if self.k_only else layer.v_cache[:, 0]
@@ -1090,6 +1131,7 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
                 self.index_compress_query.data,
                 v.pool_scale,
                 ic,
+                max_rows=max_rows if v.index_compress_fused else 0,
             )
         scale = self.scale * v.scale_mult
         nblk = v.attn_nblk
@@ -1141,6 +1183,8 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
                     scale,
                     n // block_tables.shape[0],
                     out_scale=mx_scale,
+                    # the forward's lengths where it gave them (else the call's own)
+                    **({} if day0_lens is None else {"seq_lens": day0_lens}),
                 )
             if day0:
                 assert (
@@ -1221,7 +1265,8 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
         rps = n // block_tables.shape[0]  # rows a sequence (static: k + 1 for a verify)
         if dsplit is not None:
             # whole sequences a rank (decode_split), so no score tile spans two of them
-            r0, r1 = dsplit
+            r0, r1 = dsplit[:2]
+            share = dsplit[2] if len(dsplit) > 2 else r1 - r0
             rq, rseq, rpos = iq[r0:r1], seq_id[r0:r1], positions[r0:r1]
         if split is not None:
             # every row scores alone, so this rank's rows come out as they would in full
@@ -1298,21 +1343,23 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
                 mine = pro_kernels.select_logical(
                     score, rpos, k, split=v.topk == "split"
                 )
+                if share > r1 - r0:
+                    mine = torch.cat([mine, mine.new_empty(share - r1 + r0, k)])
                 return attend(
-                    tensor_model_parallel_all_gather(mine, dim=0).contiguous()
+                    tensor_model_parallel_all_gather(mine, dim=0)[:n].contiguous()
                 )
-            # this rank's [page table | ctx] rows, written in place by the selection
-            mine = torch.empty(r1 - r0, k + 1, dtype=torch.int32, device=iq.device)
+            # this rank's [page table | ctx] rows, written in place by the selection; a
+            # short share's tail is left unset, gathered past row n and cut
+            mine = torch.empty(share, k + 1, dtype=torch.int32, device=iq.device)
+            m = mine[: r1 - r0]
             if select is pro_kernels.select_rows_split:
-                select(
-                    score, block_tables, rseq, rpos, k, rows=mine[:, :k], ctx=mine[:, k]
-                )
+                select(score, block_tables, rseq, rpos, k, rows=m[:, :k], ctx=m[:, k])
             else:
                 rows, ctx = select(score, block_tables, rseq, rpos, k)
-                mine[:, :k], mine[:, k] = rows, ctx
+                m[:, :k], m[:, k] = rows, ctx
             # the shares are contiguous and in rank order: gathered, the rows are in place;
             # aiter takes the page table at any row stride, the lengths contiguous
-            full = tensor_model_parallel_all_gather(mine, dim=0)
+            full = tensor_model_parallel_all_gather(mine, dim=0)[:n]
             return attend(None, (full[:, :k], full[:, k].contiguous()))
         if split is not None:
             from aiter.dist.communication_op import tensor_model_parallel_all_gather
@@ -1464,10 +1511,13 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
 
     # ---------------------------------------------------------------- forward --
     def decode_split(self, n: int, v: ProVariants, seqs: int = 0):
-        """This rank's ``(first, end)`` rows of a graph's ``n`` decode rows of ``seqs``
-        sequences under ``index_split_decode``, or ``None``: every rank selects every row.
-        A rank's share holds whole sequences (``n / seqs`` rows each). The shapes alone
-        decide, so every rank and layer agrees and a graph holds it."""
+        """This rank's ``(first, end, share)`` rows of a graph's ``n`` decode rows of
+        ``seqs`` sequences under ``index_split_decode``, or ``None``: every rank selects
+        every row. Rank r's share is rows ``r * share`` on, ceil(seqs / TP) whole sequences
+        (``n / seqs`` rows each); it selects rows ``first .. end`` into the share's head,
+        and the rest of the share, gathered past row ``n``, is cut. A rank past the last
+        sequence selects that sequence again into rows it gathers past ``n``. The shapes
+        alone decide, so every rank and layer agrees and a graph holds it."""
         if not v.index_split_decode or n < v.index_split_decode:
             return None
         if not self._aiter_attn(v, n) or v.topk not in ("fused", "split"):
@@ -1487,12 +1537,14 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
         )
 
         tp = get_tensor_model_parallel_world_size()
-        rps = n // seqs if seqs else 1
-        if tp == 1 or n % tp or (n // tp) % rps:
+        if tp == 1 or (seqs and n % seqs):
             return None
-        share = n // tp
-        rank = get_tensor_model_parallel_rank()
-        return rank * share, (rank + 1) * share
+        rps = n // seqs if seqs else 1
+        share = -(-(n // rps) // tp) * rps
+        first = get_tensor_model_parallel_rank() * share
+        if first >= n:
+            first = n - rps
+        return first, min(first + share, n), share
 
     def index_split(self, n_tok: int):
         """This forward's ``index_split`` plan, ``(idx, seg, n, tp)`` (``row_split_index``
@@ -1632,13 +1684,15 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
                 nb = (max(ctx) + self.page - 1) // self.page
             # the decode attention writes o_proj's MXFP8 input where o_proj takes it (mx_out,
             # set by the model): E4M3 rows here, their E8M0 scales through take_mx_scale
-            mx = static and self._mxfp8_out(
-                v,
-                n,
-                self._day0_decode(
-                    v, n, md.block_tables.shape[0], layer.k_cache.element_size() == 1
-                ),
+            day0_dec = static and self._day0_decode(
+                v, n, md.block_tables.shape[0], layer.k_cache.element_size() == 1
             )
+            mx = static and self._mxfp8_out(v, n, day0_dec)
+            if day0_dec:
+                # compiled here, in the eager forward a capture runs first, not in the capture
+                pro_kernels.day0_decode_warm_up(
+                    query.device, layer.k_cache.shape[-2], mx
+                )
             # the kernels write every row they compute in full: zero only the others
             width = h * self.value_head_dim
             out = query.new_empty(
@@ -1675,6 +1729,8 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
                     getattr(md, "pro_ring_base", None),
                     getattr(md, "pro_ring_rows", 0),
                 ),
+                max_rows=int(md.max_seqlen_q) if static else 0,
+                day0_lens=self._day0_lens(md, n, position) if day0_dec else None,
             )
             if mx:
                 self._mx_scale = mx_scale.view(torch.float8_e8m0fnu)

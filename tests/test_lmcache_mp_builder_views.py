@@ -253,7 +253,7 @@ def _assert_region_view_geometry(transfer):
         assert view.numel() * view.element_size() == region.total_bytes
 
 
-def test_minimax_m3_builder_publishes_gqa_and_index_views_without_tp_collapse(
+def test_minimax_m3_builder_publishes_gqa_and_index_views_collapsing_tp_only_when_mqa(
     mha_export_method,
 ):
     num_blocks = 3
@@ -282,6 +282,19 @@ def test_minimax_m3_builder_publishes_gqa_and_index_views_without_tp_collapse(
     transfer.set_block_count(num_blocks)
 
     assert transfer.tp_replication_factor == 1
+    # Under a runner: one KV head for the whole model (M3.1-Pro) is the same bytes on
+    # every TP rank, a GQA model's heads are not.
+    for kv_heads, want in ((1, 8), (4, 1)):
+        builder.model_runner = SimpleNamespace(
+            config=SimpleNamespace(
+                tensor_parallel_size=8,
+                decode_context_parallel_size=1,
+                prefill_context_parallel_size=1,
+                hf_config=SimpleNamespace(num_key_value_heads=kv_heads),
+            )
+        )
+        assert mha_export_method(builder).tp_replication_factor == want
+    del builder.model_runner
     assert len(transfer.block_regions) == 4 * 2 + 1
     # Every KV unit is one head-major run of the rank's one head; the indexer
     # keys are the same on every rank.

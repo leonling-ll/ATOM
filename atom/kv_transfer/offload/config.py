@@ -124,6 +124,23 @@ def _is_minimax_m3(hf_config) -> bool:
     return hf_config is not None and _is_minimax_m3_config(hf_config)
 
 
+def mqa_tp_replication_factor(config, hf_config) -> int:
+    """``config``'s TP size when ``hf_config`` caches one KV head for the whole model (MQA, e.g.
+    MiniMax-M3.1-Pro and its DSpark draft) and nothing shards the cache by token (DCP / PCP 1):
+    every rank then caches that head from the same replicated weights, so one rank's PAGE bytes
+    are the whole TP group's and one stored copy serves every rank. 1 otherwise (GQA heads are
+    sharded across ranks, e.g. M3 Flash)."""
+
+    text = getattr(hf_config, "text_config", hf_config)
+    if int(getattr(text, "num_key_value_heads", 0) or 0) != 1:
+        return 1
+    if int(getattr(config, "decode_context_parallel_size", 1)) > 1:
+        return 1
+    if int(getattr(config, "prefill_context_parallel_size", 1)) > 1:
+        return 1
+    return max(1, int(getattr(config, "tensor_parallel_size", 1)))
+
+
 def select_offload_layout(config) -> str:
     """Resolve the config-only dense/hybrid layout selection.
 

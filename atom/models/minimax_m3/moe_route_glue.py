@@ -12,7 +12,9 @@ The op's IPC buffers are made once per shape for the TP group (`build`, collecti
 every rank, before any graph capture), so a model calls `build` at construction.
 """
 
+import inspect
 import logging
+from functools import cache
 
 import torch
 
@@ -75,18 +77,34 @@ def applies(moe, rows: int) -> bool:
     )
 
 
-def route(x: torch.Tensor, residual: torch.Tensor, norm, moe) -> dict:
+@cache
+def takes_lookahead() -> bool:
+    """Whether this aiter's op also writes a lookahead norm's MXFP8 rows."""
+    from aiter.ops.triton.comms.fused import all_reduce_rmsnorm_moe_route as op
+
+    sig = inspect.signature(op.fused_all_reduce_rmsnorm_moe_route)
+    return "lookahead_weight" in sig.parameters
+
+
+def route(x: torch.Tensor, residual: torch.Tensor, norm, moe, lookahead=None) -> dict:
     """The op on this rank's partial sums `x` (the o_proj output) and the residual:
     ``normed`` (bf16, the routed experts' input), ``x_q`` / ``x_scale`` (its MXFP8
     copy, the shared expert's), ``residual_out``, ``topk_ids`` / ``topk_weights`` (the
     weights carry the routed scale where the layer folds it), the BM=16 sort and the
-    zeroed ``moe_buf``."""
+    zeroed ``moe_buf``. ``lookahead`` (`takes_lookahead`): ``(norm, q, q_scale)``,
+    ``residual_out`` through that norm as MXFP8 ``la_q`` / ``la_scale`` (into ``q`` /
+    ``q_scale`` unless None)."""
     from aiter.ops.triton.comms.fused.all_reduce_rmsnorm_moe_route import (
         fused_all_reduce_rmsnorm_moe_route,
     )
 
     ex = moe.experts
     comm = _COMMS[(x.shape[-1], ex.global_num_experts, ex.top_k)]
+    la = {}
+    if lookahead is not None:
+        n, q, s = lookahead
+        la = {"lookahead_weight": n.weight, "lookahead_eps": n.variance_epsilon}
+        la["out"] = None if q is None else {"la_q": q, "la_scale": s.view(torch.uint8)}
     return fused_all_reduce_rmsnorm_moe_route(
         x,
         residual,
@@ -104,6 +122,7 @@ def route(x: torch.Tensor, residual: torch.Tensor, norm, moe) -> dict:
         quant=True,
         block_size=BLOCK_M,
         zero_moe_buf=True,
+        **la,
     )
 
 

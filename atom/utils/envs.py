@@ -698,6 +698,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # until ROCm/aiter#7967), any other keeps ATOM's mono path; "1": on, or an
     # error naming why not; "0": off.
     "ATOM_DSV41_MONO_HI": lambda: os.getenv("ATOM_DSV41_MONO_HI", "auto"),
+    # Mixed prefill+decode forwards: a prefill step also carries the running
+    # decode requests' rows, after its prefill rows. Off (default): prefill
+    # and decode run as separate forwards. On, MiniMax-M3-Pro's attention
+    # builder allocates the decode half's own metadata buffers.
+    "ATOM_MIXED_BATCH": lambda: _flag_env("ATOM_MIXED_BATCH"),
     # Token-bucket TR graphs for prefill (`atom/utils/region_graph.py`): the
     # comma-separated token counts to record. A prefill longer than the largest
     # runs eagerly; empty records none. The default tops out at 3072 because

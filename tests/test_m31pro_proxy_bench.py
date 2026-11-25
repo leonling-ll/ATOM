@@ -10,6 +10,8 @@ import re
 import shlex
 import shutil
 import subprocess
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import pytest
@@ -21,25 +23,36 @@ AGENTIC = ROOT / "recipes" / "Agentic-MiniMax-M3.1-Pro.md"
 pytestmark = pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash")
 
 
-def _dry_run(tmp_path, **env):
-    clean = {
+_CLEARED = (
+    "ACCEPT_LENGTH",
+    "SPEC_TOKENS",
+    "THINKING",
+    "RECIPE",
+    "GPU_MEM_UTIL",
+    "MAX_NUM_SEQS",
+    "SERVER_EXTRA",
+    "PYTHONHASHSEED",
+    "CHAT_TEMPLATE",
+    "MODEL",
+    "PREWARM",
+    "PREWARM_PROMPT_TOKENS",
+    "PREWARM_BATCHES",
+    "SERVER_LOG",
+    "PORT",
+)
+
+
+def _clean_env():
+    return {
         k: v
         for k, v in os.environ.items()
         if not k.startswith(("ATOM_", "AITER_", "GPTOSS_", "LMCACHE_"))
-        and k
-        not in (
-            "ACCEPT_LENGTH",
-            "SPEC_TOKENS",
-            "THINKING",
-            "RECIPE",
-            "GPU_MEM_UTIL",
-            "MAX_NUM_SEQS",
-            "SERVER_EXTRA",
-            "PYTHONHASHSEED",
-            "CHAT_TEMPLATE",
-            "MODEL",
-        )
+        and k not in _CLEARED
     }
+
+
+def _dry_run(tmp_path, **env):
+    clean = _clean_env()
     clean.update(env, PROXY_DRY_RUN="1", HOME=str(tmp_path))
     done = subprocess.run(
         ["bash", str(BENCH), "32", str(tmp_path / "out")],
@@ -114,6 +127,25 @@ def test_agentic_recipe_launch(tmp_path):
     assert values["LMCACHE_LOCAL_CPU"] == "True"
     assert values["PYTHONHASHSEED"] == "0"
     assert values["ATOM_CUSTOM_AR_POOL_BYTES"] == "134217728"
+
+
+@pytest.mark.parametrize(
+    "sizes, served",
+    [
+        (None, "256,512,1024,2048"),
+        ("", ""),
+        ("256,512,1024,2048,3072,4096", "256,512,1024,2048,3072,4096"),
+    ],
+)
+def test_agentic_token_graph_sizes_keep_the_callers_value(tmp_path, sizes, served):
+    """Unset takes the recipe's buckets; set, even to empty (every prefill
+    eager), is served as given."""
+    env = {"RECIPE": "agentic"}
+    if sizes is not None:
+        env["ATOM_TOKEN_GRAPH_SIZES"] = sizes
+    done, values, _ = _dry_run(tmp_path, **env)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert values["ATOM_TOKEN_GRAPH_SIZES"] == served
 
 
 def test_pro_recipe_launch(tmp_path):
@@ -296,3 +328,124 @@ def test_agentic_sc_serves_from_hbm_without_index_compress(tmp_path):
     assert served == {k: v for k, v in agentic.items() if k != "index_compress"}
     assert values["GPU_MEM_UTIL"] == "0.95"
     assert values["ATOM_ONLINE_QUANT_STREAMING"] == "1"
+
+
+class _Reply(BaseHTTPRequestHandler):
+    def do_POST(self):
+        body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+        with self.server.lock, self.server.events.open("a") as events:
+            events.write(f"request max_tokens={body['max_tokens']}\n")
+        if self.server.fail:
+            self.send_error(500)
+            return
+        payload = json.dumps({"usage": {"completion_tokens": 1}}).encode()
+        self.send_response(200)
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def log_message(self, *args):
+        pass
+
+
+def _full_run(tmp_path, fail=False, **env):
+    """Run proxy_bench.sh with stubbed server scripts, trace subset and client,
+    against a recording HTTP server; return the run and its ordered events."""
+    tmp_path.mkdir(exist_ok=True)
+    tree = tmp_path / "tree"
+    (tree / "scripts" / "m31pro").mkdir(parents=True)
+    shutil.copy(BENCH, tree / "scripts" / "m31pro" / "proxy_bench.sh")
+    events = tmp_path / "events"
+    events.touch()
+    for name in ("start_atom_server", "stop_atom_server", "wait_server_ready"):
+        (tree / "scripts" / f"{name}.sh").write_text(f"echo {name} >> {events}\n")
+    (tree / "scripts" / "m31pro" / "trace_subset.py").write_text(
+        "import sys\n"
+        "from pathlib import Path\n"
+        "out = Path(sys.argv[sys.argv.index('--out') + 1])\n"
+        "out.mkdir(parents=True)\n"
+        "(out / 't.json').write_text('{}')\n"
+    )
+    stubs = tmp_path / "stubs"
+    stubs.mkdir()
+    (stubs / "aiperf").write_text(f"#!/bin/bash\necho aiperf >> {events}\n")
+    real_python = shutil.which("python3") or shutil.which("python")
+    (stubs / "python3").write_text(
+        '#!/bin/bash\ncase "$*" in *"import atom"*) exit 0 ;; esac\n'
+        f'exec "{real_python}" "$@"\n'
+    )
+    for stub in stubs.iterdir():
+        stub.chmod(0o755)
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _Reply)
+    server.lock, server.events, server.fail = threading.Lock(), events, fail
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        clean = _clean_env()
+        clean.update(
+            env,
+            HOME=str(tmp_path),
+            PATH=f"{stubs}{os.pathsep}{os.environ['PATH']}",
+            PORT=str(server.server_port),
+            SERVER_LOG=str(tmp_path / "server.log"),
+            MODEL=str(tmp_path),
+        )
+        done = subprocess.run(
+            ["bash", str(tree / "scripts" / "m31pro" / "proxy_bench.sh"), "32"],
+            env=clean,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+    finally:
+        server.shutdown()
+    return done, events.read_text().splitlines()
+
+
+PREWARM_PLAN = {"PREWARM_PROMPT_TOKENS": "8,16", "PREWARM_BATCHES": "1,2"}
+NO_PREWARM = ["start_atom_server", "wait_server_ready", "aiperf", "stop_atom_server"]
+
+
+def test_prewarm_runs_after_the_server_is_ready_and_before_the_client(tmp_path):
+    done, events = _full_run(tmp_path, RECIPE="agentic", **PREWARM_PLAN)
+    assert "prewarm done" in done.stdout, done.stdout + done.stderr
+    # two prefill prompts (1 token), then 1 + 2 decode prompts (64 tokens)
+    prewarm = ["request max_tokens=1"] * 2 + ["request max_tokens=64"] * 3
+    assert events[:2] == ["start_atom_server", "wait_server_ready"]
+    assert events[2:7] == prewarm
+    assert events[7] == "aiperf"
+
+
+def test_prewarm_is_skipped_with_prewarm_0(tmp_path):
+    done, events = _full_run(tmp_path, RECIPE="agentic", PREWARM="0", **PREWARM_PLAN)
+    assert "prewarm done" not in done.stdout
+    assert events == NO_PREWARM
+
+
+def test_prewarm_is_off_for_the_pro_recipe_unless_asked(tmp_path):
+    _, events = _full_run(tmp_path / "pro", **PREWARM_PLAN)
+    assert events == NO_PREWARM
+    _, events = _full_run(tmp_path / "on", PREWARM="1", **PREWARM_PLAN)
+    assert events.count("request max_tokens=64") == 3
+
+
+def test_prewarm_plan_in_the_dry_run(tmp_path):
+    done, values, _ = _dry_run(tmp_path, RECIPE="agentic")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert values["prewarm"] == "1"
+    prompts = [int(n) for n in values["prewarm_prompt_tokens"].split(",")]
+    assert max(prompts) > 16384  # beyond one prefill chunk
+    batches = [int(n) for n in values["prewarm_batches"].split(",")]
+    # every graph a CONC 32 run can replay (MAX_NUM_SEQS 64)
+    assert batches == [n for n in json.loads(AGENTIC_LADDER) if n <= 64]
+    done, values, _ = _dry_run(tmp_path, RECIPE="agentic", PREWARM="0")
+    assert values["prewarm"] == "0"
+    assert "prewarm_batches" not in values
+
+
+def test_a_failed_prewarm_reply_stops_the_run(tmp_path):
+    done, events = _full_run(tmp_path, fail=True, RECIPE="agentic", **PREWARM_PLAN)
+    assert done.returncode != 0
+    assert "aiperf" not in events
+    assert events[-1] == "stop_atom_server"

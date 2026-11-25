@@ -344,9 +344,12 @@ class DraftKvBuilder(PoolRowsMixin):
 
     def get_kv_transfer_tensors(self):
         from atom.kv_transfer.disaggregation.types import KVTransferTensors
+        from atom.kv_transfer.offload.config import mqa_tp_replication_factor
 
         pool, rows = self.kv_pool, self.pool_rows[DRAFT_KV_ROWS]
         modules = sorted(rows, key=rows.get)
+        runner = getattr(self, "model_runner", None)  # none: a bare export, sharded
+        spec = None if runner is None else runner.config.speculative_config
         return KVTransferTensors(
             # Described by its pool like the target's, under a namespace of its
             # own: its rows sit in the same block ids.
@@ -360,7 +363,14 @@ class DraftKvBuilder(PoolRowsMixin):
                     for m in modules
                 ],
             ),
-            # A paged MHA/GQA draft is a per-rank shard. Appending it to an
-            # otherwise replicated target must disable whole-object collapse.
-            tp_replication_factor=1,
+            # A paged MHA/GQA draft is a per-rank shard, and appending it to an
+            # otherwise replicated target disables whole-object collapse; an MQA
+            # draft (one KV head, M3.1-Pro's DSpark) is replicated like its target.
+            tp_replication_factor=(
+                1
+                if spec is None
+                else mqa_tp_replication_factor(
+                    runner.config, spec.draft_model_hf_config
+                )
+            ),
         )

@@ -221,7 +221,7 @@ def test_releasing_before_the_first_build_builds_nothing():
     assert asked == []
 
 
-def test_draft_exports_zero_copy_mp_views_and_disables_tp_collapse():
+def test_draft_exports_zero_copy_mp_views_and_collapses_tp_only_when_mqa():
     pool = MhaKvPool(
         layers=1,
         block_size=128,
@@ -239,6 +239,18 @@ def test_draft_exports_zero_copy_mp_views_and_disables_tp_collapse():
     transfer.set_block_count(2)
 
     assert transfer.tp_replication_factor == 1
+    # An MQA draft (M3.1-Pro's DSpark: one KV head) is the same bytes on every rank.
+    builder.model_runner = SimpleNamespace(
+        config=SimpleNamespace(
+            tensor_parallel_size=8,
+            decode_context_parallel_size=1,
+            prefill_context_parallel_size=1,
+            speculative_config=SimpleNamespace(
+                draft_model_hf_config=SimpleNamespace(num_key_value_heads=1)
+            ),
+        )
+    )
+    assert builder.get_kv_transfer_tensors().tp_replication_factor == 8
     assert [region.semantic_role for region in transfer.block_regions] == [
         "draft.k.layer_0",
         "draft.v.layer_0",
