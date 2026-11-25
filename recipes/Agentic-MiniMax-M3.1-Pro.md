@@ -430,7 +430,7 @@ Single steps, 600 s each on one node. 600 s runs of one launch differ by up to a
 | + the decode fusions (*) | 15,631 | 45.19 | 0.5 / 76.2 s |
 | + the decode fusions, without `index_day0` | 14,584 | 42.22 | 0.3 / 79.1 s |
 | + the LMCache MP transfer settings, no fusions (*, transfer profiling on) | 14,610 | 46.66 | 0.5 / 72.8 s |
-| This launch | pending | | |
+| This launch | 14,664 | 44.24 | 0.5 / 69.9 s |
 
 (*) These runs also had `index_day0`, a prefill indexer variant that needs a package outside
 aiter-M3 and is not in ATOM; the third row is the second without it.
