@@ -3,7 +3,8 @@
 This recipe runs the SemiAnalysis/Weka AgentX replay workload against MiniMax-M3.1-Pro
 with ATOM on 8×AMD MI355X GPUs. It is tuned for **CONC 64**: sections 1 and 2 are the launch the
 CONC 64 proxy measured, and the current best CONC 64 launch on the full workload (1M context) is in
-[CONC 64 on the full workload](#conc-64-on-the-full-workload). The current best **CONC 32** launch is in [CONC 32](#conc-32).
+[CONC 64 on the full workload](#conc-64-on-the-full-workload). The current best **CONC 32** launch is in [CONC 32](#conc-32),
+and the CONC 1-16 launch is in [Small concurrency](#small-concurrency-conc-1-16).
 The configuration of sections 1 and 2 uses:
 
 - MiniMax-M3.1-Pro (MXFP8 attention/dense, NVFP4 routed experts converted to MXFP4 at load)
@@ -114,6 +115,7 @@ tokens loaded from the CPU tier and the re-ask's TTFT down from 2.85 s to 0.20 s
 | Prefill | 16384-token chunks; prefill attention on aiter's FlyDSL `minimax_m3_fp8_sparse_prefill` (amd-kernels-day0's kernel, ported into aiter-M3 `hatwu/m3.1-pro-infx` at `a26613a8a`) when the aiter build has it, otherwise the Triton kernel. `amd_kernels` is never installed. |
 | Decode attention | from 24 rows, aiter's FlyDSL `minimax_m3_fp8_sparse_decode` (amd-kernels-day0's kernel, ported into aiter-M3 `hatwu/m3.1-pro-infx` at `3c55cbcc2`) with an MXFP8 output for `o_proj`, when the aiter build has it; otherwise aiter's paged attention |
 | Decode front | up to 16 rows (`ar_lamport_rows`), a layer's q, k, index q and index k come from one MXFP8 GEMM over `[x; lookahead input]`; above it, two GEMMs |
+| MoE layers at ≤ 16 rows | mono decode (`mono_ffn_rows` 16, the default): a decode or verify forward of at most 16 rows runs each MoE layer's `o_proj` through its FFN partial as one persistent FlyDSL kernel, with A16W4 routed experts (bf16 activations, the same MXFP4 weights). Needs FlyDSL, the Lamport all-reduce (`ar_lamport_rows` 16) and the day0 decode starting above 16 rows (`day0_decode_rows` 24); without them production serves those layers. Mono sums its all-reduce in the Lamport kernel's order, so a launch with `ar_fused_rows` above 0 runs with mono off (`mono FFN off: ar_fused_rows N overlaps 1 .. 16`): the CONC 32 launch (`"ar_fused_rows": 128`) is one. The small-concurrency launch (`RECIPE=agentic_sc`, Small concurrency below) keeps `ar_fused_rows` at 0 (unset), as these variants do |
 | `max-num-seqs` | 2 × CONC (128) |
 
 ## 0. Build aiter-M3 into the container
@@ -211,6 +213,9 @@ Check the startup log:
   `--text-only` and the comm-group reuse). A pool near 35 GB means pad_align 128 is not in; near
   11 GB, streaming quant is not on.
 - One `Creating LMCacheEngine` line per rank with `'max_local_cpu_size': 184.0`.
+- After the first request, one `MiniMax-M3.1-Pro mono FFN: forwards of 1 .. 16 rows, routed experts
+  A16W4` line per rank. A `MiniMax-M3.1-Pro mono FFN off: <why>` line means mono is off and
+  production serves every MoE layer.
 
 ### Host memory for LMCache
 
@@ -625,6 +630,81 @@ the window: 203 s eager, 163 s here.
 - No GSM8K run yet with `moe_route_glue` and `index_compress` together at k=3.
 - AIME 2025 has not run yet; its gate is `scripts/m31pro/aime_gate.sh` (#174).
 
+## Small concurrency (CONC 1-16)
+
+The CONC 1, 4, 8 and 16 launch, as `scripts/m31pro/proxy_bench.sh` starts it with
+`RECIPE=agentic_sc` (`tests/test_m31pro_proxy_bench.py` diffs the two). It is the section 1 launch
+and aiter (section 0) with three settings off and a smaller `--max-num-seqs` below CONC 8:
+
+| Setting | Here | Why |
+|---|---|---|
+| LMCache offload, cache-aware admission | off | Up to CONC 16 the HBM pool holds every live session's prefix: at CONC 16 the prefix working set peaks at about 1.2M tokens, and util 0.95 with streaming quant gives 155,940 blocks (2.5M tokens). On that HBM-only launch, adding LMCache (184 GiB a rank) and admission left the prefix hit at 0.94 and cost 10.6% P90 E2E-normalized interactivity (77.38 -> 69.21) and 1.4% tok/s/GPU (3270.4 -> 3224.7). This was one 900 s run per arm at CONC 16, k=7, AL 2.94, measured in #133. |
+| `index_compress` | off | Up to 16 rows the centroid writes (two launches a layer, 576 us a step) cost more than the faster scoring saves: a decode step is 2.9% slower at CONC 1 (13,018 -> 13,398 us) and 2.0% slower at CONC 4 (#145, 8-row buckets). Its 17.6% more KV blocks are not needed here. |
+| `ar_fused_rows` | 0 (unset) | Up to 16 rows the all-reduce already runs on the Lamport path (`ar_lamport_rows` 16), and the mono decode path (#55) refuses an `ar_fused_rows` above 0. |
+| `--max-num-seqs` | 16 below CONC 8, else 2 × CONC | `proxy_bench.sh`'s rule for every small-concurrency point. |
+
+The rest of section 1 stays, including `moe_route_glue`. In #145 it raised P90 E2E-normalized interactivity
+by 14.8% at CONC 1, 9.6% at CONC 4 and 8.2% at CONC 16, on the #33 launch at util 0.87. The chat
+template is the 237eada one, as in section 1.
+
+```bash
+export MODEL_PATH="${MODEL_PATH:-/data/models/m3-pro}"
+export CHAT_TEMPLATE="${CHAT_TEMPLATE:-}"     # the 237eada chat_template.jinja (section 1)
+export PORT="${PORT:-8000}"
+export CONC="${CONC:-16}"                     # 1 to 16
+
+export AITER_LOG_LEVEL=WARNING
+unset AITER_CUSTOM_AR_DISABLE_LAMPORT          # ar_lamport_rows needs the Lamport path
+export ATOM_M3PRO_VARIANTS='{"kernels": true, "attn": "aiter", "topk": "split", "prep": "aiter", "index_split": true, "score_tq": 8, "ar_lamport_rows": 16, "k_only": true, "k_plain_fp8": true, "prefill_attn": "day0", "index_split_decode": 64, "moe_route_glue": true}'
+export ATOM_WARMUP_TOKENS=auto
+export ATOM_ONLINE_QUANT_STREAMING=1
+export AITER_REUSE_IDENTICAL_COMM_GROUPS=1
+export ATOM_CUSTOM_AR_POOL_BYTES=134217728   # 128 MiB custom all-reduce pool
+export GPTOSS_SWIGLU_MXFP4_BF16_BOUND=1040
+export ATOM_TOKEN_GRAPH_SIZES=256,512,1024,2048
+# no LMCache, no cache-aware admission
+
+rm -rf ~/.cache/atom/*
+
+python3 -m atom.entrypoints.openai_server \
+  --model "${MODEL_PATH}" \
+  --trust-remote-code \
+  --tensor-parallel-size 8 \
+  --server-port "${PORT}" \
+  --kv_cache_dtype fp8 \
+  --index-cache-dtype fp8 \
+  --block-size 16 \
+  --level 0 \
+  --max-model-len 132096 \
+  --max-num-seqs $(( CONC < 8 ? 16 : 2 * CONC )) \
+  --max-num-batched-tokens 16384 \
+  --cudagraph-capture-sizes "[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,18,20,22,24,26,28,30,32,48,64,128,256,512]" \
+  --gpu-memory-utilization 0.95 \
+  --online_quant_config '{"layer_quant_config": {"*.experts": "mxfp4"}}' \
+  --method dspark \
+  --num-speculative-tokens 7 \
+  --spec-decode-acceptance-length 2.94 \
+  --text-only \
+  --timeout-keep-alive 600 \
+  ${CHAT_TEMPLATE:+--chat-template "${CHAT_TEMPLATE}"} \
+  2>&1 | tee "server-m31pro-agentx-c${CONC}.log"
+```
+
+The proxy run, one fresh server a point:
+
+```bash
+export RECIPE=agentic_sc MODEL="${MODEL_PATH}" CHAT_TEMPLATE=/path/to/237eada/chat_template.jinja
+for CONC in 1 4 8 16; do
+  flock /tmp/m31pro-gpu.lock bash scripts/m31pro/proxy_bench.sh "${CONC}" "results/m31pro-agentx-sc-c${CONC}"
+done
+```
+
+Check the startup log: no `Creating LMCacheEngine` line, one `M3-Pro moe_route_glue` line a rank,
+and `num_kvcache_blocks` above the 155,940 that util 0.95 with streaming quant gave without
+`--text-only` (#133).
+
+No row has been measured on this launch yet. The CONC 1, 4, 8 and 16 points at k=7, AL 2.94 are #135.
+
 ## Accuracy
 
 Start the same server **without** `--spec-decode-acceptance-length` (keep `--method dspark`), then
@@ -673,7 +753,8 @@ verify steps are 129-256 rows, where tuned a16w4 is within 3-5% of a4w4 per MoE 
 ## Not covered yet
 
 - Other concurrencies: only CONC 64 has been measured with these settings, and CONC 32 with
-  its own (CONC 32, above).
+  its own (CONC 32, above). CONC 1-16 has its launch (Small concurrency, above) but no measured row
+  yet.
 - CONC 32 with the full 237eada chat template (#182), and at aiter-M3 `5bc8d81ec`.
 - A 3600 s run with `GPTOSS_SWIGLU_MXFP4_BF16_BOUND=1040`; the 3600 s row above is without it.
 - The intermittent LMCache start hang (see Host memory for LMCache) is not fixed in the launcher.

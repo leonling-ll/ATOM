@@ -6,6 +6,7 @@
 import itertools
 import json
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -170,8 +171,16 @@ def _ladders(args):
     return [b for a, b in pairs if a == "--cudagraph-capture-sizes"]
 
 
-def test_agentic_launch_captures_graphs_between_8_16_and_32(tmp_path):
-    done, _, args = _dry_run(tmp_path, RECIPE="agentic")
+# RECIPE value -> its launch section in the Agentic recipe.
+AGENTIC_LAUNCHES = {
+    "agentic": "1. Start the ATOM server",
+    "agentic_sc": "Small concurrency (CONC 1-16)",
+}
+
+
+@pytest.mark.parametrize("recipe", AGENTIC_LAUNCHES)
+def test_agentic_launch_captures_graphs_between_8_16_and_32(tmp_path, recipe):
+    done, _, args = _dry_run(tmp_path, RECIPE=recipe)
     assert done.returncode == 0, done.stdout + done.stderr
     assert _ladders(args) == [AGENTIC_LADDER]
 
@@ -206,10 +215,20 @@ def _flags(words):
     return flags
 
 
-def _recipe_launch():
-    """Exports, unsets and server flags of the Agentic recipe's server launch."""
+# Variables proxy_bench passes as server flags, and quick all-reduce, which it
+# turns off in every run (#7 section 11).
+LAUNCH_ONLY_ENV = {
+    "KV_CACHE_DTYPE",
+    "GPU_MEM_UTIL",
+    "MAX_NUM_SEQS",
+    "AITER_QUICK_REDUCE_QUANTIZATION",
+}
+
+
+def _recipe_launch(heading=AGENTIC_LAUNCHES["agentic"]):
+    """Exports, unsets and server flags of one server launch in the Agentic recipe."""
     text = AGENTIC.read_text(encoding="utf-8")
-    section = text.split("\n## 1. Start the ATOM server\n", 1)[1]
+    section = text.split(f"\n## {heading}\n", 1)[1]
     block = section.split("```bash\n", 1)[1].split("\n```", 1)[0]
     env, unset = {}, set()
     for line in block.splitlines():
@@ -230,23 +249,24 @@ def _recipe_launch():
     return env, unset, _flags(shlex.split(command))
 
 
-def test_agentic_launch_is_the_recipe_launch(tmp_path):
+@pytest.mark.parametrize("recipe", AGENTIC_LAUNCHES)
+def test_agentic_launch_is_the_recipe_launch(tmp_path, recipe):
     template = tmp_path / "chat_template.jinja"
     template.write_text("{% if thinking_mode %}{% endif %}")
-    done, values, args = _dry_run(
-        tmp_path, RECIPE="agentic", CHAT_TEMPLATE=str(template)
-    )
+    done, values, args = _dry_run(tmp_path, RECIPE=recipe, CHAT_TEMPLATE=str(template))
     assert done.returncode == 0, done.stdout + done.stderr
-    env, unset, flags = _recipe_launch()
+    env, unset, flags = _recipe_launch(AGENTIC_LAUNCHES[recipe])
 
     variants = env.pop("ATOM_M3PRO_VARIANTS")
-    served = json.loads(values["ATOM_M3PRO_VARIANTS"])
-    for key, value in json.loads(variants).items():
-        assert served.get(key) == value, key
+    assert json.loads(values["ATOM_M3PRO_VARIANTS"]) == json.loads(variants)
     for name, value in env.items():
         assert values.get(name) == value, name
     for name in unset:
         assert name not in values, name
+    # and nothing the recipe leaves out, such as another launch's offload
+    launched = {name for name in values if re.fullmatch(r"[A-Z][A-Z0-9_]*", name)}
+    extra = launched - set(env) - LAUNCH_ONLY_ENV - {"ATOM_M3PRO_VARIANTS"}
+    assert not extra
 
     # start_atom_server.sh turns these three variables into flags.
     served = _flags(shlex.split(args.removeprefix("server_args:")))
@@ -259,16 +279,19 @@ def test_agentic_launch_is_the_recipe_launch(tmp_path):
             value = str(template)
         assert flag in served, flag
         assert served[flag] == value, flag
+    assert not set(served) - set(flags)
 
 
-def test_agentic_variants_add_onto_the_recipe(tmp_path):
+@pytest.mark.parametrize("recipe", AGENTIC_LAUNCHES)
+def test_agentic_variants_add_onto_the_recipe(tmp_path, recipe):
     extra = {"index": "fused", "ar_fused_rows": 128, "index_compress": False}
     done, values, _ = _dry_run(
-        tmp_path, RECIPE="agentic", ATOM_M3PRO_VARIANTS=json.dumps(extra)
+        tmp_path, RECIPE=recipe, ATOM_M3PRO_VARIANTS=json.dumps(extra)
     )
     assert done.returncode == 0, done.stdout + done.stderr
     served = json.loads(values["ATOM_M3PRO_VARIANTS"])
-    assert served == {**json.loads(_recipe_launch()[0]["ATOM_M3PRO_VARIANTS"]), **extra}
+    launch = _recipe_launch(AGENTIC_LAUNCHES[recipe])[0]
+    assert served == {**json.loads(launch["ATOM_M3PRO_VARIANTS"]), **extra}
 
 
 def test_pro_variants_replace(tmp_path):
@@ -277,6 +300,7 @@ def test_pro_variants_replace(tmp_path):
     assert values["ATOM_M3PRO_VARIANTS"] == '{"kernels": false}'
 
 
+@pytest.mark.parametrize("recipe", AGENTIC_LAUNCHES)
 @pytest.mark.parametrize(
     "template, ok",
     [
@@ -284,13 +308,26 @@ def test_pro_variants_replace(tmp_path):
         ("{% if thinking_mode %}{% endif %}", True),
     ],
 )
-def test_agentic_refuses_the_stub_template(tmp_path, template, ok):
+def test_agentic_refuses_the_stub_template(tmp_path, recipe, template, ok):
     (tmp_path / "chat_template.jinja").write_text(template)
-    done, _, args = _dry_run(tmp_path, RECIPE="agentic", MODEL=str(tmp_path))
+    done, _, args = _dry_run(tmp_path, RECIPE=recipe, MODEL=str(tmp_path))
     assert (done.returncode == 0) == ok, done.stdout + done.stderr
     assert "--chat-template" not in args
     if not ok:
         assert "CHAT_TEMPLATE" in done.stderr
+
+
+def test_agentic_sc_serves_from_hbm_without_index_compress(tmp_path):
+    done, values, _ = _dry_run(tmp_path, RECIPE="agentic_sc")
+    assert done.returncode == 0, done.stdout + done.stderr
+    for name in ("ATOM_KV_OFFLOAD", "ATOM_CACHE_AWARE_ADMISSION", "PYTHONHASHSEED"):
+        assert name not in values, name
+    assert not [name for name in values if name.startswith("LMCACHE_")]
+    served = json.loads(values["ATOM_M3PRO_VARIANTS"])
+    agentic = json.loads(_recipe_launch()[0]["ATOM_M3PRO_VARIANTS"])
+    assert served == {k: v for k, v in agentic.items() if k != "index_compress"}
+    assert values["GPU_MEM_UTIL"] == "0.95"
+    assert values["ATOM_ONLINE_QUANT_STREAMING"] == "1"
 
 
 class _Reply(BaseHTTPRequestHandler):

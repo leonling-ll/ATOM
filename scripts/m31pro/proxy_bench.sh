@@ -10,8 +10,9 @@
 # Run it inside the ATOM image (aiperf from agentx-harness on PATH) with this
 # tree importable, under the node's end-to-end lock. It
 #   1. writes the session subset (trace_subset.py) to OUT_DIR/traces,
-#   2. starts the server with the Pro recipe's fast configuration (RECIPE=pro)
-#      or the Agentic recipe's launch (RECIPE=agentic), plus DSpark at
+#   2. starts the server with the Pro recipe's fast configuration (RECIPE=pro),
+#      the Agentic recipe's launch (RECIPE=agentic) or its small-concurrency
+#      launch (RECIPE=agentic_sc), plus DSpark at
 #      SPEC_TOKENS draft tokens and a forced acceptance length: Pro's golden AL
 #      for that draft length unless ACCEPT_LENGTH is set,
 #   3. prewarms the server (PREWARM, below) so first-use compiles do not land
@@ -22,6 +23,12 @@
 #      request rate and how many replies differ in length from the trace's
 #      output length (also written to OUT_DIR/summary.json). The scenario sends
 #      ignore_eos, so that count should be 0 on any weights.
+#   5. prints proxy_tail.py's contamination report (also written to
+#      OUT_DIR/contamination.txt): TTFT outliers and the p90 without them, the
+#      p90's bootstrap band, kernels compiled during the replay (Triton cache
+#      entries and aiter JIT modules, counted into OUT_DIR/compile_counts.txt
+#      before and after it), and exits 1 when the server log shows an aiter
+#      without Pro's tuned FlyDSL MoE rows.
 #
 # Environment (defaults in brackets):
 #   MODEL            checkpoint [/data/models/yuhua/m3-pro]
@@ -37,20 +44,23 @@
 #   RECIPE           pro: recipes/MiniMax-M3-Pro.md's fast configuration;
 #                    agentic: the launch in recipes/Agentic-MiniMax-M3.1-Pro.md's
 #                    "1. Start the ATOM server", every env and flag of it
-#                    (tests/test_m31pro_proxy_bench.py diffs the two) [pro]
-#   CHAT_TEMPLATE    agentic: --chat-template file; unset, a checkpoint
+#                    (tests/test_m31pro_proxy_bench.py diffs the two);
+#                    agentic_sc: the same recipe's "Small concurrency (CONC
+#                    1-16)" launch, section 1 without LMCache, cache-aware
+#                    admission and index_compress [pro]
+#   CHAT_TEMPLATE    agentic*: --chat-template file; unset, a checkpoint
 #                    chat_template.jinja without the thinking_mode switch (the
 #                    1 KB stub) is refused []
 #   MAX_NUM_SEQS     [16 below CONC 8, else 2 x CONC]
 #   MAX_MODEL_LEN    [MAX_CONTEXT + 1024: room for the chat template]
 #   PORT             server port [8300]
 #   SERVER_LOG       the server's log, copied to OUT_DIR [/app/logs_claude/atom_server.log]
-#   GPU_MEM_UTIL     --gpu-memory-utilization [pro 0.94, agentic 0.95]
+#   GPU_MEM_UTIL     --gpu-memory-utilization [pro 0.94, agentic* 0.95]
 #   SERVER_EXTRA     more server flags, split on spaces, e.g. --load_dummy=xavier []
 #   ATOM_CUSTOM_AR_POOL_BYTES  custom all-reduce input pool [134217728]
-#   GPTOSS_SWIGLU_MXFP4_BF16_BOUND  agentic: bf16 MoE activation bound [1040]
+#   GPTOSS_SWIGLU_MXFP4_BF16_BOUND  agentic*: bf16 MoE activation bound [1040]
 #   ATOM_M3PRO_VARIANTS  Pro attention variants: pro replaces its variants with
-#                    it; agentic merges it onto the recipe's, so a caller adds
+#                    it; agentic* merge it onto the recipe's, so a caller adds
 #                    keys such as {"index": "fused", "ar_fused_rows": 128}
 #                    [RECIPE's]
 #   PREWARM          1: after the server is ready and before the client, send
@@ -149,10 +159,13 @@ pro)
     default_variants='{"kernels": true, "attn": "aiter", "topk": "fused"}'
     export GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.94}"
     ;;
-agentic)
+agentic | agentic_sc)
     # ar_lamport_rows needs the Lamport path.
     unset AITER_CUSTOM_AR_DISABLE_LAMPORT
-    recipe_variants='{"kernels": true, "attn": "aiter", "topk": "split", "prep": "aiter", "index_split": true, "score_tq": 8, "ar_lamport_rows": 16, "k_only": true, "k_plain_fp8": true, "prefill_attn": "day0", "index_split_decode": 64, "moe_route_glue": true, "index_compress": true}'
+    recipe_variants='{"kernels": true, "attn": "aiter", "topk": "split", "prep": "aiter", "index_split": true, "score_tq": 8, "ar_lamport_rows": 16, "k_only": true, "k_plain_fp8": true, "prefill_attn": "day0", "index_split_decode": 64, "moe_route_glue": true'
+    # Up to 16 rows the centroid writes cost more than the faster scoring saves.
+    [ "$RECIPE" = agentic_sc ] || recipe_variants+=', "index_compress": true'
+    recipe_variants+='}'
     default_variants=$(python3 -c 'import json, sys
 print(json.dumps({**json.loads(sys.argv[1]), **json.loads(sys.argv[2] or "{}")}))'         "$recipe_variants" "${ATOM_M3PRO_VARIANTS:-}")
     unset ATOM_M3PRO_VARIANTS
@@ -162,12 +175,16 @@ print(json.dumps({**json.loads(sys.argv[1]), **json.loads(sys.argv[2] or "{}")})
     export GPTOSS_SWIGLU_MXFP4_BF16_BOUND="${GPTOSS_SWIGLU_MXFP4_BF16_BOUND:-1040}"
     export ATOM_WARMUP_TOKENS=auto
     export ATOM_ONLINE_QUANT_STREAMING=1
-    export ATOM_CACHE_AWARE_ADMISSION=1
-    export ATOM_KV_OFFLOAD=lmcache
-    export LMCACHE_LOCAL_CPU=True
-    export LMCACHE_MAX_LOCAL_CPU_SIZE=184
-    export LMCACHE_CHUNK_SIZE=256
-    export PYTHONHASHSEED=0
+    # Up to CONC 16 the HBM pool holds the sessions' prefixes; offload and
+    # admission cost interactivity there.
+    if [ "$RECIPE" = agentic ]; then
+        export ATOM_CACHE_AWARE_ADMISSION=1
+        export ATOM_KV_OFFLOAD=lmcache
+        export LMCACHE_LOCAL_CPU=True
+        export LMCACHE_MAX_LOCAL_CPU_SIZE=184
+        export LMCACHE_CHUNK_SIZE=256
+        export PYTHONHASHSEED=0
+    fi
     # Set but empty records no bucket: every prefill runs eagerly.
     export ATOM_TOKEN_GRAPH_SIZES="${ATOM_TOKEN_GRAPH_SIZES-256,512,1024,2048}"
     # Graphs between 8, 16 and 32 sequences: a step replays the smallest graph
@@ -185,7 +202,7 @@ print(json.dumps({**json.loads(sys.argv[1]), **json.loads(sys.argv[2] or "{}")})
     fi
     ;;
 *)
-    echo "proxy_bench: RECIPE must be pro or agentic, not $RECIPE" >&2
+    echo "proxy_bench: RECIPE must be pro, agentic or agentic_sc, not $RECIPE" >&2
     exit 1
     ;;
 esac
@@ -279,6 +296,16 @@ PY
 fi
 
 # --- 4. replay ---
+# count_compiles WHEN: Triton cache entries and aiter JIT modules right now.
+AITER_JIT="${AITER_JIT_DIR:-$(python3 -c 'import importlib.util, os
+spec = importlib.util.find_spec("aiter")
+print(os.path.join(spec.submodule_search_locations[0], "jit") if spec else "")')}"
+count_compiles() {
+    echo "$1 $(find "${TRITON_CACHE_DIR:-$HOME/.triton/cache}" -mindepth 1 -maxdepth 1 2>/dev/null | wc -l)" \
+        "$(find "$AITER_JIT" -maxdepth 1 -name '*.so' 2>/dev/null | wc -l)" >>"$OUT_DIR/compile_counts.txt"
+}
+rm -f "$OUT_DIR/compile_counts.txt"
+count_compiles before
 export AIPERF_HTTP_TCP_USER_TIMEOUT=900000
 export AIPERF_DATASET_CONFIGURATION_TIMEOUT=1800
 export AIPERF_SERVICE_PROFILE_CONFIGURE_TIMEOUT=1800
@@ -314,6 +341,7 @@ aiperf profile --scenario inferencex-agentx-mvp --unsafe-override \
     --custom-dataset-type weka_trace --input-file "$OUT_DIR/traces" \
     --max-context-length "$MAX_CONTEXT" \
     --output-artifact-dir "$OUT_DIR/aiperf" 2>&1 | tee "$OUT_DIR/aiperf.log"
+count_compiles after
 
 stop_server
 trap - EXIT
@@ -371,3 +399,7 @@ print(f"c{conc}: p90 E2E-normalized interactivity "
       f"failed {failed}/{total} ({100 * failed / max(total, 1):.2f}%), "
       f"output length off the trace in {off_trace}")
 PY
+
+# --- 6. contamination ---
+python3 "$HERE/proxy_tail.py" --contamination "$OUT_DIR/aiperf/profile_export.jsonl" |
+    tee "$OUT_DIR/contamination.txt"

@@ -5,12 +5,14 @@ GEMM over a ring slot's ``[x; lookahead input]`` (``ProLookaheadState.front_rows
 gives all four.
 
 CPU (aiter importable): the packing and its views, the ring hand-over through the real
-decoder layer over 68 layers, the cases that keep two GEMMs. GPU: the one GEMM against
-an fp32 reference and against the two, the norms' output arguments, a CUDA graph.
+decoder layer over 68 layers (with the mono layer kernel on the MoE layers too, the
+compiled kernel faked), the cases that keep two GEMMs. GPU: the one GEMM against an
+fp32 reference and against the two, the norms' output arguments, a CUDA graph.
 """
 
 from __future__ import annotations
 
+import ctypes
 from types import SimpleNamespace
 
 import pytest
@@ -30,6 +32,9 @@ from atom.model_ops.layernorm import GemmaRMSNorm
 from atom.model_ops.minimax_m3 import pro_attn
 from atom.model_ops.minimax_m3.pro_attn import ProVariants
 from atom.models.minimax_m3 import pro
+from atom.models.minimax_m3.pro_mono import runner as mono_runner
+from atom.models.minimax_m3.pro_mono.layout import DIMS
+from atom.models.minimax_m3.pro_mono.weights import lookahead_reader
 from atom.quant_spec import LayerQuantConfig
 
 U8, FP8, E8M0 = torch.uint8, torch.float8_e4m3fn, torch.float8_e8m0fnu
@@ -316,10 +321,76 @@ def _state(ahead=2, start=2):
     )
 
 
+class _MonoRoute:
+    """``ProMonoRoute`` taking every MoE layer at every width."""
+
+    def __init__(self, runner):
+        self.runner = runner
+
+    def take(self, layer_id, rows):
+        return self.runner
+
+
+def _mono(monkeypatch, st, layers, rows, norms):
+    """A ``ProMonoRunner`` over ``layers`` whose ``segment`` and ``launch`` are the real
+    ones and whose compiled kernel writes zeros to every output it is handed and, as the
+    lookahead norm, fresh random bytes to ``la8`` / ``la8s`` (remembered as the reader's
+    lookahead, as ``_Norms`` does for ``put``). Returns the layers launched."""
+    h = SMALL["hidden"]
+    # the outputs at the stand-ins' hidden size
+    monkeypatch.setattr(
+        mono_runner,
+        "OUTPUTS",
+        {
+            name: (dtype, h // 32 if name.endswith("s") else h)
+            for name, (dtype, _) in mono_runner.OUTPUTS.items()
+        },
+    )
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda: "stream")
+    r = mono_runner.ProMonoRunner.__new__(mono_runner.ProMonoRunner)
+    r.state, r.check, r.debug, r.rank = st, False, False, 0
+    w = SimpleNamespace(
+        w_o=torch.zeros(1), s_o=torch.zeros(1), g_post=torch.zeros(1),
+        g_ahead=torch.zeros(1), eps=1e-6, eps_ahead=1e-6,
+    )  # fmt: skip
+    table = torch.zeros(1, dtype=torch.int64)
+    r.layers = {
+        lid: mono_runner.MonoLayer(w, lookahead_reader(lid, st), table)
+        for lid in layers
+    }
+    r.first, r.last = min(layers), max(layers)
+    r.scratch, r.plain = torch.zeros(1, dtype=U8), torch.zeros(1, dtype=U8)
+    r.peers = SimpleNamespace(addresses=torch.zeros(1, dtype=torch.int64))
+    r.mailboxes = SimpleNamespace(begin_step=lambda: None)
+    r.builds = {rows: {lw.kind: "launcher" for lw in r.layers.values()}}
+    launched = []
+
+    def kernel(launcher, *packed):
+        args = dict(zip(mono_runner.ABI.names, packed[:-1]))
+        launched.append(args["layer"])
+        for name, (dtype, cols) in mono_runner.OUTPUTS.items():
+            nbytes = rows * cols * torch.empty(0, dtype=dtype).element_size()
+            if args.get(name, 0) and name not in mono_runner.LOOKAHEAD_OUTPUTS:
+                ctypes.memset(args[name], 0, nbytes)
+        if args["la8"]:
+            seen = (
+                torch.randint(0, 120, (rows, h), generator=norms.g, dtype=U8),
+                torch.randint(0, 255, (rows, h // 32), generator=norms.g, dtype=U8),
+            )
+            ctypes.memmove(args["la8"], seen[0].data_ptr(), seen[0].numel())
+            ctypes.memmove(args["la8s"], seen[1].data_ptr(), seen[1].numel())
+            norms.la[args["layer"] + 2] = seen
+
+    monkeypatch.setattr(mono_runner, "_run_compiled", kernel)
+    return r, launched
+
+
 @pytest.fixture
 def front(monkeypatch):
-    """``run(layers, rows, world, lamport, runs_bf16, x_ignored, **variants)``: that
-    many real ``MiniMaxM3ProDecoderLayer`` forwards over the stand-ins above."""
+    """``run(layers, rows, world, lamport, runs_bf16, x_ignored, mono_from,
+    **variants)``: that many real ``MiniMaxM3ProDecoderLayer`` forwards over the
+    stand-ins above; from layer ``mono_from`` on (None: none) MoE layers the mono
+    route takes (``_mono``)."""
     norms = _Norms()
     monkeypatch.setattr(pro, "gemma_rms_norm_mxfp8", norms.mx)
     monkeypatch.setattr(pro, "fused_allreduce_gemma_rms_norm_mxfp8", norms.ar)
@@ -338,6 +409,7 @@ def front(monkeypatch):
         lamport=True,
         runs_bf16=False,
         x_ignored=False,
+        mono_from=None,
         **variants,
     ):
         norms.x_ignored = x_ignored
@@ -354,17 +426,32 @@ def front(monkeypatch):
 
         st.put = put_traced
         decs = []
+
+        # what a mono layer's attention hands its kernel: bf16 [T, o_proj K]
+        def core(*args):
+            return torch.zeros(rows, DIMS.o_k, dtype=torch.bfloat16)
+
         for i in range(layers):
             dec = pro.MiniMaxM3ProDecoderLayer.__new__(pro.MiniMaxM3ProDecoderLayer)
             nn.Module.__init__(dec)
-            dec._pro_state, dec.layer_num, dec.is_moe_layer = st, i, False
-            dec.self_attn = _attention(_Gemm(calls, runs_bf16=runs_bf16), SMALL)
+            moe = mono_from is not None and i >= mono_from
+            dec._pro_state, dec.layer_num, dec.is_moe_layer = st, i, moe
+            dec.self_attn = _attention(
+                _Gemm(calls, runs_bf16=runs_bf16), SMALL, core if moe else None
+            )
             dec.input_layernorm = _TorchNorm(h)
             dec.post_attention_layernorm = _TorchNorm(h)
             dec.mlp = _MLP()
             st.norms[i] = dec.input_layernorm
             st.index_linears[i] = (dec.self_attn.qkv_proj,)
             decs.append(dec)
+        norms.launched = []
+        if mono_from is not None:
+            runner, norms.launched = _mono(
+                monkeypatch, st, range(mono_from, layers), rows, norms
+            )
+            for dec in decs:
+                dec._mono = _MonoRoute(runner)
         x, res, per_layer = torch.randn(rows, h), None, []
         for dec in decs:
             norms.cur, start = dec.layer_num, len(calls)
@@ -375,9 +462,14 @@ def front(monkeypatch):
     return run
 
 
+@pytest.mark.parametrize("mono_from", [None, 4], ids=["mono off", "mono on"])
 @pytest.mark.parametrize("rows", [1, 8, 16])
-def test_every_layer_reads_the_lookahead_put_two_layers_back(front, rows):
-    per_layer, norms = front(68, rows)
+def test_every_layer_reads_the_lookahead_put_two_layers_back(front, rows, mono_from):
+    """With mono on, the MoE layers 4-67 run the layer kernel, whose lookahead norm
+    (``la8`` / ``la8s``) feeds readers 6-67: it must land in the reader's ring rows as
+    ``put``'s does (layers 0-3) for the reader's one GEMM."""
+    per_layer, norms = front(68, rows, mono_from=mono_from)
+    assert norms.launched == ([] if mono_from is None else list(range(4, 68)))
     n_qk = sum(_sizes(SMALL)[0])
     for layer, (calls, (q, k, iq, ik)) in enumerate(per_layer):
         assert [c[0] for c in calls] == ["qkv"], layer  # one GEMM
@@ -387,7 +479,7 @@ def test_every_layer_reads_the_lookahead_put_two_layers_back(front, rows):
         assert torch.equal(a_scale[:rows].view(U8), x_scale)
         if layer < 2:  # no lookahead: the indexer reads x, T rows
             assert a.shape[0] == rows
-        else:  # rows [T, 2T): the lookahead norm's bytes, put by layer - 2
+        else:  # rows [T, 2T): the lookahead norm's bytes, put (or mono) by layer - 2
             la, la_scale = norms.la[layer]
             assert a.shape[0] == 2 * rows
             assert torch.equal(a[rows:].view(U8), la)

@@ -194,6 +194,7 @@ class ProVariants:
     # The score_tq kernel (prefill, speculative verify) leaves the tiles past a program's
     # rows unwritten instead of -inf, as the selections that read only causal blocks allow
     # (fused / split / aiter): its cost follows the context, not the block table's width.
+    # Always so in decode / verify graphs of up to pro_kernels.QTILE_ROWS rows.
     score_tq_causal: bool = False
     # vLLM's compressed index cache: every 4 index keys softmax-pooled into one bf16 row
     # (ic_c [pages, 4, 128]), written after prep; the scorer reads those rows only.
@@ -264,6 +265,25 @@ class ProVariants:
     # ... and its epilogue writes o_proj's MXFP8 input (E4M3 + E8M0 of the bf16-rounded rows,
     # quantize_fp8's bytes) where o_proj is a native group32 FP8 GEMM: no separate quant.
     day0_decode_mxfp8: bool = True
+    # Mono decode phase 1 (``models/minimax_m3/pro_mono``): the most graph rows a decode /
+    # verify forward may have for its MoE layers' o_proj .. FFN segment to run as one
+    # persistent kernel; 0 turns it off, at most ``pro_mono.config.max_rows``. Wider
+    # forwards keep production's segment (``moe_route_glue`` where it is on). The layers
+    # mono takes get the decode attention's output as bf16. On where the deployment and
+    # the variants allow it (``pro_mono.config.config_refusal``,
+    # ``pro_mono.route.variants_refusal``: TP8 with FlyDSL, the Lamport AR #1 up to
+    # these rows, the MXFP8 norms and the resid_in lookahead, a ``day0_decode_rows``
+    # above the limit); elsewhere it logs why and production serves. Latched once, at
+    # the first forward (``pro_mono.route``, agreed over the TP group): a later edit of
+    # the file does not change it. The accuracy it was turned on with (A16W4, the
+    # Agentic recipe's variants) is in recipes/MiniMax-M3.1-Pro-Accuracy-Switches.md.
+    mono_ffn_rows: int = 16
+    # The mono FFN's routed experts' activations: "bf16" (A16W4: bf16 x and mids against
+    # the MXFP4 experts dequantized in the kernel, production's a16w4 numerics at these
+    # widths), "fp8" (W4A8: the norm's MXFP8 x and MXFP8 mids, gfx950's f8f6f4 MFMA) or
+    # "fp4" (W4A4, aiter a4w4 numerics); the last two quantize the activations, a
+    # numerics change. Latched with ``mono_ffn_rows`` and agreed over the TP group.
+    mono_routed_act: str = "bf16"
     # Developer profile, not an attention switch (the attention path never reads it): count
     # the distinct routed experts each MoE layer reads in every forward (TP rank 0) into
     # ``<diag_tag>_experts.jsonl`` (``eplb.ExpertCountProfile``). A counting run, not a
@@ -448,6 +468,10 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
     # MXFP8 output (take_mx_scale)
     mx_out = False
     _mx_scale = None
+    # set for one call by ``MiniMaxM3ProAttention.forward_core``: the mono layer kernel
+    # reads the attention's output as bf16, so the Triton / aiter rows below the day0
+    # decode stay bf16 (the day0 decode's epilogue keeps ``day0_decode_mxfp8``)
+    bf16_out = False
 
     is_indexed_sparse_attention = True
     k_only = False  # the pool is ``ProKOnlyLayout`` (no V cache)
@@ -859,8 +883,8 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
         it (``mx_out``). ``day0_dec``: the batch is the day0 decode's (``_day0_decode``),
         whose epilogue writes it under ``day0_decode_mxfp8``. Below that, under
         ``fuse_mxfp8_quant``: the Triton attention always, aiter's where its gluon decode
-        takes ``output_scale``. Off under decode context parallelism (``dcp_world`` > 1),
-        the day0 decode included."""
+        takes ``output_scale``, unless the call is ``bf16_out``'s. Off under decode context
+        parallelism (``dcp_world`` > 1), the day0 decode included."""
         if self.dcp_world > 1:
             return False
         if not self.mx_out:
@@ -868,7 +892,8 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
         if day0_dec:
             return v.day0_decode_mxfp8
         return (
-            v.fuse_mxfp8_quant
+            not self.bf16_out
+            and v.fuse_mxfp8_quant
             and self.value_head_dim % 32 == 0
             and (not self._aiter_attn(v, n) or pro_kernels.aiter_mxfp8_out_available())
         )
@@ -1132,6 +1157,9 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
             and v.topk in ("fused", "split")
             and self.num_heads == 16
             and self.topk == pro_kernels.TOPK
+            # its block list is TOPK wide: a dense prefill past TOPK blocks (dense_only)
+            # attends every block with the Triton / aiter attention instead
+            and (not v.dense_only or nb <= self.topk)
             and pro_kernels.day0_prefill_available(kc4.shape[-2])
         )
 
@@ -1287,8 +1315,14 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
                 head_mode=head_mode,
                 pool_temp=v.pool_scale,
                 # torch.topk reads the whole width; the others only each token's causal
-                # blocks (the score_tq kernel only with score_tq_causal)
-                causal=v.topk != "torch" and (v.score_tq_causal or tq == 0),
+                # blocks (the score_tq kernel: in a decode / verify graph of up to
+                # QTILE_ROWS rows, elsewhere with score_tq_causal)
+                causal=v.topk != "torch"
+                and (
+                    v.score_tq_causal
+                    or tq == 0
+                    or (static and rq.shape[0] <= pro_kernels.QTILE_ROWS)
+                ),
                 tq=tq,
             )
         # select_rows_split matches select_rows bit for bit; its cost follows the context
