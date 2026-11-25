@@ -24,10 +24,12 @@ from atom.models.minimax_m3.pro_mono.config import (
     SUPPORTED_TP,
     TOPK,
     ProDims,
+    RoutedPlanes,
     act_refusal,
     config_refusal,
     gate_rows,
     latch_rows,
+    routed_width_refusal,
     rows_refusal,
 )
 from atom.mono.plan.execution import BLOCKS
@@ -39,21 +41,43 @@ def test_tp8_widths():
     """The widths the kernel's stages and byte budget are written for."""
     d = ProDims(8)
     assert (d.heads, d.o_k) == (16, 3072)
-    assert (d.e_rank, d.inter_valid, d.inter_r, d.inter_s) == (48, 640, 768, 640)
+    assert (d.e_rank, d.inter_valid, d.inter_s) == (48, 640, 640)
     assert (d.own_cols, d.own_tasks, d.nt) == (896, 7, 56)
-    # the routed planes FusedMoE leaves after its NVFP4 -> MXFP4 prep, per
-    # expert: w13 fp4x2 [1536, 3584], scale [1536, 224]; w2 [7168, 384], [7168, 24]
-    assert (d.w13_rows, d.w13_bytes) == (1536, 1536 * 3584)
-    assert (d.w13_scale_cols, d.w13_scale_bytes) == (224, 1536 * 224)
-    assert (d.w2_bytes, d.w2_scale_cols, d.w2_scale_bytes) == (
-        7168 * 384,
-        24,
-        7168 * 24,
-    )
     assert d.sh_gate_up == (1280, 7168) and d.sh_down == (7168, 640)
     # every rank's band of the router covers the experts once
     assert d.e_rank * d.tp == EXPERTS
     assert MAX_ROWS <= MAX_ROWS_LAYOUT
+
+
+@pytest.mark.parametrize(
+    "inter_r, w13, w2, s2_cols",
+    [
+        # Pro's pad_align 128 (the base since f69c3744): 640 unpadded, w2's
+        # 20 scale groups padded to 24 by aiter's shuffle_scale
+        (640, (1280, 1280 * 3584), 7168 * 320, 24),
+        # the default pad_align 256
+        (768, (1536, 1536 * 3584), 7168 * 384, 24),
+    ],
+)
+def test_routed_planes_at_the_loaded_width(inter_r, w13, w2, s2_cols):
+    """The routed planes FusedMoE leaves after its NVFP4 -> MXFP4 prep, per
+    expert, at the width it loaded: w13 fp4x2 [2 inter_r, 3584] with scale
+    [2 inter_r, 224]; w2 [7168, inter_r / 2] with scale [7168, s2_cols]."""
+    p = RoutedPlanes(inter_r)
+    assert (p.w13_rows, p.w13_bytes) == w13
+    assert (p.w13_scale_cols, p.w13_scale_bytes) == (224, w13[0] * 224)
+    assert (p.w2_bytes, p.w2_scale_cols, p.w2_scale_bytes) == (
+        w2,
+        s2_cols,
+        7168 * s2_cols,
+    )
+
+
+@pytest.mark.parametrize("inter_r", [0, 512, 639, 656, 1.5 * 640, True, None])
+def test_a_routed_width_the_kernel_cannot_address_is_refused(inter_r):
+    assert routed_width_refusal(inter_r) is not None
+    with pytest.raises(ValueError):
+        RoutedPlanes(inter_r)
 
 
 def test_supported_tp_is_what_dims_accepts():

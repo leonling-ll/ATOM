@@ -194,12 +194,25 @@ class ProMonoRunner:
             self.layers[lid] = MonoLayer(w, reader, None)
         if not self.layers:
             raise MonoUnsupported("no MoE layer")
+        # the routed planes' loaded width, which every build bakes
+        widths = {lw.w.planes.inter_r for lw in self.layers.values()}
+        if len(widths) != 1:
+            raise MonoUnsupported(
+                f"routed intermediates {sorted(widths)} across layers"
+            )
+        (self.inter_r,) = widths
         self.first = min(self.layers)
         self.last = max(self.layers)
         self.kinds = sorted({lw.kind for lw in self.layers.values()})
 
     def _allocate(self, group) -> None:
-        key = P1Build(tokens=1, upto=UPTO, debug=self.debug, routed_act=self.routed_act)
+        key = P1Build(
+            tokens=1,
+            upto=UPTO,
+            debug=self.debug,
+            routed_act=self.routed_act,
+            inter_r=self.inter_r,
+        )
         self.peers, self._finalizer = owned_peer_buffer(
             self, peer_bytes(), group, self.rank, DIMS.tp, self.dev
         )
@@ -223,7 +236,7 @@ class ProMonoRunner:
                 P1Build(
                     tokens=rows, upto=UPTO, lookahead=kind[0], eps=kind[1],
                     eps_ahead=kind[2], debug=self.debug,
-                    routed_act=self.routed_act,
+                    routed_act=self.routed_act, inter_r=self.inter_r,
                 )
             )
             for kind in self.kinds
