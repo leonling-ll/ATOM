@@ -12,8 +12,9 @@ What must hold:
 * every rank writes the same bytes (they read the same gathered sums and sums of
   squares) -- bit for bit;
 * the lookahead written into a ring slot's rows ``[S, 2S)`` (where
-  ``ProMonoRunner.launch`` points it: ``ProLookaheadState.lookahead_rows``) is
-  the bytes the same launch writes to its own tensors, and nothing else in the
+  ``ProMonoRunner.launch`` points it: ``ProLookaheadState.lookahead_rows``, up
+  to ``FRONT_ROWS`` rows; past them the launch writes its own tensors) is the
+  bytes the same launch writes to its own tensors, and nothing else in the
   ring changes;
 * (x8, x8s) is MXFP8 of the stored x, bit for bit; la8 is the lookahead norm of
   the stored h_mid within one e4m3 step;
@@ -37,6 +38,10 @@ import socket
 
 import pytest
 import torch
+
+# ``atom.models.minimax_m3.pro.FRONT_ROWS``: the lookahead ring's rows a slot
+# half (the module needs aiter; a test asserts the two agree)
+FRONT_ROWS = 16
 
 pytest.importorskip("aiter")
 pytest.importorskip("flydsl")
@@ -164,9 +169,11 @@ def _worker(rank, port, queue, done, inputs):
 
             waits = step(launch, core, res, out)
             got = {k: v.cpu() for k, v in out.items()}
-            if key.lookahead:
+            if key.lookahead and s <= FRONT_ROWS:
                 # again with the lookahead into slot 1's rows [s, 2s) of a ring
-                # (ProLookaheadState's: 3 slots of 2 x 16 rows), filled around them
+                # (ProLookaheadState's: 3 slots of 2 x 16 rows), filled around
+                # them; past FRONT_ROWS the runner hands the launch its own
+                # lookahead tensors (``lookahead_rows`` is None)
                 ring = (
                     torch.full((3, 32, HIDDEN), 0x55, dtype=torch.uint8, device=dev),
                     torch.full((3, 32, HIDDEN // 32), 0x66, dtype=torch.uint8, device=dev),
@@ -261,9 +268,12 @@ def test_every_rank_writes_the_same_bytes(ranks):
 
 
 def test_the_lookahead_into_ring_rows_is_the_own_tensors_bytes(ranks):
+    from atom.models.minimax_m3.pro import FRONT_ROWS as PRO_FRONT_ROWS
+
+    assert FRONT_ROWS == PRO_FRONT_ROWS
     for rank, results in ranks.items():
         for s, la, _, got in results:
-            if not la:
+            if not la or s > FRONT_ROWS:
                 continue
             want_q = torch.full((3, 32, HIDDEN), 0x55, dtype=torch.uint8)
             want_s = torch.full((3, 32, HIDDEN // 32), 0x66, dtype=torch.uint8)
