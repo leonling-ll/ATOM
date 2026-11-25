@@ -49,6 +49,10 @@ ROT = 64
 VALUE_DIM = 192
 IDX_HEADS = 16
 IDX_DIM = 128
+# _score_qtile_kernel's causal launch: programs a row tile (a graph's shapes alone decide),
+# and the decode / verify graphs it is the default for (up to QTILE_ROWS rows)
+QTILE_PROGRAMS = 256
+QTILE_ROWS = 24
 TOPK = 128
 # The compressed index cache (``index_compress``, vLLM's): a bf16 centroid of every GROUP
 # consecutive index keys, a page of PAGE / GROUP rows; each request's latest raw keys wait
@@ -974,9 +978,7 @@ def _score_tile_kernel(
                 4,
             )
             score = _row_tile_scores(
-                iq_ptr,
-                t + one,
-                one == 0,
+                _load_q_rows(iq_ptr, t + one, one == 0, 1, NI, DI),
                 qpos + one,
                 ik,
                 live,
@@ -1073,10 +1075,19 @@ def _score_tile_kernel(
 
 
 @triton.jit
+def _load_q_rows(iq_ptr, t, rmask, R: tl.constexpr, NI: tl.constexpr, DI: tl.constexpr):
+    """The index q ``[R * NI, DI]`` of rows ``t`` (0 where ``rmask`` is off)."""
+    ar_d = tl.arange(0, DI)
+    qrow = tl.reshape(
+        t.to(tl.int64)[:, None] * (NI * DI) + tl.arange(0, NI)[None, :] * DI, (R * NI,)
+    )
+    qm = tl.reshape(tl.broadcast_to(rmask[:, None], (R, NI)), (R * NI,))
+    return tl.load(iq_ptr + qrow[:, None] + ar_d[None, :], mask=qm[:, None], other=0.0)
+
+
+@triton.jit
 def _row_tile_scores(
-    iq_ptr,
-    t,
-    rmask,
+    iq,
     qpos,
     ik,
     live,
@@ -1094,17 +1105,12 @@ def _row_tile_scores(
     BLOCK_MODE: tl.constexpr,
     HEAD_MODE: tl.constexpr,
 ):
-    """_score_tile_kernel's scores ``[R, BB]`` of the ``R`` rows ``t`` (``rmask`` the real
-    ones, ``qpos`` their positions) over one tile of keys ``ik`` ``[BB*PG, DI]`` of blocks
-    ``j0..`` (``live`` the loaded keys): one dot for all ``R * NI`` query heads.
-    ``BLOCK_CENTROID``: ``ik`` is ``[BB*4, DI]``, the blocks' compressed rows."""
+    """_score_tile_kernel's scores ``[R, BB]`` of ``R`` rows (index q ``iq`` ``[R * NI, DI]``
+    from _load_q_rows, ``qpos`` their positions) over one tile of keys ``ik``
+    ``[BB*PG, DI]`` of blocks ``j0..`` (``live`` the loaded keys): one dot for all
+    ``R * NI`` query heads. ``BLOCK_CENTROID``: ``ik`` is ``[BB*4, DI]``, the blocks'
+    compressed rows."""
     ar_d = tl.arange(0, DI)
-    ar_i = tl.arange(0, NI)
-    qrow = tl.reshape(
-        t.to(tl.int64)[:, None] * (NI * DI) + ar_i[None, :] * DI, (R * NI,)
-    )
-    qm = tl.reshape(tl.broadcast_to(rmask[:, None], (R, NI)), (R * NI,))
-    iq = tl.load(iq_ptr + qrow[:, None] + ar_d[None, :], mask=qm[:, None], other=0.0)
     dots = tl.dot(iq, tl.trans(ik.to(iq.dtype))) * sc  # [R*NI, BB*PG]
     qb = qpos // PG
     if BLOCK_MODE == 0 or BLOCK_MODE == 3:
@@ -1121,8 +1127,9 @@ def _row_tile_scores(
         # ``ik`` holds the blocks' centroid rows (``[BB*4, DI]``): the max of q . c over them
         bs = tl.max(tl.reshape(dots, (R, NI, BB, 4)), axis=3)  # [R, NI, BB]
     else:
-        cq = tl.load(cq_ptr + ar_d).to(tl.float32)
-        lg = tl.sum(ik.to(tl.float32) * cq[None, :], axis=1) * pool_temp  # [BB*PG]
+        # every key's pool logit k . cq on the MFMA: [BB*PG, 16], each column the same
+        cqm = tl.broadcast_to(tl.load(cq_ptr + ar_d).to(iq.dtype)[:, None], (DI, 16))
+        lg = tl.max(tl.dot(ik.to(iq.dtype), cqm), axis=1) * pool_temp  # [BB*PG]
         lg = tl.reshape(lg, (BB * PG // 4, 4))
         e = tl.exp(lg - tl.max(lg, axis=1)[:, None])
         w = tl.reshape(e / tl.sum(e, axis=1)[:, None], (BB * PG,))
@@ -1146,6 +1153,29 @@ def _row_tile_scores(
 
 
 @triton.jit
+def _block_pages(bt_ptr, stride_bt, seq, j0, lastc, BB: tl.constexpr, PG: tl.constexpr):
+    """The pool page of every key row ``[BB*PG]`` of blocks ``j0..j0+BB-1`` of sequence
+    ``seq``; past block ``lastc`` the rows take block ``lastc``'s (no masked loads, which
+    the compiler would split into one branch an element)."""
+    jr = j0 + tl.arange(0, BB * PG) // PG
+    return tl.load(bt_ptr + seq * stride_bt + tl.minimum(jr, lastc))
+
+
+@triton.jit
+def _page_keys(
+    ic_ptr, ic_sb, ic_so, phys, BB: tl.constexpr, DI: tl.constexpr, PG: tl.constexpr
+):
+    """Keys ``[BB*PG, DI]`` of the key rows on pages ``phys``."""
+    r = tl.arange(0, BB * PG)
+    return tl.load(
+        ic_ptr
+        + phys.to(tl.int64)[:, None] * ic_sb
+        + (r % PG)[:, None] * ic_so
+        + tl.arange(0, DI)[None, :]
+    )
+
+
+@triton.jit
 def _load_block_keys(
     ic_ptr,
     ic_sb,
@@ -1161,18 +1191,141 @@ def _load_block_keys(
     PG: tl.constexpr,
 ):
     """Keys ``[BB*PG, DI]`` of blocks ``j0..j0+BB-1`` of sequence ``seq`` up to block ``last``,
-    and which rows are loaded (0 elsewhere)."""
-    r = tl.arange(0, BB * PG)
-    jr = j0 + r // PG
-    live = (jr <= last) & (jr < NB)
-    phys = tl.load(bt_ptr + seq * stride_bt + jr, mask=live, other=0).to(tl.int64)
-    ar_d = tl.arange(0, DI)
-    ik = tl.load(
-        ic_ptr + phys[:, None] * ic_sb + (r % PG)[:, None] * ic_so + ar_d[None, :],
-        mask=live[:, None],
-        other=0.0,
-    )
-    return ik, live
+    and which rows are live (past ``last``: block ``last``'s keys again, read from the pool;
+    every score taken from them is discarded)."""
+    lastc = tl.minimum(last, NB - 1)
+    phys = _block_pages(bt_ptr, stride_bt, seq, j0, lastc, BB, PG)
+    live = j0 + tl.arange(0, BB * PG) // PG <= lastc
+    return _page_keys(ic_ptr, ic_sb, ic_so, phys, BB, DI, PG), live
+
+
+@triton.jit
+def _qtile_one(
+    iq_ptr,
+    ic_ptr,
+    ic_sb,
+    ic_so,
+    bt_ptr,
+    stride_bt,
+    seq_ptr,
+    pos_ptr,
+    cq_ptr,
+    out_ptr,
+    stride_out,
+    sc,
+    pool_temp,
+    init_blocks,
+    local_blocks,
+    T,
+    NB,
+    t0,
+    trc,
+    rmask,
+    qpos,
+    seqs,
+    last,
+    orow,
+    j0,
+    TQ: tl.constexpr,
+    BB: tl.constexpr,
+    NI: tl.constexpr,
+    DI: tl.constexpr,
+    PG: tl.constexpr,
+    BLOCK_MODE: tl.constexpr,
+    HEAD_MODE: tl.constexpr,
+    CAUSAL: tl.constexpr,
+    RPB: tl.constexpr,
+):
+    """_score_qtile_kernel's tile of blocks ``j0..``: the rows of one sequence together,
+    else one by one; past every row's own block -inf, or (``CAUSAL``) nothing."""
+    jb = j0 + tl.arange(0, BB)
+    omask = rmask[:, None] & (jb < NB)[None, :]
+    if j0 > last:  # past every row's own block
+        if not CAUSAL:
+            tl.store(
+                orow + jb[None, :],
+                tl.full([TQ, BB], float("-inf"), tl.float32),
+                mask=omask,
+            )
+    elif tl.min(seqs, axis=0) == tl.max(seqs, axis=0):
+        ik, live = _load_block_keys(
+            ic_ptr,
+            ic_sb,
+            ic_so,
+            bt_ptr,
+            stride_bt,
+            tl.max(seqs, axis=0),
+            j0,
+            last,
+            NB,
+            BB,
+            DI,
+            RPB,
+        )
+        score = _row_tile_scores(
+            _load_q_rows(iq_ptr, trc, rmask, TQ, NI, DI),
+            qpos,
+            ik,
+            live,
+            j0,
+            cq_ptr,
+            sc,
+            pool_temp,
+            init_blocks,
+            local_blocks,
+            TQ,
+            BB,
+            NI,
+            DI,
+            PG,
+            BLOCK_MODE,
+            HEAD_MODE,
+        )
+        tl.store(orow + jb[None, :], score, mask=omask)
+    else:
+        one = tl.arange(0, 1)
+        for i in range(TQ):
+            t = tl.minimum(t0 + i, T - 1) + one
+            tm = (t0 + i + one) < T
+            p = tl.load(pos_ptr + t)
+            ik, live = _load_block_keys(
+                ic_ptr,
+                ic_sb,
+                ic_so,
+                bt_ptr,
+                stride_bt,
+                tl.max(tl.load(seq_ptr + t), axis=0),
+                j0,
+                tl.max(p, axis=0) // PG,
+                NB,
+                BB,
+                DI,
+                RPB,
+            )
+            score = _row_tile_scores(
+                _load_q_rows(iq_ptr, t, tm, 1, NI, DI),
+                p,
+                ik,
+                live,
+                j0,
+                cq_ptr,
+                sc,
+                pool_temp,
+                init_blocks,
+                local_blocks,
+                1,
+                BB,
+                NI,
+                DI,
+                PG,
+                BLOCK_MODE,
+                HEAD_MODE,
+            )
+            tl.store(
+                out_ptr + t.to(tl.int64)[:, None] * stride_out + jb[None, :],
+                score,
+                mask=tm[:, None] & (jb < NB)[None, :],
+            )
 
 
 @triton.jit
@@ -1203,52 +1356,51 @@ def _score_qtile_kernel(
     HEAD_MODE: tl.constexpr,
     CAUSAL: tl.constexpr = False,
     RPB: tl.constexpr = 16,  # key rows a block: PG, or CENTROID_ROWS (BLOCK_CENTROID)
+    STRIDE: tl.constexpr = False,
 ):
     """_score_tile_kernel's scores for ``TQ`` rows at once: rows of one sequence share each
     tile of block keys (loaded once, one dot for the ``TQ * NI`` query heads); a tile whose
-    rows span sequences scores them one by one."""
+    rows span sequences scores them one by one. One tile a program, past every row's own
+    block -inf or (``CAUSAL``) left unwritten; ``STRIDE`` (``CAUSAL`` only): a program
+    strides over its rows' causal tiles ``tl.num_programs(1)`` apart, the rows' index q
+    loaded once for all of them and the loads run ahead of the scoring, so the work
+    follows the context, not ``NB``."""
     t0 = tl.program_id(0) * TQ
-    j0 = tl.program_id(1) * BB
     tr = t0 + tl.arange(0, TQ)
     rmask = tr < T
     trc = tl.minimum(tr, T - 1)
     qpos = tl.load(pos_ptr + trc)
     seqs = tl.load(seq_ptr + trc)
-    jb = j0 + tl.arange(0, BB)
-    optr = out_ptr + trc.to(tl.int64)[:, None] * stride_out + jb[None, :]
-    omask = rmask[:, None] & (jb < NB)[None, :]
     last = tl.max(qpos, axis=0) // PG
-    if j0 > last:  # past every row's own block: -inf, or (CAUSAL) left unwritten
-        if not CAUSAL:
-            tl.store(optr, tl.full([TQ, BB], float("-inf"), tl.float32), mask=omask)
-    elif tl.min(seqs, axis=0) == tl.max(seqs, axis=0):
-        ik, live = _load_block_keys(
+    first = tl.program_id(1) * BB
+    orow = out_ptr + trc.to(tl.int64)[:, None] * stride_out
+    if not STRIDE:
+        _qtile_one(
+            iq_ptr,
             ic_ptr,
             ic_sb,
             ic_so,
             bt_ptr,
             stride_bt,
-            tl.max(seqs, axis=0),
-            j0,
-            last,
-            NB,
-            BB,
-            DI,
-            RPB,
-        )
-        score = _row_tile_scores(
-            iq_ptr,
-            trc,
-            rmask,
-            qpos,
-            ik,
-            live,
-            j0,
+            seq_ptr,
+            pos_ptr,
             cq_ptr,
+            out_ptr,
+            stride_out,
             sc,
             pool_temp,
             init_blocks,
             local_blocks,
+            T,
+            NB,
+            t0,
+            trc,
+            rmask,
+            qpos,
+            seqs,
+            last,
+            orow,
+            first,
             TQ,
             BB,
             NI,
@@ -1256,41 +1408,36 @@ def _score_qtile_kernel(
             PG,
             BLOCK_MODE,
             HEAD_MODE,
+            CAUSAL,
+            RPB,
         )
-        tl.store(optr, score, mask=omask)
-    else:
-        one = tl.arange(0, 1)
-        for i in range(TQ):
-            t = tl.minimum(t0 + i, T - 1) + one
-            p = tl.load(pos_ptr + t)
-            ik, live = _load_block_keys(
-                ic_ptr,
-                ic_sb,
-                ic_so,
-                bt_ptr,
-                stride_bt,
-                tl.max(tl.load(seq_ptr + t), axis=0),
-                j0,
-                tl.max(p, axis=0) // PG,
-                NB,
-                BB,
-                DI,
-                RPB,
-            )
+    elif tl.min(seqs, axis=0) == tl.max(seqs, axis=0):
+        seq = tl.max(seqs, axis=0)
+        iq = _load_q_rows(iq_ptr, trc, rmask, TQ, NI, DI)
+        step = tl.num_programs(1) * BB
+        # the keys load two tiles ahead of the scoring, their pages three (past ``last``
+        # they repeat block ``last``: always in the pool, never scored)
+        lastc = tl.minimum(last, NB - 1)
+        p0 = _block_pages(bt_ptr, stride_bt, seq, first, lastc, BB, RPB)
+        p1 = _block_pages(bt_ptr, stride_bt, seq, first + step, lastc, BB, RPB)
+        p2 = _block_pages(bt_ptr, stride_bt, seq, first + 2 * step, lastc, BB, RPB)
+        k0 = _page_keys(ic_ptr, ic_sb, ic_so, p0, BB, DI, RPB)
+        k1 = _page_keys(ic_ptr, ic_sb, ic_so, p1, BB, DI, RPB)
+        for j0 in range(first, tl.minimum(last + 1, NB), step):
+            p3 = _block_pages(bt_ptr, stride_bt, seq, j0 + 3 * step, lastc, BB, RPB)
+            k2 = _page_keys(ic_ptr, ic_sb, ic_so, p2, BB, DI, RPB)
             score = _row_tile_scores(
-                iq_ptr,
-                t,
-                (t0 + i + one) < T,
-                p,
-                ik,
-                live,
+                iq,
+                qpos,
+                k0,
+                j0 + tl.arange(0, BB * RPB) // RPB <= lastc,
                 j0,
                 cq_ptr,
                 sc,
                 pool_temp,
                 init_blocks,
                 local_blocks,
-                1,
+                TQ,
                 BB,
                 NI,
                 DI,
@@ -1298,10 +1445,48 @@ def _score_qtile_kernel(
                 BLOCK_MODE,
                 HEAD_MODE,
             )
+            jb = j0 + tl.arange(0, BB)
             tl.store(
-                out_ptr + t.to(tl.int64)[:, None] * stride_out + jb[None, :],
-                score,
-                mask=((t0 + i + one) < T)[:, None] & (jb < NB)[None, :],
+                orow + jb[None, :], score, mask=rmask[:, None] & (jb < NB)[None, :]
+            )
+            k0, k1, p2 = k1, k2, p3
+    elif STRIDE:  # rows of several sequences (a batch no graph holds)
+        for jm in range(first, NB, tl.num_programs(1) * BB):
+            _qtile_one(
+                iq_ptr,
+                ic_ptr,
+                ic_sb,
+                ic_so,
+                bt_ptr,
+                stride_bt,
+                seq_ptr,
+                pos_ptr,
+                cq_ptr,
+                out_ptr,
+                stride_out,
+                sc,
+                pool_temp,
+                init_blocks,
+                local_blocks,
+                T,
+                NB,
+                t0,
+                trc,
+                rmask,
+                qpos,
+                seqs,
+                last,
+                orow,
+                jm,
+                TQ,
+                BB,
+                NI,
+                DI,
+                PG,
+                BLOCK_MODE,
+                HEAD_MODE,
+                CAUSAL,
+                RPB,
             )
 
 
@@ -1347,9 +1532,13 @@ def scores(
         # 4 rows a centroid block: 16 blocks a 64-row tile, 1.4-1.5x over 8 on MI355X decode
         # verify (the same scores bit for bit; opt/topk.md round7)
         bb = 16 if block_mode == BLOCK_CENTROID else 4 if tiled and t <= 16 else 8
+    tiles = triton.cdiv(nb, bb)
     if tq:
         assert tq & (tq - 1) == 0, tq
-        _score_qtile_kernel[(triton.cdiv(t, tq), triton.cdiv(nb, bb))](
+        if causal:
+            # QTILE_PROGRAMS programs stride over a row tile's causal tiles by default
+            programs = min(tiles, programs or QTILE_PROGRAMS)
+        _score_qtile_kernel[(triton.cdiv(t, tq), programs if causal else tiles)](
             iq,
             ic,
             ic.stride(0),
@@ -1376,9 +1565,9 @@ def scores(
             HEAD_MODE=head_mode,
             CAUSAL=causal,
             RPB=CENTROID_ROWS if block_mode == BLOCK_CENTROID else PAGE,
+            STRIDE=causal and programs < tiles,
         )
         return out
-    tiles = triton.cdiv(nb, bb)
     if causal:
         # about 4096 programs by default (a program a tile when that is fewer): striding
         # saves the idle programs' cost on short rows and loses up to a third on rows of
