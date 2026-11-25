@@ -423,16 +423,12 @@ class AllocationCap:
         # nothing to wait for.
         self._alloc_copied = torch.cuda.Event()
 
-    def apply(
-        self,
-        allocated_pages,  # [>= scheduled_bs] host, pages each request holds
-        scheduled_bs: int,
-        block_positions: torch.Tensor,  # [running_bs, T]
-        slots: torch.Tensor,  # [running_bs, T] the block's KV write slots
-        unit: int,  # tokens one allocated page id spans
+    def stage_pages(
+        self, allocated_pages, scheduled_bs: int, running_bs: int
     ) -> torch.Tensor:
-        """Mask ``slots`` past each row's allocation; return it in tokens."""
-        running_bs = block_positions.shape[0]
+        """Each row's allocation in PAGES, on the device: ``[running_bs]``
+        int32, pad rows 1. ``apply`` without the masking, for a caller that
+        masks on the device itself (`dspark_block_meta`)."""
         # The host can run a step ahead of the device: the previous copy must
         # have read the pinned buffer before it is rewritten.
         self._alloc_copied.synchronize()
@@ -446,6 +442,19 @@ class AllocationCap:
         alloc = self._alloc[:running_bs]
         alloc.copy_(self._alloc_host[:running_bs], non_blocking=True)
         self._alloc_copied.record()
+        return alloc
+
+    def apply(
+        self,
+        allocated_pages,  # [>= scheduled_bs] host, pages each request holds
+        scheduled_bs: int,
+        block_positions: torch.Tensor,  # [running_bs, T]
+        slots: torch.Tensor,  # [running_bs, T] the block's KV write slots
+        unit: int,  # tokens one allocated page id spans
+    ) -> torch.Tensor:
+        """Mask ``slots`` past each row's allocation; return it in tokens."""
+        running_bs = block_positions.shape[0]
+        alloc = self.stage_pages(allocated_pages, scheduled_bs, running_bs)
         alloc.mul_(unit)
         slots.masked_fill_(block_positions >= alloc.view(running_bs, 1), -1)
         return alloc
@@ -489,9 +498,14 @@ class DSparkDraftModel(nn.Module):
 
     supports_block_graph = True
     # Whether the block attends through MLA decode, whose persistent metadata
-    # the proposer plans. A draft that attends its block another way (MiniMax-
-    # M3.1's per-row MHA decode) builds what it reads in `prepare_paged_block`.
+    # the proposer plans. A draft that attends its block another way builds
+    # what it reads in `prepare_paged_block` (Kimi-K3 GQA), or in
+    # `build_paged_block` (MiniMax-M3.1's per-row MHA decode).
     block_attention_is_mla = True
+    #: A non-MLA, non-DCP draft that builds the block's positions, KV write
+    #: slots and context lengths itself, with what it reads, in
+    #: ``build_paged_block``; the proposer then builds none of them.
+    builds_paged_block: ClassVar[bool] = False
     # A pool of the draft's own, outside the target's DCP group. None is the
     # generic pool, inside the group.
     kv_pool_spec: ClassVar[DraftKvPoolSpec | None] = None
@@ -557,6 +571,23 @@ class DSparkDraftModel(nn.Module):
         """The per-step metadata only a non-MLA block attention reads, built
         outside the captured block from the proposer's paged block metadata."""
         return
+
+    def build_paged_block(
+        self,
+        attn_metadata,
+        block_tables: torch.Tensor,  # [running_bs, W] page ids
+        anchor_positions: torch.Tensor,  # [running_bs] staged, pad rows 0
+        block_positions: torch.Tensor,  # [running_bs, T] out
+        slots: torch.Tensor,  # [running_bs * T] out, the block's KV write slots
+        ctx_lens: torch.Tensor,  # [running_bs] out, anchor + 1 + T
+        allocated_pages,  # [>= scheduled_bs] host, pages each request holds
+        scheduled_bs: int,
+        entry_tokens: int,  # tokens one block table id spans, the slots' unit
+        pad_ctx_len: int,  # a pad row's context, on page 0
+    ) -> None:
+        """The proposer's paged block metadata and ``prepare_paged_block``'s,
+        built by the draft, for a ``builds_paged_block`` draft."""
+        raise NotImplementedError(type(self).__name__)
 
     def write_context_kv(
         self,
@@ -696,6 +727,13 @@ class DSparkDraftModel(nn.Module):
         residual = None
         for layer in self.layers:
             hidden, residual = layer(positions, hidden, residual)
+        return self.block_final_norm(hidden, residual)
+
+    def block_final_norm(
+        self, hidden: torch.Tensor, residual: torch.Tensor
+    ) -> torch.Tensor:
+        """The default ``block_backbone``'s last step: ``final_norm`` over the
+        last layer's output and residual."""
         hidden, _ = self.final_norm(hidden, residual)
         return hidden
 
@@ -717,6 +755,77 @@ class DSparkDraftModel(nn.Module):
         """
         base_logits = self.lm_head(out).view(anchor_ids.shape[0], num_draft, -1)
         return self._sample_block(base_logits, anchor_ids, greedy), None
+
+    def _samples_off_the_vocab_shard(self, head) -> bool:
+        """Whether the greedy block is sampled off this rank's shard of
+        ``head``, the draft's TP-sharded LM head.
+
+        The whole-vocab head all-gathers the ``[B * T, V]`` logits for a
+        sampler that only wants each position's argmax, and then reads all of
+        ``markov_w2`` at every block position. With the fused sampler the
+        argmax of a shard is exact, so each rank reduces its shard to
+        ``(max, id)`` per position and only those cross ranks: T small gathers
+        in place of one of the whole vocab, and ``V / tp`` rows of
+        ``markov_w2`` read per position. Ids and W1 rows are bit-identical to
+        the whole-vocab op (``dspark_markov_argmax_tp``'s contract). The same
+        switch as the fused sampler (`ATOM_DSPARK_FUSED_MARKOV_SAMPLE`).
+        """
+        from atom.model_ops.dspark_markov_argmax import markov_weights_unsupported
+
+        markov = self.markov_head
+        return (
+            head is not None
+            and head.tp_size > 1
+            and head.bias is None
+            and markov.fused_sample
+            and markov_weights_unsupported(
+                markov.markov_w1.weight, markov.markov_w2.weight
+            )
+            is None
+        )
+
+    def _sample_block_off_the_vocab_shard(
+        self,
+        hidden: torch.Tensor,  # [B * T, hidden] what the LM head reads
+        head,  # the TP-sharded LM head (`_samples_off_the_vocab_shard`)
+        anchor_ids: torch.Tensor,  # [B]
+        num_draft: int,
+    ) -> "tuple[torch.Tensor, torch.Tensor]":
+        """The greedy block off this rank's vocab shard: the GEMM
+        ``ParallelLMHead.forward`` runs, minus its all-gather, then one
+        ``dspark_markov_argmax_tp`` per position. Returns the ids ``[B, T]``
+        and the ``W1[x_{k-1}]`` rows ``[B, T, r]`` the confidence head reads.
+        aiter is imported here, not at module load: this module imports
+        without it."""
+        from aiter.dist.parallel_state import get_tp_group
+        from aiter.tuned_gemm import tgemm
+
+        from atom.model_ops.dspark_markov_argmax import dspark_markov_argmax_tp
+
+        bs = anchor_ids.shape[0]
+        base_logits = tgemm.mm(hidden, head.weight).view(bs, num_draft, -1)
+        w1, w2 = self.markov_head.markov_w1.weight, self.markov_head.markov_w2.weight
+        # Position k's id lands in column k and is position k + 1's previous
+        # id; position 0 reads the anchors where they are, not a copy of them.
+        out_ids = anchor_ids.new_empty(bs, num_draft)
+        # Each step writes its W1[x] rows into its column of this block, so
+        # the confidence head reads them without a stack.
+        embeds = w1.new_empty(bs, num_draft, w1.shape[1])
+        tp_group = get_tp_group()
+        use_custom = envs.ATOM_USE_CUSTOM_ALL_GATHER
+        for k in range(num_draft):
+            dspark_markov_argmax_tp(
+                base_logits[:, k],
+                anchor_ids if k == 0 else out_ids[:, k - 1],
+                w1,
+                w2,
+                out_ids[:, k],
+                head.vocab_start_idx,
+                tp_group,
+                use_custom=use_custom,
+                embed_out=embeds[:, k],
+            )
+        return out_ids, embeds
 
     def _sample_block(
         self,

@@ -12,8 +12,9 @@ every GPU kernel of a forward against a floor computed from Pro's shapes (the mo
     floor = AR(rows)                                 all-reduce (measured latency table)
 
 ``bytes`` is the compulsory HBM traffic: every weight once, activations in and out once,
-each sequence's KV and index pages once. ``t_min`` is the shortest kernel the GPU runs
-(measured, or the shortest kernel of the trace). ``BW``, ``F`` and ``AR`` come from
+each sequence's KV and index pages once. ``t_min`` is the shortest launch the GPU runs
+(an empty kernel measured into ``--peaks``, else the 0.1th-percentile kernel duration of
+the traces, which keeps a stray outlier from setting it). ``BW``, ``F`` and ``AR`` come from
 ``--peaks`` (a JSON of measured peaks); spec-sheet values stand in when it has none, and
 the output says which. Percent of roofline = floor / measured time.
 
@@ -25,11 +26,14 @@ kernel names across roles, so they are labelled by their order between two index
 ``_prep_kernel`` launches: the first after a prep is ``o_proj``, the last two before the
 next prep ``qk_proj`` and ``index_qk_proj`` of the next layer, the rest the shared expert
 (the dense MLP in the dense layers). The draft's GEMMs are one group, against the
-draft's weight bytes.
+draft's weight bytes. The DSpark Markov head is costed per launch: each block position
+reads all of ``markov_w2`` (vocab x ``dspark_markov_rank`` bf16, replicated) and the
+position's all-gathered base logits.
 
 Outputs (``--out DIR``): ``kernels.csv`` (one row per bucket and kernel: calls, us, bytes,
 FLOPs, TB/s, TFLOPS, floor, percent of roofline, bound, note), ``steps.csv`` (one row per
-bucket: step time, coverage, share within 80% of roofline, gaps) and ``summary.md``
+bucket: step time, coverage, share within 80% of roofline -- all kernels, and without the
+routed experts, whose floor is the uniform-routing upper bound -- and gaps) and ``summary.md``
 (per bucket: the step split and the gap list ranked by time - floor). A bucket is a
 concurrency (the ``c<N>`` directory a trace sits in, else 0) and a verify width.
 
@@ -91,6 +95,8 @@ class Shapes:
     draft_inputs: int  # target layers the draft's fc reads
     draft_window: int  # the draft attention's sliding window (0: whole context)
     tp: int
+    vocab_full: int = 0  # the whole vocabulary (the draft's all-gathered logits)
+    markov_rank: int = 0  # the DSpark Markov head's rank (0: not in the config)
 
     @classmethod
     def from_config(cls, cfg: dict, tp: int) -> "Shapes":
@@ -122,6 +128,8 @@ class Shapes:
             draft_inputs=len(t.get("dspark_target_layer_ids") or []),
             draft_window=int(t.get("sliding_window") or 0),
             tp=tp,
+            vocab_full=t["vocab_size"],
+            markov_rank=int(t.get("dspark_markov_rank") or 0),
         )
 
     def gemms(self) -> dict:
@@ -151,6 +159,21 @@ class Shapes:
         ffn = 3 * self.draft_inter * h
         return self.draft_layers * (qkv + o + ffn) * MX8 + self.vocab * h * BF16
 
+    def markov_cost(self, seqs: int):
+        """(bytes, flops) of one Markov stage-1 launch (one block position, ``seqs``
+        rows): all of ``markov_w2``, the rows' base logits over the whole vocabulary
+        (bf16, after the all-gather), the gathered ``markov_w1`` rows and the per-tile
+        (max, id) partials it writes; None without a Markov rank in the config."""
+        if not self.markov_rank:
+            return None
+        v, r = self.vocab_full, self.markov_rank
+        tiles = math.ceil(v / MARKOV_TILE_V)
+        nbytes = v * r * BF16 + seqs * v * BF16 + seqs * r * BF16 + tiles * seqs * 8
+        return nbytes, 2.0 * seqs * v * r
+
+
+MARKOV_TILE_V = 128  # vocab ids a Markov stage-1 program covers (its partials' count)
+
 
 def expected_unique(experts: int, topk: int, rows: int) -> float:
     """Expected distinct experts ``rows`` tokens pick under uniform routing."""
@@ -173,6 +196,8 @@ def inter_from_name(name: str, default: int) -> int:
 RULES = [
     (r"minimax_m3_pro_mono_layer", "mono_layer"),
     (r"mono_step_begin", "misc"),
+    (r"_markov_stage1", "markov"),
+    (r"_markov_argmax_stage2", "markov_reduce"),
     (r"topk_per_row_argmax|argmax|rejection|_sample|multinomial", "sampling"),
     (r"allgather|all_gather", "allgather"),
     (r"local_device_load_rmsnorm", "allreduce_tail"),
@@ -202,7 +227,7 @@ RULES = [
         (
             r"Memcpy|Memset|copyBuffer|scatter_packed|_fill_deferred|kv_indices|embedding"
             r"|arange|searchsorted|clamp|FillFunctor|copy_kernel|CatArray|elementwise_kernel"
-            r"|index_put|_markov|sigmoid|gather|indexSelect|distribution_|_stage_anchors"
+            r"|index_put|sigmoid|gather|indexSelect|distribution_|_stage_anchors"
         ),
         "misc",
     ),
@@ -236,6 +261,8 @@ MODULES = {
     "norm": "norm_quant",
     "quant": "norm_quant",
     "mono_layer": "mono",
+    "markov": "draft",
+    "markov_reduce": "draft",
     "misc": "misc",
 }
 
@@ -451,6 +478,14 @@ def kernel_cost(s: Shapes, role: str, name: str, fw: dict, ctx_tok: float):
             "bf16",
             f"U={u:.1f} experts (uniform routing, an upper bound)",
         )
+    if role in ("markov", "markov_reduce"):  # one block position: a row a sequence
+        mc = s.markov_cost(seqs)
+        if mc is None:
+            return None, None, None, "no dspark_markov_rank in the config"
+        if role == "markov":
+            return (*mc, "bf16", "all of markov_w2 a block position")
+        tiles = math.ceil(s.vocab_full / MARKOV_TILE_V)
+        return tiles * seqs * 8 + seqs * 4, 0.0, "bf16", "stage-1 partials"
     if role == "mono_layer":
         b, f = mono_cost(s, m)
         return (
@@ -647,7 +682,10 @@ def forward_rows(fw: dict, s: Shapes, peaks: dict, t_min: float, ctx: int):
             gflops = 0.0
         else:
             gbytes = s.draft_weight_bytes(tag)
-            gflops = 2.0 * m * gbytes  # ~2 FLOPs a weight byte a row (MXFP8 ~1 B)
+            # ~2 FLOPs a weight byte a row: right for the MXFP8 weights (~1 B each),
+            # twice the bf16 ones' (fc, lm_head). Only a compute-bound draft group
+            # would need the split; at c1-c16 the group is memory-bound.
+            gflops = 2.0 * m * gbytes
             gfloor, bound = floor_us(peaks, t_min * len(items), gbytes, gflops, "fp8")
             note = f"draft {tag} GEMMs as one group (weights only)"
         for key, d, r in items:
@@ -737,6 +775,10 @@ def write_csv(path, rows):
         w.writerows(rows)
 
 
+# Roles whose floor rests on the uniform-routing expert count (an upper bound)
+UNIFORM_ROUTED = ("routed_gemm1", "routed_gemm2", "mono_layer")
+
+
 def write_outputs(res: dict, out: str, peaks: dict, t_min: float, src: dict):
     os.makedirs(out, exist_ok=True)
     L = [
@@ -752,7 +794,9 @@ def write_outputs(res: dict, out: str, peaks: dict, t_min: float, src: dict):
     for (conc, rows), (step, agg) in res.items():
         wall = step["wall"]
         cov = sum(v[1] for v in agg.values() if v[7])
-        w80 = sum(v[1] for v in agg.values() if v[7] and v[4] >= 0.8 * v[1])
+        w80_keys = [k for k, v in agg.items() if v[7] and v[4] >= 0.8 * v[1]]
+        w80 = sum(agg[k][1] for k in w80_keys)
+        w80_routed = sum(agg[k][1] for k in w80_keys if k[2] in UNIFORM_ROUTED)
         fl = sum(v[4] for v in agg.values() if v[7])
         lat = [v for v in agg.values() if v[7] and v[5] == "latency"]
         lat_us, lat_n = sum(v[1] for v in lat), sum(v[0] for v in lat)
@@ -767,6 +811,7 @@ def write_outputs(res: dict, out: str, peaks: dict, t_min: float, src: dict):
                 "kernel_us": round(step["kernels"], 1),
                 "covered_pct": round(100 * cov / step["kernels"], 1),
                 "within80_pct": round(100 * w80 / wall, 1),
+                "within80_excl_routed_pct": round(100 * (w80 - w80_routed) / wall, 1),
                 "floor_us": round(fl, 1),
                 "latency_bound_us": round(lat_us, 1),
                 "latency_bound_launches": round(lat_n, 1),
@@ -809,8 +854,10 @@ def write_outputs(res: dict, out: str, peaks: dict, t_min: float, src: dict):
                 f"{step['gaps in forward']:.0f} us, idle between forwards "
                 f"{step['idle between forwards']:.0f} us. Floor of the modelled "
                 f"kernels {fl:.0f} us. Within 80% of roofline: "
-                f"{100 * w80 / wall:.1f}% of the step. Latency-bound kernels (floor = "
-                f"t_min): {lat_n:.0f} launches, {lat_us:.0f} us."
+                f"{100 * w80 / wall:.1f}% of the step, "
+                f"{100 * (w80 - w80_routed) / wall:.1f}% without the routed experts "
+                f"(their floor is the uniform-routing upper bound). Latency-bound "
+                f"kernels (floor = t_min): {lat_n:.0f} launches, {lat_us:.0f} us."
             ),
             "",
             "| module | us | share | floor us | % roofline |",
@@ -861,7 +908,9 @@ def load_peaks(path):
     src["ar_us"] = got.get("ar_source", "measured") if peaks["ar_us"] else "none"
     peaks["kernel_min_us"] = got.get("kernel_min_us")
     src["kernel_min_us"] = (
-        "measured" if peaks["kernel_min_us"] else "shortest kernel in the trace"
+        "measured"
+        if peaks["kernel_min_us"]
+        else "0.1th-percentile kernel of the traces"
     )
     return peaks, src
 

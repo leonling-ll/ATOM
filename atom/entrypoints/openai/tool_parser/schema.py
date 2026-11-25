@@ -26,7 +26,13 @@ class ParamTypes(dict):
     difference between a 0.12 ms and a 1.28 ms streamed call. Carrying the
     built mapping in place of the list it came from makes the rebuild a type
     check. The subclass is the tag -- a plain dict could be a caller's tools.
+
+    ``schemas`` keeps each parameter's whole JSON Schema beside its type, for
+    a format that spells nested values out (MiniMax-M3's XML elements) and
+    needs the sub-schemas to type their leaves.
     """
+
+    schemas: dict[str, dict[str, Any]]
 
 
 def build_param_types(tools: list | None) -> dict[str, dict[str, Any]]:
@@ -39,6 +45,7 @@ def build_param_types(tools: list | None) -> dict[str, dict[str, Any]]:
     if isinstance(tools, ParamTypes):
         return tools
     out: dict[str, dict[str, Any]] = {}
+    schemas: dict[str, dict[str, Any]] = {}
     for tool in tools or []:
         if not isinstance(tool, dict):
             continue
@@ -55,7 +62,10 @@ def build_param_types(tools: list | None) -> dict[str, dict[str, Any]]:
             k: (v.get("type") if isinstance(v, dict) else None)
             for k, v in (props or {}).items()
         }
-    return ParamTypes(out)
+        schemas[name] = {k: v for k, v in (props or {}).items() if isinstance(v, dict)}
+    built = ParamTypes(out)
+    built.schemas = schemas
+    return built
 
 
 def coerce_param_value(value: str, ptype: Any) -> Any:

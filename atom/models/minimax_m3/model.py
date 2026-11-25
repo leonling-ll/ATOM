@@ -360,6 +360,18 @@ class MiniMaxM3MLP(nn.Module):
         return self.down_proj(x)
 
 
+_moe_side_streams: dict[torch.device, torch.cuda.Stream] = {}
+
+
+def _moe_side_stream(device: torch.device) -> torch.cuda.Stream:
+    """The stream of ``device`` that every MoE layer runs its shared expert on beside
+    its routed experts."""
+    stream = _moe_side_streams.get(device)
+    if stream is None:
+        stream = _moe_side_streams[device] = torch.cuda.Stream(device)
+    return stream
+
+
 class MiniMaxM3MoE(nn.Module):
     """MiniMax-M3 routed MoE for MXFP4 checkpoints."""
 
@@ -439,6 +451,11 @@ class MiniMaxM3MoE(nn.Module):
             and self.experts.routed_scaling_factor == self.routed_scaling_factor
         )
 
+        if is_minimax_m3_pro_config(config):
+            from atom.model_ops.fused_moe.pro_experts_decode import ProDecodeExperts
+
+            self.experts.pro_decode_experts = ProDecodeExperts.from_variants()
+
         self.shared_experts: MiniMaxM3MLP | None = None
         if getattr(config, "n_shared_experts", 0) and not self.fuse_shared_experts:
             self.shared_experts = MiniMaxM3MLP(
@@ -449,21 +466,10 @@ class MiniMaxM3MoE(nn.Module):
                 prefix=f"{prefix}.shared_experts",
             )
 
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        shared_input: tuple[torch.Tensor, torch.Tensor] | None = None,
-        quant_down: bool = False,
-    ) -> torch.Tensor:
-        """``shared_input``: ``hidden_states`` already quantised (``(x, x_scale)``) for
-        the shared expert; ``quant_down``: see ``MiniMaxM3MLP.forward``."""
-        orig_shape = hidden_states.shape
-        hidden_states = hidden_states.view(-1, orig_shape[-1])
-        router_logits = self.gate(hidden_states)
-
+    def _routed(self, hidden_states: torch.Tensor) -> torch.Tensor:
         routed_output = self.experts(
             hidden_states=hidden_states,
-            router_logits=router_logits,
+            router_logits=self.gate(hidden_states),
         )
         if (
             not self.fuse_shared_experts
@@ -471,20 +477,59 @@ class MiniMaxM3MoE(nn.Module):
             and self.routed_scaling_factor != 1.0
         ):
             routed_output = routed_output * self.routed_scaling_factor
+        return routed_output
 
-        if self.shared_experts is not None:
-            if shared_input is None:
-                shared = self.shared_experts(hidden_states, quant_down=quant_down)
-            else:
-                sx, sx_scale = shared_input
-                shared = self.shared_experts(
-                    sx.view(-1, sx.shape[-1]),
-                    sx_scale.view(-1, sx_scale.shape[-1]),
-                    quant_down=quant_down,
-                )
-            routed_output = routed_output + shared
+    def _shared(
+        self,
+        hidden_states: torch.Tensor,
+        shared_input: tuple[torch.Tensor, torch.Tensor] | None,
+        quant_down: bool,
+    ) -> torch.Tensor:
+        if shared_input is None:
+            return self.shared_experts(hidden_states, quant_down=quant_down)
+        sx, sx_scale = shared_input
+        return self.shared_experts(
+            sx.view(-1, sx.shape[-1]),
+            sx_scale.view(-1, sx_scale.shape[-1]),
+            quant_down=quant_down,
+        )
 
-        return routed_output.view(orig_shape)
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        shared_input: tuple[torch.Tensor, torch.Tensor] | None = None,
+        quant_down: bool = False,
+        defer_shared: bool = False,
+        two_streams: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        """``shared_input``: ``hidden_states`` already quantised (``(x, x_scale)``) for
+        the shared expert; ``quant_down``: see ``MiniMaxM3MLP.forward``.
+        ``defer_shared``: return ``(routed, shared)`` unsummed (the caller adds them);
+        a layer without a shared expert returns the routed output alone.
+        ``two_streams``: the shared expert runs on a side stream while the router and
+        routed experts run on the current one; the current stream waits for the side
+        stream before anything here reads the shared output."""
+        orig_shape = hidden_states.shape
+        hidden_states = hidden_states.view(-1, orig_shape[-1])
+        if self.shared_experts is None:
+            return self._routed(hidden_states).view(orig_shape)
+        if two_streams and not torch.compiler.is_compiling():
+            main = torch.cuda.current_stream()
+            side = _moe_side_stream(hidden_states.device)
+            side.wait_stream(main)
+            with torch.cuda.stream(side):
+                shared = self._shared(hidden_states, shared_input, quant_down)
+            routed_output = self._routed(hidden_states)
+            # Every tensor the side stream allocated is read or freed on the main
+            # stream only after this join, and the side stream's next work waits on
+            # the main stream first, so no record_stream is needed.
+            main.wait_stream(side)
+        else:
+            routed_output = self._routed(hidden_states)
+            shared = self._shared(hidden_states, shared_input, quant_down)
+        if defer_shared:
+            return routed_output.view(orig_shape), shared.view(orig_shape)
+        return (routed_output + shared).view(orig_shape)
 
     def forward_glue(self, r: dict, quant_down: bool = False) -> torch.Tensor:
         """`forward` on the outputs of ``moe_route_glue.route`` (normed rows, their

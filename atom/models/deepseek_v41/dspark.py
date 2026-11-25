@@ -30,10 +30,6 @@ from atom.model_ops.deepseek_v41.dspark import (
 from atom.model_ops.deepseek_v41.mhc import SinglePassHCState
 from atom.model_ops.deepseek_v41.rope_window import rope_quant_window
 from atom.model_ops.deepseek_v41.rotary import RotaryEmbedding
-from atom.model_ops.dspark_markov_argmax import (
-    dspark_markov_argmax_tp,
-    markov_weights_unsupported,
-)
 from atom.model_ops.layernorm import RMSNorm, rmsnorm2d_fwd_
 from atom.model_ops.linear import ReplicatedLinear
 from atom.model_ops.moe import FusedMoE
@@ -797,52 +793,15 @@ class DeepseekV41DSpark(DSparkDraftModel):
         return out_ids, confidence
 
     def _sharded_markov_sample(self) -> bool:
-        """Whether the block is sampled off this rank's vocab shard.
-
-        V4's head all-gathers the ``[B * T, V]`` logits for a sampler that only
-        wants each position's argmax. With the fused sampler the argmax of a
-        shard is exact, so the ranks exchange ``(max, id)`` per position
-        instead: T small gathers in place of one of the whole vocab.
-        """
-        head = self.head
-        markov = self.mtp[-1].markov_head
-        return (
-            head is not None
-            and head.tp_size > 1
-            and head.bias is None
-            and markov.fused_sample
-            and markov_weights_unsupported(
-                markov.markov_w1.weight, markov.markov_w2.weight
-            )
-            is None
-        )
+        """Whether the block is sampled off this rank's vocab shard
+        (`DSparkDraftModel._samples_off_the_vocab_shard`)."""
+        return self._samples_off_the_vocab_shard(self.head)
 
     def _head_and_sample_sharded(self, normed, hc_hidden, anchor_ids):
         """``_head_and_sample`` with the LM head left sharded (see
         ``_sharded_markov_sample``); the same ids and confidences."""
-        B, T, _ = hc_hidden.shape
-        head, last = self.head, self.mtp[-1]
-        base_logits = tgemm.mm(normed, head.weight).view(B, T, -1)  # [B, T, V/tp]
-        tp_group = get_tp_group()
-        use_custom = envs.ATOM_USE_CUSTOM_ALL_GATHER
-        # Position k's id lands in column k and is position k + 1's previous
-        # id; position 0 reads the anchors where they are, not a copy of them.
-        out_ids = anchor_ids.new_empty(B, T)
-        # Each step writes its W1[x] rows into its column of this block, so
-        # the confidence head reads them without a stack.
-        markov_w1 = last.markov_head.markov_w1.weight
-        markov_embeds = markov_w1.new_empty(B, T, markov_w1.shape[1])
-        for k in range(T):
-            dspark_markov_argmax_tp(
-                base_logits[:, k],
-                anchor_ids if k == 0 else out_ids[:, k - 1],
-                last.markov_head.markov_w1.weight,
-                last.markov_head.markov_w2.weight,
-                out_ids[:, k],
-                head.vocab_start_idx,
-                tp_group,
-                use_custom=use_custom,
-                embed_out=markov_embeds[:, k],
-            )
-        confidence = last.confidence_head(hc_hidden, markov_embeds)
+        out_ids, markov_embeds = self._sample_block_off_the_vocab_shard(
+            normed, self.head, anchor_ids, hc_hidden.shape[1]
+        )
+        confidence = self.mtp[-1].confidence_head(hc_hidden, markov_embeds)
         return out_ids, confidence
