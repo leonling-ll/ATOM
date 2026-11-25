@@ -1,8 +1,10 @@
 # MiniMax-M3.1-Pro AgentX Recipe on MI355X
 
 This recipe runs the SemiAnalysis/Weka AgentX replay workload against MiniMax-M3.1-Pro
-with ATOM on 8×AMD MI355X GPUs. It is tuned for **CONC 64**; the current best **CONC 32** launch is in [CONC 32](#conc-32).
-The configuration uses:
+with ATOM on 8×AMD MI355X GPUs. It is tuned for **CONC 64**: sections 1 and 2 are the launch the
+CONC 64 proxy measured, and the current best CONC 64 launch on the full workload (1M context) is in
+[CONC 64 on the full workload](#conc-64-on-the-full-workload). The current best **CONC 32** launch is in [CONC 32](#conc-32).
+The configuration of sections 1 and 2 uses:
 
 - MiniMax-M3.1-Pro (MXFP8 attention/dense, NVFP4 routed experts converted to MXFP4 at load)
 - TP8, DCP=1
@@ -305,6 +307,139 @@ aiperf profile \
 The server's `/metrics` has what explains a run: `atom:prefix_cache_hit_ratio`,
 `atom:lmcache_loaded_tokens_total`, `atom:requests_running` / `atom:requests_waiting` and
 `atom:kv_cache_usage_ratio`.
+
+## CONC 64 on the full workload
+
+The current best CONC 64 launch on the uncapped AgentX corpus, whose sessions grow to 1M tokens. It
+was measured with the official InferenceX client (`benchmarks/srt_agentic.sh` at InferenceX
+`e1999621`, agentx-harness 1.0.14). It changes four things in section 1's launch:
+
+- **One LMCache server stores the KV once.** Pro has one KV head, so the eight TP ranks hold the
+  same KV and section 1's in-process LMCache pins eight identical copies. In LMCache's multiprocess
+  mode with `lmcache.mp.tp_rank_collapse` `"auto"`, one rank stores each block and all eight load
+  it, so the 2,240 GiB host pool holds a single copy (#76).
+- **1M context.** At `--max-model-len 132096` the server cannot schedule the sessions that grow
+  past 132k tokens.
+- **DSpark 5 draft tokens at AL 2.89**, the golden AL for 5 tokens with thinking on, as in vLLM's
+  launch (#225).
+- **The decode fusions and the LMCache MP transfer settings** in the block below (#279, #280).
+
+The aiter is section 0's (aiter-M3 `yuhua/m3.1-pro` with aiter-M3#19, `6b9b5e32a`). `amd_kernels` is not
+needed.
+
+```bash
+export MODEL_PATH="${MODEL_PATH:-/data/models/m3-pro}"
+export CHAT_TEMPLATE="${CHAT_TEMPLATE:-}"     # the 237eada chat_template.jinja, as in section 1
+export PORT="${PORT:-8000}"
+export CONC="${CONC:-64}"
+export LMCACHE_PORT="${LMCACHE_PORT:-5555}"
+
+# One LMCache server for the host, started before ATOM; its L1 pool grows lazily up to 2,240 GiB.
+lmcache server --host 127.0.0.1 --port "${LMCACHE_PORT}" --chunk-size 256 --null-block-id -1 \
+  --separate-object-groups --supported-transfer-mode lmcache_driven \
+  --l1-size-gb 2240 --l1-use-lazy --l1-read-ttl-seconds 900 \
+  --eviction-policy LRU --eviction-trigger-watermark 0.98 --max-cpu-workers 4 \
+  > lmcache-server.log 2>&1 &
+until (exec 3<>"/dev/tcp/127.0.0.1/${LMCACHE_PORT}") 2>/dev/null; do sleep 2; done
+
+export AITER_LOG_LEVEL=WARNING
+unset AITER_CUSTOM_AR_DISABLE_LAMPORT          # ar_lamport_rows needs the Lamport path
+export ATOM_M3PRO_VARIANTS='{"kernels": true, "attn": "aiter", "topk": "split", "prep": "aiter", "index_split": true, "score_tq": 8, "ar_lamport_rows": 16, "k_only": true, "k_plain_fp8": true, "prefill_attn": "day0", "index_split_decode": 64, "moe_route_glue": true, "index_compress": true, "score_tq_causal": true, "ar_fused_rows": 128, "moe_tail_ar": true, "moe_glue_fold": true, "index_compress_fused": true, "day0_decode_rows": 48}'
+export ATOM_WARMUP_TOKENS=auto
+export ATOM_ONLINE_QUANT_STREAMING=1
+export ATOM_CACHE_AWARE_ADMISSION=1
+export AITER_REUSE_IDENTICAL_COMM_GROUPS=1
+export ATOM_CUSTOM_AR_POOL_BYTES=134217728
+export GPTOSS_SWIGLU_MXFP4_BF16_BOUND=1040
+export ATOM_TOKEN_GRAPH_SIZES=256,512,1024,2048,3072,4096
+
+# KV offload to the LMCache server
+export ATOM_KV_OFFLOAD=lmcache_mp
+export ATOM_KV_OFFLOAD_EXTRA_CONFIG="{\"lmcache.mp.host\": \"tcp://127.0.0.1\", \"lmcache.mp.port\": ${LMCACHE_PORT}, \"lmcache.mp.tp_rank_collapse\": \"auto\"}"
+export LMCACHE_CHUNK_SIZE=256
+export OFFLOAD_MAX_PENDING_SAVES=32
+export OFFLOAD_MP_SAVE_SAME_STEP=1
+export OFFLOAD_MIN_LOAD_TOKENS=2048
+export OFFLOAD_MP_TRANSFER_THREAD=1
+export PYTHONHASHSEED=0
+
+rm -rf ~/.cache/atom/*
+
+python3 -m atom.entrypoints.openai_server \
+  --model "${MODEL_PATH}" \
+  --served-model-name minimax-m3-pro \
+  --trust-remote-code \
+  --tensor-parallel-size 8 \
+  --server-port "${PORT}" \
+  --kv_cache_dtype fp8 \
+  --index-cache-dtype fp8 \
+  --block-size 16 \
+  --level 0 \
+  --max-model-len 1048576 \
+  --max-num-seqs $((2 * CONC)) \
+  --max-num-batched-tokens 16384 \
+  --cudagraph-capture-sizes "[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,18,20,22,24,26,28,30,32,48,64,128,256,512]" \
+  --gpu-memory-utilization 0.95 \
+  --online_quant_config '{"layer_quant_config": {"*.experts": "mxfp4"}}' \
+  --method dspark \
+  --num-speculative-tokens 5 \
+  --spec-decode-acceptance-length 2.89 \
+  --text-only \
+  --timeout-keep-alive 900 \
+  ${CHAT_TEMPLATE:+--chat-template "${CHAT_TEMPLATE}"} \
+  2>&1 | tee "server-m31pro-agentx-full-c${CONC}.log"
+```
+
+What the settings beyond section 1 do:
+
+| Setting | What it does |
+|---|---|
+| `score_tq_causal` | The index score kernel leaves the blocks past each row's context unwritten instead of writing -inf (`362bd6bd`). A verify graph's score table is max-model-len / 16 blocks wide, 65,536 at 1M. The selected blocks are the same bit for bit. |
+| `ar_fused_rows` 128, `moe_tail_ar` | One-launch Lamport all-reduce + RMSNorm + MXFP8 up to 128 rows, and the shared-expert add in the next all-reduce (#127). |
+| `day0_decode_rows` 48, `index_compress_fused`, `moe_glue_fold` | Decode attention on aiter-M3's FlyDSL fp8 sparse decode from 48 rows (#208); the compressed index insert in one launch (#216); the MoE glue's shared add in the next Lamport all-reduce and the lookahead norm from the route op (#220). |
+| `ATOM_TOKEN_GRAPH_SIZES` up to 4096 | Token graphs for prefills up to 4096 tokens (#217). |
+| `OFFLOAD_MAX_PENDING_SAVES=32` | Lets 32 saves run or wait at once; unset, the bound is twice the copy workers. |
+| `OFFLOAD_MP_SAVE_SAME_STEP=1` | Submits a prefill chunk's save once the step that computed it has finished its forward, instead of at the next step. |
+| `OFFLOAD_MIN_LOAD_TOKENS=2048` | Loads CPU-tier hits from 2048 tokens; shorter ones are recomputed. `lmcache_mp`'s default is 8192. |
+| `OFFLOAD_MP_TRANSFER_THREAD=1` | The TP workers submit transfers from a thread instead of the forward thread. |
+
+Check the startup log: `num_kvcache_blocks` near 217,600 (`available_for_kv` near 80 GB) on every
+rank, and the `ATOM_KV_OFFLOAD` line with `"lmcache.mp.tp_rank_collapse": "auto"`. The client needs
+the served name `minimax-m3-pro`; with InferenceX's `srt_agentic.sh` set `SERVED_MODEL_NAME`
+to it and `KV_OFFLOADING=dram`, `KV_OFFLOAD_BACKEND=lmcache_mp`, `TOTAL_CPU_DRAM_GB=2405`.
+The host needs 2,240 GiB free for the pool once it fills, on top of the server and the page cache.
+
+### Measured (full workload, CONC 64)
+
+The official client's summary over its profiling window, one node, one run per row. Every row ran
+the uncapped corpus at 1M context and DSpark k=5 at AL 2.89, and no request failed.
+
+| Launch | Duration | tok/s/GPU | p90 interactivity | TTFT p50 / p90 |
+|---|---|---|---|---|
+| Section 1's launch (in-process LMCache, 184 GiB a rank) | 3600 s | 3,698 | 7.53 | 322 / 405 s |
+| One LMCache server, 2,240 GiB, section 1's variants + `score_tq_causal` (*) | 3600 s | 15,241 | 40.90 | 3.0 / 99.6 s |
+| vLLM, #225's launch (2.4 TB CPU offload) | 3600 s | 12,360 | 35.88 | 64 / 100 s |
+| This launch | 3600 s | pending | | |
+
+Single steps, 600 s each on one node. 600 s runs of one launch differ by up to about 10% run to run.
+
+| Launch | tok/s/GPU | p90 interactivity | TTFT p50 / p90 |
+|---|---|---|---|
+| One LMCache server, 2,240 GiB (*) | 13,237 | 39.35 | 0.3 / 85.4 s |
+| + the decode fusions (*) | 15,631 | 45.19 | 0.5 / 76.2 s |
+| + the decode fusions, without `index_day0` | 14,584 | 42.22 | 0.3 / 79.1 s |
+| + the LMCache MP transfer settings, no fusions (*, transfer profiling on) | 14,610 | 46.66 | 0.5 / 72.8 s |
+| This launch | pending | | |
+
+(*) These runs also had `index_day0`, a prefill indexer variant that needs a package outside
+aiter-M3 and is not in ATOM; the third row is the second without it.
+
+Over the hour, the one-server launch recomputed 4.6% of its prompt tokens and vLLM 9.4%: ATOM
+served about 30% from HBM and 66% from the CPU tier, vLLM 7% and 84%. The in-process run
+recomputed most of its prompts and queued: its median TTFT was 322 s.
+
+GSM8K for the second row's launch (DSpark k=5 at real acceptance, 3 runs): 0.9439 64-shot,
+0.9353 on vLLM's 5-shot protocol, where vLLM scores 0.9174 with DSpark.
 
 ## CONC 32
 
