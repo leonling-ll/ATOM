@@ -41,6 +41,7 @@ CONFIG = {
         "moe_layer_freq": [0] * DENSE + [1] * (LAYERS - DENSE),
         "dflash_config": {"num_hidden_layers": 5},
         "dspark_ffn_hidden_size": 20480,
+        "dspark_markov_rank": 256,
         "dspark_target_layer_ids": [1, 2, 3, 4, 5],
         "sliding_window": 2048,
         "sparse_attention_config": {
@@ -291,6 +292,7 @@ class _Trace:
         for name, d in (
             ("bmm_a8w8_mxscale_t64x64x256", 9.0),
             ("_markov_stage1", 5.0),
+            ("_dspark_markov_argmax_stage2", 3.0),
             ("void aiter::cross_device_reduce_2stage<bf16>()", 10.0),
         ):
             self.launch(name, d)
@@ -374,6 +376,15 @@ def test_trace_end_to_end(run):
     assert float(dg["bytes_per_step"]) == pytest.approx(
         SHAPES.draft_weight_bytes("propose_dspark"), rel=1e-6
     )
+    # the Markov head reads all of markov_w2 and the 4 sequences' base logits a launch
+    mk = k[("propose_dspark", "markov", "_markov_stage1")]
+    v, r = 200064, 256
+    mb = v * r * 2 + 4 * v * 2 + 4 * r * 2 + math.ceil(v / 128) * 4 * 8
+    assert float(mk["bytes_per_step"]) == pytest.approx(mb, rel=1e-6)
+    assert float(mk["floor_us"]) == pytest.approx(mb / 5e6, abs=0.01)
+    assert mk["bound"] == "memory"
+    m2 = k[("propose_dspark", "markov_reduce", "_dspark_markov_argmax_stage2")]
+    assert float(m2["bytes_per_step"]) == math.ceil(v / 128) * 4 * 8 + 4 * 4
     assert k[("post", "sampling", "topk_per_row_argmax_fold1")]["bound"] == "latency"
     unk = k[("target", "other", UNKNOWN)]
     assert unk["floor_us"] == "" and unk["note"]
@@ -395,3 +406,28 @@ def test_needs_context_without_sk_labels(tmp_path):
     assert kr.main(args + ["--ctx", "1000"]) == 0
     (step,) = _rows(tmp_path / "o" / "steps.csv")
     assert step["ctx_per_seq"] == "1000"
+
+
+def test_within80_without_routed(run):
+    """The share within 80% of roofline is also given without the routed experts,
+    whose floor rests on the uniform-routing expert count."""
+    (step,) = _rows(run / "steps.csv")
+    routed = sum(
+        float(r["us_per_step"])
+        for r in _rows(run / "kernels.csv")
+        if r["role"] in ("routed_gemm1", "routed_gemm2")
+        and float(r["pct_roofline"]) >= 80
+    )
+    assert routed > 0
+    assert float(step["within80_excl_routed_pct"]) == pytest.approx(
+        float(step["within80_pct"]) - 100 * routed / float(step["step_us"]), abs=0.11
+    )
+
+
+def test_markov_without_rank_has_no_metric():
+    s = kr.Shapes.from_config(
+        {"text_config": {**CONFIG["text_config"], "dspark_markov_rank": 0}}, tp=8
+    )
+    fw = {"rows": 32, "seqs": 4, "draft": True}
+    b, _, _, note = kr.kernel_cost(s, "markov", "_markov_stage1", fw, 0)
+    assert b is None and "dspark_markov_rank" in note
