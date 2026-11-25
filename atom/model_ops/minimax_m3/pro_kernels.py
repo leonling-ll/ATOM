@@ -2269,16 +2269,16 @@ def select_rows_split(
         count,
         nb,
     )
-    meta = dict(
-        SPAN=span,
-        K=k,
-        CHUNK=chunk,
-        PG=PAGE,
-        FUSED=fused,
-        IS_HIP=dev.type == "cuda" and torch.version.hip is not None,
-        LOGICAL=logical,
-        num_warps=num_warps,
-    )
+    meta = {
+        "SPAN": span,
+        "K": k,
+        "CHUNK": chunk,
+        "PG": PAGE,
+        "FUSED": fused,
+        "IS_HIP": dev.type == "cuda" and torch.version.hip is not None,
+        "LOGICAL": logical,
+        "num_warps": num_warps,
+    }
     _select_split_kernel[(t, parts)](*args, WIDE=span > chunk, **meta)
     warm = (dev, k, chunk, fused, logical, num_warps)
     if span <= chunk and warm not in _wide_warmed:
