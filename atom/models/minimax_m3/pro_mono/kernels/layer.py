@@ -69,6 +69,7 @@ from atom.models.minimax_m3.pro_mono.layout import (
     SM_ROW,
     SMSC_WORDS,
     TL_POINTS,
+    TOKEN_TILE,
     TP,
     X4_ROW,
     X8_ROW,
@@ -82,6 +83,7 @@ from atom.models.minimax_m3.pro_mono.layout import (
     plain_layout,
     rs_pair,
     scratch_layout,
+    token_tiles,
 )
 from atom.models.minimax_m3.pro_mono.sources import SOURCES
 from atom.mono.device.mx import (
@@ -278,7 +280,9 @@ def stage_o(c):
     4 waves each a quarter of K) -> bf16 partial rows -> the owner rank's
     ``rs`` (this rank's slot). The weight and its scales are in flight while
     the core rows are quantized, the core rows' loads issued first (their
-    quantization then waits for them alone)."""
+    quantization then waits for them alone). Past 16 rows a wave runs its
+    MFMAs once a token tile (``token_tiles``) on the same weight registers,
+    and the K-quarter sum runs a pass a tile."""
     s, tid, lane, wave, bid = c["S"], c["tid"], c["lane"], c["wave"], c["bid"]
     g4 = lane // 16
     l16 = lane % 16
@@ -305,42 +309,60 @@ def stage_o(c):
         ws = [s_lo[d] for d in range(4)] + [s_hi[d] for d in range(2)]
         gpu.barrier()
         c["stamp"](1)
-        # B column l16 is token l16 (the last token past S: its column is
-        # discarded); chunks 2p, 2p + 1 in one 16x16x128 scaled MFMA, its lane
-        # holding k 16 g4 .. + 16 of each 64-k chunk
-        col_tok = fx.min(l16, s - 1)
-        acc = fx.Vector.filled(4, 0.0, fx.Float32)
+        # B column l16 of tile k is token 16 k + l16 (a token past S: its
+        # column is discarded); chunks 2p, 2p + 1 in one 16x16x128 scaled
+        # MFMA, its lane holding k 16 g4 .. + 16 of each 64-k chunk
+        tiles = token_tiles(s)
+        col_tok = [fx.min(TOKEN_TILE * k + l16, s - 1) for k in range(tiles)]
+        acc = [fx.Vector.filled(4, 0.0, fx.Float32) for _ in range(tiles)]
         for p in range_constexpr(O_CPW // 2):
-            xb = [
-                fx.Vector(
-                    fx.ptr_load(
-                        c["xs"]
-                        + (col_tok * O_ROW + (q4 * O_CPW + 2 * p + h) * 16 + g4 * 4),
-                        result_type=v4f,
-                    )
-                ).bitcast(fx.Int32)
-                for h in range(2)
-            ]
-            sb = fx.ptr_load(c["osc"] + (col_tok * OSC_ROW + q4 * (O_CPW // 2) + p))
-            acc = mfma_scaled(
-                fx.Vector.from_elements(
-                    [wts[2 * p + h][e] for h in range(2) for e in range(4)], fx.Int32
-                ),
-                fx.Vector.from_elements(
-                    [xb[h][e] for h in range(2) for e in range(4)], fx.Int32
-                ),
-                acc,
-                fx.Int32(ws[p]) >> (g4 * 8),
-                fx.Int32(sb) >> (g4 * 8),
-            )
-        fx.ptr_store(acc, c["red"] + (wave * 64 + lane) * 4)
+            for k in range_constexpr(tiles):
+                xb = [
+                    fx.Vector(
+                        fx.ptr_load(
+                            c["xs"]
+                            + (
+                                col_tok[k] * O_ROW
+                                + (q4 * O_CPW + 2 * p + h) * 16
+                                + g4 * 4
+                            ),
+                            result_type=v4f,
+                        )
+                    ).bitcast(fx.Int32)
+                    for h in range(2)
+                ]
+                sb = fx.ptr_load(
+                    c["osc"] + (col_tok[k] * OSC_ROW + q4 * (O_CPW // 2) + p)
+                )
+                acc[k] = mfma_scaled(
+                    fx.Vector.from_elements(
+                        [wts[2 * p + h][e] for h in range(2) for e in range(4)],
+                        fx.Int32,
+                    ),
+                    fx.Vector.from_elements(
+                        [xb[h][e] for h in range(2) for e in range(4)], fx.Int32
+                    ),
+                    acc[k],
+                    fx.Int32(ws[p]) >> (g4 * 8),
+                    fx.Int32(sb) >> (g4 * 8),
+                )
+        # tile k's accumulators a tile of ``red`` on
+        for k in range_constexpr(tiles):
+            fx.ptr_store(acc[k], c["red"] + ((k * WAVES + wave) * 64 + lane) * 4)
         gpu.barrier()
-        # the 4 K quarters summed in wave order: thread (token, row of 32)
-        if tid < O_ROWS * s:
-            tk = tid // O_ROWS
-            grp = (tid % O_ROWS) // 16
-            tot = row_sum(c["red"], tid % 16, tk, [grp * 4 + w for w in range(4)])
-            fx.ptr_store(bf16_round(tot), c["misc"] + tid)
+        # the 4 K quarters summed in wave order: thread (token, row of 32), a
+        # pass a token tile (THREADS = O_ROWS x TOKEN_TILE cells)
+        for k in range_constexpr(tiles):
+            if tid < O_ROWS * (min(s, TOKEN_TILE * (k + 1)) - TOKEN_TILE * k):
+                tk = tid // O_ROWS
+                grp = (tid % O_ROWS) // 16
+                tot = row_sum(
+                    c["red"] + k * WAVES * 64 * 4,
+                    tid % 16,
+                    tk,
+                    [grp * 4 + w for w in range(4)],
+                )
+                fx.ptr_store(bf16_round(tot), c["misc"] + (tid + THREADS * k))
         gpu.barrier()
         # a pair of rows a thread -> the owner of these columns, this rank's slot
         if tid < (O_ROWS // 2) * s:
@@ -361,7 +383,7 @@ def stage_o(c):
 
 @traced
 def ar_reduce(c, ins):
-    """Stages reduce / gather, the wave's tokens (one or two passes) at once:
+    """Stages reduce / gather, the wave's tokens (one to three passes) at once:
     -> the f32 v = bf16(sum) + res of this lane's two columns, a token each.
     The owner of the columns polls every token's partials of the 8 ranks in
     one batch, sums each token's in rank order and sends its bf16 sum and the
@@ -371,9 +393,11 @@ def ar_reduce(c, ins):
     lane, la = c["lane"], c["lookahead"]
     n = len(ins)
     # bound before the traced ifs: names their branches bind are not seen
-    # past them otherwise (a second pass's, unused at <= 8 rows)
+    # past them otherwise (a second pass's, unused at <= 8 rows; a third's,
+    # unused at <= 16)
     a0, a1 = fx.Float32(0.0), fx.Float32(0.0)
     b0, b1 = fx.Float32(0.0), fx.Float32(0.0)
+    d0, d1 = fx.Float32(0.0), fx.Float32(0.0)
     enter_stage("reduce")
     if c["is_owner"]:
         own_rs = preg(c["own"], c["off"]["rs"], "rs")
@@ -419,8 +443,10 @@ def ar_reduce(c, ins):
                 )
             held_o.append((v0, v1))
         a0, a1 = held_o[0]
-        if const_expr(n == 2):
+        if const_expr(n >= 2):
             b0, b1 = held_o[1]
+        if const_expr(n == 3):
+            d0, d1 = held_o[2]
     enter_stage("gather")
     if c["not_owner"]:
         w = c["poll"](
@@ -432,11 +458,15 @@ def ar_reduce(c, ins):
         g0, g1 = bf2_f32(w[0][0])
         a0 = g0 + ins[0][2][0]
         a1 = g1 + ins[0][2][1]
-        if const_expr(n == 2):
+        if const_expr(n >= 2):
             h0, h1 = bf2_f32(w[1][0])
             b0 = h0 + ins[1][2][0]
             b1 = h1 + ins[1][2][1]
-    return [[a0, a1], [b0, b1]][:n]
+        if const_expr(n == 3):
+            e0, e1 = bf2_f32(w[2][0])
+            d0 = e0 + ins[2][2][0]
+            d1 = e1 + ins[2][2][1]
+    return [[a0, a1], [b0, b1], [d0, d1]][:n]
 
 
 @traced
@@ -562,7 +592,8 @@ def build(key: P1Build):
     class Smem:
         xs: fx.Array[fx.Int32, s * xs_row, 16]
         osc: fx.Array[fx.Int32, s * OSC_ROW, 16]
-        red: fx.Array[fx.Float32, WAVES * 64 * 4, 16]
+        # a wave's 16x16 accumulators, a token tile's after another
+        red: fx.Array[fx.Float32, token_tiles(s) * WAVES * 64 * 4, 16]
         misc: fx.Array[fx.Float32, O_ROWS * s, 16]
         tls: fx.Array[fx.Int64, TL_POINTS, 16]
 
@@ -653,12 +684,13 @@ def build(key: P1Build):
             if (bid < NT) & (wave < s):
                 ar_tokens(c, [0])
         else:
-            both = s - WAVES  # waves holding a token in both passes
-            if (bid < NT) & (wave < both):
-                ar_tokens(c, [0, 1])
-            if const_expr(both < WAVES):  # noqa: SIM102
-                if (bid < NT) & (wave >= both):
-                    ar_tokens(c, [0])
+            # waves holding a token in every pass; the rest skip the last
+            every = s - WAVES * (passes - 1)
+            if (bid < NT) & (wave < every):
+                ar_tokens(c, list(range(passes)))
+            if const_expr(every < WAVES):  # noqa: SIM102
+                if (bid < NT) & (wave >= every):
+                    ar_tokens(c, list(range(passes - 1)))
         stamp(tl_on, tls, tid, 5)
         if const_expr(ffn_on):
             fl = alloc.allocate(FfnLds).peek()
