@@ -402,3 +402,113 @@ def test_compressed_index_pooled_per_rank_gathers_to_the_single_ranks(K):
                         atol=0,
                         rtol=0,
                     )
+
+
+# -- the decode merge: aiter's mailbox combine, else all-to-all ----------------------
+
+
+@pytest.fixture
+def mailbox(monkeypatch):
+    """A DCP8 Pro layer (16 heads x 192 a rank, 64 sequences x k=5) between stub
+    collectives: aiter's mailbox workspace and combine, and the all-to-all, record what
+    they are given. ``(impl, config, built workspaces, calls, group)``."""
+    from conftest import gpu_stack_import
+
+    pro_attn = gpu_stack_import("atom.model_ops.minimax_m3.pro_attn")
+    from atom.model_ops import dcp_ops
+
+    built, calls = [], {}
+
+    class Workspace:
+        def __init__(self, group, device, heads, dim, max_tokens):
+            built.append((heads, dim, max_tokens))
+            self.max_tokens = max_tokens
+            self.peers = SimpleNamespace(bytes=torch.empty(0))
+
+    def combine(ws, out, lse, base_e=True, row_counts=None, res=None):
+        calls["mailbox"] = (out, lse, res)
+        return res.fill_(7)
+
+    def a2a(out, lse, group, owned_counts=None, quant_dtype=None):
+        calls["a2a"] = (out, lse)
+        return torch.arange(out.shape[0] * out.shape[1] // 8 * 64.0).view(
+            out.shape[0], -1, 64
+        )
+
+    monkeypatch.setitem(
+        sys.modules,
+        "aiter.ops.flydsl.dcp_mailbox",
+        SimpleNamespace(CombineWorkspace=Workspace, dcp_lse_combine=combine),
+    )
+    monkeypatch.setattr(dcp_ops, "_MAILBOX_WORKSPACES", {})
+    monkeypatch.setattr(dcp_ops, "_MAILBOX_LAUNCHES", {})
+    monkeypatch.setattr(dcp_ops, "cp_lse_a2a", a2a)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    group = SimpleNamespace(world_size=8, rank_in_group=3, cpu_group="gloo")
+    monkeypatch.setattr("atom.distributed.dcp_utils.get_dcp_group", lambda: group)
+    config = SimpleNamespace(
+        dcp_config=SimpleNamespace(comm_backend="mailbox"),
+        max_num_seqs=64,
+        speculative_config=SimpleNamespace(num_speculative_tokens=5),
+    )
+    monkeypatch.setattr("atom.config.get_current_atom_config", lambda: config)
+    impl = object.__new__(pro_attn.ProSparseAttentionImpl)
+    impl.num_heads, impl.value_head_dim, impl.dcp_mailbox = 16, 192, False
+    return impl, config, built, calls, group
+
+
+def test_the_mailbox_holds_the_variants_rows_of_a_ranks_heads(mailbox):
+    """``dcp_mailbox`` rows (at most the widest decode step, 64 x 6) of 16 heads x 192,
+    past the default cap (85 rows at that width); one workspace for all the layers, and
+    none without the variant or the mailbox backend."""
+    from atom.model_ops import dcp_ops
+
+    impl, config, built, _, _ = mailbox
+    assert dcp_ops._MAILBOX_MAX_ELEMS // (8 * 16 * 192) == 85
+    assert all(impl._prepare_dcp_mailbox(256) for _ in range(3))  # three layers
+    assert built == [(16, 192, 256)]
+    dcp_ops._MAILBOX_WORKSPACES.clear()
+    assert impl._prepare_dcp_mailbox(4096) and built[-1] == (16, 192, 384)
+    dcp_ops._MAILBOX_WORKSPACES.clear()
+    assert not impl._prepare_dcp_mailbox(0)
+    config.dcp_config.comm_backend = "a2a"
+    assert not impl._prepare_dcp_mailbox(256)
+    assert len(built) == 2
+
+
+@pytest.mark.parametrize(
+    "on, rows, capturing, takes",
+    [
+        (True, 8, True, True),
+        (True, 9, True, False),  # wider than the workspace
+        (True, 8, False, False),  # eager
+        (False, 8, True, False),
+    ],
+)
+def test_a_decode_merge_combines_in_the_mailbox_else_by_all_to_all(
+    mailbox, monkeypatch, on, rows, capturing, takes
+):
+    """The mailbox takes a captured step it holds, at the heads' own 192 and LSEs, into
+    the layer's output; anything else merges by all-to-all as before, at three heads of
+    64 a head with its LSE repeated, copied into the output."""
+    impl, _, _, calls, group = mailbox
+    assert impl._prepare_dcp_mailbox(8)
+    impl.dcp_mailbox = on
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: capturing)
+    g = torch.Generator().manual_seed(0)
+    of = torch.randn(rows, 8 * 16 * 192, generator=g).to(torch.bfloat16)
+    lse = torch.randn(rows, 8 * 16, generator=g)
+    out = torch.zeros(rows, 16 * 192, dtype=torch.bfloat16)
+    assert impl._dcp_merge(group, of, lse, out) is out
+    if takes:
+        o, l, res = calls["mailbox"]
+        assert o.shape == (rows, 128, 192) and o.data_ptr() == of.data_ptr()
+        assert l.data_ptr() == lse.data_ptr()
+        assert res.shape == (rows, 16, 192) and res.data_ptr() == out.data_ptr()
+        assert (out == 7).all() and "a2a" not in calls
+    else:
+        o, l = calls["a2a"]
+        assert o.shape == (rows, 384, 64) and o.data_ptr() == of.data_ptr()
+        assert torch.equal(l, lse.repeat_interleave(3, dim=1))
+        want = torch.arange(rows * 48 * 64.0).to(torch.bfloat16).view(rows, -1)
+        assert torch.equal(out, want) and "mailbox" not in calls

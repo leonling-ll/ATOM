@@ -205,6 +205,14 @@ class ProVariants:
     # ``topk`` blocks and the ranks all-gather those as sort keys (``[rows, topk]`` int64)
     # and merge them (``dcp_select``). Bit for bit the same selection.
     dcp_topk_merge: bool = False
+    # Under DCP a graph-captured decode / verify step of at most this many rows (0: off)
+    # merges the heads' partial outputs with aiter's mailbox combine: one launch storing
+    # into the peers' memory, at a rank's 16 heads x 192, straight into the output,
+    # instead of pack, all-to-all and combine at 48 x 64 (the LSE repeated to match) and
+    # a copy. Wider steps keep the all-to-all. Needs comm_backend "mailbox" (gfx950's
+    # default); read once, when the layers are built. The same weighted sum, other
+    # rounding.
+    dcp_mailbox: int = 0
     # vLLM's compressed index cache: every 4 index keys softmax-pooled into one bf16 row
     # (ic_c [pages, 4, 128]), written after prep; the scorer reads those rows only.
     index_compress: bool = False
@@ -600,11 +608,16 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
         # Bound by `AiterAttentionMetadataBuilder.build_kv_cache_tensor`:
         # the index-key cache, (blocks, page, index_head_dim).
         self.index_cache: torch.Tensor | None = None
-        self.k_only = refresh_variants(force=True).k_only
+        variants = refresh_variants(force=True)
+        self.k_only = variants.k_only
         from atom.config import get_current_atom_config
 
         self.dcp_world = get_current_atom_config().decode_context_parallel_size
         self.max_model_len = get_current_atom_config().max_model_len
+        # collective: every DCP rank builds the same layers in the same order
+        self.dcp_mailbox = self.dcp_world > 1 and self._prepare_dcp_mailbox(
+            variants.dcp_mailbox
+        )
         if self.k_only:
             from atom.config import kv_cache_torch_dtype
 
@@ -1490,6 +1503,46 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
         return attend(sel)
 
     # ------------------------------------------------- decode context parallel --
+    def _prepare_dcp_mailbox(self, rows):
+        """Map the mailbox combine's peer buffer for decode merges of up to ``rows`` rows
+        (``dcp_mailbox``) while every rank builds the same layer (collective, before the
+        KV cache is sized; one for all the layers). False: they merge by all-to-all."""
+        from atom.config import get_current_atom_config
+        from atom.distributed.dcp_utils import get_dcp_group
+        from atom.model_ops.dcp_ops import dcp_mailbox_max_tokens, prepare_dcp_mailbox
+
+        config = get_current_atom_config()
+        if rows <= 0 or config.dcp_config.comm_backend != "mailbox":
+            return False
+        group, heads, dim = get_dcp_group(), self.num_heads, self.value_head_dim
+        rows = min(rows, dcp_mailbox_max_tokens(config))
+        # the variant's rows, not the default cap's (measured on other models' shapes)
+        cap = rows * group.world_size * heads * dim
+        return prepare_dcp_mailbox(group, heads, dim, rows, max_elems=cap)
+
+    def _dcp_merge(self, group, of, lse, out):
+        """The log-sum-exp merge of every head's partial output ``of`` ``[n, W * 16 *
+        192]`` (``lse`` ``[n, W * 16]``) into this rank's heads' ``out`` ``[n, 16 * 192]``."""
+        from atom.config import get_current_atom_config
+        from atom.model_ops.dcp_ops import dcp_lse_merge, dcp_mailbox_merge
+
+        n, dv = out.shape[0], self.value_head_dim
+        h = lse.shape[1]
+        if self.dcp_mailbox:
+            res = out.view(n, -1, dv)
+            if dcp_mailbox_merge(of.view(n, h, dv), lse, group, res) is not None:
+                return out
+        # the all-to-all takes power-of-two head widths: each head's 192 as three of 64
+        parts = dv // 64
+        merged = dcp_lse_merge(
+            of.view(n, h * parts, 64),
+            lse.repeat_interleave(parts, dim=1),
+            group,
+            backend=get_current_atom_config().dcp_config.comm_backend,
+        )
+        out.copy_(merged.reshape(n, -1))
+        return out
+
     def _dcp_prefill_caches(self, kc4, ks, ic):
         """A prefill's caches under DCP: every block of its sequences, all-gathered from
         the ranks that hold them, and the block tables into those (the plan is the
@@ -1521,13 +1574,8 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
         all-gathered so each rank selects from all of them as without DCP, each rank
         attends all query heads over the selected blocks it holds, and a log-sum-exp
         merge returns this rank's heads."""
-        from atom.config import get_current_atom_config
         from atom.distributed.dcp_utils import get_dcp_group
-        from atom.model_ops.dcp_ops import (
-            dcp_all_gather,
-            dcp_all_gather_query_heads,
-            dcp_lse_merge,
-        )
+        from atom.model_ops.dcp_ops import dcp_all_gather, dcp_all_gather_query_heads
 
         pool, init, local, sc, block_mode, head_mode = score_args
         group = get_dcp_group()
@@ -1606,16 +1654,7 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
             valid_first=True,
             lse=lse,
         )
-        # the merge takes power-of-two head widths: each head's 192 as three of 64
-        parts = dv // 64
-        merged = dcp_lse_merge(
-            of.view(n, h * parts, 64),
-            lse.repeat_interleave(parts, dim=1),
-            group,
-            backend=get_current_atom_config().dcp_config.comm_backend,
-        )
-        out.copy_(merged.reshape(n, -1))
-        return out
+        return self._dcp_merge(group, of, lse, out)
 
     # ---------------------------------------------------------------- forward --
     def decode_split(self, n: int, v: ProVariants, seqs: int = 0):

@@ -917,7 +917,9 @@ def dcp_mailbox_max_tokens(atom_config) -> int:
     return atom_config.max_num_seqs * (1 + drafts)
 
 
-def prepare_dcp_mailbox(cp_group, heads, dim, max_tokens) -> bool:
+def prepare_dcp_mailbox(
+    cp_group, heads, dim, max_tokens, max_elems=_MAILBOX_MAX_ELEMS
+) -> bool:
     """Create the shared mailbox workspace of (group, heads a rank, head dim).
 
     Collective (it maps every rank's peer buffer): call it on every rank of
@@ -925,24 +927,23 @@ def prepare_dcp_mailbox(cp_group, heads, dim, max_tokens) -> bool:
     memory sits outside torch's allocator, so it must exist before the KV
     cache is sized. Returns False on every rank, and the merge stays on
     all-to-all, when the peer memory cannot be allocated or mapped. ``max_tokens`` is
-    capped at the widest merge under ``_MAILBOX_MAX_ELEMS``: wider ones take
-    all-to-all, so room for them would never be used.
+    capped at the widest merge under ``max_elems`` (``_MAILBOX_MAX_ELEMS`` unless the
+    caller sets its own): wider ones take all-to-all, so room for them would never
+    be used.
     """
     key = _mailbox_key(cp_group, heads, dim)
     if key in _MAILBOX_WORKSPACES:  # None: tried, and it fell back
         return _MAILBOX_WORKSPACES[key] is not None
     _MAILBOX_WORKSPACES[key] = None
     # Same shapes on every rank, so every rank returns here alike.
-    max_tokens = min(
-        max_tokens, _MAILBOX_MAX_ELEMS // (cp_group.world_size * heads * dim)
-    )
+    max_tokens = min(max_tokens, max_elems // (cp_group.world_size * heads * dim))
     if max_tokens < 1:
         logger.warning(
             "DCP mailbox: one token of %d heads x %d already exceeds %d elements; "
             "merging with 'a2a'",
             cp_group.world_size * heads,
             dim,
-            _MAILBOX_MAX_ELEMS,
+            max_elems,
         )
         return False
     try:
@@ -973,8 +974,11 @@ def prepare_dcp_mailbox(cp_group, heads, dim, max_tokens) -> bool:
     return True
 
 
-def _dcp_mailbox_merge(cp_attn_out, cp_attn_lse, cp_group, owned_counts, quant_dtype):
-    """The mailbox merge, or None when this call cannot take it."""
+def _dcp_mailbox_merge(
+    cp_attn_out, cp_attn_lse, cp_group, owned_counts, quant_dtype, res=None
+):
+    """The mailbox merge (into ``res`` when given), or None when this call cannot
+    take it."""
     if cp_group.world_size == 1 or not torch.cuda.is_current_stream_capturing():
         return None
     tokens, heads, dim = cp_attn_out.shape
@@ -998,10 +1002,19 @@ def _dcp_mailbox_merge(cp_attn_out, cp_attn_lse, cp_group, owned_counts, quant_d
         cp_attn_lse.to(torch.float32).contiguous(),
         base_e=True,
         row_counts=None if owned_counts is None else owned_counts[:tokens],
+        **({} if res is None else {"res": res}),
     )
     # No quantizing combine here: hand back the bf16 rows unquantized, which
     # the caller then quantizes as it would without the fused path.
     return out if quant_dtype is None else (out, None)
+
+
+def dcp_mailbox_merge(cp_attn_out, cp_attn_lse, cp_group, out=None):
+    """The ``mailbox`` backend's combine alone, without its all-to-all fallback: this
+    rank's heads ``[tokens, heads, dim]``, stored into ``out`` when given, or None
+    where the call cannot take it (eager, wider than the workspace, not bf16, no
+    workspace of this shape), for the caller to merge its own way."""
+    return _dcp_mailbox_merge(cp_attn_out, cp_attn_lse, cp_group, None, None, res=out)
 
 
 def check_dcp_mailbox_launches() -> None:
