@@ -140,6 +140,25 @@ def test_scores_select_as_single_rank(K, reading, tq, per_seq):
     assert torch.equal(sel.sort(dim=1).values, want.sort(dim=1).values)
 
 
+@pytest.mark.parametrize("init, local", [(1, 2), (0, 4), (3, 0), (2, 11), (0, 0)])
+def test_pins_a_ranks_causal_columns_by_global_block(K, init, local):
+    """``dcp_pin``: on every causal column of a rank, the init blocks 1e30 and the local
+    window 1e29 (an init block inside it too), by global block, the rest untouched."""
+    world = 4
+    pos = torch.tensor([0, 5, 16, 37, 70, 300, 517, 1000], device=DEV)
+    nbl = 1000 // PG // world + 2
+    g = torch.Generator().manual_seed(7)
+    for r in range(world):
+        s = torch.randn(len(pos), nbl, generator=g).to(DEV)
+        j = torch.arange(nbl, device=DEV) * world + r
+        qb = (pos // PG)[:, None]
+        want = s.clone().masked_fill_(j < init, 1e30)
+        want.masked_fill_(j >= qb + 1 - local, 1e29)
+        causal = j <= qb
+        got = K.dcp_pin(s, pos, r, world, init, local)
+        assert torch.equal(got[causal], want[causal])
+
+
 @pytest.mark.parametrize("split", [False, True])
 @pytest.mark.parametrize("per_seq", [1, 6])
 def test_topk_merge_selects_as_the_gathered_scores(K, split, per_seq):

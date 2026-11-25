@@ -2949,13 +2949,54 @@ def dcp_local_positions(positions, rank, world):
     return torch.where(qb >= rank, local, -PAGE)
 
 
+@triton.jit
+def _dcp_pin_kernel(
+    score_ptr,
+    stride_s,
+    pos_ptr,
+    NB,
+    R,
+    init,
+    local,
+    W: tl.constexpr,
+    BI: tl.constexpr,
+    BL: tl.constexpr,
+    PG: tl.constexpr,
+):
+    t = tl.program_id(0)
+    qb = tl.load(pos_ptr + t) // PG
+    lo = qb + 1 - local  # the local window's first global block
+    row = score_ptr + t.to(tl.int64) * stride_s
+    j = tl.arange(0, BI)
+    g = j * W + R
+    # an init block inside the window takes the window's pin, as scores' order leaves it
+    pin = (g < init) & (g < lo) & (j < NB)
+    tl.store(row + j, tl.full([BI], 1e30, tl.float32), mask=pin)
+    jl = tl.maximum(lo - R + W - 1, 0) // W + tl.arange(0, BL)
+    gl = jl * W + R
+    tl.store(row + jl, tl.full([BL], 1e29, tl.float32), mask=(gl <= qb) & (jl < NB))
+
+
 def dcp_pin(score, positions, rank, world, init, local):
-    """``scores``' pins on a rank's local columns, in place: the forced init blocks
-    above every score, the local window below them, by global block index."""
-    j = torch.arange(score.shape[1], device=score.device) * world + rank
-    qb = (positions // PAGE)[:, None]
-    score.masked_fill_(j < init, 1e30)
-    score.masked_fill_(j >= qb + 1 - local, 1e29)
+    """``scores``' pins on a rank's local columns, in place, by global block index: the
+    forced init blocks above every score, the local window below them. Only the causal
+    columns, the ones a selection reads, are written."""
+    t, nb = score.shape
+    assert score.stride(1) == 1
+    if t and (init or local):
+        _dcp_pin_kernel[(t,)](
+            score,
+            score.stride(0),
+            positions,
+            nb,
+            rank,
+            init,
+            local,
+            W=world,
+            BI=triton.next_power_of_2(-(-init // world) + 1),
+            BL=triton.next_power_of_2(-(-local // world) + 1),
+            PG=PAGE,
+        )
     return score
 
 
