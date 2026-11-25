@@ -12,7 +12,8 @@
 #   restore  a 24k-token retrieval twice, the second pass on a fresh server (lmcache_mp: the
 #            MP server keeps the tier) or with prefix caching off (lmcache): pass 2 loads its
 #            prefix from the CPU tier (atom:lmcache_loaded_tokens) and answers the same text
-#   ab       smoke's retrievals one at a time with dcp_topk_merge on, then off: the same text
+#   ab       smoke's retrievals one at a time under DCP_VARIANTS, then AB_VARIANTS (default:
+#            DCP_VARIANTS with dcp_topk_merge off): the same text
 #   gsm8k    accuracy_gate.sh's GSM8K 64-shot with DSpark k=5 at real acceptance and these
 #            variants, at DCP8 and then at DCP1
 #
@@ -25,6 +26,7 @@
 #                 or none
 #   DCP_VARIANTS  ATOM_M3PRO_VARIANTS (default C64_VARIANTS below: the CONC 64 recipe's, plus
 #                 score_tq_causal, index_day0 (no effect under DCP) and dcp_topk_merge)
+#   AB_VARIANTS   ab's second arm's ATOM_M3PRO_VARIANTS
 #   MAX_MODEL_LEN --max-model-len (default 1048576)
 #   DRY_RUN=1     print the server's environment and command line instead of starting it
 
@@ -261,13 +263,18 @@ step_restore() {
 
 step_ab() {
     local out="$M31PRO_OUT/ab" rc=0 lines arm
-    local gather="${C64_VARIANTS/\"dcp_topk_merge\": true/\"dcp_topk_merge\": false}"
+    local a="$DCP_VARIANTS"
+    local b="${AB_VARIANTS:-${a/\"dcp_topk_merge\": true/\"dcp_topk_merge\": false}}"
+    if [ "$a" = "$b" ]; then
+        echo "ERROR: ab's arms are the same variants; set AB_VARIANTS" >&2
+        return 1
+    fi
     [ -n "${DRY_RUN:-}" ] || mkdir -p "$out"
-    for arm in merge gather; do
-        if [ "$arm" = merge ]; then
-            DCP_VARIANTS="$C64_VARIANTS"
+    for arm in a b; do
+        if [ "$arm" = a ]; then
+            DCP_VARIANTS="$a"
         else
-            DCP_VARIANTS="$gather"
+            DCP_VARIANTS="$b"
         fi
         start_dcp "ab_$arm" || return 1
         [ -n "${DRY_RUN:-}" ] && continue
@@ -278,8 +285,8 @@ step_ab() {
     done
     [ -n "${DRY_RUN:-}" ] && return 0
     for lines in $LENGTHS; do
-        if ! cmp -s "$out/merge_$lines.json" "$out/gather_$lines.json"; then
-            echo "ERROR: dcp_topk_merge changed the $lines-line answers" >&2
+        if ! cmp -s "$out/a_$lines.json" "$out/b_$lines.json"; then
+            echo "ERROR: the $lines-line answers differ between $a and $b" >&2
             rc=1
         fi
     done

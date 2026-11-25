@@ -105,6 +105,23 @@ def test_ab_launches_differ_only_in_dcp_topk_merge(tmp_path):
     assert a == b
 
 
+def test_ab_runs_dcp_variants_against_ab_variants(tmp_path):
+    (env, _), = _launches(_dry("serve", tmp_path).stdout)
+    c64 = json.loads(env["ATOM_M3PRO_VARIANTS"])
+    fold = json.dumps(dict(c64, dcp_fold=True))
+    done = _dry("ab", tmp_path, DCP_VARIANTS=fold, AB_VARIANTS=json.dumps(c64))
+    assert done.returncode == 0, done.stdout + done.stderr
+    (env_a, _), (env_b, _) = _launches(done.stdout)
+    a = json.loads(env_a["ATOM_M3PRO_VARIANTS"])
+    b = json.loads(env_b["ATOM_M3PRO_VARIANTS"])
+    assert a.pop("dcp_fold") is True and a == b
+
+
+def test_ab_refuses_arms_of_the_same_variants(tmp_path):
+    done = _dry("ab", tmp_path, DCP_VARIANTS='{"kernels": true}')
+    assert done.returncode == 1 and "set AB_VARIANTS" in done.stderr
+
+
 def test_an_unknown_offload_mode_is_refused(tmp_path):
     done = _dry("serve", tmp_path, OFFLOAD="bogus")
     assert done.returncode == 1
