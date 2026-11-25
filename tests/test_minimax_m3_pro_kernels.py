@@ -978,6 +978,34 @@ class TestSelectRowsSplit:
             got = K.select_rows_split(score, bt, seq, pos, 128, fused=fused)
             assert torch.equal(got[0], want[0]) and torch.equal(got[1], want[1])
 
+    @pytest.mark.skipif(not GPU, reason="the interpreter compiles nothing to count")
+    @pytest.mark.parametrize("fused", [True, False])
+    def test_no_compile_after_the_first_launch(self, fused):
+        # 512+ rows run one span over the whole row, so a prefill's span grows a 16k-token
+        # band at a time (fewer rows: 2 to 9 spans of 1024-3072 blocks). A compile is
+        # seconds of stall: the first launch (the server's warmup: a short, one-chunk
+        # span) compiles the span kernel for one-chunk spans and the one for every
+        # wider span, and no context compiles another (the unfused merge: once)
+        dev = torch.cuda.current_device()
+        kernels = (K._select_split_kernel, K._select_merge_kernel)
+        for kernel in kernels:
+            kernel.device_caches.clear()
+        K._wide_warmed.clear()
+        for t in (9, 200, 600, 1200):
+            for width in (1024, 3000, 6000, 8256):  # contexts of 16k, 48k, 96k, 132k
+                score, bt, seq, pos = self._case(t, width, seed=t + width)
+                want = K.select_rows(
+                    score.masked_fill(score.isnan(), float("-inf")), bt, seq, pos, 128
+                )
+                got = K.select_rows_split(score, bt, seq, pos, 128, fused=fused)
+                assert torch.equal(got[0], want[0]) and torch.equal(got[1], want[1]), (
+                    t,
+                    width,
+                )
+                compiled = [len(kernel.device_caches[dev][0]) for kernel in kernels]
+                assert compiled[0] == 2, (t, width, compiled)
+        assert compiled == [2, 0 if fused else 1]
+
     @pytest.mark.skipif(not GPU, reason="CUDA graphs need a GPU")
     @pytest.mark.parametrize("t", [4, 32])
     def test_graph_replays_other_rows(self, t):

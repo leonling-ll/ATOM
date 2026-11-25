@@ -2239,8 +2239,19 @@ def _merge_keys(base, count, K: tl.constexpr, VOLATILE: tl.constexpr):
     return best
 
 
+# SPAN is a runtime argument: a long prefill's SPAN grows with its context (a value per
+# 16k-token band), and as a constexpr each new value compiled this large kernel again.
+# WIDE (SPAN > CHUNK) stays a constexpr: spans of one chunk (decode, short prefills) run
+# a kernel compiled without the chunk loop, smaller and faster; one more serves the rest
 @triton.jit(
-    do_not_specialize=["stride_s", "stride_bt", "stride_rows", "stride_ctx", "NB"]
+    do_not_specialize=[
+        "stride_s",
+        "stride_bt",
+        "stride_rows",
+        "stride_ctx",
+        "NB",
+        "SPAN",
+    ]
 )
 def _select_split_kernel(
     score_ptr,
@@ -2256,14 +2267,17 @@ def _select_split_kernel(
     part_ptr,  # [T, P, K] int64 scratch
     count_ptr,  # [T] int32 arrivals, zero between calls (FUSED only)
     NB,
-    SPAN: tl.constexpr,
+    SPAN,
     K: tl.constexpr,
     CHUNK: tl.constexpr,
     PG: tl.constexpr,
     FUSED: tl.constexpr,
     IS_HIP: tl.constexpr,
     LOGICAL: tl.constexpr = False,
+    WIDE: tl.constexpr = True,
 ):
+    if not WIDE:  # a chunk a span: a constant, so no chunk loop is compiled
+        SPAN = CHUNK
     t = tl.program_id(0)
     part = tl.program_id(1)
     qpos = tl.load(pos_ptr + t)
@@ -2326,7 +2340,9 @@ def _select_split_kernel(
             tl.atomic_xchg(count_ptr + t, 0, sem="relaxed", scope="gpu")
 
 
-@triton.jit(do_not_specialize=["stride_bt", "stride_rows", "stride_ctx", "NB", "P"])
+@triton.jit(
+    do_not_specialize=["stride_bt", "stride_rows", "stride_ctx", "NB", "P", "SPAN"]
+)
 def _select_merge_kernel(
     bt_ptr,
     stride_bt,
@@ -2339,7 +2355,7 @@ def _select_merge_kernel(
     part_ptr,
     NB,
     P,
-    SPAN: tl.constexpr,
+    SPAN,
     K: tl.constexpr,
     PG: tl.constexpr,
     LOGICAL: tl.constexpr = False,
@@ -2378,6 +2394,8 @@ def _select_merge_kernel(
 # allocated in a capture there. A caller that captures first must replay that graph before
 # any other use of the stream's counters.
 _split_buffers: dict[tuple, list[torch.Tensor]] = {}
+# the (device, constants) whose wide span kernel ``select_rows_split`` has compiled
+_wide_warmed: set[tuple] = set()
 
 
 def _split_buffer(kind, numel, dtype, device):
@@ -2434,7 +2452,7 @@ def select_rows_split(
         fused = True
     part = _split_buffer("part", t * parts * k, torch.int64, dev)
     count = _split_buffer("count", t, torch.int32, dev)
-    _select_split_kernel[(t, parts)](
+    args = (
         score,
         score.stride(0),
         block_tables,
@@ -2448,15 +2466,25 @@ def select_rows_split(
         part,
         count,
         nb,
-        SPAN=span,
-        K=k,
-        CHUNK=chunk,
-        PG=PAGE,
-        FUSED=fused,
-        IS_HIP=dev.type == "cuda" and torch.version.hip is not None,
-        LOGICAL=logical,
-        num_warps=num_warps,
     )
+    meta = {
+        "SPAN": span,
+        "K": k,
+        "CHUNK": chunk,
+        "PG": PAGE,
+        "FUSED": fused,
+        "IS_HIP": dev.type == "cuda" and torch.version.hip is not None,
+        "LOGICAL": logical,
+        "num_warps": num_warps,
+    }
+    _select_split_kernel[(t, parts)](*args, WIDE=span > chunk, **meta)
+    warm = (dev, k, chunk, fused, logical, num_warps)
+    if span <= chunk and warm not in _wide_warmed:
+        # the first one-chunk launch of these constants (the startup warmup's forwards
+        # and graph captures) also compiles, without running, the wide kernel: its
+        # first use is a long prefill, which a compile would stall for seconds
+        _wide_warmed.add(warm)
+        _select_split_kernel.warmup(*args, WIDE=True, grid=(t, parts), **meta)
     if not fused and parts > 1:
         _select_merge_kernel[(t,)](
             block_tables,
