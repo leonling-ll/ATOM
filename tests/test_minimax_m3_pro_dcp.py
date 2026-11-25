@@ -159,13 +159,15 @@ def test_pins_a_ranks_causal_columns_by_global_block(K, init, local):
         assert torch.equal(got[causal], want[causal])
 
 
+@pytest.mark.parametrize("fold", [False, True])
 @pytest.mark.parametrize("split", [False, True])
 @pytest.mark.parametrize("per_seq", [1, 6])
-def test_topk_merge_selects_as_the_gathered_scores(K, split, per_seq):
+def test_topk_merge_selects_as_the_gathered_scores(K, split, per_seq, fold):
     """``dcp_topk_merge``: each rank's best k, all-gathered as sort keys and merged, is
     the gathered scores' selection cut to the rank, order included: with ties, -inf
     blocks, pins, junk past a rank's causal blocks (pinned too), rows with fewer than k
-    causal blocks and rows with none on a rank."""
+    causal blocks and rows with none on a rank. ``fold``: the selection's own keys are
+    ``dcp_local_keys``' (the all-gather is handed exactly those)."""
     world, k, init, local = 4, 8, 1, 2
     c = Split([300, 517, 70, 20], world)
     seq, pos = c.rows(per_seq)
@@ -192,8 +194,32 @@ def test_topk_merge_selects_as_the_gathered_scores(K, split, per_seq):
             assert torch.equal(x, keys[r])
             return gathered
 
-        got = K.dcp_select(parts[r], qpos[r], k, r, world, gather, split=split)
+        got = K.dcp_select(
+            parts[r], qpos[r], k, r, world, gather, split=split, fold=fold
+        )
         assert torch.equal(got, K.dcp_local_selection(want, r, world))
+
+
+@pytest.mark.parametrize("fused", [True, False])
+def test_the_folded_keys_over_spans_are_dcp_local_keys(K, fused):
+    """``dcp_fold``'s keys from a selection over several spans (merged by the last span
+    or a second launch) and from the one-launch one are ``dcp_local_keys``' of their
+    ids, bit for bit: ties, -inf blocks, a row with no causal block on the rank, one
+    with fewer than k."""
+    world, r, k, nb = 4, 2, 8, 200
+    g = torch.Generator().manual_seed(11)
+    pos = torch.tensor([-16, 5, 100, 1000, 3199, 2000, 47]).to(DEV)
+    s = torch.randint(0, 6, (len(pos), nb), generator=g).float()
+    s[torch.rand(s.shape, generator=g) < 0.1] = float("-inf")
+    s = s.to(DEV)
+    split = dict(parts=3, chunk=32, fused=fused, logical=True)
+    ids = K.select_rows_split(s, s, pos, pos, k, **split)[0]
+    got = K.select_rows_split(s, s, pos, pos, k, dcp_keys=(r, world), **split)[0]
+    assert got.dtype == torch.int64
+    assert torch.equal(got, K.dcp_local_keys(s, ids, pos, r, world))
+    ids = K.select_logical(s, pos, k)
+    got = K.select_logical(s, pos, k, dcp_keys=(r, world))
+    assert torch.equal(got, K.dcp_local_keys(s, ids, pos, r, world))
 
 
 @pytest.mark.parametrize("splits", [1, 4])
@@ -272,11 +298,80 @@ def test_an_fp8_query_attends_as_its_values_do(K, splits):
         out = torch.empty(len(pos), 16 * 192, dtype=DT, device=DEV)
         lse = torch.empty(len(pos), 16, device=DEV)
         K.attention(
-            q, rk.kc, rk.bt, seq, qpos, sel, out, D**-0.5, splits, valid_first=True,
+            q,
+            rk.kc,
+            rk.bt,
+            seq,
+            qpos,
+            sel,
+            out,
+            D**-0.5,
+            splits,
+            valid_first=True,
             lse=lse,
         )
         got.append((out, lse))
     assert torch.equal(got[0][0], got[1][0]) and torch.equal(got[0][1], got[1][1])
+
+
+@pytest.mark.parametrize("splits", [1, 4])
+def test_the_attention_stores_the_lse_repeated(K, splits):
+    """``lse_rep``: each head's LSE stored that many times in a row, bit for bit the
+    plain store's ``repeat_interleave``, the output as it was; -inf where a row sees no
+    key on the rank."""
+    world, r = 4, 3
+    c = Split([40, 517, 70], world, seed=2)
+    seq, pos = c.rows(4)
+    g = torch.Generator().manual_seed(9)
+    q = torch.randn(len(pos), 16, D, generator=g).to(DT).to(DEV)
+    rk = c.ranks[r]
+    sel = torch.stack([torch.randperm(8, generator=g) for _ in pos]).int().to(DEV)
+    qpos = K.dcp_local_positions(pos, r, world)
+    got = []
+    for rep in (1, 3):
+        out = torch.empty(len(pos), 16 * 192, dtype=DT, device=DEV)
+        lse = torch.empty(len(pos), 16 * rep, device=DEV)
+        K.attention(
+            q,
+            rk.kc,
+            rk.bt,
+            seq,
+            qpos,
+            sel,
+            out,
+            D**-0.5,
+            splits,
+            valid_first=True,
+            lse=lse,
+            lse_rep=rep,
+        )
+        got.append((out, lse))
+    (o1, l1), (o3, l3) = got
+    assert torch.equal(o1, o3) and torch.equal(l3, l1.repeat_interleave(3, dim=1))
+    assert (l1 == float("-inf")).any() and torch.isfinite(l1).any()
+
+
+def test_the_all_to_all_merge_writes_the_callers_buffer(monkeypatch):
+    """``dcp_fold``'s merge: the a2a combine into the caller's ``[B, H_local, D]`` (the
+    layer's output viewed as 48 heads of 64), bit for bit its own buffer's, returned."""
+    from conftest import gpu_stack_import
+
+    dcp_ops = gpu_stack_import("atom.model_ops.dcp_ops")
+
+    def all_to_all(recv, send, group=None):  # every rank sends what this one does
+        recv.copy_(send)
+
+    monkeypatch.setattr(torch.distributed, "all_to_all_single", all_to_all)
+    group = SimpleNamespace(world_size=8, device_group=None)
+    g = torch.Generator().manual_seed(4)
+    of = torch.randn(5, 8 * 48, 64, generator=g).to(DT).to(DEV)
+    lse = torch.randn(5, 8 * 48, generator=g).to(DEV)
+    lse[1] = float("-inf")  # a row no rank holds a key of
+    want = dcp_ops.cp_lse_a2a(of, lse, group)
+    for merge in (dcp_ops.cp_lse_a2a, dcp_ops.dcp_lse_merge):
+        out = torch.full((5, 16 * 192), float("nan"), dtype=DT, device=DEV)
+        got = merge(of, lse, group, out=out.view(5, 48, 64))
+        assert got.data_ptr() == out.data_ptr() and torch.equal(got, want)
 
 
 def test_prefill_gather_holds_every_block(K):
@@ -455,11 +550,12 @@ def mailbox(monkeypatch):
         calls["mailbox"] = (out, lse, res)
         return res.fill_(7)
 
-    def a2a(out, lse, group, owned_counts=None, quant_dtype=None):
-        calls["a2a"] = (out, lse)
-        return torch.arange(out.shape[0] * out.shape[1] // 8 * 64.0).view(
-            out.shape[0], -1, 64
+    def a2a(of, lse, group, owned_counts=None, quant_dtype=None, out=None):
+        calls["a2a"] = (of, lse, out)
+        merged = torch.arange(of.shape[0] * of.shape[1] // 8 * 64.0).view(
+            of.shape[0], -1, 64
         )
+        return merged if out is None else out.copy_(merged)
 
     monkeypatch.setitem(
         sys.modules,
@@ -533,11 +629,32 @@ def test_a_decode_merge_combines_in_the_mailbox_else_by_all_to_all(
         assert res.shape == (rows, 16, 192) and res.data_ptr() == out.data_ptr()
         assert (out == 7).all() and "a2a" not in calls
     else:
-        o, l = calls["a2a"]
+        o, l, buf = calls["a2a"]
         assert o.shape == (rows, 384, 64) and o.data_ptr() == of.data_ptr()
-        assert torch.equal(l, lse.repeat_interleave(3, dim=1))
+        assert torch.equal(l, lse.repeat_interleave(3, dim=1)) and buf is None
         want = torch.arange(rows * 48 * 64.0).to(torch.bfloat16).view(rows, -1)
         assert torch.equal(out, want) and "mailbox" not in calls
+
+
+@pytest.mark.parametrize("on", [False, True])
+def test_dcp_fold_merges_a_repeated_lse_into_the_output(mailbox, monkeypatch, on):
+    """``dcp_fold``: the attention's LSE comes repeated once a 64-wide part, which the
+    all-to-all takes as it is (and the mailbox, reading each head's once, leaves), and
+    its combine writes the layer's output."""
+    impl, _, _, calls, group = mailbox
+    assert impl._prepare_dcp_mailbox(8)
+    impl.dcp_mailbox = on
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+    g = torch.Generator().manual_seed(0)
+    of = torch.randn(8, 8 * 16 * 192, generator=g).to(torch.bfloat16)
+    lse = torch.randn(8, 8 * 16 * 3, generator=g)
+    out = torch.zeros(8, 16 * 192, dtype=torch.bfloat16)
+    assert impl._dcp_merge(group, of, lse, out, fold=True) is out
+    o, l, buf = calls["a2a"]
+    assert o.shape == (8, 384, 64) and l is lse and "mailbox" not in calls
+    assert buf.shape == (8, 48, 64) and buf.data_ptr() == out.data_ptr()
+    want = torch.arange(8 * 48 * 64.0).to(torch.bfloat16).view(8, -1)
+    assert torch.equal(out, want)
 
 
 @pytest.fixture
@@ -579,13 +696,14 @@ def decode(monkeypatch):
     impl = object.__new__(pro_attn.ProSparseAttentionImpl)
     impl.dcp_world, impl.topk, impl.scale, impl.value_head_dim = 8, 128, 0.1, 192
 
-    def merge(group, of, lse, out):
-        calls["merge"] = (of, lse)
+    def merge(group, of, lse, out, fold=False):
+        calls["merge"] = (of, lse, fold)
         return out
 
     impl._dcp_merge = merge
 
-    def run(**variants):
+    def run(mailbox=False, **variants):
+        impl.dcp_mailbox = mailbox
         v = pro_attn.ProVariants(dcp_topk_merge=True, topk="split", **variants)
         n = 12
         q = torch.randn(n, 16, 256).to(torch.bfloat16)
@@ -621,3 +739,19 @@ def test_dcp_q_fp8_gathers_the_query_as_its_e4m3_cast(decode, fp8):
     assert qa.dtype == sent.dtype and qa.shape == (12, 128, 256)
     assert of.dtype == out.dtype == torch.bfloat16 and of.shape == (12, 128 * 192)
     assert calls["merge"][0] is of
+
+
+@pytest.mark.parametrize("fold, mailbox, rep", [(0, 0, 1), (1, 0, 3), (1, 1, 1)])
+def test_dcp_fold_asks_for_the_keys_the_lse_as_merged_and_the_output(
+    decode, fold, mailbox, rep
+):
+    """``dcp_fold`` has the selection store its keys, the attention the LSE as the
+    all-to-all reads it (once a head under the mailbox merge) and the merge the
+    output."""
+    run, calls = decode
+    run(mailbox=bool(mailbox), dcp_fold=bool(fold))
+    assert calls["select"]["fold"] is bool(fold)
+    _, of, kw = calls["attention"]
+    assert kw["lse_rep"] == rep and kw["lse"].shape == (12, 128 * rep)
+    m_of, m_lse, m_fold = calls["merge"]
+    assert m_of is of and m_lse is kw["lse"] and m_fold is bool(fold)

@@ -738,6 +738,7 @@ def cp_lse_a2a(
     return_lse: bool = False,
     owned_counts=None,
     quant_dtype=None,
+    out=None,
 ):
     """A2A backend: pack -> one all-to-all -> local LSE combine.
 
@@ -758,6 +759,8 @@ def cp_lse_a2a(
             ``scale is None`` in the return means the output came back
             UNQUANTIZED and the caller must quantize as before; that is the
             single-rank shortcut below, not an error.
+        out: optional ``[B, H_local, D]`` buffer (unit last stride) the combine
+            writes and returns instead of a new one; not with ``quant_dtype``.
     """
     # Checked before the single-rank shortcut, not after: that path returns
     # early, so an assertion below it would let the one caller combination this
@@ -765,13 +768,15 @@ def cp_lse_a2a(
     assert (
         quant_dtype is None or not return_lse
     ), "cp_lse_a2a: the fused-quant combine does not emit LSE"
+    assert out is None or quant_dtype is None, "cp_lse_a2a: out takes unquantized rows"
 
     n_ranks = cp_group.world_size
     if n_ranks == 1:
         if quant_dtype is not None:
             # Nothing to combine, so there is no kernel to fold the quant into.
             return cp_attn_out, None
-        return (cp_attn_out, cp_attn_lse) if return_lse else cp_attn_out
+        merged = cp_attn_out if out is None else out.copy_(cp_attn_out)
+        return (merged, cp_attn_lse) if return_lse else merged
 
     b, h_total, head_dim = cp_attn_out.shape
     assert h_total % n_ranks == 0, (
@@ -844,7 +849,9 @@ def cp_lse_a2a(
         )
         return out, out_scale
 
-    out = torch.empty((b, h_local, head_dim), dtype=dtype, device=dev)
+    if out is None:
+        out = torch.empty((b, h_local, head_dim), dtype=dtype, device=dev)
+    assert out.shape == (b, h_local, head_dim) and out.stride(2) == 1, out.shape
     out_lse = (
         torch.empty((b, h_local), dtype=torch.float32, device=dev)
         if return_lse
@@ -1048,6 +1055,7 @@ def dcp_lse_merge(
     ctx=None,
     owned_counts=None,
     quant_dtype=None,
+    out=None,
 ):
     """Reconstruct the global softmax from the per-rank partials.
 
@@ -1069,10 +1077,14 @@ def dcp_lse_merge(
     when its workspace was prepared (``prepare_dcp_mailbox``) and the call
     fits it, else all-to-all. Every input to that choice is the same on every
     rank of the group.
+
+    ``out`` (no ``quant_dtype``): the ``[B, H_local, D]`` buffer the merged
+    output is returned in, written by the combine itself on the a2a and
+    mailbox backends.
     """
     if backend == "mailbox":
         merged = _dcp_mailbox_merge(
-            cp_attn_out, cp_attn_lse, cp_group, owned_counts, quant_dtype
+            cp_attn_out, cp_attn_lse, cp_group, owned_counts, quant_dtype, res=out
         )
         if merged is not None:
             return merged
@@ -1084,6 +1096,7 @@ def dcp_lse_merge(
             cp_group,
             owned_counts=owned_counts,
             quant_dtype=quant_dtype,
+            out=out,
         )
     assert (
         quant_dtype is None
@@ -1092,7 +1105,8 @@ def dcp_lse_merge(
         # AG+RS has no existing kernel before its LSE AllGather. The default
         # A2A path above fuses this mask and remains launch-free.
         cp_attn_lse = mask_empty_dcp_lse(cp_attn_lse, owned_counts)
-    return cp_lse_ag_out_rs(cp_attn_out, cp_attn_lse, cp_group, ctx=ctx)
+    merged = cp_lse_ag_out_rs(cp_attn_out, cp_attn_lse, cp_group, ctx=ctx)
+    return merged if out is None else out.copy_(merged)
 
 
 def dcp_gather_compressed_kv(

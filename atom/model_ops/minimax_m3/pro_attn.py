@@ -218,6 +218,11 @@ class ProVariants:
     # The Triton attention reads them back exactly, so q rounds as at DCP 1's day0 decode
     # (not bit for bit the bf16 DCP decode).
     dcp_q_fp8: bool = False
+    # Under DCP a decode / verify step's selection stores the sort keys it all-gathers
+    # itself, the all-to-all merge writes the output itself, and (without dcp_mailbox,
+    # which reads each head's LSE once) the attention stores the LSE once a 64-wide part,
+    # as that merge reads it: up to three launches fewer a layer, bit for bit.
+    dcp_fold: bool = False
     # vLLM's compressed index cache: every 4 index keys softmax-pooled into one bf16 row
     # (ic_c [pages, 4, 128]), written after prep; the scorer reads those rows only.
     index_compress: bool = False
@@ -1525,15 +1530,16 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
         cap = rows * group.world_size * heads * dim
         return prepare_dcp_mailbox(group, heads, dim, rows, max_elems=cap)
 
-    def _dcp_merge(self, group, of, lse, out):
+    def _dcp_merge(self, group, of, lse, out, fold=False):
         """The log-sum-exp merge of every head's partial output ``of`` ``[n, W * 16 *
-        192]`` (``lse`` ``[n, W * 16]``) into this rank's heads' ``out`` ``[n, 16 * 192]``."""
+        192]`` (``lse`` ``[n, W * 16]``, or repeated once a 64-wide part) into this
+        rank's heads' ``out`` ``[n, 16 * 192]``; ``fold``: the merge writes ``out``."""
         from atom.config import get_current_atom_config
         from atom.model_ops.dcp_ops import dcp_lse_merge, dcp_mailbox_merge
 
         n, dv = out.shape[0], self.value_head_dim
-        h = lse.shape[1]
-        if self.dcp_mailbox:
+        h = of.shape[1] // dv
+        if self.dcp_mailbox and lse.shape[1] == h:
             res = out.view(n, -1, dv)
             if dcp_mailbox_merge(of.view(n, h, dv), lse, group, res) is not None:
                 return out
@@ -1541,11 +1547,13 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
         parts = dv // 64
         merged = dcp_lse_merge(
             of.view(n, h * parts, 64),
-            lse.repeat_interleave(parts, dim=1),
+            lse.repeat_interleave(parts, dim=1) if lse.shape[1] == h else lse,
             group,
             backend=get_current_atom_config().dcp_config.comm_backend,
+            out=out.view(n, -1, 64) if fold else None,
         )
-        out.copy_(merged.reshape(n, -1))
+        if not fold:
+            out.copy_(merged.reshape(n, -1))
         return out
 
     def _dcp_prefill_caches(self, kc4, ks, ic):
@@ -1627,7 +1635,7 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
                 )
 
             sel = pro_kernels.dcp_select(
-                score, qpos, k, r, w, gather, split=v.topk == "split"
+                score, qpos, k, r, w, gather, split=v.topk == "split", fold=v.dcp_fold
             )
         else:
             score = pro_kernels.dcp_interleave(dcp_all_gather(group, score, 0), w)
@@ -1641,7 +1649,8 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
         h = qf.shape[1]
         dv = self.value_head_dim
         of = torch.empty(n, h * dv, dtype=out.dtype, device=q.device)
-        lse = torch.empty(n, h, dtype=torch.float32, device=q.device)
+        rep = dv // 64 if v.dcp_fold and not self.dcp_mailbox else 1
+        lse = torch.empty(n, h * rep, dtype=torch.float32, device=q.device)
         # a rank holds about 1/w of the selected blocks, for w times the heads
         splits = max(
             1, (v.attn_splits or (32 if n <= 16 else 16 if n <= 32 else 8)) // w
@@ -1660,8 +1669,9 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
             k_scale=ks,
             valid_first=True,
             lse=lse,
+            lse_rep=rep,
         )
-        return self._dcp_merge(group, of, lse, out)
+        return self._dcp_merge(group, of, lse, out, fold=v.dcp_fold)
 
     # ---------------------------------------------------------------- forward --
     def decode_split(self, n: int, v: ProVariants, seqs: int = 0):

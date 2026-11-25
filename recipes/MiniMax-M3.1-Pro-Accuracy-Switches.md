@@ -59,6 +59,8 @@ These are switchable on their branches and will be listed above once they are me
     many rows, the same weighted sum in another order (bf16 output within one rounding).
   - `dcp_q_fp8`: the decode query all-gathered as a plain e4m3 cast, as DCP1's day0 decode
     reads it (q rounded to fp8; the bf16 DCP decode does not round it).
+  - `dcp_fold`: the selection stores the sort keys it all-gathers, the attention the LSE
+    as the all-to-all merge reads it, and that merge the layer's output: the same bits.
 - `--enable-tbo` with F1 split collectives: changes all-reduce grouping in prefill.
 - amd-kernels shuffle16 decode GEMMs: cosine ≥ 0.9999999, relative L2 ≤ 4.2e-5 per GEMM.
 - F4, routed + shared expert outputs written in one pass: heavier error tail at the atomic stage-2 rows.
