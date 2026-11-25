@@ -304,9 +304,10 @@ split over the ranks and the FlyDSL / aiter decode, three checks cover hits:
 * `tests/test_minimax_m3_pro_prefix_hit.py`: a request admitted through the block manager's prefix walk
   (a full hit, a half hit) prefills only its uncached rows. It must select the blocks a cold prefill
   selects, write the same cache bytes for its new tokens, leave the shared blocks untouched and give the
-  same attention output, and so must a chunked cold prefill and a rejected, then accepted, k = 7 verify
-  after a hit. Without a GPU the small variants run in Triton's interpreter; the served variants need a
-  GPU, `amd_kernels` on `PYTHONPATH` and an aiter whose `pa_decode_gluon` takes `value_rows`.
+  same attention output within bf16 tolerance, and so must a chunked cold prefill and a rejected, then
+  accepted, k = 7 verify after a hit. Without a GPU the small variants run in Triton's interpreter; the
+  served variants need a GPU, `amd_kernels` on `PYTHONPATH` and an aiter whose `pa_decode_gluon` takes
+  `value_rows`.
   `tests/test_scheduler_spec_prefix_publish.py` checks that DSpark decode publishes a block only once
   all of its KV is final.
 * `scripts/m31pro/pfx_probe.py probe` against a running server (started as the Agentic recipe does,
@@ -350,10 +351,14 @@ Results (MI355X TP8):
   ([#66](https://github.com/zhuyuhua-v/ATOM-M3/issues/66#issuecomment-7168136893)) reads them as
   run-to-run noise, not a hit-path effect. In every layer where two cold prefills of a prompt are bitwise
   equal (layers 0-4; from layer 5 on they already differ), a hit is bitwise equal to a cold prefill
-  chunked at the hit boundary: attention output on every row, the selected blocks, and the prefix K,
-  scale and index pages. No launch wrote a shared page, and the first-token logprob gap of a hit against
-  cold is within the gap of cold against cold. That run prefilled over cached pages with Triton and
-  aiter's paged attention; the hit test covers the day0 prefill over cached pages.
+  chunked at the hit boundary in attention output on every row and in the prefix K, scale and index
+  pages. The selection checksum compared logical block ids only on chunks of 16 rows or fewer, where it
+  is equal through layer 6, as between two cold prefills. On chunks of 17 rows or more the hook recorded
+  physical page ids, so equal selection there is inferred from the bitwise-equal attention output and
+  from a control of two cold prefills, without a hit, that shows the same page-id difference. No launch
+  wrote a shared page, and the first-token logprob gap of a hit against cold is within the gap of cold
+  against cold. That run prefilled over cached pages with Triton and aiter's paged attention; the hit
+  test covers the day0 prefill over cached pages.
 * gsm8k_pfx at 5812c071, both servers with the Agentic variants without `ATOM_TOKEN_GRAPH_SIZES`: 0.9325
   with prefix caching, 0.9196 without, 34 questions right to wrong and 51 wrong to right (McNemar
   p 0.082), cached share 0.993, measured AL 4.10 on both (golden 2.94). Both are below `pair`'s absolute
