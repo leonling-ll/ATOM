@@ -521,6 +521,9 @@ def ar_norm(c, ins, held, w_post, w_ahead):
         cm = CM_DEV if const_expr(ffn_on) else 0
         _st_words(_pack(v), c["h_mid"], word)
         _st_words(_pack(y), c["x"], word, cm)
+        if const_expr(ffn_on):
+            # the router's x: tagged, so it polls its slice without the flag
+            c["put_words"](c["xr"](), word, _pack(y))
         yb = [bf16_round(ye) for ye in y]
         mx_store(c, c["x8"], c["x8s"], t, col, yb, cm)
         if const_expr(ffn_on and c["routed_act"] == "fp4"):
@@ -690,6 +693,10 @@ def build(key: P1Build):
                 "red1": fx.recast_iter(fx.Float32, xs + (s * xs_row - red_words)),
             }
         if const_expr(ffn_on):
+            # made where the norm puts it: an address held from the kernel's
+            # start costs the o stage SGPRs
+            c["xr"] = lambda: sreg(scratch, slay["xr"][0], "xr")
+        if const_expr(ffn_on):
             # the norm writes MXFP4 x to ``plain`` (one buffer resource over
             # every plain region, a region a word offset); the rest of the
             # FFN's context is made past the norm
@@ -746,7 +753,7 @@ def build(key: P1Build):
             c |= {
                 r: sreg(scratch, slay[r][0], r)
                 for r in FFN_REGIONS
-                if r != "rlog" and r in slay
+                if r not in ("rlog", "xr") and r in slay
             }
             # this CTA's x / x8 / x4 columns are out
             if bid < NT:

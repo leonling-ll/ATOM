@@ -132,7 +132,6 @@ def test_ffn_regions_are_disjoint_and_sized(debug, act):
         assert all(o % 16 == 0 for o, _ in spans)
     s = L.scratch_layout(key)
     t = MAX_ROWS_LAYOUT - 1
-    assert (L.rpart_pair(L.R_TASKS - 1, t, L.R_ROWS - 1) + 1) * 8 == s["rpart"][1]
     assert (L.route_pair(t, 2 * L.TOPK - 1) + 1) * 8 == s["route"][1]
     assert (L.smid_pair(t, L.INTER_S - 2) + 1) * 8 == s["smid"][1]
     assert s["ugf"][1] == L.max_u(MAX_ROWS_LAYOUT) * L.UG_GROUPS * 8
@@ -171,10 +170,33 @@ def test_ffn_regions_are_disjoint_and_sized(debug, act):
         assert p["inter"][1] == MAX_ROWS_LAYOUT * L.TOPK * L.INTER_V * 2
         assert "isc" not in p
     peer = L.peer_layout()
-    assert (L.rlog_pair(L.TP - 1, t, L.E_RANK - 1) + 1) * 8 == peer["rlog"][1]
+    last = L.rlog_pair(L.TP - 1, t, L.R_PARTS - 1, L.E_RANK - 1)
+    assert (last + 1) * 8 == peer["rlog"][1]
     # a norm build has none of them
     norm = L.P1Build(tokens=MAX_ROWS)
     assert L.plain_layout(norm) == {} and "route" not in L.scratch_layout(norm)
+
+
+def test_every_router_part_has_its_own_logit_slot_on_every_rank():
+    """Each router part sends its fp32 partial to every rank's ``rlog`` and
+    the route adds the parts there: a (rank, token, part, expert) slot each,
+    all inside the region, and no router-to-router hand-off left on the
+    route's path."""
+    rows = range(MAX_ROWS_LAYOUT)
+    got = [
+        L.rlog_pair(src, t, q, e)
+        for src in range(L.TP)
+        for t in rows
+        for q in range(L.R_PARTS)
+        for e in range(L.E_RANK)
+    ]
+    assert len(set(got)) == len(got)
+    assert min(got) == 0 and (max(got) + 1) * 8 == L.peer_layout()["rlog"][1]
+    key = L.P1Build(tokens=MAX_ROWS, upto="ffn", inter_r=INTER_R)
+    router = [d for d in L.decls(key) if "router" in d.writers]
+    assert [(d.name, d.space, d.exchange) for d in router] == [
+        ("rlog", Space.PEER, False)
+    ]
 
 
 @pytest.mark.parametrize("act", ROUTED_ACTS)
@@ -405,7 +427,6 @@ def test_ffn_build_key_and_contract_table():
     got = {d.name: (d.space, d.writers, d.exchange) for d in L.decls(key)}
     assert set(got) == set(L.REGIONS)
     assert got["rlog"] == (Space.PEER, ("router",), False)
-    assert got["rpart"] == (Space.SCRATCH, ("router",), True)
     assert got["ugf"][:2] == (Space.SCRATCH, ("ug",))
     # a half-0 ug task polls its half-1 task's partials, ug to ug
     assert got["ugp"] == (Space.SCRATCH, ("ug",), True)

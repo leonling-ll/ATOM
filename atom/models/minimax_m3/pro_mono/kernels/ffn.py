@@ -114,7 +114,6 @@ from atom.models.minimax_m3.pro_mono.layout import (
     rlog_pair,
     route_cta0,
     route_pair,
-    rpart_pair,
     smid_pair,
     task_list,
     token_tiles,
@@ -288,6 +287,29 @@ def wait_x(c):
 # ------------------------------------------------------------ router
 
 
+@traced
+def load_xr(c, q, xrow):
+    """Router K slice q of every token's bf16 x -> ``xl`` (``xrow`` a row),
+    polled from the norm's tagged ``xr`` pairs: two pairs (four columns) a
+    thread a row, threads 2 m + h on rows h, h + 2, .. (the last row again
+    past S, not stored). One round trip after the slice's norm CTAs, where the
+    ``xrdy`` flags then x's loads took two after every norm CTA. The row
+    is a lane's (h = tid % 2), not a wave's: wave-uniform rows held their
+    offsets in SGPRs across the poll's spin."""
+    s, tid = c["S"], c["tid"]
+    h, m = tid % 2, tid // 2
+    rows = [fx.min(h + 2 * k, s - 1) for k in range(-(-s // 2))]
+    xr = c["xr"]()
+    got = c["poll"]([(xr, (t * HIDDEN + q * R_KLEN) // 2 + 2 * m, 2) for t in rows])
+    for k in range_constexpr(len(rows)):
+        if h + 2 * k < s:
+            fx.ptr_store(
+                fx.Vector.from_elements(got[k], fx.Int32),
+                c["xl"] + (rows[k] * xrow + 4 * m) // 2,
+            )
+    gpu.barrier()
+
+
 def router_loads(c, task):
     """Router task ``task``'s weights for this wave: rows 16 i .. of the
     rank's band, K slice q (``R_KLEN``), one 128-column chunk a wave."""
@@ -307,18 +329,17 @@ def router_loads(c, task):
 @traced
 def stage_router(c, task, ops):
     """Router task (i, q) = (task / R_PARTS, task % R_PARTS): its rows against
-    x's K slice q (bf16 MFMA, fp32). Parts q > 0 publish their fp32 partials;
-    part 0 adds them in part order and sends the fp32 logits to every rank's
-    ``rlog``, unrounded as production's ``moe_route_glue`` keeps them: a bf16
-    rounding here picks another 4th expert where the 4th and 5th scores are
-    closer than its error."""
+    x's K slice q (bf16 MFMA, fp32), the fp32 partial sent to every rank's
+    ``rlog`` (part q's slot). The route adds the parts in part order, the
+    logits kept fp32 as production's ``moe_route_glue`` keeps them: a bf16
+    rounding picks another 4th expert where the 4th and 5th scores are closer
+    than its error. Each part sends its own: a part 0 that polled the other
+    parts' partials first put a device-scope round trip on the route's
+    path."""
     s, tid, lane, wave = c["S"], c["tid"], c["lane"], c["wave"]
     i, q = task // R_PARTS, task % R_PARTS
     xrow = R_KLEN + gemv.LDS_PAD
-    wait_x(c)
-    gemv.rows_to_lds(
-        tid, c["x"], R_KLEN, s, c["xl"], xrow, CM_DEV, ldk=HIDDEN, k0=q * R_KLEN
-    )
+    load_xr(c, q, xrow)
     tiles = token_tiles(s)
     for k in range_constexpr(tiles):
         t0, n = tile_span(s, k)
@@ -331,28 +352,19 @@ def stage_router(c, task, ops):
             r = tid % R_ROWS
             t = tid // R_ROWS
             v = row_sum(red_tile(c, k), r, t if k == 0 else t - TOKEN_TILE * k)
-            if q > 0:
-                c["put"](c["rpart"], rpart_pair(task, t, r), v)
-            if q == 0:
-                got = c["poll"](
-                    [
-                        (c["rpart"], rpart_pair(task + p, t, r), 1)
-                        for p in range(1, R_PARTS)
-                    ]
-                )
-                for p in range_constexpr(R_PARTS - 1):
-                    v = v + _f32_of(got[p][0])
-                for p in range_constexpr(TP):
-                    c["put"](c["rlog"][p], rlog_pair(c["rank"], t, i * R_ROWS + r), v)
+            for p in range_constexpr(TP):
+                c["put"](c["rlog"][p], rlog_pair(c["rank"], t, q, i * R_ROWS + r), v)
     gpu.barrier()
 
 
 # ------------------------------------------------------------ route
 
 # The route's words of ``red`` (one wave's): the picks' sigmoids and experts
-# by rank. Its candidates: ``cand`` / ``csig`` in LDS.
+# by rank; past wave 0's words, the 384 logits. Its candidates: ``cand`` /
+# ``csig`` in LDS.
 R_SIG = 64
 R_EXP = R_SIG + TOPK
+R_LOG = 256
 # candidates, two a lane: past this many the route takes the radix path
 ROUTE_CAP = 128
 ROUTE_SLOTS = ROUTE_CAP + BATCH  # ``wave_compact``'s dead tail included
@@ -376,7 +388,8 @@ def _route_rank(cand, csig, n, lane, red):
 
 @traced
 def stage_route(c, t):
-    """Token t (wave 0): the 384 logits of every rank's ``rlog``, 6 a lane
+    """Token t: wave i < 6 adds expert lane + 64 i's R_PARTS partials from
+    ``rlog`` in part order (fp32) -> ``red``; wave 0: the 384 logits, 6 a lane
     (expert lane + 64 i) -> sigmoid -> + bias -> the top 4 ranked by score,
     descending, equal scores the lower expert first -> the unbiased sigmoids
     renormalized in that order, x ``ROUTE_SCALE`` -> ``route``.
@@ -384,18 +397,26 @@ def stage_route(c, t):
     The top 4 by counting (``device.select``'s one-wave form); past
     ``ROUTE_CAP`` candidates (many equal keys) a radix search, same order."""
     lane, wave, red = c["lane"], c["wave"], c["red"]
+    per = EXPERTS // 64
+    # the bias does not depend on the logits: in flight under the poll
+    bias = [ld_f32(weight(c, "bias"), lane + 64 * i) for i in range(per)]
+    if wave < per:
+        e = lane + 64 * wave
+        got = c["poll"](
+            [
+                (c["rlog_own"], rlog_pair(e // E_RANK, t, p, e % E_RANK), 1)
+                for p in range(R_PARTS)
+            ]
+        )
+        lg = _f32_of(got[0][0])
+        for p in range_constexpr(1, R_PARTS):
+            lg = lg + _f32_of(got[p][0])
+        fx.ptr_store(lg, red + (R_LOG + e))
+    gpu.barrier()
     if wave == 0:
-        per = EXPERTS // 64
-        specs = []
-        for i in range_constexpr(per):
-            e = lane + 64 * i
-            specs.append((c["rlog_own"], rlog_pair(e // E_RANK, t, e % E_RANK), 1))
-        # the bias does not depend on the logits: in flight under the poll
-        bias = [ld_f32(weight(c, "bias"), lane + 64 * i) for i in range(per)]
-        got = c["poll"](specs)
         keys, sigs = [], []
         for i in range_constexpr(per):
-            lg = _f32_of(got[i][0])
+            lg = fx.ptr_load(red + (R_LOG + lane + 64 * i))
             sg = hw_rcp(fx.Float32(1.0) + hw_exp2(lg * fx.Float32(-LOG2E)))
             sc = sg + bias[i]
             # a NaN logit (a pad row's garbage) ranks last
