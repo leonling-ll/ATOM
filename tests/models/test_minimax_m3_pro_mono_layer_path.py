@@ -11,14 +11,17 @@
   the wider ones (and every one with mono off) take the glue's launch where
   it applies, else the separate launches;
 * the launch (``ProMonoRunner.launch``, the compiled kernel faked): every
-  ABI argument by name, the layer's ``moe_w`` table in ``MOE_TABLE`` order;
+  ABI argument by name, the layer's ``moe_w`` table in ``MOE_TABLE`` order,
+  the lookahead into its reader's ring rows up to ``FRONT_ROWS``;
 * the segment (``ProMonoRunner.segment``, its launch faked): the lookahead in
   ``resid_in[L + 2]`` as MXFP8, production's MoE on the kernel's (x, x8) under
   ``upto = "norm"`` and none when the build writes the FFN; check mode runs
-  production on a copy of the residual first and logs every output.
+  production on a copy of the residual first and logs every output, its
+  lookahead copied out of the ring rows the kernel then writes.
 
 Needs aiter (``pro`` imports the model stack) and FlyDSL (the runner)."""
 
+import ctypes
 import weakref
 from types import SimpleNamespace
 
@@ -32,6 +35,9 @@ runner_mod = pytest.importorskip("atom.models.minimax_m3.pro_mono.runner")
 
 from atom.model_ops.minimax_m3 import pro_attn
 from atom.model_ops.minimax_m3.pro_attn import ProVariants
+
+# the routed planes' width (Pro's pad_align 128)
+INTER_R = 640
 
 N, H, OK = 3, 8, 6  # rows, hidden, o_proj's K (small stand-ins)
 NATIVE = SimpleNamespace(native_a8_group_rows=1)
@@ -517,19 +523,33 @@ def test_moe_table_holds_the_operands_in_the_kernels_order():
     assert MOE_TABLE[-1] == "queue" and len(set(table.tolist())) == len(MOE_TABLE)
 
 
-@pytest.mark.parametrize("reader", [6, None])
-def test_launch_passes_every_abi_argument(monkeypatch, reader):
-    from atom.models.minimax_m3.pro_mono.layout import (
-        DIMS,
-        HIDDEN,
-        P1Build,
-        queue_word_offset,
+def _state():
+    """A real ``ProLookaheadState`` (lookahead 2 from layer 2) whose layer 6 reads
+    layer 4's lookahead through a native MXFP8 indexer projection."""
+    st = pro.ProLookaheadState(
+        SimpleNamespace(
+            sparse_attention_config={
+                "sparse_indexer_lookahead_num_layers": 2,
+                "sparse_indexer_lookahead_start_layer": 2,
+            }
+        )
     )
+    st.norms[6], st.index_linears[6] = object(), (NATIVE,)
+    return st
+
+
+def _launching(monkeypatch, reader, rows, kernel=None, check=False):
+    """A runner whose ``launch`` and ``segment`` are the real ones over layer 4
+    (``reader``: its lookahead's reader) and a real ``_state()``; the compiled kernel
+    is ``kernel(args by ABI name)`` (default: record them). Returns (runner, the
+    recorded calls, the layer's ``moe_w``, the begin_step calls)."""
+    from atom.models.minimax_m3.pro_mono.layout import P1Build, queue_word_offset
 
     w = _bound()
     r = runner_mod.ProMonoRunner.__new__(runner_mod.ProMonoRunner)
-    r.debug, r.rank, r.first, r.last = False, 3, 4, 4
-    r.scratch_key = P1Build(tokens=1, upto="ffn")
+    r.check, r.debug, r.rank, r.first, r.last = check, False, 3, 4, 4
+    r.state = _state()
+    r.scratch_key = P1Build(tokens=1, upto="ffn", inter_r=INTER_R)
     r.scratch = torch.zeros(16, dtype=torch.uint8)
     queue = r.scratch.data_ptr() + queue_word_offset(r.scratch_key, 4)
     table = runner_mod.moe_table(w, torch.device("cpu"), queue)
@@ -538,13 +558,33 @@ def test_launch_passes_every_abi_argument(monkeypatch, reader):
     r.peers = SimpleNamespace(addresses=torch.zeros(8, dtype=torch.int64))
     steps = []
     r.mailboxes = SimpleNamespace(begin_step=lambda: steps.append(1))
-    kind = r.layers[4].kind
-    r.builds = {2: {kind: "launcher"}}
+    r.builds = {rows: {r.layers[4].kind: "launcher"}}
     got = []
-    monkeypatch.setattr(runner_mod, "_run_compiled", lambda *a: got.append(a))
+
+    def run(launcher, *packed):
+        got.append((launcher, *packed))
+        if kernel is not None:
+            kernel(dict(zip(runner_mod.ABI.names, packed[:-1])))
+
+    monkeypatch.setattr(runner_mod, "_run_compiled", run)
     monkeypatch.setattr(torch.cuda, "current_stream", lambda: "stream")
-    core = torch.zeros(2, DIMS.o_k, dtype=torch.bfloat16)
-    res = torch.zeros(2, HIDDEN, dtype=torch.bfloat16)
+    return r, got, table, steps
+
+
+def _inputs(rows):
+    from atom.models.minimax_m3.pro_mono.layout import DIMS, HIDDEN
+
+    core = torch.zeros(rows, DIMS.o_k, dtype=torch.bfloat16)
+    return core, torch.zeros(rows, HIDDEN, dtype=torch.bfloat16)
+
+
+@pytest.mark.parametrize("rows", [2, pro.FRONT_ROWS, pro.FRONT_ROWS + 1])
+@pytest.mark.parametrize("reader", [6, None])
+def test_launch_passes_every_abi_argument(monkeypatch, reader, rows):
+    from atom.models.minimax_m3.pro_mono.layout import HIDDEN
+
+    r, got, table, steps = _launching(monkeypatch, reader, rows)
+    core, res = _inputs(rows)
     out = r.launch(4, core, res)
     (call,) = got
     assert call[0] == "launcher" and call[-1] == "stream" and steps == [1]
@@ -555,12 +595,94 @@ def test_launch_passes_every_abi_argument(monkeypatch, reader):
     # no forward context: every row real
     assert args["nvalid"] == 0
     assert args["ffn_out"] == out["ffn_out"].data_ptr()
-    assert out["ffn_out"].shape == (2, HIDDEN)
+    assert out["ffn_out"].shape == (rows, HIDDEN)
     for name in ("la8", "la8s"):
         if reader is None:
             assert args[name] == 0 and name not in out
         else:
             assert args[name] == out[name].data_ptr()
+            assert out[name].shape == (rows, runner_mod.OUTPUTS[name][1])
+    if reader is None:
+        return
+    # up to FRONT_ROWS, the lookahead is rows [T, 2T) of its reader's ring slot, where
+    # put writes it and the reader's one front GEMM reads it; past it, new tensors
+    ring = r.state.lookahead_rows(reader, rows, res)
+    if rows <= pro.FRONT_ROWS:
+        assert (
+            args["la8"]
+            == ring[0].data_ptr()
+            == r.state.front_rows(reader, rows, res)[0][rows].data_ptr()
+        )
+        assert args["la8s"] == ring[1].data_ptr()
+        assert out["la8s"].dtype == torch.uint8
+    else:
+        assert ring is None and r.state._ring is None
+
+
+@pytest.mark.parametrize("rows", [1, 8, 16])
+def test_segment_hands_the_reader_the_ring_rows_it_reads_as_one_gemm(
+    monkeypatch, rec, rows
+):
+    """What the reader's ``front_input`` gets after a mono layer: its input norm's rows
+    and the lookahead the kernel wrote are one ring slot, so it takes all 2T rows."""
+    r, _, _, _ = _launching(monkeypatch, 6, rows)
+    layer = _layer(rec)
+    layer.layer_num = 4
+    core, res = _inputs(rows)
+    r.segment(layer, core, res, None)
+    index_src = r.state.source_for(6)
+    front = r.state.front_rows(6, rows, res)
+    x = (front[0][:rows], front[1][:rows])  # where the reader's input norm writes
+    assert pro.ProLookaheadState.front_input(front, rows, x, index_src) is front
+    assert index_src[1].dtype == torch.float8_e8m0fnu
+
+
+def test_check_mode_compares_the_kernels_lookahead_with_productions_copy(
+    monkeypatch, rec, caplog
+):
+    """Production's put and the kernel write the same ring rows: check mode must
+    compare the kernel's lookahead with a copy of production's, not with the rows
+    the kernel just overwrote."""
+    from atom.models.minimax_m3.pro_mono.layout import HIDDEN
+
+    rows = 3
+    monkeypatch.setattr(runner_mod, "capturing", lambda: False)
+
+    def kernel(args):  # writes its outputs; the lookahead differs from production's
+        for name, (dtype, cols) in runner_mod.OUTPUTS.items():
+            if args.get(name, 0):
+                fill = {"la8": 0x20, "la8s": 120}.get(name, 0)
+                size = rows * cols * torch.empty(0, dtype=dtype).element_size()
+                ctypes.memset(args[name], fill, size)
+
+    r, _, _, _ = _launching(monkeypatch, 6, rows, kernel, check=True)
+    r.rank = 0  # the rank that logs
+
+    def norm_mx(x, residual, norm, write_bf16=True, q_out=None, q_scale_out=None):
+        # production's lookahead norm, into the rows put hands it
+        assert q_out is not None and q_scale_out is not None
+        q_out.view(torch.uint8).fill_(0x10)
+        q_scale_out.view(torch.uint8).fill_(127)
+        return None, q_out, q_scale_out, None
+
+    monkeypatch.setattr(pro, "gemma_rms_norm_mxfp8", norm_mx)
+
+    def reference(res):
+        r.state.put(4, res, res)  # the real put: the ring rows of reader 6
+        z, zs = torch.zeros(rows, HIDDEN), torch.zeros(rows, HIDDEN // 32)
+        return z, z, z, z, zs  # ffn, h_mid, x, x8, x8s
+
+    layer = _layer(rec)
+    core, res = _inputs(rows)
+    with caplog.at_level("INFO", logger="atom"):
+        r.segment(layer, core, res, reference)
+    line = caplog.records[-1].getMessage()
+    assert "la8 differ 1.0000" in line and "la8s differ 1.0000" in line, line
+    # the forward goes on from the kernel's lookahead, in the reader's ring rows
+    la, la_s = r.state.resid_in[6]
+    assert la.data_ptr() == r.state.lookahead_rows(6, rows, res)[0].data_ptr()
+    assert (la.view(torch.uint8) == 0x20).all()
+    assert (la_s.view(torch.uint8) == 120).all()
 
 
 def test_the_real_row_count_is_the_forward_contexts(monkeypatch):

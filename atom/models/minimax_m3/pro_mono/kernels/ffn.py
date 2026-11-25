@@ -23,7 +23,7 @@ x8, which the shared expert also reads, and MXFP8 mids, ``quantize_fp8``'s
 rule; the gfx950 f8f6f4 MFMA with the MXFP4 weight as A, cbsz 4, and the
 MXFP8 activation as B, blgp 0), and production's MXFP8 shared expert::
 
-    logit  = bf16(x @ w_gate^T)                       (fp32 accumulate)
+    logit  = x @ w_gate^T                    (fp32 accumulate, kept fp32)
     s      = sigmoid(logit); picks = top-4 of s + bias (lower expert on a tie)
     w_k    = s_k / (s_0 + s_1 + s_2 + s_3) * 2.0      (rank order sum)
     xa     = x               (A16W4: the norm's bf16 x)
@@ -48,8 +48,10 @@ sums ((q0 + q1) + q2) + q3. The routed combine is this kernel's (fp32 sum of
 the bf16 picks, top-k order, then bf16) where gemm2 adds the bf16 picks with
 bf16 atomics in arrival order: more exact, not the same bits.
 
-The routed experts' zero pad (intermediate 640 .. 767, ``layout.INTER_V``) is
-skipped: its mids are exactly zero, whole MXFP4 blocks of their own.
+The routed planes are addressed at the loader's width (``P1Build.inter_r``:
+640 at Pro's ``pad_align`` 128, no pad); a zero pad past the valid 640
+(``layout.INTER_V``; 640 .. 767 at the default 256) is skipped: its mids are
+exactly zero, whole MXFP4 blocks of their own.
 """
 
 import math
@@ -68,12 +70,10 @@ from atom.models.minimax_m3.pro_mono.config import (
     TOPK,
 )
 from atom.models.minimax_m3.pro_mono.layout import (
-    DIMS,
     DOWN_BATCH,
     DOWN_ROWS,
     DOWN_TASKS,
     E_RANK,
-    INTER_R,
     INTER_S,
     INTERB_WORDS,
     MIDB_ROW,
@@ -121,6 +121,7 @@ from atom.models.minimax_m3.pro_mono.layout import (
     ugp_pair,
     w2_scale_word,
     w13_scale_word,
+    w13_up_group,
     xh_word,
 )
 from atom.mono.device import gemv, queue, route
@@ -177,8 +178,6 @@ from atom.mono.plan.execution import BLOCKS, THREADS, WAVES
 from atom.mono.plan.trace import enter_stage
 
 LOG2E = 1.0 / math.log(2.0)
-W13_BYTES = DIMS.w13_bytes
-W2_BYTES = DIMS.w2_bytes
 
 
 def weight(c, name):
@@ -272,8 +271,10 @@ def router_loads(c, task):
 def stage_router(c, task, ops):
     """Router task (i, q) = (task / R_PARTS, task % R_PARTS): its rows against
     x's K slice q (bf16 MFMA, fp32). Parts q > 0 publish their fp32 partials;
-    part 0 adds them in part order, rounds to bf16 (the gate's output dtype)
-    and sends the logits to every rank's ``rlog``."""
+    part 0 adds them in part order and sends the fp32 logits to every rank's
+    ``rlog``, unrounded as production's ``moe_route_glue`` keeps them: a bf16
+    rounding here picks another 4th expert where the 4th and 5th scores are
+    closer than its error."""
     s, tid, lane, wave, red = c["S"], c["tid"], c["lane"], c["wave"], c["red"]
     i, q = task // R_PARTS, task % R_PARTS
     xrow = R_KLEN + gemv.LDS_PAD
@@ -296,7 +297,6 @@ def stage_router(c, task, ops):
             )
             for p in range_constexpr(R_PARTS - 1):
                 v = v + _f32_of(got[p][0])
-            v = bf16_round(v)
             for p in range_constexpr(TP):
                 c["put"](c["rlog"][p], rlog_pair(c["rank"], t, i * R_ROWS + r), v)
     gpu.barrier()
@@ -578,16 +578,16 @@ def load_x4(c):
 # ------------------------------------------------------------ routed ug
 
 
-def ug_row_group(task, wave):
+def ug_row_group(c, task, wave):
     """Wave ``wave``'s 16-row group of w13 in ug task ``task`` (an ug pair:
     slot task / UG_GROUPS, 32 mid columns 32 g ..): waves w % 4 = 0, 1 the
-    gate's two (rows 32 g .., + 16), 2, 3 the up's (rows INTER_R + 32 g ..);
-    w / 4 picks the K slice (``ug_kslice``)."""
+    gate's two (rows 32 g .., + 16), 2, 3 the up's (rows ``inter_r`` + 32 g
+    ..); w / 4 picks the K slice (``ug_kslice``)."""
     g = task % UG_GROUPS
     # bit ops, not % 4: the o stage's wave % 4, merged with this one, was
     # held from there to here and spilled an SGPR
     rgl = wave & 3
-    return (rgl >> 1) * (INTER_R // 16) + 2 * g + (rgl & 1)
+    return (rgl >> 1) * w13_up_group(c["planes"]) + 2 * g + (rgl & 1)
 
 
 def ug_kslice(c):
@@ -611,7 +611,6 @@ def ug_kslice(c):
 # its 14 steps come in three. Every part even (a scale word holds two steps'
 # codes).
 UG_PARTS = {"fp4": (14, 14), "fp8": (8, 10, 10), "bf16": (4, 4, 6)}
-S13_BYTES = EXPERTS * DIMS.w13_scale_bytes
 assert all(not any(n % 2 for n in p) for p in UG_PARTS.values())
 assert sum(UG_PARTS["bf16"]) == W13_Q
 assert sum(UG_PARTS["fp4"]) == sum(UG_PARTS["fp8"]) == W13_HALF
@@ -638,22 +637,28 @@ def ug_loads(c, task, part, live):
     i0, n = ug_parts(c)[part]
     slot = task // UG_GROUPS
     e = uniform(fx.ptr_load(rt["expert"] + slot))
-    rg = uniform(ug_row_group(task, wave))
+    rg = uniform(ug_row_group(c, task, wave))
     s0 = ug_kslice(c) + i0
     # the row group's first step of the part in the descriptor's base, a
     # step's 1 KB in soffset: one address VGPR for every tile (a VGPR offset
     # a step was hoisted out of the loop, 28 of them)
+    planes = c["planes"]
+    w13_bytes = planes.w13_bytes
     r_w = rsrc(
-        c["w13"] + fx.Int64(e) * W13_BYTES + fx.Int64(rg * (2 * HIDDEN) + s0 * 256) * 4,
-        live.select(fx.Int32(W13_BYTES), fx.Int32(0)),
+        c["w13"] + fx.Int64(e) * w13_bytes + fx.Int64(rg * (2 * HIDDEN) + s0 * 256) * 4,
+        live.select(fx.Int32(w13_bytes), fx.Int32(0)),
     )
     # the scale words first: a step's MFMA then waits for its own tile, not
     # for the part's last one (``vmcnt`` counts in issue order)
-    r_s = rsrc(c["s13"], live.select(fx.Int32(S13_BYTES), fx.Int32(0)))
+    s13_bytes = EXPERTS * planes.w13_scale_bytes
+    r_s = rsrc(c["s13"], live.select(fx.Int32(s13_bytes), fx.Int32(0)))
     sw = [
         fx.Int32(
             bo.buffer_load(
-                r_s, w13_scale_word(e, rg, s0 + i, lane), vec_width=1, dtype=T.i32
+                r_s,
+                w13_scale_word(planes, e, rg, s0 + i, lane),
+                vec_width=1,
+                dtype=T.i32,
             )
         )
         for i in range(0, n, 2)
@@ -692,7 +697,7 @@ def ug_mfmas(c, task, ops, part, t, acc):
     lane, wave = c["lane"], c["wave"]
     fp8 = fp8_routed(c)
     i0, n = ug_parts(c)[part]
-    rg = ug_row_group(task, wave)
+    rg = ug_row_group(c, task, wave)
     q = wave >> 2
     av = ops[:n]
     sw = ops[n:]
@@ -1136,7 +1141,7 @@ def w2_scale_words(c, e, rgd, nbytes):
         fx.Int32(
             bo.buffer_load(
                 rsrc(c["s2"], nbytes),
-                w2_scale_word(e, rgd >> 1, m, lane),
+                w2_scale_word(c["planes"], e, rgd >> 1, m, lane),
                 vec_width=1,
                 dtype=T.i32,
             )
@@ -1150,8 +1155,6 @@ def w2_code(words, rgd, st):
     return (words[st // 2] >> ((st % 2) * 16 + (rgd & 1) * 8)) & 0xFF
 
 
-W2_ALL_BYTES = EXPERTS * W2_BYTES
-S2_BYTES = EXPERTS * DIMS.w2_scale_bytes
 W_SD_BYTES = HIDDEN * INTER_S
 S_SD_BYTES = HIDDEN * INTER_S // 32
 
@@ -1167,11 +1170,16 @@ def down_loads(c, rgd, nu, b0, j, live):
     slot = fx.min(b0 + WAVES * j, nu - 1)
     on = live & (b0 + WAVES * j < nu)
     e = uniform(fx.ptr_load(rt["expert"] + slot))
-    sw = w2_scale_words(c, e, rgd, on.select(fx.Int32(S2_BYTES), fx.Int32(0)))
+    planes = c["planes"]
+    s2_bytes = EXPERTS * planes.w2_scale_bytes
+    sw = w2_scale_words(c, e, rgd, on.select(fx.Int32(s2_bytes), fx.Int32(0)))
+    w2_bytes = planes.w2_bytes
     r_w = rsrc(
-        c["w2"] + fx.Int64(e) * W2_BYTES, on.select(fx.Int32(W2_BYTES), fx.Int32(0))
+        c["w2"] + fx.Int64(e) * w2_bytes, on.select(fx.Int32(w2_bytes), fx.Int32(0))
     )
-    av = [fp4_tile_load(r_w, 0, rgd, INTER_R, st, lane * 4) for st in range(W2_STEPS)]
+    # w2's K is the loaded width (``inter_r``); the steps cover the valid 640
+    k = planes.inter_r
+    av = [fp4_tile_load(r_w, 0, rgd, k, st, lane * 4) for st in range(W2_STEPS)]
     return av + sw
 
 
