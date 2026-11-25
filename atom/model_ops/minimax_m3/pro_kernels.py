@@ -1549,6 +1549,9 @@ def scores(
             CAUSAL=causal,
             RPB=CENTROID_ROWS if block_mode == BLOCK_CENTROID else PAGE,
             STRIDE=stride,
+            # the strided loop unpipelined: two stages hold another tile in registers and
+            # measured 1-5 us a layer slower at 16-24 rows (MI355X)
+            **({"num_stages": 1} if stride else {}),
         )
         return out
     if causal:
