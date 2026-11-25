@@ -52,7 +52,8 @@ build's the bf16 x)::
             A16W4 deals them to its two lists alternately; a 1-row build
             places ug and down tasks round-robin, ``queued``), each CTA's
             next task's first w2 batch in flight under the one before; every
-            ug flag polled once: w2 of every expert of U against its
+            ug flag polled once (A16W4: then every pick's bf16 mid row to
+            LDS, the B operands): w2 of every expert of U against its
             picks' mids -> bf16(w acc) a pick, summed in top-k order -> bf16;
             the shared down (MXFP8 of ``smid``) -> bf16; bf16(routed + shared)
             -> ``ffn_out`` [S, 7168], this rank's FFN partial (a padding
@@ -199,6 +200,20 @@ def interb_word(row, blk, col):
 SM_WORDS = INTER_S // 4
 SM_ROW = SM_WORDS + 4
 SMSC_WORDS = INTER_S // 128
+# A16W4: the down's B operands, every pick's bf16 mid row staged in LDS (in
+# ``xs`` past the shared mid's rows), padded so that the 16 rows a lane group
+# reads (a pick column a lane, 16 B each) start 4 banks apart (324 = 4 mod 64)
+MIDB_ROW = INTERB_WORDS + 4
+
+
+def midb_word(row, st, kb, j):
+    """A16W4: the LDS word (from the staged mids, past ``SM_ROW`` words a
+    token) of pick row ``row``'s B operand j of the down's 128-k step ``st``
+    on lane group ``kb``: ``interb_word(row, 4 st + kb, 8 j)`` in a row of
+    ``MIDB_ROW`` words."""
+    return row * MIDB_ROW + (4 * st + kb) * (UG_COLS // 2) + 4 * j
+
+
 # placement: the router on the last CTAs (no o task: their weights are in
 # flight from the start), the route before them, the shared gate_up past the
 # norm CTAs

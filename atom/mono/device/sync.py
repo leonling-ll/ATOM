@@ -13,7 +13,15 @@ from aiter.ops.flydsl.kernels import buffer_ops as bo
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 
-from atom.mono.device.ops import CM_DEV, CM_SYS, bf16_pair, memrealtime, rsrc, traced
+from atom.mono.device.ops import (
+    CM_DEV,
+    CM_SYS,
+    bf16_pair,
+    memrealtime,
+    rsrc,
+    traced,
+    uniform,
+)
 from atom.mono.plan.layout import DIAG_WORDS
 from atom.mono.plan.trace import Space, note
 from atom.mono.polling import POLL_SLEEP_UNITS
@@ -22,10 +30,10 @@ POLL_MAX = 12  # mailbox specs polled per batch (bounds live registers)
 
 
 @traced
-def _spin(load_all, pending):
-    """Re-issue ``load_all`` until ``pending`` clears; a side-effecting op in the
-    loop keeps the loads from being hoisted."""
-    v = load_all()
+def _spin(v, load_all, pending):
+    """Re-issue ``load_all`` until ``pending`` clears, from its first result
+    ``v``; a side-effecting op in the loop keeps the loads from being
+    hoisted."""
     while pending(v):
         rocdl.s_sleep(POLL_SLEEP_UNITS)
         v = load_all()
@@ -46,11 +54,10 @@ DIAG_TICKS = 10 * 100_000_000
 
 
 @traced
-def _spin_bounded(load_all, pending, diag, region_id, index, tag):
+def _spin_bounded(v, load_all, pending, diag, region_id, index, tag):
     """``_spin`` giving up after DIAG_TICKS: the CTA's record in ``diag`` names the
     wait (the runner raises with it after the step), and the kernel runs on."""
     t0 = memrealtime()
-    v = load_all()
     late = fx.Int32(0)
     while pending(v) & (late == 0):
         rocdl.s_sleep(POLL_SLEEP_UNITS)
@@ -170,24 +177,49 @@ class Mailbox:
             cache_modifier=_SCOPE_CM[a.space],
         )
 
-    def spin(self, a, index, load_all, pending):
+    def spin(self, a, index, load_all, pending, first=None):
         """Re-issue ``load_all`` until ``pending`` clears: a wait in region
         ``a`` (its word ``index``), bounded and named in a debug build's
         report like every pair's (``poll``). A wait on plain words (counts
-        that say themselves when they are in) comes this way too."""
+        that say themselves when they are in) comes this way too. ``first``:
+        ``load_all``'s first result, loaded earlier (``peek``)."""
+        v = load_all() if first is None else first
         if const_expr(self.diag is None):
-            return _spin(load_all, pending)
+            return _spin(v, load_all, pending)
         rid = self.region_ids.get(a.region, -1)
-        return _spin_bounded(load_all, pending, self.diag, rid, index, self.tag)
+        return _spin_bounded(v, load_all, pending, self.diag, rid, index, self.tag)
 
-    def poll(self, specs, batch=POLL_MAX):
+    def peek(self, a, i, n, on):
+        """One load of pairs i .. i + n - 1 (n in {1, 2}) of region ``a`` at
+        its space's scope, nothing waited for: its words, tags included, for
+        ``poll(..., first=)``, which re-loads only while a tag is stale. A
+        load issued ahead of loads its wait must not follow (``vmcnt`` counts
+        in issue order). ``on`` false (wave-uniform): against an empty buffer
+        range, zeros and no memory traffic. Not a wait: the contract records
+        the ``poll`` that settles it (``trace``)."""
+        nbytes = uniform(on.select(fx.Int32(0x7FFFFFFF), fx.Int32(0)))
+        w = fx.Vector(
+            bo.buffer_load(
+                rsrc(a.value, nbytes),
+                fx.Int32(i) * 2,
+                vec_width=2 * n,
+                dtype=T.i32,
+                cache_modifier=_SCOPE_CM[a.space],
+            )
+        )
+        return fx.Vector.from_elements([w[e] for e in range(2 * n)], fx.Int32)
+
+    def poll(self, specs, batch=POLL_MAX, first=None):
         """Batched poll of pairs ``specs`` = [(Addr, pair index, npairs in {1, 2})],
         each loaded at its own space's scope.
 
         All pairs are re-loaded together while any tag is stale, so a batch costs
-        one round trip after its last producer lands. Returns the value words."""
+        one round trip after its last producer lands. Returns the value words.
+        ``first``: one spec's words as ``peek`` loaded them earlier (no load
+        when every tag is live)."""
         if const_expr(len(specs) == 0):
             return []
+        assert first is None or len(specs) == 1, len(specs)
         if const_expr(len(specs) > batch):
             return self.poll(specs[:batch], batch) + self.poll(specs[batch:], batch)
         cms = [_SCOPE_CM[a.space] for a, _, _ in specs]
@@ -217,7 +249,7 @@ class Mailbox:
                 bad = bad | (v[e] != tag)
             return bad
 
-        v = self.spin(specs[0][0], specs[0][1], load_all, pending)
+        v = self.spin(specs[0][0], specs[0][1], load_all, pending, first)
         outs, e = [], 0
         for _, _, n in specs:
             outs.append([v[e + 2 * q] for q in range(n)])

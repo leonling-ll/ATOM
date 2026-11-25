@@ -45,7 +45,7 @@ import functools
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from aiter.ops.flydsl.kernels import buffer_ops as bo
-from flydsl.expr import const_expr, gpu, range_constexpr
+from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import Int32, Int64, T
 
 from atom.models.minimax_m3.pro_mono.config import COLS, EXPERTS, HIDDEN, TOPK
@@ -53,6 +53,7 @@ from atom.models.minimax_m3.pro_mono.kernels import ffn
 from atom.models.minimax_m3.pro_mono.layout import (
     ABI_NAMES,
     FFN_REGIONS,
+    MIDB_ROW,
     NORM_REGIONS,
     NT,
     O_CPW,
@@ -183,23 +184,45 @@ def _or(a, b):
 # ------------------------------------------------------------------ o_proj
 
 
-@traced
-def load_core(c):
-    """The core rows (bf16 [S, 3072], plain loads: the attention wrote them)
-    -> MXFP8 1x32 in LDS: e4m3 words at ``xs`` (token t's at t O_ROW), their
-    E8M0 codes four a word at ``osc``. A thread takes 8 values, 4 threads a
-    block; S * 384 items is a multiple of 16, so a 16-lane group is either all
-    live or all past the end (clamped, nothing stored)."""
+def core_loads(c):
+    """The core rows' loads (bf16 [S, 3072], plain: the attention wrote them),
+    every round of ``load_core``'s strided loop, issued before anything else
+    of the o stage: a round's stores are conditional, so a load in a later
+    round went out only after the earlier round's use, which waited (``vmcnt``
+    in issue order) for every w_o load issued before it -- 5 serial L2 round
+    trips at 8 rows, 11 at 16."""
     s, tid = c["S"], c["tid"]
     n = s * CORE_ITEMS
     r_core = rsrc(c["core"])
+    out = []
     for i in range_constexpr(-(-n // THREADS)):
         e = fx.min(tid + THREADS * i, n - 1)
         t = e // CORE_ITEMS
         q = e % CORE_ITEMS
-        v = fx.Vector(
-            bo.buffer_load(r_core, (t * O_K + 8 * q) // 2, vec_width=4, dtype=T.i32)
+        out.append(
+            fx.Vector(
+                bo.buffer_load(r_core, (t * O_K + 8 * q) // 2, vec_width=4, dtype=T.i32)
+            )
         )
+    # issued here, ahead of w_o's: the scheduler would sink them past it
+    rocdl.sched_barrier(0)
+    return out
+
+
+@traced
+def load_core(c, loads):
+    """The core rows (``core_loads``) -> MXFP8 1x32 in LDS: e4m3 words at
+    ``xs`` (token t's at t O_ROW), their E8M0 codes four a word at ``osc``. A
+    thread takes 8 values, 4 threads a block; S * 384 items is a multiple of
+    16, so a 16-lane group is either all live or all past the end (clamped,
+    nothing stored)."""
+    s, tid = c["S"], c["tid"]
+    n = s * CORE_ITEMS
+    for i in range_constexpr(len(loads)):
+        e = fx.min(tid + THREADS * i, n - 1)
+        t = e // CORE_ITEMS
+        q = e % CORE_ITEMS
+        v = loads[i]
         vals = _unpack([fx.Int32(v[d]) for d in range(4)])
         code = _code(butterfly(_absmax(vals), (1, 2), fx.max))
         inv = rcp_pow2(code)
@@ -220,7 +243,8 @@ def stage_o(c):
     """CTA t < O_TASKS: o_proj rows 32 t .. + 32 (two 16-row groups, a group's
     4 waves each a quarter of K) -> bf16 partial rows -> the owner rank's
     ``rs`` (this rank's slot). The weight and its scales are in flight while
-    the core rows are quantized."""
+    the core rows are quantized, the core rows' loads issued first (their
+    quantization then waits for them alone)."""
     s, tid, lane, wave, bid = c["S"], c["tid"], c["lane"], c["wave"], c["bid"]
     g4 = lane // 16
     l16 = lane % 16
@@ -229,6 +253,7 @@ def stage_o(c):
     if bid < O_TASKS:
         t = bid
         rg = t * 2 + wave // 4
+        core = core_loads(c)
         r_wo = rsrc(c["w_o"])
         wts = [
             fx.Vector(
@@ -249,7 +274,7 @@ def stage_o(c):
         s_lo = fx.Vector(bo.buffer_load(r_so, sw, vec_width=4, dtype=T.i32))
         s_hi = fx.Vector(bo.buffer_load(r_so, sw + 4, vec_width=2, dtype=T.i32))
         ws = [s_lo[d] for d in range(4)] + [s_hi[d] for d in range(2)]
-        load_core(c)
+        load_core(c, core)
         gpu.barrier()
         c["stamp"](1)
         # B column l16 is token l16 (the last token past S: its column is
@@ -486,13 +511,21 @@ def build(key: P1Build):
     # ``xs``: the o stage's MXFP8 core rows, then (FFN) the router's bf16 x
     # slice, a W4A8 build's MXFP8 x rows or an A16W4 build's bf16 x K halves
     # (the routed B operands: union to ug) and the shared mid's MXFP8 rows
-    # (down) -- stages apart, past barriers
+    # (down; A16W4 every pick's bf16 mid row past them, ``ffn.load_mids``) --
+    # stages apart, past barriers
     xs_row = O_ROW
     if fp8:
         xs_row = max(O_ROW, X8_ROW)
     if bf16:
         xs_row = max(O_ROW, XH_ROW)
     assert xs_row >= (ffn.R_KLEN + 8) // 2 and xs_row >= SM_ROW
+    # A16W4's down: the staged mids past the shared mid's rows. A build that
+    # shrinks ``xs`` a token (a wider one, to fit the CU's LDS) has to stage
+    # them in passes instead
+    assert not bf16 or xs_row >= SM_ROW + TOPK * MIDB_ROW, (
+        f"A16W4 staged mids need {SM_ROW + TOPK * MIDB_ROW} xs words a token, "
+        f"the build has {xs_row}"
+    )
 
     @fx.struct
     class Smem:
@@ -570,7 +603,7 @@ def build(key: P1Build):
             "xs": lds.xs.ptr, "osc": lds.osc.ptr, "red": lds.red.ptr,
             "misc": lds.misc.ptr,
             "put": mb.put, "put_bf": mb.put_bf, "put_words": mb.put_words,
-            "poll": mb.poll, "stamp": lambda k: stamp(tl_on, tls, tid, k),
+            "poll": mb.poll, "peek": mb.peek, "stamp": lambda k: stamp(tl_on, tls, tid, k),
             "ffn_on": ffn_on, "routed_act": key.routed_act,
             "planes": key.planes if ffn_on else None,
         }  # fmt: skip
@@ -605,6 +638,7 @@ def build(key: P1Build):
                 ],
                 "rlog_own": preg(c["own"], play["rlog"][0], "rlog"),
                 "xl": lds.xs.ptr, "sm8": lds.xs.ptr,
+                "midl": lds.xs.ptr + s * SM_ROW,
                 "xbl": lds.xs.ptr if fp8 or bf16 else fl.x4l.ptr,
                 "xsl": fl.xsl.ptr,
                 "smsc": fl.smsc.ptr,
