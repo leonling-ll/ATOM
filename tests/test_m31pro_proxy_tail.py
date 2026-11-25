@@ -17,13 +17,23 @@ SPEC.loader.exec_module(proxy_tail)
 from interactivity import agentic_interactivity  # on the path the script set
 
 
-def _record(rid, start_s, ttft_ms, gaps_ms, phase="profiling", tokens_per_chunk=2):
+def _record(
+    rid,
+    start_s,
+    ttft_ms,
+    gaps_ms,
+    phase="profiling",
+    tokens_per_chunk=2,
+    isl=1000,
+    cached=0,
+):
     osl = 1 + tokens_per_chunk * len(gaps_ms)
     decode_ms = sum(gaps_ms)
     metrics = {
         "time_to_first_token": {"value": ttft_ms},
         "output_sequence_length": {"value": osl},
-        "input_sequence_length": {"value": 1000},
+        "input_sequence_length": {"value": isl},
+        "usage_prompt_cache_read_tokens": {"value": cached},
         "request_latency": {"value": ttft_ms + decode_ms},
         "inter_chunk_latency": {"value": gaps_ms},
     }
@@ -134,3 +144,95 @@ def test_cli_relative_file_path(tmp_path, records, capsys, monkeypatch, cwd_part
     monkeypatch.setattr("sys.argv", ["proxy_tail.py", arg])
     proxy_tail.main()
     assert capsys.readouterr().out.splitlines()[2].startswith("| arm/c2 | 4 |")
+
+
+@pytest.fixture
+def stalled():
+    """Two first-use stalls (TTFT > 5 s) among requests in three new-token bands."""
+    gaps = [10.0] * 5
+    return [
+        _record("w", 50.0, 9000.0, gaps, phase="warmup"),  # never counted
+        _record("a", 100.0, 100.0, gaps, isl=60000, cached=59500),  # new 500
+        _record("b", 110.0, 300.0, gaps, isl=60000, cached=59600),  # new 400
+        _record("c", 120.0, 12000.0, gaps, isl=61000, cached=60550),  # new 450
+        _record("d", 130.0, 1000.0, gaps, isl=9000, cached=4000),  # new 5000
+        _record("e", 140.0, 400.0, gaps, isl=9000, cached=4200),  # new 4800
+        _record("f", 150.0, 9000.0, gaps, isl=70000),  # new 70000, alone
+    ]
+
+
+def _contaminate(path, monkeypatch, capsys):
+    monkeypatch.setattr("sys.argv", ["proxy_tail.py", "--contamination", str(path)])
+    with pytest.raises(SystemExit) as done:
+        proxy_tail.main()
+    return done.value.code, capsys.readouterr().out
+
+
+def test_ttft_outliers_listed_and_replaced_by_their_band_median(tmp_path, stalled):
+    path = _write(tmp_path, stalled)
+    row = proxy_tail.contamination(path, outlier_ttft_s=5.0)
+    assert row["p90_e2e_norm"] == pytest.approx(agentic_interactivity(path)["value"])
+    assert [
+        (r["index"], r["isl"], r["new"], r["ttft"]) for r in row["ttft_outliers"]
+    ] == [
+        (2, 61000, 450, pytest.approx(12.0)),
+        (5, 70000, 70000, pytest.approx(9.0)),
+    ]
+    # "c" takes its band's (256..511 new tokens) median of 0.1 and 0.3 s; "f"'s
+    # band holds no other request, so it takes the nearest band's (4096..8191)
+    # median of 1.0 and 0.4 s.
+    reqs, _ = proxy_tail.load(path)
+    fixed = {"c": 0.2, "f": 0.7}
+    expected = [dict(r, ttft=fixed.get(r["id"], r["ttft"])) for r in reqs]
+    assert row["p90_corrected"] == pytest.approx(proxy_tail.p90_metric(expected))
+    assert row["p90_corrected"] > row["p90_e2e_norm"]
+
+
+def test_no_outlier_leaves_the_p90_alone(tmp_path, records):
+    row = proxy_tail.contamination(_write(tmp_path, records), outlier_ttft_s=5.0)
+    assert row["ttft_outliers"] == []
+    assert row["p90_corrected"] == pytest.approx(row["p90_e2e_norm"])
+
+
+def test_bootstrap_band_is_seeded_and_brackets_the_p90(tmp_path, stalled):
+    path = _write(tmp_path, stalled)
+    reqs, _ = proxy_tail.load(path)
+    lo, hi = proxy_tail.p90_band(reqs)
+    assert (lo, hi) == proxy_tail.p90_band(reqs)
+    assert lo < proxy_tail.p90_metric(reqs) < hi
+
+
+def test_compiles_during_the_replay_warn(tmp_path, stalled, monkeypatch, capsys):
+    path = _write(tmp_path, stalled)
+    code, out = _contaminate(path, monkeypatch, capsys)
+    assert "compiles during the replay: not recorded" in out
+    assert "WARNING" not in out
+    (path.parents[1] / "compile_counts.txt").write_text("before 40 12\nafter 41 12\n")
+    code, out = _contaminate(path, monkeypatch, capsys)
+    assert code == 0
+    assert "1 Triton cache entries, 0 aiter JIT modules" in out
+    assert "WARNING: arm/c2: kernels compiled during the replay" in out
+    assert "#2: ISL 61000, new 450, OSL 11, TTFT 12.00 s" in out
+
+
+@pytest.mark.parametrize("where", [("c2",), ()])
+def test_untuned_flydsl_moe_is_fatal(tmp_path, records, monkeypatch, capsys, where):
+    log = tmp_path.joinpath("arm", *where, "server.log")
+    log.parent.mkdir(parents=True)
+    log.write_text(
+        "[aiter] [fused_moe] no tuned FlyDSL config for ('gfx950', 256, 256, "
+        "7168, 640, 384, 4), using heuristic FlyDSL fallback\n" * 3
+    )
+    code, out = _contaminate(_write(tmp_path, records), monkeypatch, capsys)
+    assert code == 1
+    assert f"FATAL: arm/c2: {log} has 3 'no tuned FlyDSL config' lines" in out
+
+
+def test_clean_server_log_passes(tmp_path, records, monkeypatch, capsys):
+    log = tmp_path / "arm" / "c2" / "server.log"
+    log.parent.mkdir(parents=True)
+    log.write_text("[aiter] [fused_moe] using tuned FlyDSL config\n")
+    code, out = _contaminate(_write(tmp_path, records), monkeypatch, capsys)
+    assert code == 0
+    assert "'no tuned FlyDSL config' lines in the server log: 0" in out
+    assert "FATAL" not in out

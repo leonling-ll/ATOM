@@ -21,6 +21,12 @@
 #      request rate and how many replies differ in length from the trace's
 #      output length (also written to OUT_DIR/summary.json). The scenario sends
 #      ignore_eos, so that count should be 0 on any weights.
+#   5. prints proxy_tail.py's contamination report (also written to
+#      OUT_DIR/contamination.txt): TTFT outliers and the p90 without them, the
+#      p90's bootstrap band, kernels compiled during the replay (Triton cache
+#      entries and aiter JIT modules, counted into OUT_DIR/compile_counts.txt
+#      before and after it), and exits 1 when the server log shows an aiter
+#      without Pro's tuned FlyDSL MoE rows.
 #
 # Environment (defaults in brackets):
 #   MODEL            checkpoint [/data/models/yuhua/m3-pro]
@@ -221,6 +227,16 @@ bash "$REPO/scripts/start_atom_server.sh" "$MODEL" "$TP" "$PORT" "${server_args[
 bash "$REPO/scripts/wait_server_ready.sh" "$PORT" 60 30 "$SERVER_LOG"
 
 # --- 3. replay ---
+# count_compiles WHEN: Triton cache entries and aiter JIT modules right now.
+AITER_JIT="${AITER_JIT_DIR:-$(python3 -c 'import importlib.util, os
+spec = importlib.util.find_spec("aiter")
+print(os.path.join(spec.submodule_search_locations[0], "jit") if spec else "")')}"
+count_compiles() {
+    echo "$1 $(find "${TRITON_CACHE_DIR:-$HOME/.triton/cache}" -mindepth 1 -maxdepth 1 2>/dev/null | wc -l)" \
+        "$(find "$AITER_JIT" -maxdepth 1 -name '*.so' 2>/dev/null | wc -l)" >>"$OUT_DIR/compile_counts.txt"
+}
+rm -f "$OUT_DIR/compile_counts.txt"
+count_compiles before
 export AIPERF_HTTP_TCP_USER_TIMEOUT=900000
 export AIPERF_DATASET_CONFIGURATION_TIMEOUT=1800
 export AIPERF_SERVICE_PROFILE_CONFIGURE_TIMEOUT=1800
@@ -256,6 +272,7 @@ aiperf profile --scenario inferencex-agentx-mvp --unsafe-override \
     --custom-dataset-type weka_trace --input-file "$OUT_DIR/traces" \
     --max-context-length "$MAX_CONTEXT" \
     --output-artifact-dir "$OUT_DIR/aiperf" 2>&1 | tee "$OUT_DIR/aiperf.log"
+count_compiles after
 
 stop_server
 trap - EXIT
@@ -313,3 +330,7 @@ print(f"c{conc}: p90 E2E-normalized interactivity "
       f"failed {failed}/{total} ({100 * failed / max(total, 1):.2f}%), "
       f"output length off the trace in {off_trace}")
 PY
+
+# --- 5. contamination ---
+python3 "$HERE/proxy_tail.py" --contamination "$OUT_DIR/aiperf/profile_export.jsonl" |
+    tee "$OUT_DIR/contamination.txt"
