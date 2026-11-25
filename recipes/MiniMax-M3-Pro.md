@@ -315,11 +315,15 @@ split over the ranks and the FlyDSL / aiter decode, three checks cover hits:
   against the same token ids prefilled cold, at concurrency 1 and 8. Greedy decoding here is not
   reproducible (a prompt sent cold twice parts after its answer, at confident tokens), so hits are
   judged against two cold runs of the same prompts: it passes when every answer is right, every hit's
-  answer equals its cold twin's, and per phase the divergences, the off-tie ones and the largest
-  logprob gap before them stay within the cold-vs-cold floor (+2, +2, +0.25).
+  answer equals its cold twin's, and per phase the divergences and the off-tie ones stay within the
+  cold-vs-cold floor of the same run, length and concurrency (+2, +2), and the largest logprob gap
+  before them within the largest cold-vs-cold gap of all the runs judged together (+0.25): one
+  run's floor of that gap swings with its noise (0.23-0.49 in one run, up to 1.30 in another).
+  `judge` re-judges the logs of two runs together.
 
   ```bash
   python3 scripts/m31pro/pfx_probe.py probe --port 8000 --model "${MODEL_PATH}" --out probe.jsonl --lengths 32000
+  python3 scripts/m31pro/pfx_probe.py judge --run a/probe.jsonl --run b/probe.jsonl
   ```
 * GSM8K behind one shared 64-shot prefix (`scripts/m31pro/lm_eval_tasks/gsm8k_pfx.yaml`), on one server
   with prefix caching and one with `--no-enable_prefix_caching`, then the paired comparison (exact
@@ -340,7 +344,12 @@ Results (MI355X TP8; tests unchanged since 6384a207). The hit test: 44 passed / 
 interpreter, 40 passed on GPU. gsm8k_pfx at 5812c071, both servers with the Agentic variants without
 `ATOM_TOKEN_GRAPH_SIZES`: 0.9325 with prefix caching, 0.9196 without, 34 questions right to wrong and 51
 wrong to right (McNemar p 0.082), cached share 0.993, measured AL 4.10 on both (golden 2.94). Both are
-below `pair`'s absolute 0.94 bar. The probe with the round-2 rule has not run yet.
+below `pair`'s absolute 0.94 bar. The probe at 05f18899, two runs of the same prompts (one with
+`ATOM_TOKEN_GRAPH_SIZES=256,512,1024,2048`, one without) judged together: every warm phase's largest
+logprob gap is within the 1.30 floor + 0.25 (at most 1.12), and 239 of 240 warm answers are right.
+Both runs still fail the other checks: with token graphs, 64k c1 `half` answers one key with the
+value of a similar key; without, 32k c8 `half` differs from its cold twin (the twin is the wrong
+one) and 32k c1 `turn2` has 3 off-tie divergences against a floor of 0 + 2.
 
 ## CPU KV offload
 
