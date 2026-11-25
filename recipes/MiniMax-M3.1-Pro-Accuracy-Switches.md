@@ -57,6 +57,8 @@ These are switchable on their branches and will be listed above once they are me
   are unchanged. GSM8K DCP8 against DCP1 not run yet.
   - `dcp_mailbox` (rows): the merge in aiter's mailbox combine for captured steps up to that
     many rows, the same weighted sum in another order (bf16 output within one rounding).
+  - `dcp_q_fp8`: the decode query all-gathered as a plain e4m3 cast, as DCP1's day0 decode
+    reads it (q rounded to fp8; the bf16 DCP decode does not round it).
 - `--enable-tbo` with F1 split collectives: changes all-reduce grouping in prefill.
 - amd-kernels shuffle16 decode GEMMs: cosine ≥ 0.9999999, relative L2 ≤ 4.2e-5 per GEMM.
 - F4, routed + shared expert outputs written in one pass: heavier error tail at the atomic stage-2 rows.

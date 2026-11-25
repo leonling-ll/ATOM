@@ -1685,6 +1685,7 @@ def _attn_kernel(
     EP2: tl.constexpr = 1,
     MX: tl.constexpr = False,
     WRITE_LSE: tl.constexpr = False,
+    QDT: tl.constexpr = None,
 ):
     t = tl.program_id(0)
     sp = tl.program_id(1)
@@ -1704,6 +1705,8 @@ def _attn_kernel(
     q1 = tl.load(qrow + 64 + ar_c[None, :])
     q2 = tl.load(qrow + 128 + ar_c[None, :])
     q3 = tl.load(qrow + 192 + ar_c[None, :])
+    if QDT is not None:  # an fp8 q, read back in the output's dtype (exactly)
+        q0, q1, q2, q3 = q0.to(QDT), q1.to(QDT), q2.to(QDT), q3.to(QDT)
 
     m_i = tl.full([16], float("-inf"), tl.float32)
     l_i = tl.zeros([16], tl.float32)
@@ -1915,13 +1918,19 @@ def attention(
     fp32: also write each head's log-sum-exp (natural base), -inf with output 0 where the
     token sees no key, for a log-sum-exp merge of partial outputs.
     ``out_scale`` ``[T, H * 6]`` uint8: ``out`` is E4M3 and the two are ``quantize_fp8`` of
-    the bf16 output, bit for bit (E8M0 codes a group of 32).
+    the bf16 output, bit for bit (E8M0 codes a group of 32). An fp8 ``q`` (a plain cast)
+    attends as its values in ``out``'s dtype (bf16 with ``out_scale``) would.
     """
     t, h, _ = q.shape
     mx = out_scale is not None
     assert not mx or (out.element_size() == 1 and out_scale.dtype == torch.uint8)
     assert not (mx and lse is not None), "MXFP8 output and lse are never combined"
     assert h % 16 == 0 and kc4.stride(-1) == 1 and q.stride(-1) == 1
+    qdt = None
+    if q.element_size() == 1:
+        qdt = {torch.float32: tl.float32, torch.float16: tl.float16}.get(
+            out.dtype, tl.bfloat16
+        )
     fp8 = kc4.element_size() == 1
     assert k_scale is not None or not fp8
     dense = sel is None
@@ -1974,6 +1983,7 @@ def attention(
         EP2=triton.next_power_of_2(n_entries),
         MX=mx,
         WRITE_LSE=lse is not None,
+        QDT=qdt,
     )
     if splits > 1:
         _combine_kernel[(t, h)](

@@ -213,6 +213,11 @@ class ProVariants:
     # default); read once, when the layers are built. The same weighted sum, other
     # rounding.
     dcp_mailbox: int = 0
+    # Under DCP a decode / verify step all-gathers its query heads as a plain fp8 cast
+    # (the e4m3 values the day0 decode reads at DCP 1) instead of bf16: half the bytes.
+    # The Triton attention reads them back exactly, so q rounds as at DCP 1's day0 decode
+    # (not bit for bit the bf16 DCP decode).
+    dcp_q_fp8: bool = False
     # vLLM's compressed index cache: every 4 index keys softmax-pooled into one bf16 row
     # (ic_c [pages, 4, 128]), written after prep; the scorer reads those rows only.
     index_compress: bool = False
@@ -1630,10 +1635,12 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
                 score, positions, k, split=v.topk == "split"
             )
             sel = pro_kernels.dcp_local_selection(sel, r, w)
+        if v.dcp_q_fp8:
+            q = q.to(torch.float8_e4m3fn)
         qf = dcp_all_gather_query_heads(group, q)
         h = qf.shape[1]
         dv = self.value_head_dim
-        of = q.new_empty(n, h * dv)
+        of = torch.empty(n, h * dv, dtype=out.dtype, device=q.device)
         lse = torch.empty(n, h, dtype=torch.float32, device=q.device)
         # a rank holds about 1/w of the selected blocks, for w times the heads
         splits = max(

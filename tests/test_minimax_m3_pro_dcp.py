@@ -253,6 +253,32 @@ def test_attention_merge_as_single_rank(K, splits, case, per_seq):
     torch.testing.assert_close(merged.flatten(1), want.float(), atol=ATOL, rtol=0)
 
 
+@pytest.mark.parametrize("splits", [1, 4])
+def test_an_fp8_query_attends_as_its_values_do(K, splits):
+    """``dcp_q_fp8``'s gathered query, a plain e4m3 cast, attends bit for bit as the
+    same values in the output's dtype: output and LSE."""
+    world = 4
+    c = Split([300, 517, 70], world, seed=2)
+    seq, pos = c.rows(6)
+    g = torch.Generator().manual_seed(8)
+    q8 = (torch.randn(len(pos), 16, D, generator=g) * 3).to(torch.float8_e4m3fn)
+    q8 = q8.to(DEV)
+    rk, r = c.ranks[1], 1
+    # local blocks, valid first; the kernel drops the ones past a row's own
+    sel = torch.stack([torch.randperm(8, generator=g) for _ in pos]).int().to(DEV)
+    qpos = K.dcp_local_positions(pos, r, world)
+    got = []
+    for q in (q8, q8.to(DT)):
+        out = torch.empty(len(pos), 16 * 192, dtype=DT, device=DEV)
+        lse = torch.empty(len(pos), 16, device=DEV)
+        K.attention(
+            q, rk.kc, rk.bt, seq, qpos, sel, out, D**-0.5, splits, valid_first=True,
+            lse=lse,
+        )
+        got.append((out, lse))
+    assert torch.equal(got[0][0], got[1][0]) and torch.equal(got[0][1], got[1][1])
+
+
 def test_prefill_gather_holds_every_block(K):
     world = 4
     c = Split([300, 517, 70], world, seed=4)
@@ -512,3 +538,86 @@ def test_a_decode_merge_combines_in_the_mailbox_else_by_all_to_all(
         assert torch.equal(l, lse.repeat_interleave(3, dim=1))
         want = torch.arange(rows * 48 * 64.0).to(torch.bfloat16).view(rows, -1)
         assert torch.equal(out, want) and "mailbox" not in calls
+
+
+@pytest.fixture
+def decode(monkeypatch):
+    """``ProSparseAttentionImpl._dcp_decode`` of rank 3 of 8, 12 rows, between stubs
+    that record what reaches the query all-gather, the attention and the merge.
+    ``(run(**variants) -> (q, out), calls)``."""
+    from conftest import gpu_stack_import
+
+    pro_attn = gpu_stack_import("atom.model_ops.minimax_m3.pro_attn")
+    from atom.model_ops import dcp_ops
+
+    P, calls = pro_attn.pro_kernels, {}
+    group = SimpleNamespace(world_size=8, rank_in_group=3)
+    monkeypatch.setattr("atom.distributed.dcp_utils.get_dcp_group", lambda: group)
+    monkeypatch.setattr(
+        pro_attn,
+        "get_forward_context",
+        lambda: SimpleNamespace(attn_metadata=SimpleNamespace()),
+    )
+    monkeypatch.setattr(P, "dcp_local_positions", lambda pos, r, w: pos)
+    monkeypatch.setattr(P, "scores", lambda iq, *a, **k: torch.zeros(iq.shape[0], 8))
+    monkeypatch.setattr(P, "dcp_pin", lambda score, *a: score)
+
+    def select(score, qpos, k, *a, **kw):
+        calls["select"] = kw
+        return torch.zeros(score.shape[0], k, dtype=torch.int32)
+
+    def gather_q(group, q):
+        calls["gather"] = q
+        return torch.empty(q.shape[0], 8 * 16, q.shape[2], dtype=q.dtype)
+
+    def attention(q, kc4, bt, seq, pos, sel, out, *a, **kw):
+        calls["attention"] = (q, out, kw)
+
+    monkeypatch.setattr(P, "dcp_select", select)
+    monkeypatch.setattr(dcp_ops, "dcp_all_gather_query_heads", gather_q)
+    monkeypatch.setattr(P, "attention", attention)
+    impl = object.__new__(pro_attn.ProSparseAttentionImpl)
+    impl.dcp_world, impl.topk, impl.scale, impl.value_head_dim = 8, 128, 0.1, 192
+
+    def merge(group, of, lse, out):
+        calls["merge"] = (of, lse)
+        return out
+
+    impl._dcp_merge = merge
+
+    def run(**variants):
+        v = pro_attn.ProVariants(dcp_topk_merge=True, topk="split", **variants)
+        n = 12
+        q = torch.randn(n, 16, 256).to(torch.bfloat16)
+        out = torch.empty(n, 16 * 192, dtype=torch.bfloat16)
+        pos = torch.arange(n) + 100
+        tables = torch.zeros(2, 64, dtype=torch.int32)
+        seq = torch.zeros(n, dtype=torch.int32)
+        iq = torch.zeros(n, 16, 128)
+        score_args = (False, 1, 2, 1.0, 0, 0)
+        got = impl._dcp_decode(
+            q, iq, pos, seq, tables, None, None, None, v, out, score_args
+        )
+        assert got is out
+        return q, out
+
+    return run, calls
+
+
+@pytest.mark.parametrize("fp8", [False, True])
+def test_dcp_q_fp8_gathers_the_query_as_its_e4m3_cast(decode, fp8):
+    """The all-gather takes the query's plain e4m3 cast (half the bytes), the attention
+    reads that, and the partial outputs stay in the output's dtype."""
+    run, calls = decode
+    q, out = run(dcp_q_fp8=fp8)
+    sent = calls["gather"]
+    if fp8:
+        assert sent.dtype == torch.float8_e4m3fn and sent.is_contiguous()
+        want = q.to(torch.float8_e4m3fn)
+        assert torch.equal(sent.view(torch.uint8), want.view(torch.uint8))
+    else:
+        assert sent is q
+    qa, of, _ = calls["attention"]
+    assert qa.dtype == sent.dtype and qa.shape == (12, 128, 256)
+    assert of.dtype == out.dtype == torch.bfloat16 and of.shape == (12, 128 * 192)
+    assert calls["merge"][0] is of
