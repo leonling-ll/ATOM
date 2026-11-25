@@ -338,8 +338,9 @@ def open_trace(path):
 DRAFT = ("draft_kv[", "propose_dspark[", "dspark_sched[", "propose_eagle[")
 
 
-def read_forwards(path, idle_cap_us=5000.0):
-    """Pure-decode forwards of one trace: dicts with the forward's labels, its kernels
+def read_forwards(path, idle_cap_us=5000.0, decode_only=True):
+    """Pure-decode forwards of one trace (every forward with ``decode_only=False``):
+    dicts with the forward's labels, its kernels
     [(ts, dur, role, name, part, draft part)] in GPU order and its ``wall`` (to the next
     forward's first kernel). Dropped: the first and last forward (the window edges cut
     them) and a forward followed by more than ``idle_cap_us`` of GPU idle (no work was
@@ -427,6 +428,7 @@ def read_forwards(path, idle_cap_us=5000.0):
                 and first_int(fkv.get("decode"), 0) > 0,
                 "rows": first_int(fkv.get("tokens"), 0),
                 "seqs": first_int(fkv.get("decode"), 0),
+                "prefill": first_int(fkv.get("prefill"), 0),
                 "spec": first_int(rkv.get("spec"), 0),
                 "sk": first_int(rkv.get("sk")),
                 "start": kl[0][0],
@@ -439,7 +441,7 @@ def read_forwards(path, idle_cap_us=5000.0):
         a["wall"] = (
             b["start"] - a["start"] if b["start"] - a["end"] <= idle_cap_us else None
         )
-    return [f for f in fwds[1:-1] if f["decode"] and f.get("wall")]
+    return [f for f in fwds[1:-1] if (f["decode"] or not decode_only) and f.get("wall")]
 
 
 # ---------------------------------------------------------------- the models

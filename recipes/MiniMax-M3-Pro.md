@@ -671,8 +671,8 @@ bytes `quantize_fp8` would give -- instead of a separate `quantize_fp8` launch b
 `quantize_fp8` per layer goes from 5 launches to 1, o_proj's input. In decode and DSpark verify
 (the decode graphs) that one goes too, with the kernel path: the attention writes o_proj's input as MXFP8 itself, the same bytes `quantize_fp8`
 gives for its bf16 output, and hands the E8M0 scales to o_proj through `take_mx_scale`. Which kernel writes it follows the rows of the batch:
-from `day0_decode_rows` (24) rows on the K-only plain fp8 cache, amd-kernels-day0's FlyDSL sparse decode does, in its epilogue (`day0_decode_mxfp8`, when the `amd_kernels` package imports);
-below that, or without the package, the Triton attention does it in its epilogue and aiter's attention (17
+from `day0_decode_rows` (24) rows on the K-only plain fp8 cache, aiter's FlyDSL `minimax_m3_fp8_sparse_decode` (amd-kernels-day0's kernel, ported into aiter-M3) does, in its epilogue (`day0_decode_mxfp8`, when the aiter build has it);
+below that, or with an aiter that lacks it, the Triton attention does it in its epilogue and aiter's attention (17
 rows and more on the K-only cache, every row over the V cache) through `pa_decode_gluon(output_scale=...)`, which needs aiter-M3 `d251a5af`
 ([zhuyuhua-v/aiter-M3#8](https://github.com/zhuyuhua-v/aiter-M3/pull/8)) or later. Prefill keeps the
 bf16 output and the separate launch. The startup line `M3-Pro attention: ...` reports `day0 decode from 24 rows (MXFP8 out)` for the first, and `Triton / aiter decode MXFP8

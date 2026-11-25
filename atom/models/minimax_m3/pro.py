@@ -91,6 +91,55 @@ def _native_a8(*linears) -> bool:
     return all(getattr(m, "native_a8_group_rows", None) is not None for m in linears)
 
 
+def _pair_operand(linear, x, x_scale) -> bool:
+    """Whether ``linear(x, x_scale)`` is a plain native MXFP8 GEMM on a preshuffled
+    weight: what ``gemm_a8w8_blockscale_bpreshuffle_pair`` computes for it."""
+    return (
+        x_scale is not None
+        and x.dim() == 2
+        and getattr(linear, "native_a8_group_rows", None) == 1
+        and getattr(linear.weight, "is_shuffled", False)
+        and linear.bias is None
+        and not linear.is_output_padded
+        and not (linear.tp_dim == 1 and linear.tp_size > 1 and linear.reduce_results)
+    )
+
+
+def _qk_pair(qk_proj, x, x_scale, index_qk_proj, ix, ix_scale):
+    """(qk, index qk) from one ``gemm_a8w8_blockscale_bpreshuffle_pair`` call when
+    ``qk_pair`` is on and both GEMMs qualify, else None."""
+    if not variants().qk_pair:
+        return None
+    import aiter
+
+    pair_gemm = getattr(aiter, "gemm_a8w8_blockscale_bpreshuffle_pair", None)
+    if not (
+        pair_gemm is not None
+        and x.shape[0] == ix.shape[0]
+        and _pair_operand(qk_proj, x, x_scale)
+        and _pair_operand(index_qk_proj, ix, ix_scale)
+    ):
+        return None
+    m = x.shape[0]
+    qk = torch.empty(m, qk_proj.weight.shape[0], dtype=torch.bfloat16, device=x.device)
+    iqk = torch.empty(
+        m, index_qk_proj.weight.shape[0], dtype=torch.bfloat16, device=x.device
+    )
+    pair_gemm(
+        x,
+        qk_proj.weight,
+        x_scale,
+        qk_proj.weight_scale,
+        ix,
+        index_qk_proj.weight,
+        ix_scale,
+        index_qk_proj.weight_scale,
+        qk,
+        iqk,
+    )
+    return qk, iqk
+
+
 @cache
 def _aiter_mx_norm() -> bool:
     """Whether this aiter's norm kernels can write MXFP8 (``add_rmsnorm_mxfp8`` and the
@@ -251,7 +300,39 @@ class ProLookaheadState:
             ),
         }
 
-    def put(self, layer: int, ffn_in: torch.Tensor, resid: torch.Tensor) -> None:
+    def mx_target(self, layer: int, like: torch.Tensor) -> tuple | None:
+        """``put``'s MXFP8 route for ``layer`` (``like``: an activation of its rows):
+        ``(norm, q, q_scale)``, the reader's input norm and its ring rows (``front_rows``;
+        None: new tensors), or None where ``put`` takes another route."""
+        v, reader = variants(), layer + self.ahead
+        linears = self.index_linears.get(reader)
+        if not (
+            self.ahead
+            and not v.diag
+            and v.lookahead
+            and v.fuse_mxfp8_quant
+            and v.lookahead_src == "resid_in"
+            and reader >= self.start
+            and reader in self.norms
+            and linears is not None
+            and _native_a8(*linears)
+            and _aiter_mx_norm()
+        ):
+            return None
+        rows = like.shape[0]
+        front = self.front_rows(reader, rows, like)
+        if front is None:
+            return self.norms[reader], None, None
+        return self.norms[reader], front[0][rows:], front[1][rows:]
+
+    def put(
+        self,
+        layer: int,
+        ffn_in: torch.Tensor,
+        resid: torch.Tensor,
+        written: tuple[torch.Tensor, torch.Tensor] | None = None,
+    ) -> None:
+        """``written``: ``mx_target``'s rows, already written (by the MoE route op)."""
         if not self.ahead:
             return
         # Copies: the next layer's fused add updates ``resid`` in place, and the FFN
@@ -263,28 +344,16 @@ class ProLookaheadState:
             self.ffn_in[layer] = ffn_in.clone()
         elif v.lookahead_src == "resid_in" and self.norms:
             # the reader's input norm now, one kernel writing a new tensor: no copy
-            if v.lookahead and reader >= self.start and reader in self.norms:
-                norm = self.norms[reader]
-                linears = self.index_linears.get(reader)
-                if (
-                    v.fuse_mxfp8_quant
-                    and linears is not None
-                    and _native_a8(*linears)
-                    and _aiter_mx_norm()
-                ):
-                    rows = resid.shape[0]
-                    front = self.front_rows(reader, rows, resid)
-                    _, q, q_scale, _ = gemma_rms_norm_mxfp8(
-                        resid,
-                        None,
-                        norm,
-                        write_bf16=False,
-                        q_out=None if front is None else front[0][rows:],
-                        q_scale_out=None if front is None else front[1][rows:],
-                    )
-                    self.resid_in[reader] = (q, q_scale)
-                else:
-                    self.resid_in[reader] = norm.forward_cuda(resid)
+            mx = self.mx_target(layer, resid)
+            if written is not None:
+                self.resid_in[reader] = written
+            elif mx is not None:
+                _, q, q_scale, _ = gemma_rms_norm_mxfp8(
+                    resid, None, mx[0], write_bf16=False, q_out=mx[1], q_scale_out=mx[2]
+                )
+                self.resid_in[reader] = (q, q_scale)
+            elif v.lookahead and reader >= self.start and reader in self.norms:
+                self.resid_in[reader] = self.norms[reader].forward_cuda(resid)
         elif v.lookahead_src in ("resid", "resid_in"):
             self.resid[layer] = resid.clone()
         else:
@@ -452,16 +521,22 @@ class MiniMaxM3ProAttention(nn.Module):
             if index_src is None:
                 own.append(self.index_qk_proj)
             x, xs = _quantized_once(hidden_states, hidden_states_scale, own)
-            q, k = self.qk_proj(x, x_scale=xs).split(self.qk_sizes, dim=-1)
             if index_src is None:
-                iq, ik = self._index_qk(x, xs)
+                ix, ixs = x, xs
             else:
                 ix, ixs = (
                     index_src
                     if isinstance(index_src, tuple)
                     else _quantized_once(index_src, None, [self.index_qk_proj])
                 )
-                iq, ik = self._index_qk(ix, ixs)
+            pair = _qk_pair(self.qk_proj, x, xs, self.index_qk_proj, ix, ixs)
+            if pair is None:
+                qk = self.qk_proj(x, x_scale=xs)
+                iqk = self.index_qk_proj(ix, x_scale=ixs)
+            else:
+                qk, iqk = pair
+            q, k = qk.split(self.qk_sizes, dim=-1)
+            iq, ik = iqk.split(self.index_qk_sizes, dim=-1)
         if diag_srcs is not None:
             # raw indexer projections of every candidate input, for `pro_diag`
             own = (
@@ -605,13 +680,22 @@ class MiniMaxM3ProDecoderLayer(MiniMaxM3DecoderLayer):
             and moe_route_glue.applies(ffn, hidden_states.shape[0])
             and _native_a8(ffn.shared_experts.gate_up_proj)  # it reads the MXFP8 copy
         ):
-            # all-reduce + norm (+ MXFP8 copy) + router + top-k + sort in one launch
+            # all-reduce + norm (+ MXFP8 copy) + router + top-k + sort in one launch;
+            # moe_glue_fold: also the lookahead norm's MXFP8 rows, and the shared add
+            # moves into the next layer's input all-reduce
+            mx = None
+            if v.moe_glue_fold and moe_route_glue.takes_lookahead():
+                mx = state.mx_target(self.layer_num, hidden_states)
             r = moe_route_glue.route(
-                hidden_states, residual, self.post_attention_layernorm, ffn
+                hidden_states, residual, self.post_attention_layernorm, ffn, mx
             )
             residual = r["residual_out"]
-            state.put(self.layer_num, r["normed"], residual)
-            hidden_states = ffn.forward_glue(r, quant_down=True)
+            la = mx and (r["la_q"], r["la_scale"].view(torch.float8_e8m0fnu))
+            state.put(self.layer_num, r["normed"], residual, la)
+            defer = v.moe_glue_fold and self.layer_num + 1 < state.end_layer
+            hidden_states = ffn.forward_glue(r, quant_down=True, defer_shared=defer)
+            if defer:
+                hidden_states, state.moe_tail = hidden_states
             if aux_hidden_state is not None:
                 return hidden_states, residual, aux_hidden_state
             return hidden_states, residual
