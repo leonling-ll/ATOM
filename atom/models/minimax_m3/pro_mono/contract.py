@@ -84,7 +84,7 @@ if __name__ == "__main__":
     upto = args.pop(0) if args and args[0] in ("norm", "ffn") else "norm"
     act = args.pop(0) if args and args[0] in ROUTED_ACTS else ROUTED_ACT_DEFAULT
     ir = int(args.pop(0)[3:]) if args and args[0].startswith("ir=") else None
-    sizes = [int(a) for a in args] or list(range(1, max_tokens(upto) + 1))
+    sizes = [int(a) for a in args] or list(range(1, max_tokens(upto, act) + 1))
     for key in builds(sizes, upto, act, ir):
         r = check_build(key)
         print(

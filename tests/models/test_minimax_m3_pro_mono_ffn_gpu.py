@@ -35,13 +35,17 @@ What must hold:
 * with padding rows (``nvalid`` below the width, ``PADDED``) the real rows'
   FFN partial is the unpadded launch's bit for bit, and the padding rows'
   finite: a padding row is routed nowhere, so the union may shrink and the
-  routed tasks land on other CTAs, but no real row's sum changes.
+  routed tasks land on other CTAs, but no real row's sum changes;
+* past 16 rows (A16W4: two token tiles, ug over K quarters) the same, and
+  with a hot router bias (``HOT``: every row picks two experts) a slot of
+  more than 16 picks runs the second token tile of ug and down.
 
 Needs 8 GPUs of 256 CUs (MI355X), aiter and FlyDSL, about 7 GB a GPU; skipped
 otherwise.
 """
 
 import os
+import resource
 
 import pytest
 import torch
@@ -92,11 +96,16 @@ INTER_V, INTER_R, INTER_S = 640, 640, 640
 # the lookahead); W4A8 (32/32 on GPU at 05a6fc80) and W4A4 (26/26 at
 # c467bcf9) at one row and the widest, so every format stays covered (and
 # runs padded)
+# A16W4 past 16 rows: a third token a wave's AR pass (17), 20, the widest
+# (24, with and without the lookahead), and the widest with the hot router
+# bias (a fourth field, ``HOT``)
 CASES = (
     (1, True, "bf16"), (2, True, "bf16"), (3, True, "bf16"), (4, True, "bf16"),
     (8, True, "bf16"), (9, True, "bf16"), (16, True, "bf16"),
     (16, False, "bf16"),
     (1, True, "fp8"), (16, True, "fp8"), (1, True, "fp4"), (16, True, "fp4"),
+    (17, True, "bf16"), (20, True, "bf16"), (24, True, "bf16"),
+    (24, False, "bf16"), (24, True, "bf16", "hot"),
 )  # fmt: skip
 
 
@@ -105,7 +114,13 @@ CASES = (
 PADDED = {
     (8, True, "bf16"): 5, (16, True, "bf16"): 9,
     (16, True, "fp8"): 9, (16, True, "fp4"): 9,
+    (24, True, "bf16"): 17, (24, False, "bf16"): 20,
+    (24, True, "bf16", "hot"): 20,
 }  # fmt: skip
+
+# the hot cases' router bias: these experts' + 2.0 (a sigmoid is below 1, the
+# bias's std 0.02), so every row picks both and their slots hold every row
+HOT = (7, 300)
 
 
 # near-tie launches: (rows, lookahead, routed_act) of a case's build, all rows
@@ -131,6 +146,13 @@ def _router():
     g = torch.Generator().manual_seed(23)
     w = (torch.randn(EXPERTS, HIDDEN, generator=g) * GATE_STD).to(torch.bfloat16)
     return w, torch.randn(EXPERTS, generator=g) * BIAS_STD
+
+
+def _hot(bias):
+    """``bias`` with the ``HOT`` experts' raised."""
+    out = bias.clone()
+    out[list(HOT)] += 2.0
+    return out
 
 
 def _planes(rank, dev):
@@ -214,7 +236,7 @@ def _worker(rank, port, queue, done, inputs, ties):
                 debug=True,
                 routed_act=act,
             )
-            for s, la, act in CASES
+            for s, la, act, *_ in CASES
         ]
         launches = compile_kernels([(build(k), ABI) for k in keys])
         peers = PeerBuffer(L.peer_bytes(), group, rank, TP, dev)
@@ -249,6 +271,8 @@ def _worker(rank, port, queue, done, inputs, ties):
             )
 
         moe_w = moe_table(w_gate, bias)
+        bias_hot = _hot(bias)
+        moe_w_hot = moe_table(w_gate, bias_hot)
         deq = {}
 
         def routed_of(e):
@@ -313,13 +337,15 @@ def _worker(rank, port, queue, done, inputs, ties):
             return picks, weights, bad, excess
 
         results = []
-        for key, launch, (core, res) in zip(keys, launches, inputs):
+        for case, key, launch, (core, res) in zip(CASES, keys, launches, inputs):
             s = key.tokens
+            hot = len(case) > 3
+            moe_c, bias_c = (moe_w_hot, bias_hot) if hot else (moe_w, bias)
             core, res = core.to(dev), res.to(dev)
             out = outputs(s)
-            waits = run(launch, out, core, res, moe_w)
+            waits = run(launch, out, core, res, moe_c)
             picks, weights, route_bad, logit_excess = route_of(
-                s, out["x"], w_gate, bias
+                s, out["x"], w_gate, bias_c
             )
             x8 = out["x8"].view(torch.float8_e4m3fn)
             want = ffn_reference(
@@ -328,13 +354,13 @@ def _worker(rank, port, queue, done, inputs, ties):
             )  # fmt: skip
             got = out["ffn_out"]
             pad = None
-            nv = PADDED.get((s, key.lookahead, key.routed_act))
+            nv = PADDED.get(case)
             if nv is not None:
                 # the same rows again, only the first nv real: the real rows'
                 # partial bit for bit, the padding rows' finite
                 out_p = {k: torch.zeros_like(v) for k, v in out.items()}
                 count = torch.tensor([nv], dtype=torch.int32, device=dev)
-                waits += run(launch, out_p, core, res, moe_w, count.data_ptr())
+                waits += run(launch, out_p, core, res, moe_c, count.data_ptr())
                 fp = out_p["ffn_out"]
                 pad = {
                     "rows": nv,
@@ -356,7 +382,7 @@ def _worker(rank, port, queue, done, inputs, ties):
             results.append(
                 {
                     "rows": s, "lookahead": key.lookahead, "waits": waits,
-                    "act": key.routed_act,
+                    "act": key.routed_act, "hot": hot,
                     "norm": norm, "picks": picks.cpu(), "weights": weights.cpu(),
                     "route_bad": route_bad, "logit_excess": logit_excess,
                     "ffn_bad": ffn_failures(got.cpu(), want.cpu()),
@@ -403,6 +429,11 @@ def runs():
     import torch.multiprocessing as mp
 
     os.environ.setdefault("ARCH", "gfx950")
+    # every rank's result tensors come over the queue as file descriptors,
+    # all held here at once: 17 cases x 8 ranks pass a soft limit of 1024
+    # ("received 0 items of ancdata"); the hard limit is far above
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    resource.setrlimit(resource.RLIMIT_NOFILE, (max(soft, min(hard, 65536)), hard))
     ctx = mp.get_context("spawn")
     queue = ctx.Queue()
     done = ctx.Event()
@@ -523,6 +554,16 @@ def test_every_ranks_ffn_partial_matches_the_reference(ranks, case):
             f" |U| {r['union']}"
         )
         assert not r["ffn_bad"], (rank, r["rows"], r["act"], r["ffn_bad"])
+
+
+def test_the_hot_case_fills_a_second_token_tile(ranks):
+    """The hot bias puts every row on the ``HOT`` experts: their slots hold
+    24 picks, past one token tile (ug's and down's tile 1 run)."""
+    for i, case in enumerate(CASES):
+        if len(case) > 3:
+            picks = ranks[0][i]["picks"]
+            for e in HOT:
+                assert int((picks == e).sum()) == case[0] > 16, (case, e)
 
 
 @pytest.mark.parametrize("case", [i for i, c in enumerate(CASES) if c in PADDED])

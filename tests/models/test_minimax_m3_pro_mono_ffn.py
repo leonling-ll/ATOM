@@ -142,9 +142,9 @@ def test_ffn_regions_are_disjoint_and_sized(debug, act):
     # where the other formats' do
     pairs = {k: v for k, v in s.items() if k != "queue"}
     if act == "bf16":
-        assert (L.ugp_pair(MAX_ROWS_LAYOUT * L.TOPK - 1, L.UG_GROUPS - 1, 31) + 2) * (
-            8
-        ) == s["ugp"][1]
+        # (the K quarters' three partner parts: a 24-row build's)
+        last = (MAX_ROWS_LAYOUT * L.TOPK - 1, L.UG_GROUPS - 1, 31, L.UGP_PARTS - 1)
+        assert (L.ugp_pair(*last) + 2) * 8 == s["ugp"][1]
         assert max(o for o, _ in pairs.values()) == s["ugp"][0]
     else:
         assert "ugp" not in s

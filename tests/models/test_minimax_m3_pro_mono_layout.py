@@ -31,10 +31,12 @@ from atom.models.minimax_m3.pro_mono import layout as L
 from atom.models.minimax_m3.pro_mono.config import (
     HIDDEN,
     MAX_ROWS,
+    MAX_ROWS_A16W4,
     MAX_ROWS_LAYOUT,
     MAX_ROWS_NORM,
     ROUTED_ACTS,
 )
+from atom.mono.plan.execution import BLOCKS
 
 
 def test_tp8_geometry():
@@ -95,22 +97,96 @@ def test_build_key():
     assert names == list(L.NORM_REGIONS)
 
 
-def test_a_norm_build_takes_24_rows_an_ffn_build_16():
-    """Past 16 rows only the norm build exists (two token tiles in the o stage,
-    AR #1 in three passes); no FFN format builds there yet, so no forward of
-    17 .. 24 rows can reach a stage that holds one tile."""
-    assert MAX_ROWS < MAX_ROWS_NORM == 24 <= MAX_ROWS_LAYOUT
-    assert L.max_tokens("norm") == MAX_ROWS_NORM and L.max_tokens("ffn") == MAX_ROWS
+def test_a_norm_and_an_a16w4_build_take_24_rows_w4a4_and_w4a8_16():
+    """Past 16 rows the norm build (two token tiles in the o stage, AR #1 in
+    three passes) and the A16W4 FFN build (two token tiles in every stage, ug
+    over K quarters) exist; W4A4 and W4A8 hold one tile, so no forward of 17
+    .. 24 rows reaches a stage of theirs."""
+    assert MAX_ROWS < MAX_ROWS_NORM == MAX_ROWS_A16W4 == 24 <= MAX_ROWS_LAYOUT
+    assert L.max_tokens("norm") == MAX_ROWS_NORM
+    assert L.max_tokens("ffn", "bf16") == MAX_ROWS_A16W4
+    assert L.max_tokens("ffn", "fp4") == L.max_tokens("ffn", "fp8") == MAX_ROWS
     assert L.P1Build(tokens=MAX_ROWS_NORM).tokens == 24
     with pytest.raises(ValueError, match="norm build"):
         L.P1Build(tokens=MAX_ROWS_NORM + 1)
     for act in ROUTED_ACTS:
-        L.P1Build(tokens=MAX_ROWS, upto="ffn", routed_act=act, inter_r=640)
+        top = MAX_ROWS_A16W4 if act == "bf16" else MAX_ROWS
+        L.P1Build(tokens=top, upto="ffn", routed_act=act, inter_r=640)
         with pytest.raises(ValueError, match="ffn build"):
-            L.P1Build(tokens=MAX_ROWS + 1, upto="ffn", routed_act=act, inter_r=640)
+            L.P1Build(tokens=top + 1, upto="ffn", routed_act=act, inter_r=640)
     # the o stage: a tile a 16 tokens, its K-quarter sum a pass a tile
     assert [L.token_tiles(s) for s in (1, 16, 17, 24)] == [1, 1, 2, 2]
     assert L.O_ROWS * L.TOKEN_TILE == 512
+
+
+@pytest.mark.parametrize("s", [1, 2, 16, 17, 20, 24])
+def test_a16w4_task_lists_hold_every_entry_and_down_task_once(s):
+    """A16W4 up to 16 rows: two lists (K halves), a task a CTA; past 16: four
+    (K quarters), each entry two tasks a CTA runs at once. Every (list,
+    entry) of the first round is placed on one CTA, and the lists' entries
+    past their ug ones deal the 448 down tasks once."""
+    act = "bf16"
+    wide = s > L.TOKEN_TILE
+    n = L.ug_split(act, s)
+    assert n == (L.UG_QUARTERS if wide else L.UG_HALVES)
+    assert L.ug_per_cta(act, s) == (2 if wide else 1)
+    assert L.xk_row(act, s) == (L.XQ_ROW if wide else L.XH_ROW)
+    per = [L.list_ctas(act, s, lst) for lst in range(n)]
+    assert sum(per) == BLOCKS
+    if wide:
+        # the quarter-0 list (the merges) on more CTAs, the first after the
+        # shared expert's (no stage before ug)
+        assert per == [L.QUARTER0_CTAS] + [L.QUARTER_CTAS] * 3
+        assert L.QUARTER0_CTAS > L.QUARTER_CTAS
+        assert all(
+            L.task_list(L.UG_FIRST_CTA + k, act, s) == (0, k)
+            for k in range(L.QUARTER0_CTAS)
+        )
+    placed = [L.task_list(b, act, s) for b in range(BLOCKS)]
+    assert sorted(placed) == [(lst, k) for lst in range(n) for k in range(per[lst])]
+    for ug in (0, 7, 590):
+        downs = [
+            L.list_down(k, ug, lst, act, s)
+            for lst in range(n)
+            for k in range(ug, ug + L.DOWN_TASKS // n)
+        ]
+        assert sorted(downs) == list(range(L.DOWN_TASKS))
+    # the launch's queue words cover the widest build's lists
+    assert L.queue_lists(act) == L.UG_QUARTERS >= n
+    assert L.queue_lists("fp4") == L.queue_lists("fp8") == L.ug_split("fp8", s) == 1
+    # a quarter's x rows: 24 rows fit where a K half's would not
+    assert L.XQ_WORDS * L.UG_QUARTERS * 2 == HIDDEN
+    assert MAX_ROWS_A16W4 * L.XQ_ROW * 4 < 163840 < MAX_ROWS_A16W4 * L.XH_ROW * 4
+
+
+def test_the_route_ctas_follow_the_build_rows():
+    """A token a route CTA, the last before the router's: 219 .. 234 up to 16
+    rows (as before), 211 .. 234 at 24; never on a shared or router CTA."""
+    assert L.route_cta0(1) == L.route_cta0(MAX_ROWS) == L.RT0 == 219
+    assert L.route_cta0(MAX_ROWS_A16W4) == 211
+    for s in (MAX_ROWS, MAX_ROWS_A16W4):
+        route = set(range(L.route_cta0(s), L.route_cta0(s) + s))
+        assert max(route) == L.R0 - 1
+        assert not route & set(range(L.SH0, L.SH0 + L.SH_TASKS))
+
+
+def test_the_ugp_parts_are_apart():
+    """The K slices > 0's partials (quartered: three) a part after another;
+    part 0 is the K halves' layout unchanged."""
+    last = (MAX_ROWS_LAYOUT * L.TOPK - 1, L.UG_GROUPS - 1, L.UG_COLS - 1)
+    assert L.ugp_pair(*last, 0) == L.ugp_pair(*last)
+    cells = [
+        L.ugp_pair(r, g, c, p)
+        for p in range(L.UGP_PARTS)
+        for r in (0, MAX_ROWS_LAYOUT * L.TOPK - 1)
+        for g in (0, L.UG_GROUPS - 1)
+        for c in (0, L.UG_COLS - 1)
+    ]
+    assert len(set(cells)) == len(cells)
+    key = L.P1Build(tokens=24, upto="ffn", routed_act="bf16", inter_r=640)
+    assert (L.ugp_pair(*last, L.UGP_PARTS - 1) + 2) * 8 == L.scratch_layout(key)["ugp"][
+        1
+    ]
 
 
 def test_debug_scratch_holds_the_wait_records():
