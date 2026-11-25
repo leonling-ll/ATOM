@@ -21,9 +21,14 @@ What must hold:
 * every rank writes the same h_mid / x / x8 / la8 and the same route (picks,
   weights), bit for bit; h_mid / x / x8 / la8 match the norm's reference
   (``layer_failures``);
-* the gathered logits are within one bf16 step of the reference on the
-  kernel's x, the picks the top 4 of its own logits but for ties, the weights
-  their renormalization x 2 (``route_failures``);
+* the gathered logits are fp32, within the sum-order bound of the
+  reference on the kernel's x (``logit_bound``; a bf16 rounding is far past
+  it), the picks the top 4 of its own logits but for ties, the weights their
+  renormalization x 2 (``route_failures``);
+* on a near tie (``near_tie_router``, built on the kernel's own x of identical
+  rows at 1 and 16 rows) the picks are the ones the fp32 logits make, as
+  production's ``moe_route_glue`` picks, where bf16-rounded logits pick
+  another 4th expert;
 * each rank's FFN partial within ``FFN_BOUND`` per row (``ffn_failures``: the
   CPU test shows the bound passes summation-order noise and catches a lost
   scale, weight, operand, pick, K block, the clamp, the shared expert);
@@ -62,6 +67,8 @@ from minimax_m3_pro_mono_ref import (
     layer_failures,
     layer_reference,
     layer_report,
+    logit_bound,
+    near_tie_router,
     route_failures,
     route_reference,
     row_relnorm,
@@ -99,6 +106,17 @@ PADDED = {
     (8, True, "bf16"): 5, (16, True, "bf16"): 9,
     (16, True, "fp8"): 9, (16, True, "fp4"): 9,
 }  # fmt: skip
+
+
+# near-tie launches: (rows, lookahead, routed_act) of a case's build, all rows
+# one row's inputs (so one near tie serves every token)
+TIES = ((1, True, "bf16"), (16, True, "bf16"))
+
+
+def _tie_inputs(tie):
+    s = TIES[tie][0]
+    cores, _, res = case_inputs(1, [_weight(r) for r in range(TP)], 7000 + tie)
+    return [c.expand(s, -1).contiguous() for c in cores], res.expand(s, -1).contiguous()
 
 
 def _inputs(case):
@@ -163,8 +181,9 @@ def _planes(rank, dev):
     return routed, shared
 
 
-def _worker(rank, port, queue, done, inputs):
-    """``inputs``: per case, (this rank's core rows, the residual). The worker stays
+def _worker(rank, port, queue, done, inputs, ties):
+    """``inputs``: per case, (this rank's core rows, the residual); ``ties``: the
+    same per ``TIES`` entry. The worker stays
     alive until the parent has received every rank's results (``done``): torch hands
     tensors over the queue as file descriptors that the sender must still hold."""
     import torch.distributed as dist
@@ -214,17 +233,22 @@ def _worker(rank, port, queue, done, inputs):
         w_post, w_ahead = (t.to(dev) for t in _norm_weights())
         w_gate, bias = (t.to(dev) for t in _router())
         routed, shared = _planes(rank, dev)
-        band = w_gate[L.E_RANK * rank : L.E_RANK * (rank + 1)]
-        table = {
-            "w_gate": band, "bias": bias, "w13": routed["w13"], "s13": routed["s13"],
-            "w2": routed["w2"], "s2": routed["s2"], "w_sgu": shared["w_sgu"],
-            "s_sgu": shared["s_sgu"], "w_sd": shared["w_sd"], "s_sd": shared["s_sd"],
-        }  # fmt: skip
-        addrs = {n: t.data_ptr() for n, t in table.items()}
-        addrs["queue"] = scratch.data_ptr() + L.queue_word_offset(keys[0], LAYER)
-        moe_w = torch.tensor(
-            [addrs[n] for n in L.MOE_TABLE], dtype=torch.int64, device=dev
-        )
+
+        def moe_table(w_gate, bias):
+            band = w_gate[L.E_RANK * rank : L.E_RANK * (rank + 1)]
+            table = {
+                "w_gate": band, "bias": bias, "w13": routed["w13"],
+                "s13": routed["s13"], "w2": routed["w2"], "s2": routed["s2"],
+                "w_sgu": shared["w_sgu"], "s_sgu": shared["s_sgu"],
+                "w_sd": shared["w_sd"], "s_sd": shared["s_sd"],
+            }  # fmt: skip
+            addrs = {n: t.data_ptr() for n, t in table.items()}
+            addrs["queue"] = scratch.data_ptr() + L.queue_word_offset(keys[0], LAYER)
+            return torch.tensor(
+                [addrs[n] for n in L.MOE_TABLE], dtype=torch.int64, device=dev
+            )
+
+        moe_w = moe_table(w_gate, bias)
         deq = {}
 
         def routed_of(e):
@@ -235,15 +259,11 @@ def _worker(rank, port, queue, done, inputs):
                 )
             return deq[e]
 
-        results = []
-        for key, launch, (core, res) in zip(keys, launches, inputs):
-            s = key.tokens
-            core, res = core.to(dev), res.to(dev)
-
+        def outputs(s):
             def z(*shape, dt=torch.uint8):
                 return torch.zeros(*shape, dtype=dt, device=dev)
 
-            out = {
+            return {
                 "h_mid": z(s, HIDDEN, dt=torch.bfloat16),
                 "x": z(s, HIDDEN, dt=torch.bfloat16),
                 "x8": z(s, HIDDEN), "x8s": z(s, HIDDEN // 32),
@@ -251,29 +271,30 @@ def _worker(rank, port, queue, done, inputs):
                 "ffn_out": z(s, HIDDEN, dt=torch.bfloat16),
             }  # fmt: skip
 
-            def run(nvalid=0, out=out, core=core, res=res, launch=launch):
-                args = ABI.pack(
-                    {
-                        "core": core.data_ptr(), "w_o": w_o.data_ptr(),
-                        "s_o": s_o.data_ptr(), "res": res.data_ptr(),
-                        "g_post": w_post.data_ptr(), "g_ahead": w_ahead.data_ptr(),
-                        "moe_w": moe_w.data_ptr(),
-                        **{k: v.data_ptr() for k, v in out.items()},
-                        "scratch": scratch.data_ptr(), "plain": plain.data_ptr(),
-                        "nvalid": nvalid,
-                        "peers": peers.addresses.data_ptr(), "rank": rank,
-                        "layer": LAYER, "tl": 0,
-                    }
-                )  # fmt: skip
-                dist.barrier(group=group)
-                mbx.begin_step()
-                _run_compiled(launch, *args, torch.cuda.current_stream())
-                torch.cuda.synchronize()
-                got = given_up_waits(diag, region_namer(L.REGIONS))
-                return got + [f"fence: rank {r}" for r in mbx.missing_ranks()]
+        def run(launch, out, core, res, moe_w, nvalid=0):
+            args = ABI.pack(
+                {
+                    "core": core.data_ptr(), "w_o": w_o.data_ptr(),
+                    "s_o": s_o.data_ptr(), "res": res.data_ptr(),
+                    "g_post": w_post.data_ptr(), "g_ahead": w_ahead.data_ptr(),
+                    "moe_w": moe_w.data_ptr(),
+                    **{k: v.data_ptr() for k, v in out.items()},
+                    "scratch": scratch.data_ptr(), "plain": plain.data_ptr(),
+                    "nvalid": nvalid,
+                    "peers": peers.addresses.data_ptr(), "rank": rank,
+                    "layer": LAYER, "tl": 0,
+                }
+            )  # fmt: skip
+            dist.barrier(group=group)
+            mbx.begin_step()
+            _run_compiled(launch, *args, torch.cuda.current_stream())
+            torch.cuda.synchronize()
+            got = given_up_waits(diag, region_namer(L.REGIONS))
+            return got + [f"fence: rank {r}" for r in mbx.missing_ranks()]
 
-            waits = run()
-            # the route record and the gathered logits (tagged pairs: values)
+        def route_of(s, x, w_gate, bias):
+            """The route record and the gathered fp32 logits (tagged pairs:
+            values) of the last launch, and ``route_failures`` on them."""
             rec = scratch[route_at : route_at + s * 2 * TOPK * 8].view(torch.int32)
             rec = rec.view(s, 2 * TOPK, 2)[..., 0]
             picks = rec[:, :TOPK].long()
@@ -281,14 +302,26 @@ def _worker(rank, port, queue, done, inputs):
             n = TP * L.MAX_ROWS_LAYOUT * L.E_RANK * 8
             rl = peers.bytes[rlog_at : rlog_at + n].view(torch.int32)
             rl = rl.view(TP, L.MAX_ROWS_LAYOUT, L.E_RANK, 2)[:, :s, :, 0]
-            logits = (
-                rl.contiguous().view(torch.float32).permute(1, 0, 2).reshape(s, -1)
-            ).to(torch.bfloat16)
-            x8 = out["x8"].view(torch.float8_e4m3fn)
-            ref_logits = route_reference(out["x"], w_gate, bias)[0]
-            route_bad = route_failures(
-                logits.cpu(), picks.cpu(), weights.cpu(), ref_logits.cpu(), bias.cpu()
+            logits = rl.contiguous().view(torch.float32).permute(1, 0, 2).reshape(s, -1)
+            ref = route_reference(x, w_gate, bias)[0].cpu()
+            bound = logit_bound(x, w_gate).cpu()
+            logits = logits.cpu()
+            bad = route_failures(
+                logits, picks.cpu(), weights.cpu(), ref, bias.cpu(), bound
             )
+            excess = float(((logits - ref).abs() / bound).max())
+            return picks, weights, bad, excess
+
+        results = []
+        for key, launch, (core, res) in zip(keys, launches, inputs):
+            s = key.tokens
+            core, res = core.to(dev), res.to(dev)
+            out = outputs(s)
+            waits = run(launch, out, core, res, moe_w)
+            picks, weights, route_bad, logit_excess = route_of(
+                s, out["x"], w_gate, bias
+            )
+            x8 = out["x8"].view(torch.float8_e4m3fn)
             want = ffn_reference(
                 out["x"], x8, out["x8s"], picks, weights, routed_of,
                 shared["deq"], act=key.routed_act,
@@ -301,7 +334,7 @@ def _worker(rank, port, queue, done, inputs):
                 # partial bit for bit, the padding rows' finite
                 out_p = {k: torch.zeros_like(v) for k, v in out.items()}
                 count = torch.tensor([nv], dtype=torch.int32, device=dev)
-                waits += run(count.data_ptr(), out_p)
+                waits += run(launch, out_p, core, res, moe_w, count.data_ptr())
                 fp = out_p["ffn_out"]
                 pad = {
                     "rows": nv,
@@ -325,14 +358,37 @@ def _worker(rank, port, queue, done, inputs):
                     "rows": s, "lookahead": key.lookahead, "waits": waits,
                     "act": key.routed_act,
                     "norm": norm, "picks": picks.cpu(), "weights": weights.cpu(),
-                    "route_bad": route_bad,
+                    "route_bad": route_bad, "logit_excess": logit_excess,
                     "ffn_bad": ffn_failures(got.cpu(), want.cpu()),
                     "ffn_rel": row_relnorm(got.cpu(), want.cpu()),
                     "union": len(set(picks.flatten().tolist())),
                     "pad": pad,
                 }
             )  # fmt: skip
-        queue.put((rank, results, None))
+        tie_results = []
+        for spec, (core, res) in zip(TIES, ties):
+            s = spec[0]
+            i = CASES.index(spec)
+            core, res = core.to(dev), res.to(dev)
+            # the kernel's own x on the base router, then the near tie built on it
+            out = outputs(s)
+            waits = run(launches[i], out, core, res, moe_w)
+            x = out["x"].cpu()
+            same = bool((x == x[:1]).all())
+            tw, tb, want, want_bf16 = near_tie_router(x[0], w_gate.cpu(), bias.cpu())
+            tw, tb = tw.to(dev), tb.to(dev)
+            out = outputs(s)
+            waits += run(launches[i], out, core, res, moe_table(tw, tb))
+            picks, _, route_bad, logit_excess = route_of(s, out["x"], tw, tb)
+            tie_results.append(
+                {
+                    "rows": s, "waits": waits, "same_rows": same,
+                    "picks": [sorted(p) for p in picks.cpu().tolist()],
+                    "want": want, "want_bf16": want_bf16, "route_bad": route_bad,
+                    "logit_excess": logit_excess,
+                }
+            )  # fmt: skip
+        queue.put((rank, {"cases": results, "ties": tie_results}, None))
         done.wait(TIMEOUT_S)
     except Exception as e:  # noqa: BLE001 - reported to the parent by name
         import traceback
@@ -341,8 +397,9 @@ def _worker(rank, port, queue, done, inputs):
 
 
 @pytest.fixture(scope="module")
-def ranks():
-    """Every rank's results of every case: {rank: [dict]}."""
+def runs():
+    """Every rank's results: {rank: {"cases": [dict a case], "ties": [dict a
+    near tie]}}."""
     import torch.multiprocessing as mp
 
     os.environ.setdefault("ARCH", "gfx950")
@@ -351,10 +408,18 @@ def ranks():
     done = ctx.Event()
     port = _free_port()
     ins = [_inputs(i) for i in range(len(CASES))]
+    tie_ins = [_tie_inputs(i) for i in range(len(TIES))]
     procs = [
         ctx.Process(
             target=_worker,
-            args=(r, port, queue, done, [(cores[r], res) for cores, _, res in ins]),
+            args=(
+                r,
+                port,
+                queue,
+                done,
+                [(cores[r], res) for cores, _, res in ins],
+                [(cores[r], res) for cores, res in tie_ins],
+            ),
         )
         for r in range(TP)
     ]
@@ -376,6 +441,18 @@ def ranks():
                 p.terminate()
     assert not errors, "\n".join(errors)
     return got
+
+
+@pytest.fixture(scope="module")
+def ranks(runs):
+    """Every rank's results of every case: {rank: [dict]}."""
+    return {rank: r["cases"] for rank, r in runs.items()}
+
+
+@pytest.fixture(scope="module")
+def ties(runs):
+    """Every rank's near-tie results: {rank: [dict]}."""
+    return {rank: r["ties"] for rank, r in runs.items()}
 
 
 def test_no_wait_gave_up(ranks):
@@ -414,7 +491,27 @@ def test_the_norm_matches_the_reference(ranks, case):
 @pytest.mark.parametrize("case", range(len(CASES)))
 def test_the_router_matches_the_reference(ranks, case):
     for rank in range(TP):
-        assert not ranks[rank][case]["route_bad"], (rank, ranks[rank][case])
+        r = ranks[rank][case]
+        print(
+            f"rows {r['rows']} {r['act']} rank {rank}: logit error"
+            f" {r['logit_excess']:.3g} of the sum-order bound"
+        )
+        assert not r["route_bad"], (rank, r["rows"], r["act"], r["route_bad"])
+
+
+@pytest.mark.parametrize("tie", range(len(TIES)))
+def test_a_near_tie_picks_what_fp32_logits_pick(ties, tie):
+    for rank in range(TP):
+        t = ties[rank][tie]
+        print(
+            f"near tie rows {t['rows']} rank {rank}: picks {t['picks'][0]},"
+            f" fp32 logits pick {t['want']}, bf16 logits {t['want_bf16']};"
+            f" logit error {t['logit_excess']:.3g} of the bound"
+        )
+        assert not t["waits"] and t["same_rows"], (rank, t)
+        assert not t["route_bad"], (rank, t["rows"], t["route_bad"])
+        for tok, p in enumerate(t["picks"]):
+            assert p == t["want"], (rank, t["rows"], tok, p, t["want"], t["want_bf16"])
 
 
 @pytest.mark.parametrize("case", range(len(CASES)))

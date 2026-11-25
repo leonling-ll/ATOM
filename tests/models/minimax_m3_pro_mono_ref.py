@@ -306,7 +306,7 @@ def _bf(x):
 
 
 def route_reference_of_logits(logits, bias):
-    """The selection on bf16 logits [S, E]: sigmoid, the top 4 of sigmoid +
+    """The selection on the logits [S, E]: sigmoid, the top 4 of sigmoid +
     bias (equal scores: the lower expert first), the 4 unbiased sigmoids
     renormalized in that order x 2.0. -> (logits, picks [S, 4], weights [S,
     4], scores [S, E] f32)."""
@@ -322,10 +322,71 @@ def route_reference_of_logits(logits, bias):
 
 
 def route_reference(x, w_gate, bias):
-    """The router on the norm's bf16 x [S, H]: bf16 logits of the bf16 gate
-    [E, H] (fp32 accumulate), then ``route_reference_of_logits``."""
-    logits = (x.double() @ w_gate.double().T).to(torch.bfloat16)
+    """The router on the norm's bf16 x [S, H]: fp32 logits of the bf16 gate
+    [E, H], unrounded as production's ``moe_route_glue`` keeps them, then
+    ``route_reference_of_logits``."""
+    logits = (x.double() @ w_gate.double().T).float()
     return route_reference_of_logits(logits, bias)
+
+
+def logit_bound(x, w_gate):
+    """[S, E]: how far an fp32 sum of x [S, H] @ w_gate^T in another order may
+    land from ``route_reference``'s logits: ``LOGIT_REL`` of the sum of its
+    terms' magnitudes."""
+    return (LOGIT_REL * (x.double().abs() @ w_gate.double().abs().T)).float()
+
+
+# ``near_tie_router``: three experts far ahead (bias + 4), then a pair (A, B)
+# whose rows differ in one column only, so B's fp32 logit is A's L plus d, a
+# quarter of a bf16 step of L, and both round to one bf16 value
+TIE_TOP = (5, 200, 383)
+TIE_PAIR = (60, 300)  # on ranks 1 and 6 of 8
+TIE_LOGIT = 0.75  # a bf16 value; L sits 3/16 of its step (2^-8) below it
+TIE_STEP = 2.0**-8
+
+
+def _bf16_of(v):
+    return torch.tensor(v, dtype=torch.float64).to(torch.bfloat16)
+
+
+def near_tie_router(x, w_gate, bias, top=TIE_TOP, pair=TIE_PAIR):
+    """A router on which the fp32 and the bf16-rounded logits of one bf16 x
+    [H] pick different 4th experts: ``w_gate`` [E, H] bf16 and ``bias`` [E]
+    with rows A and B rebuilt and the biases of ``top`` and the pair raised.
+    A's logit L = TIE_LOGIT - 3/16 step and B's L + d (d = x_k w_k = 1/4 step)
+    round to the same bf16 value, 5/16 and 7/16 of a step from where the
+    rounding turns (at least 1/8 required);
+    bias_A = bias_B + (sigmoid(L + d) - sigmoid(L)) / 2, so fp32 logits pick
+    B and bf16 logits A. -> (w_gate, bias, the fp32 picks, the bf16 picks)
+    (sorted lists)."""
+    a, b = pair
+    xd = x.double()
+    j1, j2, k = (int(i) for i in xd.abs().argsort(descending=True)[:3])
+    target = TIE_LOGIT - 3 * TIE_STEP / 16
+    row = w_gate[a].clone()
+    row[[j1, j2, k]] = 0
+    # the coarse column, then the fine one with what its rounding left
+    for j in (j1, j2):
+        row[j] = _bf16_of((target - float(xd @ row.double())) / float(xd[j]))
+    rowb = row.clone()
+    rowb[k] = _bf16_of(TIE_STEP / 4 / float(xd[k]))
+    la, lb = float(xd @ row.double()), float(xd @ rowb.double())
+    ends = torch.tensor([la, lb], dtype=torch.float64)
+    near = (ends - ends.to(torch.bfloat16).double()).abs()
+    if not (
+        bool((ends.to(torch.bfloat16).double() == TIE_LOGIT).all())
+        and float(near.max()) <= 3 * TIE_STEP / 8
+        and lb - la >= TIE_STEP / 8
+    ):
+        raise ValueError(f"no near tie on this x: logits {la!r}, {lb!r}")
+    w = w_gate.clone()
+    w[a], w[b] = row, rowb
+    bias = bias.float().clone()
+    bias[list(top)] += 4.0
+    bias[b] += 2.0
+    sa, sb = torch.sigmoid(ends).tolist()
+    bias[a] = bias[b] + (sb - sa) / 2
+    return w, bias, sorted([*top, b]), sorted([*top, a])
 
 
 def qdq_mxfp8(x):
@@ -398,32 +459,24 @@ def ffn_reference(
 # (``test_minimax_m3_pro_mono_ffn``) above that noise and below the errors a
 # wrong scale, activation, operand or route leaves.
 FFN_BOUND = 2.0**-5
-# the kernel's gathered router logits may differ from the reference's by one
-# bf16 step (sum order); its picks must be the top 4 of its own logits'
+# the kernel's gathered fp32 router logits may differ from the reference's by
+# the sum order: at most ``LOGIT_REL`` of the sum of the terms' magnitudes
+# (``logit_bound``; about 60 fp32 roundings deep, where a bf16 rounding is
+# 2^-9 of the logit itself); its picks must be the top 4 of its own logits'
 # scores but for ties within ``TIE_TOL`` (hardware exp2 / rcp against torch's
 # sigmoid), and its weights their renormalization within ``WEIGHT_TOL``
-LOGIT_STEPS = 1
+LOGIT_REL = 2.0**-18
 TIE_TOL = 1e-5
 WEIGHT_TOL = 1e-4
 
 
-def bf16_steps(a, b):
-    """How many bf16 values apart two bf16 tensors are, element-wise."""
-
-    def line(t):
-        u = t.contiguous().view(torch.int16).to(torch.int32)
-        return torch.where(u < 0, -(u & 0x7FFF), u)
-
-    return (line(a) - line(b)).abs()
-
-
-def route_failures(logits, picks, weights, ref_logits, bias):
-    """The kernel's router -- its gathered logits [S, E] bf16, its picks and
-    weights [S, 4] -- against ``route_reference``'s logits, and against the
-    reference's selection and renormalization run on the kernel's own logits.
-    -> the problems, by name."""
+def route_failures(logits, picks, weights, ref_logits, bias, bound):
+    """The kernel's router -- its gathered logits [S, E] fp32, its picks and
+    weights [S, 4] -- against ``route_reference``'s logits within ``bound``
+    (``logit_bound``), and against the reference's selection and
+    renormalization run on the kernel's own logits. -> the problems, by name."""
     bad = []
-    if int(bf16_steps(logits, ref_logits).max()) > LOGIT_STEPS:
+    if bool(((logits.float() - ref_logits.float()).abs() > bound).any()):
         bad.append("logits")
     _, want_picks, want_w, score = route_reference_of_logits(logits, bias)
     for t in range(picks.shape[0]):
