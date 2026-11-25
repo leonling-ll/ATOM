@@ -2041,8 +2041,17 @@ def _merge_keys(base, count, K: tl.constexpr, VOLATILE: tl.constexpr):
     return best
 
 
+# SPAN is a runtime argument: a long prefill's SPAN grows with its context (a value per
+# 16k-token band), and as a constexpr each new value compiled this large kernel again
 @triton.jit(
-    do_not_specialize=["stride_s", "stride_bt", "stride_rows", "stride_ctx", "NB"]
+    do_not_specialize=[
+        "stride_s",
+        "stride_bt",
+        "stride_rows",
+        "stride_ctx",
+        "NB",
+        "SPAN",
+    ]
 )
 def _select_split_kernel(
     score_ptr,
@@ -2058,7 +2067,7 @@ def _select_split_kernel(
     part_ptr,  # [T, P, K] int64 scratch
     count_ptr,  # [T] int32 arrivals, zero between calls (FUSED only)
     NB,
-    SPAN: tl.constexpr,
+    SPAN,
     K: tl.constexpr,
     CHUNK: tl.constexpr,
     PG: tl.constexpr,
@@ -2128,7 +2137,9 @@ def _select_split_kernel(
             tl.atomic_xchg(count_ptr + t, 0, sem="relaxed", scope="gpu")
 
 
-@triton.jit(do_not_specialize=["stride_bt", "stride_rows", "stride_ctx", "NB", "P"])
+@triton.jit(
+    do_not_specialize=["stride_bt", "stride_rows", "stride_ctx", "NB", "P", "SPAN"]
+)
 def _select_merge_kernel(
     bt_ptr,
     stride_bt,
@@ -2141,7 +2152,7 @@ def _select_merge_kernel(
     part_ptr,
     NB,
     P,
-    SPAN: tl.constexpr,
+    SPAN,
     K: tl.constexpr,
     PG: tl.constexpr,
     LOGICAL: tl.constexpr = False,
