@@ -15,7 +15,9 @@ A mono layer's segment (``segment``), Option A::
          the next layer's AR #2 + input norm runs unchanged (Option A)
 
 The lookahead goes where ``ProLookaheadState.put`` would put it
-(``resid_in[L + 2]``, MXFP8), so layer L + 2's indexer reads it as before.
+(``resid_in[L + 2]``, MXFP8), written up to ``FRONT_ROWS`` rows into the
+same ring rows ``put`` writes (``ProLookaheadState.lookahead_rows``), so
+layer L + 2's indexer reads it as before and its one front GEMM applies.
 
 ``UPTO`` names the build: the "ffn" build writes the FFN partial itself
 (``ffn_out`` in its ABI) and the segment skips production's MoE; a "norm"
@@ -32,14 +34,17 @@ Every region is single-buffered with per-layer tags: production's AR #2
 between two mono layers holds every rank until every rank finished the
 earlier one. A layer's outputs are new tensors (a graph's pool under capture),
 as production's are, so a residual the next layer's fused add updates in
-place is never a buffer the kernel writes again.
+place is never a buffer the kernel writes again; the lookahead alone goes to
+its reader's ring rows (fixed addresses, as ``put``'s), read once by the
+reader before a later layer writes that slot again.
 
 Check mode (``ATOM_MONO_CHECK=1``, eager steps; a captured step runs mono
 alone): each mono layer first runs production's segment at that width (its
 own o_proj, then ``moe_route_glue``'s launch where it serves, else AR #1 +
 norm; the lookahead put and the MoE) on a copy of the residual, then the
 kernel, and rank 0 logs ``compare()`` of every output the two hand on; the
-forward goes on from mono's.
+forward goes on from mono's. Production's lookahead is copied out of the ring
+rows before the kernel writes the same rows.
 """
 
 import logging
@@ -97,8 +102,9 @@ UPTO = "ffn"
 
 BF16 = torch.bfloat16
 U8 = torch.uint8
-# a kernel output by ABI name: (dtype, columns); a build allocates those its
-# ABI has (``la8`` / ``la8s`` only on a layer with a lookahead reader)
+# a kernel output by ABI name: (dtype, columns); a launch allocates those its
+# ABI has (``la8`` / ``la8s`` only on a layer with a lookahead reader, and
+# then only past the reader's ring rows: ``ProMonoRunner.launch``)
 OUTPUTS = {
     "h_mid": (BF16, HIDDEN),
     "x": (BF16, HIDDEN),
@@ -253,7 +259,9 @@ class ProMonoRunner:
 
     def launch(self, layer_id: int, core: torch.Tensor, residual: torch.Tensor):
         """The layer kernel on ``core`` [S, 3072] and ``residual`` [S, 7168]:
-        its outputs by ABI name (``OUTPUTS``)."""
+        its outputs by ABI name (``OUTPUTS``). The lookahead (``la8`` /
+        ``la8s``) is its reader's ring rows where they exist
+        (``ProLookaheadState.lookahead_rows``), as ``put`` writes it."""
         n = residual.shape[0]
         lw = self.layers[layer_id]
         o_k = DIMS.o_k
@@ -264,12 +272,19 @@ class ProMonoRunner:
             )
         core = core.reshape(n, o_k).contiguous()
         residual = residual.contiguous()
+        ring = (
+            None
+            if lw.reader is None
+            else self.state.lookahead_rows(lw.reader, n, residual)
+        )
+        own_lookahead = lw.reader is not None and ring is None
         out = {
             name: torch.empty(n, cols, dtype=dtype, device=residual.device)
             for name, (dtype, cols) in OUTPUTS.items()
-            if name in ABI.names
-            and (lw.reader is not None or name not in LOOKAHEAD_OUTPUTS)
+            if name in ABI.names and (own_lookahead or name not in LOOKAHEAD_OUTPUTS)
         }
+        if ring is not None:
+            out["la8"], out["la8s"] = ring[0], ring[1].view(U8)
         ptrs = {name: 0 for name in OUTPUTS if name in ABI.names}
         ptrs.update({name: t.data_ptr() for name, t in out.items()})
         w = lw.w
@@ -321,7 +336,8 @@ class ProMonoRunner:
     def _production(self, layer, residual, reference) -> dict:
         """Production's segment on a copy of ``residual`` (its fused add may
         update the residual in place): what it hands on, by output name. The
-        lookahead it put is taken back out (the kernel's goes on)."""
+        lookahead it put is taken back out as a copy: it is the reader's ring
+        rows, which the kernel writes next (the kernel's goes on)."""
         ffn, h_mid, x, x8, x8s = reference(residual.clone())
         ref = {"h_mid": h_mid, "x": x, "x8": x8, "x8s": x8s, "ffn": ffn}
         reader = self.layers[layer.layer_num].reader
@@ -329,7 +345,7 @@ class ProMonoRunner:
             # absent when the live variants left the latched ones
             put = self.state.resid_in.pop(reader, None)
             if isinstance(put, tuple):
-                ref["la8"], ref["la8s"] = put
+                ref["la8"], ref["la8s"] = (t.clone() for t in put)
         return ref
 
     def _log_check(self, lid: int, out: dict, ffn: torch.Tensor, ref: dict) -> None:

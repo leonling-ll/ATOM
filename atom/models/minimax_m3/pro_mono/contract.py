@@ -8,17 +8,19 @@ refused) and to the CU's LDS.
 Usage: ARCH=gfx950 python -m atom.models.minimax_m3.pro_mono.contract [norm|ffn] [fp4|fp8|bf16] [ir=N] [S ...]
 (the routed activation format: an FFN build's, default ``layout.ROUTED_ACT_DEFAULT``;
 ``ir``: the routed planes' loaded intermediate, default the unpadded 640 Pro's
-``pad_align`` 128 loads)
+``pad_align`` 128 loads; the sizes default to every width ``upto`` builds,
+``layout.max_tokens``)
 """
 
 import sys
 
-from atom.models.minimax_m3.pro_mono.config import MAX_ROWS, ProDims
+from atom.models.minimax_m3.pro_mono.config import ProDims
 from atom.models.minimax_m3.pro_mono.layout import (
     ROUTED_ACT_DEFAULT,
     ROUTED_ACTS,
     P1Build,
     decls,
+    max_tokens,
 )
 from atom.mono.plan.execution import LDS_BYTES
 from atom.mono.runtime.compile import (
@@ -82,7 +84,7 @@ if __name__ == "__main__":
     upto = args.pop(0) if args and args[0] in ("norm", "ffn") else "norm"
     act = args.pop(0) if args and args[0] in ROUTED_ACTS else ROUTED_ACT_DEFAULT
     ir = int(args.pop(0)[3:]) if args and args[0].startswith("ir=") else None
-    sizes = [int(a) for a in args] or list(range(1, MAX_ROWS + 1))
+    sizes = [int(a) for a in args] or list(range(1, max_tokens(upto, act) + 1))
     for key in builds(sizes, upto, act, ir):
         r = check_build(key)
         print(

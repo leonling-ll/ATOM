@@ -199,6 +199,12 @@ class ForwardMode:
     pcp_groups: "tuple[PcpBalGroup, ...] | None" = None
 
     @property
+    def replays_graph(self) -> bool:
+        """Whether the target forward replays a recording: a request graph, or
+        the token-graph bucket a prefill pads to."""
+        return self.use_cudagraph or self.prefill_token_graph
+
+    @property
     def decode_ubatch_slices(self) -> "tuple[UBatchSlice, ...] | None":
         """`ubatch_slices` on a decode, whose micro-batches each run their
         requests' tokens in their own half (`decode_ubatch_token_order`)."""

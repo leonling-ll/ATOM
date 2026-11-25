@@ -75,13 +75,14 @@ from atom.models.minimax_m3.pro_mono.layout import (
     DOWN_TASKS,
     E_RANK,
     INTER_S,
+    INTERB_WORDS,
+    MIDB_ROW,
     MOE_TABLE,
     NT,
     R0,
     R_KLEN,
     R_PARTS,
     R_ROWS,
-    RT0,
     SD_STEPS,
     SH0,
     SH_CPW,
@@ -89,10 +90,11 @@ from atom.models.minimax_m3.pro_mono.layout import (
     SH_TASKS,
     SM_ROW,
     SMSC_WORDS,
+    TOKEN_TILE,
     TP,
     UG_COLS,
     UG_GROUPS,
-    UG_HALVES,
+    UGP_PARTS,
     W2_STEPS,
     W13_HALF,
     W13_Q,
@@ -100,26 +102,30 @@ from atom.models.minimax_m3.pro_mono.layout import (
     X4_WORDS,
     X8_ROW,
     X8_WORDS,
-    XH_ROW,
-    XH_WORDS,
     XSC_WORDS,
     inter_words,
     interb_word,
     list_ctas,
     list_down,
     max_u,
+    midb_word,
     mxfp8_tile_dword,
     queued,
     rlog_pair,
+    route_cta0,
     route_pair,
     rpart_pair,
     smid_pair,
     task_list,
+    token_tiles,
+    ug_per_cta,
+    ug_split,
     ugp_pair,
     w2_scale_word,
     w13_scale_word,
     w13_up_group,
     xh_word,
+    xk_row,
 )
 from atom.mono.device import gemv, queue, route
 from atom.mono.device.mx import (
@@ -139,12 +145,14 @@ from atom.mono.device.mx import (
 from atom.mono.device.ops import (
     CM_DEV,
     CM_NT,
+    batched_rounds,
     bf2_f32,
     bf16_pair,
     bf16_round,
     block_excl_scan,
     butterfly,
     fp8_pack4,
+    fresh,
     hw_exp2,
     hw_rcp,
     ld_dev,
@@ -214,6 +222,40 @@ def swiglu(g, u):
     return swiglu_mul_batch([g], [u], fx.Float32(-SWIGLU_LIMIT))[0]
 
 
+# ------------------------------------------------------------ token tiles
+# A build past 16 rows (A16W4 only) runs each stage whose MFMA B operand is
+# the token rows once a 16-token tile (``layout.TOKEN_TILE``): B column l16 of
+# tile k is token 16 k + l16. A build of at most 16 rows has one tile and runs
+# each stage as before.
+
+
+def red_tile(c, k):
+    """Token tile k's 16x16 accumulators, a wave's 256 B at + (wave 64 +
+    lane) 4: tile 0 in ``red``, tile 1 in ``red1`` (``layer.build``: past
+    tile 0, or in ``xs`` in an FFN build past one tile)."""
+    return c["red"] if k == 0 else c["red1"]
+
+
+def tile_col(c, k):
+    """This lane's B column's token in tile k (unclamped)."""
+    l16 = c["lane"] % 16
+    return l16 if k == 0 else TOKEN_TILE * k + l16
+
+
+def tile_span(s, k):
+    """Tile k's tokens of an ``s``-row build: (first, count)."""
+    return TOKEN_TILE * k, min(s, TOKEN_TILE * (k + 1)) - TOKEN_TILE * k
+
+
+def tile_threads(tid, per, s, k):
+    """Whether thread ``tid`` has a cell of tile k when the cells are ``per``
+    a token, token-major (a pass a tile)."""
+    t0, n = tile_span(s, k)
+    if k == 0:
+        return tid < per * n
+    return (tid >= per * t0) & (tid < per * (t0 + n))
+
+
 # ------------------------------------------------------------ x hand-off
 
 
@@ -270,30 +312,38 @@ def stage_router(c, task, ops):
     ``rlog``, unrounded as production's ``moe_route_glue`` keeps them: a bf16
     rounding here picks another 4th expert where the 4th and 5th scores are
     closer than its error."""
-    s, tid, lane, wave, red = c["S"], c["tid"], c["lane"], c["wave"], c["red"]
+    s, tid, lane, wave = c["S"], c["tid"], c["lane"], c["wave"]
     i, q = task // R_PARTS, task % R_PARTS
     xrow = R_KLEN + gemv.LDS_PAD
     wait_x(c)
     gemv.rows_to_lds(
         tid, c["x"], R_KLEN, s, c["xl"], xrow, CM_DEV, ldk=HIDDEN, k0=q * R_KLEN
     )
-    acc = gemv.mfmas(lane, wave, c["xl"], xrow, R_KLEN, s, ops)
-    fx.ptr_store(acc, red + (wave * 64 + lane) * 4)
+    tiles = token_tiles(s)
+    for k in range_constexpr(tiles):
+        t0, n = tile_span(s, k)
+        xl = c["xl"] if k == 0 else c["xl"] + t0 * xrow // 2
+        acc = gemv.mfmas(lane, wave, xl, xrow, R_KLEN, n, ops)
+        fx.ptr_store(acc, red_tile(c, k) + (wave * 64 + lane) * 4)
     gpu.barrier()
-    if tid < R_ROWS * s:
-        r = tid % R_ROWS
-        t = tid // R_ROWS
-        v = row_sum(red, r, t)
-        if q > 0:
-            c["put"](c["rpart"], rpart_pair(task, t, r), v)
-        if q == 0:
-            got = c["poll"](
-                [(c["rpart"], rpart_pair(task + p, t, r), 1) for p in range(1, R_PARTS)]
-            )
-            for p in range_constexpr(R_PARTS - 1):
-                v = v + _f32_of(got[p][0])
-            for p in range_constexpr(TP):
-                c["put"](c["rlog"][p], rlog_pair(c["rank"], t, i * R_ROWS + r), v)
+    for k in range_constexpr(tiles):
+        if tile_threads(tid, R_ROWS, s, k):
+            r = tid % R_ROWS
+            t = tid // R_ROWS
+            v = row_sum(red_tile(c, k), r, t if k == 0 else t - TOKEN_TILE * k)
+            if q > 0:
+                c["put"](c["rpart"], rpart_pair(task, t, r), v)
+            if q == 0:
+                got = c["poll"](
+                    [
+                        (c["rpart"], rpart_pair(task + p, t, r), 1)
+                        for p in range(1, R_PARTS)
+                    ]
+                )
+                for p in range_constexpr(R_PARTS - 1):
+                    v = v + _f32_of(got[p][0])
+                for p in range_constexpr(TP):
+                    c["put"](c["rlog"][p], rlog_pair(c["rank"], t, i * R_ROWS + r), v)
     gpu.barrier()
 
 
@@ -506,20 +556,24 @@ def load_xb(c):
 
 @traced
 def load_xh(c):
-    """A16W4: K half ``ugh`` (the half of every ug task of this CTA) of each
-    token's bf16 x (the norm's ``x``, stored at device scope) -> LDS rows of
-    ``XH_ROW`` words. A whole x row (14 KB) would not fit 16 of them."""
+    """A16W4: K slice ``ugh`` (``ug_split``'s: the slice of every ug task of
+    this CTA) of each token's bf16 x (the norm's ``x``, stored at device
+    scope) -> LDS rows of ``xk_row`` words. A whole x row (14 KB) would not
+    fit 16 of them, a K half not 24."""
     s, tid = c["S"], c["tid"]
+    split = ug_split(c["routed_act"], s)
+    words = HIDDEN // 2 // split
+    row = xk_row(c["routed_act"], s)
     wait_x(c)
-    k0 = c["ugh"] * XH_WORDS
-    n = s * XH_WORDS // 4
+    k0 = c["ugh"] * words
+    n = s * words // 4
     for i in range_constexpr(passes(n)):
         e = fx.min(tid + THREADS * i, n - 1)
-        t = e // (XH_WORDS // 4)
-        w = e % (XH_WORDS // 4) * 4
-        v = fx.Vector(ld_dev(c["x"], t * (UG_HALVES * XH_WORDS) + k0 + w, 4))
+        t = e // (words // 4)
+        w = e % (words // 4) * 4
+        v = fx.Vector(ld_dev(c["x"], t * (split * words) + k0 + w, 4))
         if tid + THREADS * i < n:
-            fx.ptr_store(v, c["xbl"] + (t * XH_ROW + w))
+            fx.ptr_store(v, c["xbl"] + (t * row + w))
     gpu.barrier()
 
 
@@ -585,21 +639,31 @@ def ug_row_group(c, task, wave):
     return (rgl >> 1) * w13_up_group(c["planes"]) + 2 * g + (rgl & 1)
 
 
-def ug_steps(c) -> int:
-    """A wave's 128-k steps of an ug task: W4A4 / W4A8 a K half
-    (``W13_HALF``), A16W4 a quarter (``W13_Q``: the task is one K half)."""
-    return W13_Q if bf16_routed(c) else W13_HALF
+def quartered(c) -> bool:
+    """Whether the build's ug tasks are K quarters, two a CTA at once
+    (``layout.ug_per_cta``: A16W4 past one token tile; a build-time
+    constant)."""
+    return ug_per_cta(c["routed_act"], c["S"]) == 2
 
 
 def ug_kslice(c):
     """This wave's first 128-k step of an ug task: W4A4 / W4A8 the K half
     wave / 4; A16W4 the quarter wave / 4 of the CTA's K half ``ugh`` (wave w
-    sums K 1792 (w / 4 + 2 ugh) .. + 1792, gemm1_a16w4's k_wave 4 slice).
-    Its steps: ``ug_steps``."""
+    sums K 1792 (w / 4 + 2 ugh) .. + 1792, gemm1_a16w4's k_wave 4 slice), or
+    quartered the CTA's quarter ``ugh`` (every wave all of it, its own task's
+    row group). Its steps: W13_HALF (A16W4: W13_Q)."""
     q = uniform(c["wave"] >> 2)
     if const_expr(bf16_routed(c)):
+        if const_expr(quartered(c)):
+            return c["ugh"] * W13_Q
         return c["ugh"] * W13_HALF + q * W13_Q
     return q * W13_HALF
+
+
+def ug_local0(c, q):
+    """A16W4: the first step, in the CTA's K slice, of wave quarter ``q``'s
+    steps (halves: q W13_Q; quartered: 0, a wave takes the whole slice)."""
+    return 0 if quartered(c) else q * W13_Q
 
 
 # a task's w13 operands come in parts of its wave's K slice: the next task's
@@ -621,6 +685,12 @@ def ug_parts(c):
     """The build's parts (``UG_PARTS``): (first step in the K slice, steps)."""
     sizes = UG_PARTS[c["routed_act"]]
     return [(sum(sizes[:p]), n) for p, n in enumerate(sizes)]
+
+
+def ug_task_loads(c) -> int:
+    """The vector memory loads of one task's ``ug_loads`` (every part): a
+    tile a step and a scale word two steps (A16W4 21, W4A4 / W4A8 42)."""
+    return sum(n + n // 2 for _, n in ug_parts(c))
 
 
 def ug_loads(c, task, part, live):
@@ -705,10 +775,13 @@ def ug_mfmas(c, task, ops, part, t, acc):
             # the tile dequantized to 4 bf16 operands; x's k 32 kb + 8 j ..
             # + 8 of the step, in the K half's row
             wa = fp4_bf16_tile(av[i], sa)
-            local = q * W13_Q + i0 + i
+            local = ug_local0(c, q) + i0 + i
+            row = xk_row(c["routed_act"], c["S"])
             for j in range_constexpr(4):
                 xb = fx.Vector(
-                    fx.ptr_load(c["xbl"] + xh_word(t, local, kb, j), result_type=_v4i())
+                    fx.ptr_load(
+                        c["xbl"] + xh_word(t, local, kb, j, row), result_type=_v4i()
+                    )
                 )
                 acc = mfma_bf16(wa[j], xb.bitcast(fx.BFloat16), acc)
         else:
@@ -727,27 +800,71 @@ def ug_mfmas(c, task, ops, part, t, acc):
 
 
 @traced
-def ug_epilogue(c, task, first, count):
-    """Task ``task``'s gate / up sums (``red``, past a barrier) of its picks at
-    first .. first + count -> its mids (``ug_mx_mids``; A16W4 the K-half
-    hand-off, ``ug_bf16_mids``)."""
-    tid, red = c["tid"], c["red"]
-    g = task % UG_GROUPS
-    # thread (pick column tt, mid column col of 32): g / u summed over the K
-    # halves (A16W4: quarters) in wave order
+def ug_mfmas_tile1(c, task, ops, part, t1, acc1):
+    """Quartered A16W4: ``ug_mfmas`` of part ``part`` against token tile 1
+    (pick columns 16 .., ``t1`` this lane's token) on the same weight
+    registers, each tile dequantized again: run only when the task's slot has
+    more than 16 picks."""
+    lane = c["lane"]
+    i0, n = ug_parts(c)[part]
+    # the row group's parity (``ug_row_group``: wave & 1), no task arithmetic
+    odd = c["wave"] & 1
+    av, sw = ops[:n], ops[n:]
+    kb = lane // 16
+    row = xk_row(c["routed_act"], c["S"])
+    for i in range_constexpr(n):
+        sa = (sw[i // 2] >> ((i % 2) * 16 + odd * 8)) & 0xFF
+        wa = fp4_bf16_tile(av[i], sa)
+        for j in range_constexpr(4):
+            xb = fx.Vector(
+                fx.ptr_load(
+                    c["xbl"] + xh_word(t1, i0 + i, kb, j, row), result_type=_v4i()
+                )
+            )
+            acc1 = mfma_bf16(wa[j], xb.bitcast(fx.BFloat16), acc1)
+    return acc1
+
+
+def ug_cell(c, first, count):
+    """This thread's cell of an ug task's picks at first .. first + count:
+    (pick row, mid column of 32, live), thread (pick column tt, column col)."""
+    tid = c["tid"]
     tt = tid // UG_COLS
+    return first + tt, tid % UG_COLS, tt < count
+
+
+def ug_waves(c, h, rgl):
+    """The waves holding row group ``rgl`` of the CTA's task h, in sum
+    order: two K quarters (rgl, rgl + 4); quartered the task's one wave 4 h +
+    rgl (``ug_per_cta``)."""
+    if quartered(c):
+        return (4 * h + rgl,)
+    return (rgl, rgl + 4)
+
+
+def ug_sums(c, count, h=0, red=None, tc=None):
+    """This thread's gate / up sums of the CTA's task h in ``red`` (past a
+    barrier; default tile 0's, ``tc`` its pick column there): the K halves
+    (A16W4: this half's quarters) in wave order."""
+    tid = c["tid"]
+    red = c["red"] if red is None else red
+    tc = fx.min(tid // UG_COLS, count - 1) if tc is None else tc
     col = tid % UG_COLS
-    live = tt < count
-    tc = fx.min(tt, count - 1)
     r = col % 16
     lo = col < 16
-    gv = lo.select(row_sum(red, r, tc, waves=(0, 4)), row_sum(red, r, tc, waves=(1, 5)))
-    uv = lo.select(row_sum(red, r, tc, waves=(2, 6)), row_sum(red, r, tc, waves=(3, 7)))
-    row = first + tt
-    if const_expr(bf16_routed(c)):
-        ug_bf16_mids(c, g, row, col, live, gv, uv)
-    else:
-        ug_mx_mids(c, g, row, col, live, gv, uv)
+    w = [ug_waves(c, h, g) for g in range(4)]
+    gv = lo.select(row_sum(red, r, tc, waves=w[0]), row_sum(red, r, tc, waves=w[1]))
+    uv = lo.select(row_sum(red, r, tc, waves=w[2]), row_sum(red, r, tc, waves=w[3]))
+    return gv, uv
+
+
+@traced
+def ug_epilogue(c, task, first, count):
+    """W4A4 / W4A8: task ``task``'s gate / up sums of its picks at first ..
+    first + count -> its mids (``ug_mx_mids``)."""
+    row, col, live = ug_cell(c, first, count)
+    gv, uv = ug_sums(c, count)
+    ug_mx_mids(c, task % UG_GROUPS, row, col, live, gv, uv)
 
 
 @traced
@@ -781,34 +898,173 @@ def ug_mx_mids(c, g, row, col, live, gv, uv):
         st_dev(code, c["plain"], c["pw"]["isc"] + row * UG_GROUPS + g)
 
 
+# A16W4's K-half hand-off. A half-1 task sends its gate / up sums at once
+# (``ug_put``); a half-0 task's are merged with its partner's one task late
+# (``ug_merge``): the partials' load (``ug_peek``) goes out in the next task,
+# with its first part's MFMAs (the scheduler may take it above them) and
+# before the task after's first loads, so the epilogue's wait for it
+# (``vmcnt`` in issue order) waits for no weight load of the task after. Merged in the task's own epilogue, the poll's
+# load followed every load of the next task (its 21) and took them all
+# (v1a16w4tuned_1124T0306_259: list 0's ug ended 3.6 / 4.2 us after list 1's
+# at 8 / 16 rows). Half 1 never waits, so a half-0 merge always ends: its
+# pair's half-1 task is in the other task list, whose CTAs wait for nothing
+# in ug (``layout.task_lists``).
+
+
+def ug_slice(c):
+    """This CTA's K slice ``ugh``; quartered through an opaque move
+    (``fresh``), so the conditions on it are formed at their use: hoisted out
+    of the ug loop as lane masks they spilled the 24-row debug build's
+    SGPRs."""
+    return fresh(c["ugh"]) if quartered(c) else c["ugh"]
+
+
+def half_task(c, task):
+    """Whether ``task`` (-1: none) is a half-0 task of this CTA's (A16W4)."""
+    return (task >= 0) & (ug_slice(c) == 0)
+
+
+def ug_sender(c):
+    """A16W4: whether this CTA's tasks send their partials (K slice > 0) and
+    the ``ugp`` part they send to."""
+    if quartered(c):
+        h = ug_slice(c)
+        return h != 0, h - 1
+    return c["ugh"] == 1, 0
+
+
 @traced
-def ug_bf16_mids(c, g, row, col, live, gv, uv):
-    """A16W4: this K half's gate / up of (pick row ``row``, mid column 32 g +
-    ``col``). Half 1 sends them (``ugp``, one 16 B put a cell); half 0 adds
-    them to its own -- (q0 + q1) + (q2 + q3) -- -> SwiGLU-OAI -> the bf16 mid
-    -> ``inter`` (an even column stores its pair's word; plain, announced by
-    ``ugf`` once drained)."""
-    h = c["ugh"]
-    at = ugp_pair(row, g, col)
-    # half 1 never waits, so a half-0 task's wait always ends: its pair's
-    # half-1 task is in the other task list, whose CTAs wait for nothing in
-    # ug (``layout.task_lists``)
-    if live & (h == 1):
+def ug_put(c, task, first, count, h=0):
+    """A16W4: this thread's cell's gate / up sums of ``task`` (the CTA's task
+    h); K slices > 0 send them (``ugp``, one 16 B put a cell). Returns the
+    sums."""
+    row, col, live = ug_cell(c, first, count)
+    gv, uv = ug_sums(c, count, h)
+    sender, part = ug_sender(c)
+    at = ugp_pair(row, task % UG_GROUPS, col, part)
+    if live & sender:
         c["put_words"](c["ugp"], at, [gv.bitcast(fx.Int32), uv.bitcast(fx.Int32)])
-    if live & (h == 0):
-        got = c["poll"]([(c["ugp"], at, 2)])[0]
-        y = bf16_round(swiglu(gv + _f32_of(got[0]), uv + _f32_of(got[1])))
-        # both lanes of a pair are live (one pick row)
-        word = bf16_pair(y, xshfl(y, 1)).bitcast(fx.Int32)
-        if col % 2 == 0:
-            st_dev(word, c["plain"], c["pw"]["inter"] + interb_word(row, g, col))
+    return gv, uv
 
 
-def ug_pick_token(c, first, count):
-    """This lane's pick column's token (a column past the slot's picks repeats
-    the last; its sums are never stored)."""
+def ug_pending(c, task, first, count):
+    """A16W4 half 0: what ``ug_merge`` needs of ``task`` a task later --
+    the task, this thread's pick row (past the picks: the last pick's) and
+    whether its cell is live -- in VGPRs: held round the task loop as SGPRs
+    they spilled SGPRs at 7 rows (debug) and 10 .. 16 (timeline)."""
+    tt = c["tid"] // UG_COLS
+    live = (tt < count).select(fx.Int32(1), fx.Int32(0))
+    return fresh(task), first + fx.min(tt, count - 1), live
+
+
+def ug_peek(c, ptask, prow):
+    """A16W4 half 0: the load of the half-1 partials of this thread's cell of
+    the pending task (``ug_pending``; none: -1, or a half-1 CTA: zeros, no
+    traffic)."""
+    task = uniform(ptask)
+    g = fx.max(task, 0) % UG_GROUPS
+    if const_expr(quartered(c)):
+        col = c["tid"] % UG_COLS
+        on = half_task(c, task)
+        return [
+            c["peek"](c["ugp"], ugp_pair(prow, g, col, p), 2, on)
+            for p in range(UGP_PARTS)
+        ]
+    at = ugp_pair(prow, g, c["tid"] % UG_COLS)
+    return c["peek"](c["ugp"], at, 2, half_task(c, task))
+
+
+@traced
+def ug_merge(c, ptask, prow, plive, gv, uv, raw):
+    """A16W4 half 0: the pending task's (``ug_pending``; -1: none) gate / up
+    sums ``gv`` / ``uv`` of this thread's cell plus its pair's half-1
+    partials (``raw``: ``ug_peek``'s words, polled on while stale; None:
+    polled here) -- (q0 + q1) + (q2 + q3) -- -> SwiGLU-OAI -> the bf16 mid ->
+    ``inter`` (an even column stores its pair's word; plain, announced by
+    ``ugf`` once drained)."""
+    task = uniform(ptask)
+    row, col = prow, c["tid"] % UG_COLS
+    g = fx.max(task, 0) % UG_GROUPS
+    if (plive != 0) & half_task(c, task):
+        ug_mid(c, row, g, col, gv, uv, raw)
+
+
+@traced
+def ug_mid(c, row, g, col, gv, uv, raw):
+    """A16W4 K slice 0, a live cell: its gate / up sums ``gv`` / ``uv`` plus
+    the other K slices' partials (``raw``: ``ug_peek``'s, or None: polled
+    here) -- halves q0 + q1, quartered (q0 + q1) + (q2 + q3) -- -> SwiGLU-OAI
+    -> the bf16 mid -> ``inter`` (an even column stores its pair's word)."""
+    if const_expr(quartered(c)):
+        specs = [(c["ugp"], ugp_pair(row, g, col, p), 2) for p in range(UGP_PARTS)]
+        if const_expr(raw is None):
+            # one batch: a spin loop, not three
+            gots = c["poll"](specs)
+        else:
+            gots = [c["poll"]([sp], first=w)[0] for sp, w in zip(specs, raw)]
+        gs = [_f32_of(got[0]) for got in gots]
+        us = [_f32_of(got[1]) for got in gots]
+        gsum = (gv + gs[0]) + (gs[1] + gs[2])
+        usum = (uv + us[0]) + (us[1] + us[2])
+    else:
+        got = c["poll"]([(c["ugp"], ugp_pair(row, g, col), 2)], first=raw)[0]
+        gsum = gv + _f32_of(got[0])
+        usum = uv + _f32_of(got[1])
+    y = bf16_round(swiglu(gsum, usum))
+    # both lanes of a pair are live (one pick row)
+    word = bf16_pair(y, xshfl(y, 1)).bitcast(fx.Int32)
+    if col % 2 == 0:
+        st_dev(word, c["plain"], c["pw"]["inter"] + interb_word(row, g, col))
+
+
+@traced
+def ug_tile1(c, entry):
+    """Quartered A16W4: the picks past 16 of this wave's task of list entry
+    ``entry`` (token tile 1, ``ug_mfmas_tile1``'s sums in ``red1``, past the
+    task's barrier), a thread a cell (waves 0-3 the CTA's task 0, 4-7 its
+    task 1: 8 picks x 32 columns each): K slices > 0 send their partials,
+    slice 0 merges them at once (a rare cell: a slot of more than 16 picks)
+    and stores the mids, announced with the task's tile-0 mids a task later
+    (``run_ug``). The task and its picks are read again here, in VGPRs: held
+    from the MFMAs as SGPRs they spilled the 24-row debug build's."""
+    tid, wave, rt = c["tid"], c["wave"], c["rt"]
+    task = 2 * entry + (wave >> 2)
+    slot = task // UG_GROUPS
+    first = fx.ptr_load(rt["first"] + slot)
+    count = fx.ptr_load(rt["first"] + slot + 1) - first
+    tt = TOKEN_TILE + (tid % (THREADS // 2)) // UG_COLS
+    col = tid % UG_COLS
+    tc = fx.min(tt, count - 1)
+    h4 = (wave >> 2) * 4
+    r = col % 16
+    lo = col < 16
+    red1 = c["red1"]
+    tl = tc - TOKEN_TILE
+    gv = lo.select(
+        row_sum(red1, r, tl, waves=(h4,)), row_sum(red1, r, tl, waves=(h4 + 1,))
+    )
+    uv = lo.select(
+        row_sum(red1, r, tl, waves=(h4 + 2,)), row_sum(red1, r, tl, waves=(h4 + 3,))
+    )
+    row = first + tc
+    g = task % UG_GROUPS
+    sender, part = ug_sender(c)
+    if tt < count:
+        if sender:
+            c["put_words"](
+                c["ugp"],
+                ugp_pair(row, g, col, part),
+                [gv.bitcast(fx.Int32), uv.bitcast(fx.Int32)],
+            )
+        else:
+            ug_mid(c, row, g, col, gv, uv, None)
+
+
+def ug_pick_token(c, first, count, k=0):
+    """This lane's pick column's token in tile k (a column past the slot's
+    picks repeats the last; its sums are never stored)."""
     rt = c["rt"]
-    return fx.ptr_load(rt["order"] + first + fx.min(c["lane"] % 16, count - 1)) // TOPK
+    return fx.ptr_load(rt["order"] + first + fx.min(tile_col(c, k), count - 1)) // TOPK
 
 
 @traced
@@ -833,7 +1089,18 @@ def put_claim(c, got):
 def read_claim(c):
     """The list index of the claim in LDS: the list's first round is placed
     (``list_ctas`` entries), the queue counts the entries past it."""
-    return list_ctas(c["routed_act"]) + uniform(fx.ptr_load(c["claim"]))
+    if const_expr(quartered(c)):
+        # the list's size formed here from the opaque ``ug_slice``: a
+        # condition held across the loop spilled the debug build's SGPRs
+        base = uniform(list_ctas(c["routed_act"], c["S"], ug_slice(c), _sel))
+    else:
+        base = list_ctas(c["routed_act"], c["S"])
+    return base + uniform(fx.ptr_load(c["claim"]))
+
+
+def _sel(cond, a, b):
+    """``layout``'s select on traced values."""
+    return cond.select(fx.Int32(a), fx.Int32(b))
 
 
 def flag_due(c, prev):
@@ -842,8 +1109,50 @@ def flag_due(c, prev):
     hands its partials over in ``ugp``, the half-0 task finishes the pair)."""
     due = prev >= 0
     if const_expr(bf16_routed(c)):
-        due = due & (c["ugh"] == 0)
+        due = due & (ug_slice(c) == 0)
     return due
+
+
+def wave_task(c, entry):
+    """This wave's ug task of list entry ``entry``: the entry, or quartered
+    (``ug_per_cta``) task 2 entry + wave / 4."""
+    if quartered(c):
+        return 2 * entry + uniform(c["wave"] >> 2)
+    return entry
+
+
+def ug_entry_cells_of(c, task):
+    """Ug task ``task``'s (task, first pick row, pick count)."""
+    rt = c["rt"]
+    slot = task // UG_GROUPS
+    first = fx.ptr_load(rt["first"] + slot)
+    count = uniform(fx.ptr_load(rt["first"] + slot + 1) - first)
+    return task, first, count
+
+
+def ug_entry_cells(c, entry):
+    """The CTA's ug tasks of list entry ``entry`` (``ug_per_cta``): (task,
+    first pick row, pick count) each. Quartered, the counts stay in VGPRs
+    (the epilogue's; the wave's own task is ``ug_entry_cells_of``'s): two
+    more held as SGPRs spilled the 24-row build's SGPRs."""
+    rt = c["rt"]
+    out = []
+    for h in range(ug_per_cta(c["routed_act"], c["S"])):
+        task = 2 * entry + h if quartered(c) else entry
+        slot = task // UG_GROUPS
+        first = fx.ptr_load(rt["first"] + slot)
+        count = fx.ptr_load(rt["first"] + slot + 1) - first
+        out.append((task, first, count if quartered(c) else uniform(count)))
+    return out
+
+
+@traced
+def ug_tile1_mfmas(c, two, task, ops, part, t1, acc1):
+    """``ug_mfmas_tile1`` when ``two`` (the wave's task has more than 16
+    picks), else ``acc1`` as it is."""
+    if two:
+        acc1 = ug_mfmas_tile1(c, task, ops, part, t1, acc1)
+    return acc1
 
 
 @traced
@@ -860,68 +1169,136 @@ def run_ug(c, bid, nu):
     part p is used (``UG_PARTS``), so a CTA's loads never drain between
     tasks; the claim of the task after next is taken a whole task ahead. A
     task's ``ugf`` flag (A16W4: the half-0 task's, the pair's) is published in
-    the next task, once its mid stores have drained behind the next task's
-    loads (a flag at once would wait for those: ``vmcnt`` counts in issue
-    order), the CTA's last task's at the end.
+    the task after its mids are stored, once those stores have drained (a
+    ``vmcnt`` that leaves the next task's loads in flight: a flag at once
+    would wait for those, ``vmcnt`` counting in issue order), the CTA's last
+    at the end. An A16W4 half-0 task's mids are stored a task late
+    (``ug_merge``), so its flag goes out two tasks on.
+
+    Quartered (A16W4 past one token tile, ``ug_per_cta``): a list entry is
+    two tasks of the list's K quarter, run at once (waves 0-3 the first,
+    4-7 the second), each cell's merge pending as above; a task's picks past
+    16 run a second token tile on the same weights (``ug_mfmas_tile1``) and
+    are finished in the task's own epilogue (``ug_tile1``).
 
     A build that is not ``queued`` (1 row) takes no claim: its next task is
     ``list_ctas`` on (the list round-robin, the first round as placed), the
     down tasks ``run_down``'s placed ones."""
-    tid, lane, wave, rt, red = c["tid"], c["lane"], c["wave"], c["rt"], c["red"]
-    q = queued(c["S"])
-    per = list_ctas(c["routed_act"])
+    tid, lane, wave, red = c["tid"], c["lane"], c["wave"], c["red"]
+    s, act = c["S"], c["routed_act"]
+    q = queued(s)
+    per = list_ctas(act, s)
+    cells_n = ug_per_cta(act, s)
+    tiles = token_tiles(s)
     total = nu * UG_GROUPS
+    if const_expr(cells_n > 1):
+        # UG_GROUPS is even: an entry's two tasks are always both real
+        total = total // cells_n
     last = total - 1
-    task = c["k0"]
-    # the claim before the loads: its return waits behind none of them
-    got = take_ahead(c) if q else fx.Int32(0)
+    # the placed entry, formed here from the block index (held from the
+    # route as a value of its own, the quartered list's selects spilled the
+    # 24-row debug build's SGPRs)
+    task = task_list(bid, act, s, _sel)[1] if quartered(c) else c["k0"]
     t0 = fx.min(task, last)
     live0 = task < total
     parts = range(len(ug_parts(c)))
-    ops = [ug_loads(c, t0, p, live0) for p in parts]
-    if const_expr(q):
-        put_claim(c, got)
-        gpu.barrier()
+    ops = [ug_loads(c, wave_task(c, t0), p, live0) for p in parts]
+    # the first claim was taken and stored before the route's poll
+    # (``run_ffn``), its LDS word past ``load_route``'s barriers
     nxt = read_claim(c) if q else task + per
     if const_expr(q):
         # every thread has read it before the loop's first claim lands there
         gpu.barrier()
-    prev = fx.Int32(-1)
+    bf16 = bf16_routed(c)
+    # the task whose ugf flag is due (its mids stored); A16W4 half 0: the
+    # task whose merge is pending (``ug_pending``) and this thread's sums; a
+    # list of the CTA's tasks at once (``ug_per_cta``)
+    prev = [fx.Int32(-1) for _ in range(cells_n)]
+    pend = [
+        ug_pending(c, fx.Int32(-1), fx.Int32(0), fx.Int32(0)) for _ in range(cells_n)
+    ]
+    pgv = [fx.Float32(0.0) for _ in range(cells_n)]
+    puv = [fx.Float32(0.0) for _ in range(cells_n)]
     while task < total:
         got = take_ahead(c) if q else fx.Int32(0)
-        slot = task // UG_GROUPS
-        first = fx.ptr_load(rt["first"] + slot)
-        count = uniform(fx.ptr_load(rt["first"] + slot + 1) - first)
+        cells = ug_entry_cells(c, task)
+        if const_expr(cells_n == 1):
+            wt, first, count = cells[0]
+        else:
+            wt = wave_task(c, task)
+            _, first, count = ug_entry_cells_of(c, wt)
         t = ug_pick_token(c, first, count)
         nt = fx.min(nxt, last)
         nlive = nxt < total
         acc = fx.Vector.filled(4, 0.0, fx.Float32)
+        acc1 = fx.Vector.filled(4, 0.0, fx.Float32) if tiles > 1 else None
+        t1 = ug_pick_token(c, first, count, 1) if tiles > 1 else None
         ops_n = []
         for p in range_constexpr(len(parts)):
-            acc = ug_mfmas(c, task, ops[p], p, t, acc)
+            acc = ug_mfmas(c, wt, ops[p], p, t, acc)
+            if const_expr(tiles > 1):
+                acc1 = ug_tile1_mfmas(c, count > TOKEN_TILE, wt, ops[p], p, t1, acc1)
             if const_expr(p + 1 < len(parts)):
                 rocdl.sched_barrier(0)
-            ops_n.append(ug_loads(c, nt, p, nlive))
+            if const_expr(bf16 and p == 0):
+                # with this task's first part, ahead of the next task's loads
+                raw = [ug_peek(c, pend[h][0], pend[h][1]) for h in range(cells_n)]
+                rocdl.sched_barrier(0)
+            ops_n.append(ug_loads(c, wave_task(c, nt), p, nlive))
         fx.ptr_store(acc, red + (wave * 64 + lane) * 4)
+        if const_expr(tiles > 1):
+            fx.ptr_store(acc1, c["red1"] + (wave * 64 + lane) * 4)
         # every vector memory op older than the next task's loads is done:
-        # the previous task's mid stores and the claim (at least the next
-        # task's ``ug_steps`` tile loads were issued after them)
-        rocdl.s_waitcnt(vmcnt=ug_steps(c))
+        # the mid stores of the task before, the claim and (A16W4) the
+        # partials' peek
+        rocdl.s_waitcnt(vmcnt=ug_task_loads(c))
         if const_expr(q):
             put_claim(c, got)
         gpu.barrier()
-        if flag_due(c, prev) & (tid == 0):
-            c["put"](c["ugf"], prev, fx.Int32(1))
+        for h in range_constexpr(cells_n):
+            if flag_due(c, prev[h]) & (tid == h):
+                c["put"](c["ugf"], prev[h], fx.Int32(1))
         nxt_n = read_claim(c) if q else nxt + per
-        ug_epilogue(c, task, first, count)
+        if const_expr(bf16):
+            prev_n, pend_n, pgv_n, puv_n = [], [], [], []
+            for h in range_constexpr(cells_n):
+                th, fh, ch = cells[h]
+                gv, uv = ug_put(c, th, fh, ch, h)
+                ug_merge(c, pend[h][0], pend[h][1], pend[h][2], pgv[h], puv[h], raw[h])
+                # quartered: the flag due stays in a VGPR (two as SGPRs
+                # spilled the 24-row build's)
+                prev_n.append(pend[h][0] if cells_n > 1 else uniform(pend[h][0]))
+                pend_n.append(ug_pending(c, th, fh, ch))
+                pgv_n.append(gv)
+                puv_n.append(uv)
+            if const_expr(tiles > 1):
+                ug_tile1(c, task)
+            prev = prev_n
+            pend = pend_n
+            pgv = pgv_n
+            puv = puv_n
+        else:
+            ug_epilogue(c, task, first, count)
+            prev = [task]
         # ``red`` and ``claim`` read by every thread before they are rewritten
         gpu.barrier()
-        prev = task
         task = nxt
         nxt = nxt_n
         ops = ops_n
-    if flag_due(c, prev):
-        publish(c["put"], c["ugf"], prev, fx.Int32(1), tid == 0)
+    if const_expr(bf16):
+        last_task = uniform(pend[0][0])
+        if half_task(c, last_task):
+            for h in range_constexpr(cells_n):
+                ug_merge(c, pend[h][0], pend[h][1], pend[h][2], pgv[h], puv[h], None)
+            publish(c["put"], c["ugf"], last_task, fx.Int32(1), tid == 0)
+            for h in range_constexpr(1, cells_n):
+                if tid == h:
+                    c["put"](c["ugf"], uniform(pend[h][0]), fx.Int32(1))
+            for h in range_constexpr(cells_n):
+                if flag_due(c, prev[h]) & (tid == h):
+                    c["put"](c["ugf"], prev[h], fx.Int32(1))
+    elif flag_due(c, prev[0]):
+        publish(c["put"], c["ugf"], prev[0], fx.Int32(1), tid == 0)
     return task, nxt
 
 
@@ -987,29 +1364,34 @@ def stage_shared(c, j, ops):
     """Half task j: the GEMV against every token's x8 (B column l % 16 =
     token) -> bf16 gate / up (production's gate_up output) -> SwiGLU-OAI ->
     bf16 -> ``smid`` columns 8 j .. + 8 of every token."""
-    s, tid, lane, wave, red = c["S"], c["tid"], c["lane"], c["wave"], c["red"]
+    s, tid, lane, wave = c["S"], c["tid"], c["lane"], c["wave"]
     wts, scs = ops
     g4 = lane // 16
-    col = fx.min(lane % 16, s - 1)
+    tiles = token_tiles(s)
+    cols = [fx.min(tile_col(c, k), s - 1) for k in range(tiles)]
     wait_x(c)
-    acc = fx.Vector.filled(4, 0.0, fx.Float32)
+    accs = [fx.Vector.filled(4, 0.0, fx.Float32) for _ in range(tiles)]
     for i in range_constexpr(SH_CPW):
         kc = wave * SH_CPW + i
-        b, sb = x8_operand(c, col, kc, g4)
-        acc = mfma_scaled(wts[i], b, acc, scs[i], sb, FP8, FP8)
-    fx.ptr_store(acc, red + (wave * 64 + lane) * 4)
+        for k in range_constexpr(tiles):
+            b, sb = x8_operand(c, cols[k], kc, g4)
+            accs[k] = mfma_scaled(wts[i], b, accs[k], scs[i], sb, FP8, FP8)
+    for k in range_constexpr(tiles):
+        fx.ptr_store(accs[k], red_tile(c, k) + (wave * 64 + lane) * 4)
     gpu.barrier()
     # mid columns 2 rp, 2 rp + 1 of token tk: gate in tile rows 2 rp .., up in
     # 8 + 2 rp ..
-    if tid < (SH_ROWS // 2) * s:
-        rp = tid % (SH_ROWS // 2)
-        tk = tid // (SH_ROWS // 2)
-        y = []
-        for h in range_constexpr(2):
-            gs = bf16_round(row_sum(red, 2 * rp + h, tk))
-            us = bf16_round(row_sum(red, SH_ROWS + 2 * rp + h, tk))
-            y.append(bf16_round(swiglu(gs, us)))
-        c["put_bf"](c["smid"], 2 * smid_pair(tk, SH_ROWS * j + 2 * rp), y)
+    for k in range_constexpr(tiles):
+        if tile_threads(tid, SH_ROWS // 2, s, k):
+            rp = tid % (SH_ROWS // 2)
+            tk = tid // (SH_ROWS // 2)
+            red, tl = red_tile(c, k), tk if k == 0 else tk - TOKEN_TILE * k
+            y = []
+            for h in range_constexpr(2):
+                gs = bf16_round(row_sum(red, 2 * rp + h, tl))
+                us = bf16_round(row_sum(red, SH_ROWS + 2 * rp + h, tl))
+                y.append(bf16_round(swiglu(gs, us)))
+            c["put_bf"](c["smid"], 2 * smid_pair(tk, SH_ROWS * j + 2 * rp), y)
     gpu.barrier()
 
 
@@ -1077,12 +1459,6 @@ W_SD_BYTES = HIDDEN * INTER_S
 S_SD_BYTES = HIDDEN * INTER_S // 32
 
 
-def down_batch(c) -> int:
-    """A wave's slots whose w2 is in flight together: ``DOWN_BATCH``; A16W4
-    one (a slot's bf16 B operands are 80 VGPRs, four times W4A4's)."""
-    return 1 if bf16_routed(c) else DOWN_BATCH
-
-
 def down_loads(c, rgd, nu, b0, j, live):
     """Batch slot j's w2 tiles and scale words (slot b0 + 8 j of a wave's
     batch from b0), its scale words first (a step's MFMA then waits for its
@@ -1107,42 +1483,91 @@ def down_loads(c, rgd, nu, b0, j, live):
     return av + sw
 
 
+def down_batch(c) -> int:
+    """A wave's slots whose w2 is in flight together: ``DOWN_BATCH``; one in
+    an A16W4 build whose union is at most a slot a wave (``max_u`` <=
+    ``WAVES``: 1 and 2 rows), where a second slot is always past U and would
+    only add its zero tile's dequant and MFMAs to every wave's down."""
+    return 1 if bf16_routed(c) and max_u(c["S"]) <= WAVES else DOWN_BATCH
+
+
 def batch_loads(c, rgd, nu, b0, live):
     """``down_loads`` of every slot of a wave's batch from b0."""
     return [down_loads(c, rgd, nu, b0, j, live) for j in range(down_batch(c))]
 
 
 def inter_operands(c, row):
-    """A lane's B operands of mid row ``row`` (its K steps' words at lane group
-    lane / 16 -- MXFP4: k 32 kb .. + 32; MXFP8: k 16 kb .. + 16 and 64 + 16 kb
-    .. + 16 -- and their codes; bf16: k 32 kb + 8 j .. + 8, the 4 operands of
-    bf16 MFMAs j = 0 .. 3, no code), device scope (every ug flag polled
-    first: ``wait_ug``), as loaded (``live_operand`` at their use)."""
+    """W4A4 / W4A8: a lane's B operands of mid row ``row`` (its K steps' words
+    at lane group lane / 16 -- MXFP4: k 32 kb .. + 32; MXFP8: k 16 kb .. + 16
+    and 64 + 16 kb .. + 16 -- and their codes), device scope (every ug flag
+    polled first: ``wait_ug``), as loaded (``live_operand`` at their use).
+    A16W4 reads its from LDS (``load_mids``, ``mid_operands``)."""
     kb = c["lane"] // 16
     iw = inter_words(c["routed_act"])
     base = c["pw"]["inter"] + row * iw
     out = []
     for st in range_constexpr(W2_STEPS):
-        if const_expr(bf16_routed(c)):
-            ops = []
-            for j in range_constexpr(4):
-                at = c["pw"]["inter"] + interb_word(row, st * 4 + kb, 8 * j)
-                ops.append(fx.Vector(ld_dev(c["plain"], at, 4)))
-            out.append((ops, None))
+        if const_expr(fp8_routed(c)):
+            at = base + st * 32 + kb * 4
+            hv = [fx.Vector(ld_dev(c["plain"], at + 16 * h, 4)) for h in range(2)]
+            words = [hv[h][e] for h in range(2) for e in range(4)]
         else:
-            if const_expr(fp8_routed(c)):
-                at = base + st * 32 + kb * 4
-                hv = [fx.Vector(ld_dev(c["plain"], at + 16 * h, 4)) for h in range(2)]
-                words = [hv[h][e] for h in range(2) for e in range(4)]
-            else:
-                bw = fx.Vector(ld_dev(c["plain"], base + st * 16 + kb * 4, 4))
-                words = [bw[d] for d in range(4)]
-            code = fx.Int32(
-                ld_dev(c["plain"], c["pw"]["isc"] + row * UG_GROUPS + st * 4 + kb)
-            )
-            bw = fx.Vector.from_elements(words, fx.Int32)
-            out.append((bw, code))
+            bw = fx.Vector(ld_dev(c["plain"], base + st * 16 + kb * 4, 4))
+            words = [bw[d] for d in range(4)]
+        code = fx.Int32(
+            ld_dev(c["plain"], c["pw"]["isc"] + row * UG_GROUPS + st * 4 + kb)
+        )
+        bw = fx.Vector.from_elements(words, fx.Int32)
+        out.append((bw, code))
     return out
+
+
+@traced
+def load_mids(c):
+    """A16W4: every pick's bf16 mid row (``inter``, device scope; every ug
+    flag is in, ``wait_ug``) -> LDS rows of ``MIDB_ROW`` words (``midl``),
+    the down's B operands (``mid_operands``), every round's loads issued
+    before the first store. A CTA reads the step's mids once (80 KB at 16
+    rows); read from ``inter`` at each slot, a slot's 16 pick columns (a dead
+    one its first row's) cost 20 KB of L2 / MALL reads and a round trip
+    behind the slot's w2. Rows past the real rows' picks are past the buffer
+    range: zeros, no memory traffic."""
+    s, tid = c["S"], c["tid"]
+    n = s * TOPK * INTERB_WORDS // 4
+    r = rsrc(
+        c["plain"] + fx.Int64(c["pw"]["inter"] * 4),
+        down_rows(c) * (TOPK * INTERB_WORDS * 4),
+    )
+    batched_rounds(
+        tid, n,
+        lambda v: fx.Vector(
+            bo.buffer_load(r, v * 4, vec_width=4, dtype=T.i32, cache_modifier=CM_DEV)
+        ),
+        lambda v, w: fx.ptr_store(
+            w,
+            c["midl"]
+            + (v * 4 // INTERB_WORDS * MIDB_ROW + v * 4 % INTERB_WORDS),
+        ),
+        batch=passes(n),
+    )  # fmt: skip
+    gpu.barrier()
+
+
+def mid_operands(c, row, st, live):
+    """A16W4: a lane's 4 B operands of the down's step ``st`` (bf16 MFMAs j =
+    0 .. 3: k 128 st + 32 kb + 8 j .. + 8, kb = lane / 16) of pick row
+    ``row`` from the staged mids (``load_mids``), zero where the column is
+    dead."""
+    kb = c["lane"] // 16
+    return [
+        _live_words(
+            fx.Vector(
+                fx.ptr_load(c["midl"] + midb_word(row, st, kb, j), result_type=_v4i())
+            ),
+            live,
+        )
+        for j in range(4)
+    ]
 
 
 def _live_words(v, live):
@@ -1156,49 +1581,74 @@ def live_operand(b, live):
     """``inter_operands``' step: a dead column multiplies zero. Done where the
     MFMA takes it, so the wait for the load is there too."""
     bw, code = b
-    if const_expr(code is None):
-        # bf16: 4 operands, no code
-        return [_live_words(v, live) for v in bw], None
     return _live_words(bw, live), live.select(code, fx.Int32(UNIT_SCALE))
 
 
-def tile_row(c, first, count):
-    """A lane's pick row of the tile at first (``count`` picks) and whether its
-    column is live; a dead column (past the picks, or a slot past U: count 0)
-    reads row first."""
-    col = c["lane"] % 16
+def tile_row(c, first, count, k=0):
+    """A lane's pick row of token tile k of the slot at first (``count``
+    picks) and whether its column is live; a dead column (past the picks, or
+    a slot past U: count 0) reads row first."""
+    col = tile_col(c, k)
     return first + fx.max(fx.min(col, count - 1), 0), col < count
 
 
 @traced
 def down_tile(c, rgd, ops, first, count, bs):
     """A batch slot's w2 rows 16 rgd .. (``ops``: ``down_loads``) against its
-    picks (their B operands ``bs``), a pick a column -> bf16(w acc) of each
-    pick into LDS ``contrib`` (lane: rows 4 (lane / 16) + i of pick column
-    lane % 16)."""
-    lane, rt = c["lane"], c["rt"]
+    picks (their B operands ``bs``; A16W4 from LDS, ``mid_operands``), a pick
+    a column -> bf16(w acc) of each pick into LDS ``contrib`` (lane: rows 4
+    (lane / 16) + i of pick column lane % 16)."""
     row, live = tile_row(c, first, count)
     words = ops[W2_STEPS:]
     acc = fx.Vector.filled(4, 0.0, fx.Float32)
     b_fmt = FP8 if fp8_routed(c) else FP4
     for st in range_constexpr(W2_STEPS):
-        bw, sb = live_operand(bs[st], live)
         if const_expr(bf16_routed(c)):
             # A16W4: the w2 tile dequantized to bf16, 4 bf16 MFMAs a step
+            bw = mid_operands(c, row, st, live)
             wa = fp4_bf16_tile(ops[st], w2_code(words, rgd, st))
             for q in range_constexpr(4):
                 acc = mfma_bf16(wa[q], bw[q].bitcast(fx.BFloat16), acc)
         else:
+            bw, sb = live_operand(bs[st], live)
             acc = mfma_scaled(ops[st], bw, acc, w2_code(words, rgd, st), sb, FP4, b_fmt)
     if live:
-        pid = fx.ptr_load(rt["order"] + row)
-        t, k = pid // TOPK, pid % TOPK
-        wt = fx.ptr_load(rt["route"] + route_pair(t, TOPK + k)).bitcast(fx.Float32)
-        for i in range_constexpr(4):
-            fx.ptr_store(
-                bf16_round(acc[i] * wt),
-                c["contrib"] + (pid * DOWN_ROWS + 4 * (lane // 16) + i),
-            )
+        put_contrib(c, row, acc)
+    if const_expr(token_tiles(c["S"]) > 1 and bf16_routed(c)):  # noqa: SIM102
+        if count > TOKEN_TILE:
+            down_tile1(c, rgd, ops, first, count)
+
+
+@traced
+def put_contrib(c, row, acc):
+    """bf16(w acc) of pick row ``row`` (this lane's column) -> LDS
+    ``contrib`` (lane: rows 4 (lane / 16) + i)."""
+    lane, rt = c["lane"], c["rt"]
+    pid = fx.ptr_load(rt["order"] + row)
+    t, k = pid // TOPK, pid % TOPK
+    wt = fx.ptr_load(rt["route"] + route_pair(t, TOPK + k)).bitcast(fx.Float32)
+    for i in range_constexpr(4):
+        fx.ptr_store(
+            bf16_round(acc[i] * wt),
+            c["contrib"] + (pid * DOWN_ROWS + 4 * (lane // 16) + i),
+        )
+
+
+@traced
+def down_tile1(c, rgd, ops, first, count):
+    """A16W4 past one token tile: ``down_tile``'s picks past 16 of its slot
+    (token tile 1) on the same w2 registers, each tile dequantized again: run
+    only for a slot of more than 16 picks."""
+    row, live = tile_row(c, first, count, 1)
+    words = ops[W2_STEPS:]
+    acc = fx.Vector.filled(4, 0.0, fx.Float32)
+    for st in range_constexpr(W2_STEPS):
+        bw = mid_operands(c, row, st, live)
+        wa = fp4_bf16_tile(ops[st], w2_code(words, rgd, st))
+        for q in range_constexpr(4):
+            acc = mfma_bf16(wa[q], bw[q].bitcast(fx.BFloat16), acc)
+    if live:
+        put_contrib(c, row, acc)
 
 
 def sdown_loads(c, rgd, live):
@@ -1261,17 +1711,26 @@ def stage_down(c, rgd, nu, ops0, sops, nrgd):
     # every wave (a branch on the wave left its mask live from the kernel's
     # start); waves past SD_STEPS multiply zeros, left out of the sum
     kc = fx.min(wave, SD_STEPS - 1)
-    tk = fx.min(lane % 16, s - 1)
-    base = c["sm8"] + (tk * SM_ROW + kc * 32 + 4 * g4)
-    hv = [fx.Vector(fx.ptr_load(base + 16 * j, result_type=_v4i())) for j in range(2)]
-    b = fx.Vector.from_elements(
-        [hv[j][e] for j in range(2) for e in range(4)], fx.Int32
-    )
-    sb = fx.ptr_load(c["smsc"] + (tk * SMSC_WORDS + kc)) >> (g4 * 8)
-    acc = mfma_scaled(
-        sops[0], b, fx.Vector.filled(4, 0.0, fx.Float32), sops[1], sb, FP8, FP8
-    )
-    fx.ptr_store(acc, red + (wave * 64 + lane) * 4)
+    tiles = token_tiles(s)
+    sacc = []
+    for k in range_constexpr(tiles):
+        tk = fx.min(tile_col(c, k), s - 1)
+        base = c["sm8"] + (tk * SM_ROW + kc * 32 + 4 * g4)
+        hv = [
+            fx.Vector(fx.ptr_load(base + 16 * j, result_type=_v4i())) for j in range(2)
+        ]
+        b = fx.Vector.from_elements(
+            [hv[j][e] for j in range(2) for e in range(4)], fx.Int32
+        )
+        sb = fx.ptr_load(c["smsc"] + (tk * SMSC_WORDS + kc)) >> (g4 * 8)
+        sacc.append(
+            mfma_scaled(
+                sops[0], b, fx.Vector.filled(4, 0.0, fx.Float32), sops[1], sb, FP8, FP8
+            )
+        )
+    # tile 0's in ``red``; tile 1's held until the epilogue's second pass (the
+    # staged mids fill ``xs``, where ``red1`` is in a build past one tile)
+    fx.ptr_store(sacc[0], red + (wave * 64 + lane) * 4)
     nlive = nrgd < DOWN_TASKS
     nr = fx.min(nrgd, DOWN_TASKS - 1)
     # the next task's shared down first: its MFMA then waits for no batch
@@ -1294,14 +1753,15 @@ def stage_down(c, rgd, nu, ops0, sops, nrgd):
             firsts.append(first)
             # a slot past U repeats the last: its picks are written once
             counts.append(((b0 + WAVES * j) < nu).select(count, fx.Int32(0)))
-        # every slot's B operands first; then a slot's MFMAs, and the next
-        # batch's weights for that slot (this task's, or past its last batch
-        # the next task's first) into the registers they freed: in flight
-        # under the next slot's MFMAs and B wait, and carried round the loop
-        # without a copy (a copy would wait for them)
+        # every slot's B operands first (A16W4: LDS, read at the MFMAs); then
+        # a slot's MFMAs, and the next batch's weights for that slot (this
+        # task's, or past its last batch the next task's first) into the
+        # registers they freed: in flight under the next slot's MFMAs and B
+        # wait, and carried round the loop without a copy (a copy would wait
+        # for them)
         for j in range_constexpr(nbat):
             row, _ = tile_row(c, firsts[j], counts[j])
-            bss.append(inter_operands(c, row))
+            bss.append(None if bf16_routed(c) else inter_operands(c, row))
         nrg = more.select(rgd, nr)
         nb0 = more.select(nb, wave)
         nlv = more | nlive
@@ -1315,24 +1775,33 @@ def stage_down(c, rgd, nu, ops0, sops, nrgd):
         ops = ops_n
         go = (b0 < nu).select(fx.Int32(1), fx.Int32(0))
     gpu.barrier()
-    if tid < (DOWN_ROWS // 2) * s:
-        rp = tid % (DOWN_ROWS // 2)
-        tt = tid // (DOWN_ROWS // 2)
-        out = []
-        for h in range_constexpr(2):
-            r = 2 * rp + h
-            y = fx.ptr_load(c["contrib"] + (tt * TOPK * DOWN_ROWS + r))
-            for k in range_constexpr(1, TOPK):
-                y = y + fx.ptr_load(c["contrib"] + ((tt * TOPK + k) * DOWN_ROWS + r))
-            # a padding row has no picks (its contribs were never written)
-            y = (tt < c["nv"]).select(y, fx.Float32(0.0))
-            sh = bf16_round(row_sum(red, r, tt, waves=range(SD_STEPS)))
-            out.append(bf16_round(y) + sh)
-        bo.buffer_store(
-            bf16_pair(out[0], out[1]).bitcast(fx.Int32),
-            rsrc(c["ffn"]),
-            (tt * HIDDEN + rgd * DOWN_ROWS + 2 * rp) // 2,
-        )
+    for k in range_constexpr(tiles):
+        if const_expr(k > 0):
+            # tile 0's shared sums read: tile k's in ``red``
+            gpu.barrier()
+            fx.ptr_store(sacc[k], red + (wave * 64 + lane) * 4)
+            gpu.barrier()
+        if tile_threads(tid, DOWN_ROWS // 2, s, k):
+            rp = tid % (DOWN_ROWS // 2)
+            tt = tid // (DOWN_ROWS // 2)
+            tl = tt if k == 0 else tt - TOKEN_TILE * k
+            out = []
+            for h in range_constexpr(2):
+                r = 2 * rp + h
+                y = fx.ptr_load(c["contrib"] + (tt * TOPK * DOWN_ROWS + r))
+                for kk in range_constexpr(1, TOPK):
+                    y = y + fx.ptr_load(
+                        c["contrib"] + ((tt * TOPK + kk) * DOWN_ROWS + r)
+                    )
+                # a padding row has no picks (its contribs were never written)
+                y = (tt < down_rows(c)).select(y, fx.Float32(0.0))
+                sh = bf16_round(row_sum(red, r, tl, waves=range(SD_STEPS)))
+                out.append(bf16_round(y) + sh)
+            bo.buffer_store(
+                bf16_pair(out[0], out[1]).bitcast(fx.Int32),
+                rsrc(c["ffn"]),
+                (tt * HIDDEN + rgd * DOWN_ROWS + 2 * rp) // 2,
+            )
     gpu.barrier()
     return ops, sops_n
 
@@ -1345,12 +1814,15 @@ def run_down(c, nu, task, nxt):
     ahead, each task's first batch and shared down issued under the one
     before. A build that is not ``queued``: tasks bid, bid + BLOCKS, ..
     (placed)."""
-    q = queued(c["S"])
+    s = c["S"]
+    q = queued(s)
     act = c["routed_act"]
     h = c["ugh"] if bf16_routed(c) else 0
     total_ug = nu * UG_GROUPS
-    d = list_down(task, total_ug, h, act) if q else fx.Int32(c["bid"])
-    dn = list_down(nxt, total_ug, h, act) if q else d + BLOCKS
+    if const_expr(ug_per_cta(act, s) > 1):
+        total_ug = total_ug // ug_per_cta(act, s)
+    d = list_down(task, total_ug, h, act, s) if q else fx.Int32(c["bid"])
+    dn = list_down(nxt, total_ug, h, act, s) if q else d + BLOCKS
     live = d < DOWN_TASKS
     dd = fx.min(d, DOWN_TASKS - 1)
     # this CTA's first down weights in flight under the smid and ug waits
@@ -1359,6 +1831,8 @@ def run_down(c, nu, task, nxt):
     load_smid(c)
     if live:
         wait_ug(c, nu)
+        if const_expr(bf16_routed(c)):
+            load_mids(c)
     while d < DOWN_TASKS:
         got = take_ahead(c) if q else fx.Int32(0)
         ops, sops = stage_down(c, d, nu, ops, sops, dn)
@@ -1366,7 +1840,7 @@ def run_down(c, nu, task, nxt):
             put_claim(c, got)
             gpu.barrier()
         d = dn
-        dn = list_down(read_claim(c), total_ug, h, act) if q else dn + BLOCKS
+        dn = list_down(read_claim(c), total_ug, h, act, s) if q else dn + BLOCKS
 
 
 # ------------------------------------------------------------ the FFN
@@ -1385,12 +1859,26 @@ def real_rows(c):
     return uniform(has.select(fx.max(fx.min(got, s), 1), fx.Int32(s)))
 
 
+def down_rows(c):
+    """The real rows in the down: ``c["nv"]``; quartered read back from LDS
+    (``run_ffn``), so the count is not held as an SGPR across the ug loop
+    (it spilled the 24-row debug build's)."""
+    if quartered(c):
+        return uniform(fx.ptr_load(c["claim"] + 1))
+    return c["nv"]
+
+
 @traced
 def run_ffn(c, bid):
     """Every FFN stage of this CTA, in program order (``layout``'s
     placement): router / shared / route tasks, the union, ug, down."""
     s = c["S"]
     c["nv"] = real_rows(c)
+    if const_expr(quartered(c)):  # noqa: SIM102
+        # for the down (``down_rows``); LDS ``claim``'s word 1, read past the
+        # union's barriers
+        if c["tid"] == 0:
+            fx.ptr_store(c["nv"], c["claim"] + 1)
     enter_stage("router")
     rt_task = bid - R0
     if bid >= R0:
@@ -1400,28 +1888,47 @@ def run_ffn(c, bid):
     if (bid >= SH0) & (sj < SH_TASKS):
         stage_shared(c, sj, sh_loads(c, sj))
     enter_stage("route")
-    rt_tok = bid - RT0
+    rt0 = route_cta0(s)
+    rt_tok = bid - rt0
     # a padding row is routed nowhere (production's ``num_valid_rows``)
-    if (bid >= RT0) & (rt_tok < s) & (rt_tok < c["nv"]):
+    if (bid >= rt0) & (rt_tok < s) & (rt_tok < c["nv"]):
         stage_route(c, rt_tok)
     c["stamp"](6)
     enter_stage("union")
     # this CTA's task list (A16W4: its K half ``ugh``, the x half it stages)
     # and its placed entry there
-    lst, c["k0"] = task_list(bid, c["routed_act"])
+    lst, c["k0"] = task_list(bid, c["routed_act"], s, _sel)
     if const_expr(bf16_routed(c)):
         c["ugh"] = lst
-    nu = load_route(c)
-    load_xb(c)
-    c["stamp"](7)
-    enter_stage("ug")
-    # the routed and shared planes' bases, loaded once: a load in a task
-    # loop would wait (``vmcnt`` in issue order) for every weight load in
-    # flight
-    c |= {n: weight(c, n) for n in ("w13", "s13", "w2", "s2", "w_sd", "s_sd", "queue")}
+    # What needs no route goes out before the route's poll, while the route
+    # is in flight (every CTA waits there for the route CTAs): the routed and
+    # shared planes' bases (loaded once: a load in a task loop would wait,
+    # ``vmcnt`` in issue order, for every weight load in flight), the first
+    # claim of the list's queue word (``run_ug``) and the routed B operands
+    # (x is in at the norm, the route an all-gather of the logits later).
+    # After the route's poll, the union alone is left before the first ug
+    # weights go out; before, the x poll, x's loads, the table's load and the
+    # claim's atomic (every CTA of a list on one word at once) came between.
+    # Quartered, the down's bases are loaded after the ug loop instead, which
+    # held them as SGPRs it had not got (``ug_tile1``).
+    later = ("w2", "s2", "w_sd", "s_sd") if quartered(c) else ()
+    c |= {
+        n: weight(c, n)
+        for n in ("w13", "s13", "w2", "s2", "w_sd", "s_sd", "queue")
+        if n not in later
+    }
     # the list's queue word: the launch's words are one a list, in list order
     c["qword"] = c["queue"] + fx.Int64(lst) * 4 if bf16_routed(c) else c["queue"]
+    got = take_ahead(c) if queued(s) else fx.Int32(0)
+    load_xb(c)
+    if const_expr(queued(s)):
+        # read past ``load_route``'s barriers (``run_ug``)
+        put_claim(c, got)
+    nu = load_route(c)
+    c["stamp"](7)
+    enter_stage("ug")
     task, nxt = run_ug(c, bid, nu)
+    c |= {n: weight(c, n) for n in later}
     c["stamp"](8)
     enter_stage("down")
     run_down(c, nu, task, nxt)

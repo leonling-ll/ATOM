@@ -4,10 +4,11 @@
 other is refused.
 
 Phase 1 replaces one segment of each MoE layer (4 .. 67) in decode and DSpark
-verify forwards of at most ``MAX_ROWS`` rows: o_proj, the first all-reduce and
-the post-attention Gemma RMSNorm (+ MXFP8, + the lookahead's norm of layer
-L + 2), the router, the routed and shared experts and their combine. Attention,
-the indexer, the dense layers, AR #2 and prefill stay on the production path.
+verify forwards of at most ``max_rows`` rows (A16W4 24, W4A4 / W4A8 16): o_proj,
+the first all-reduce and the post-attention Gemma RMSNorm (+ MXFP8, + the
+lookahead's norm of layer L + 2), the router, the routed and shared experts and
+their combine. Attention, the indexer, the dense layers, AR #2 and prefill
+stay on the production path.
 
 Every width a kernel loops over, places tasks by or lays a region out with is a
 build-time constant of ``ProDims(8)``: the kernels place o_proj, the column
@@ -18,10 +19,10 @@ one width read off the loaded model is the routed planes' padded intermediate
 bakes as ``P1Build.inter_r``.
 
 The phase serves forwards of up to ``ProVariants.mono_ffn_rows`` rows (16 by
-default; 0 turns it off). Its value is latched once, at the first MoE layer of the first forward (``route``), and
-agreed over the TP group (``latch_rows``): the per-forward re-read of
-``ATOM_M3PRO_VARIANTS`` must never flip it, because a forward whose ranks
-disagree on mono waits in-kernel for ever.
+default; 0 turns it off). Its value is latched once, at the first MoE layer of
+the first forward (``route``), and agreed over the TP group (``latch_rows``):
+the per-forward re-read of ``ATOM_M3PRO_VARIANTS`` must never flip it, because
+a forward whose ranks disagree on mono waits in-kernel for ever.
 """
 
 from dataclasses import dataclass
@@ -65,10 +66,16 @@ MX_GROUP = 32
 # the AR + norm task: 128 columns, two a lane
 COLS = 128
 
-# Rows a forward serves at most: the widths P1 builds and gates on. A 16-row
-# MFMA B operand holds them in one tile; 32 rows need two token groups a
-# weight tile.
+# Rows every routed format's FFN build takes and serves: a 16-row MFMA B
+# operand holds them in one tile. W4A4 / W4A8 stop here.
 MAX_ROWS = 16
+# Rows a norm build (``upto = "norm"``: o_proj, AR #1 and the norms) takes at
+# most: two 16-token MFMA B tiles in the o stage, AR #1 in up to 3 passes.
+MAX_ROWS_NORM = 24
+# Rows an A16W4 FFN build takes and serves at most (``max_rows``): its stages
+# run two token tiles past 16 rows and its routed gate / up four K quarters (a
+# quarter of the bf16 x a token is what fits LDS at 24 rows).
+MAX_ROWS_A16W4 = MAX_ROWS_NORM
 # Rows the kernel ABI, the peer regions and the scratch are sized for from day
 # one, so a later 32-row build changes no layout (``begin_step`` zeroes the
 # whole buffers either way).
@@ -335,13 +342,22 @@ def config_refusal(atom_config) -> str | None:
     return first_refusal(checks)
 
 
-def rows_refusal(rows: int) -> str | None:
-    """Why a ``mono_ffn_rows`` value cannot be latched, or None (0 is "off",
-    not a refusal)."""
+def max_rows(act: str = "bf16") -> int:
+    """The widest forward the routed format ``act`` builds and serves: A16W4
+    ``MAX_ROWS_A16W4``, W4A4 / W4A8 ``MAX_ROWS`` (their stages hold one
+    token tile)."""
+    return MAX_ROWS_A16W4 if act == "bf16" else MAX_ROWS
+
+
+def rows_refusal(rows: int, act: str = "bf16") -> str | None:
+    """Why a ``mono_ffn_rows`` value cannot be latched with the routed format
+    ``act``, or None (0 is "off", not a refusal)."""
     if not isinstance(rows, int) or isinstance(rows, bool):
         return f"mono_ffn_rows {rows!r} is not an integer"
-    if not 0 <= rows <= MAX_ROWS:
-        return f"mono_ffn_rows {rows} outside 0 .. {MAX_ROWS}"
+    top = max_rows(act)
+    if not 0 <= rows <= top:
+        name = ROUTED_ACT_NAMES.get(act, repr(act))
+        return f"mono_ffn_rows {rows} outside 0 .. {top} ({name})"
     return None
 
 
@@ -371,7 +387,7 @@ def latch_rows(rows, group, act="bf16") -> tuple[int, str | None]:
     turn the phase off on every rank."""
     from atom.distributed.group_agreement import group_max_each
 
-    why = rows_refusal(rows) or act_refusal(act)
+    why = act_refusal(act) or rows_refusal(rows, act)
     local = 0 if why is not None else rows
     ai = 0 if why is not None else ROUTED_ACTS.index(act)
     # bad flag, max, -min of the rows and of the format in one collective
@@ -392,5 +408,6 @@ def latch_rows(rows, group, act="bf16") -> tuple[int, str | None]:
 
 def gate_rows(rows: int, latched: int) -> bool:
     """Whether a forward of ``rows`` graph rows (pad rows included, so it is
-    TP-uniform) is in the latched phase-1 range."""
-    return 1 <= rows <= latched <= MAX_ROWS
+    TP-uniform) is in the latched phase-1 range (``latch_rows`` holds a
+    W4A4 / W4A8 latch to ``MAX_ROWS``)."""
+    return 1 <= rows <= latched <= MAX_ROWS_A16W4

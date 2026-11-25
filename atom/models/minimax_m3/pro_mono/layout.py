@@ -33,9 +33,10 @@ build's the bf16 x)::
     route   S CTAs from RT0, token t (a real row: t < ``nvalid``'s count):
             sigmoid, top-4 of sigmoid + bias, the 4 unbiased sigmoids
             renormalized x 2.0 -> ``route``
-    union   every CTA: ``route`` -> the union U of the real rows' experts and
-            their picks (LDS), the routed B operand (x4, x8, or A16W4 the
-            CTA's K half of the bf16 x) -> LDS
+    union   every CTA: the routed B operand (x4, x8, or A16W4 the CTA's K
+            half of the bf16 x) -> LDS, staged while the route is in flight;
+            then ``route`` -> the union U of the real rows' experts and their
+            picks (LDS)
     ug      |U| x UG_GROUPS tasks, the first round placed and the rest from
             the launch's work queue (``MOE_TABLE``), each CTA's weights
             streaming from one task into the next: 32 gate + 32 up rows of an
@@ -45,14 +46,18 @@ build's the bf16 x)::
             K halves (``ug_split``), a task list and a queue word a half, a
             CTA's tasks all of its half (``task_lists``): the half-1 task
             sends its fp32 gate / up partials (``ugp``), the half-0 task adds
-            them to its own and finishes the task
+            them to its own and finishes the task. Past one token tile (17 ..
+            24 rows) A16W4 splits over K quarters instead, a list each, a CTA
+            running two tasks of its quarter at once (``ug_per_cta``); the
+            quarter-0 task adds the other three's partials
     down    DOWN_TASKS (16 hidden rows), the task list's entries past the ug
             tasks (the same queue: a CTA that drew fewer or faster ug tasks
             takes more down tasks, so the 448 fill no rounds of their own;
             A16W4 deals them to its two lists alternately; a 1-row build
             places ug and down tasks round-robin, ``queued``), each CTA's
             next task's first w2 batch in flight under the one before; every
-            ug flag polled once: w2 of every expert of U against its
+            ug flag polled once (A16W4: then every pick's bf16 mid row to
+            LDS, the B operands): w2 of every expert of U against its
             picks' mids -> bf16(w acc) a pick, summed in top-k order -> bf16;
             the shared down (MXFP8 of ``smid``) -> bf16; bf16(routed + shared)
             -> ``ffn_out`` [S, 7168], this rank's FFN partial (a padding
@@ -75,12 +80,15 @@ from atom.models.minimax_m3.pro_mono.config import (
     HIDDEN,
     LAYERS,
     MAX_ROWS,
+    MAX_ROWS_A16W4,
     MAX_ROWS_LAYOUT,
+    MAX_ROWS_NORM,
     MX_GROUP,
     ROUTED_ACTS,
     TOPK,
     ProDims,
     RoutedPlanes,
+    max_rows,
 )
 from atom.mono.plan.check import RegionDecl
 from atom.mono.plan.execution import BLOCKS, THREADS
@@ -104,12 +112,31 @@ O_SCALES_PW = O_K // MX_GROUP // 4  # 24
 O_ROW = O_K // 4 + 4
 OSC_ROW = O_K // MX_GROUP // 4
 UPTO = ("norm", "ffn")
+# tokens a 16x16 MFMA's B operand holds: a build of more rows runs each stage
+# whose B operand is the token rows once a tile (the o stage: ``stage_o``)
+TOKEN_TILE = 16
 # timeline points: 0 start, 1 core quantized, 2 o pushed, 3 reduced /
 # gathered, 4 sums of squares in, 5 stored; FFN: 6 router / shared / route
 # done, 7 union and x4 in, 8 ug done, 9 down done; 10 end
 TL_POINTS = 11
 
 assert O_TASKS <= 256 and OWN % O_ROWS == 0 and OWN % COLS == 0
+# the o stage's K-quarter sum takes a thread a (token, row) cell: a pass of
+# THREADS threads is one token tile's cells
+assert THREADS == O_ROWS * TOKEN_TILE
+
+
+def token_tiles(s: int) -> int:
+    """The 16-token MFMA B tiles of an ``s``-row build."""
+    return -(-s // TOKEN_TILE)
+
+
+def max_tokens(upto: str, act: str = "bf16") -> int:
+    """The widest build of ``upto``: a norm build ``MAX_ROWS_NORM`` (two token
+    tiles), an FFN build its routed format's ``config.max_rows`` (A16W4 two
+    token tiles, W4A4 / W4A8 one)."""
+    return MAX_ROWS_NORM if upto == "norm" else max_rows(act)
+
 
 # ---------------------------------------------------------------- the FFN
 E_RANK = DIMS.e_rank  # 48 router rows a rank
@@ -159,6 +186,13 @@ XH_WORDS = HIDDEN // UG_HALVES // 2
 XH_ROW = XH_WORDS + 4
 INTERB_WORDS = INTER_V // 2
 W13_Q = W13_HALF // 2  # 14
+# A16W4 past one token tile (``ug_split``): a task is one K quarter (its x
+# quarter, 24 rows x 900 words, is what fits LDS), a CTA runs two tasks at once
+# (``ug_per_cta``: waves 0-3 one, 4-7 the other, a row group and all W13_Q steps
+# a wave), so its weights in flight are a K half's as at 16 rows
+UG_QUARTERS = 4
+XQ_WORDS = HIDDEN // UG_QUARTERS // 2
+XQ_ROW = XQ_WORDS + 4
 # the routed experts' activation format (``config.ROUTED_ACTS``): "fp4" W4A4
 # (aiter a4w4 numerics), "fp8" W4A8 (MXFP8 x and mids, the f8f6f4 MFMA with an
 # fp4 A and an fp8 B), "bf16" A16W4 (production's a16w4 numerics: bf16 x and
@@ -171,19 +205,35 @@ def inter_words(act: str) -> int:
     return {"fp4": INTER_WORDS, "fp8": INTER8_WORDS, "bf16": INTERB_WORDS}[act]
 
 
-def ug_split(act: str) -> int:
-    """The K slices of an ug task, each its own task on its own CTA: 2 for
-    A16W4 (its bf16 x does not fit LDS whole at 16 rows, a K half does), 1
-    else."""
-    return UG_HALVES if act == "bf16" else 1
+def ug_split(act: str, tokens: int = 1) -> int:
+    """The K slices of an ug task, each its own task on its own CTA: A16W4 2
+    up to one token tile (its bf16 x does not fit LDS whole at 16 rows, a K
+    half does) and 4 past it (a K half does not fit at 24 rows); 1 else."""
+    if act != "bf16":
+        return 1
+    return UG_QUARTERS if tokens > TOKEN_TILE else UG_HALVES
 
 
-def xh_word(t, local, kb, j):
-    """A16W4: the LDS word (from ``xs``) of token t's K-half row holding the
-    B operand of bf16 MFMA j of the half's 128-k step ``local`` on lane group
-    ``kb``: k 128 local + 32 kb + 8 j .. + 8 of the half (``fp4_bf16_tile``'s
-    operand j of the w13 tile, k 32 kb + 8 j .. + 8 of its step)."""
-    return t * XH_ROW + local * 64 + kb * 16 + 4 * j
+def ug_per_cta(act: str, tokens: int) -> int:
+    """The ug tasks a CTA runs at once (a list entry's): 2 when a task is a K
+    quarter (waves 0-3 the entry's first, 4-7 its second), else 1 (the 8
+    waves split the task's K slice in two)."""
+    return 2 if ug_split(act, tokens) == UG_QUARTERS else 1
+
+
+def xk_row(act: str, tokens: int) -> int:
+    """A16W4: the LDS words of a token's x slice row (``ug_split``'s K
+    slice, padded): ``XH_ROW`` or ``XQ_ROW``."""
+    return XQ_ROW if ug_split(act, tokens) == UG_QUARTERS else XH_ROW
+
+
+def xh_word(t, local, kb, j, row=XH_ROW):
+    """A16W4: the LDS word (from ``xs``) of token t's K-slice row (``row``
+    words, ``xk_row``) holding the B operand of bf16 MFMA j of the slice's
+    128-k step ``local`` on lane group ``kb``: k 128 local + 32 kb + 8 j .. +
+    8 of the slice (``fp4_bf16_tile``'s operand j of the w13 tile, k 32 kb +
+    8 j .. + 8 of its step)."""
+    return t * row + local * 64 + kb * 16 + 4 * j
 
 
 def interb_word(row, blk, col):
@@ -199,11 +249,33 @@ def interb_word(row, blk, col):
 SM_WORDS = INTER_S // 4
 SM_ROW = SM_WORDS + 4
 SMSC_WORDS = INTER_S // 128
+# A16W4: the down's B operands, every pick's bf16 mid row staged in LDS (in
+# ``xs`` past the shared mid's rows), padded so that the 16 rows a lane group
+# reads (a pick column a lane, 16 B each) start 4 banks apart (324 = 4 mod 64)
+MIDB_ROW = INTERB_WORDS + 4
+
+
+def midb_word(row, st, kb, j):
+    """A16W4: the LDS word (from the staged mids, past ``SM_ROW`` words a
+    token) of pick row ``row``'s B operand j of the down's 128-k step ``st``
+    on lane group ``kb``: ``interb_word(row, 4 st + kb, 8 j)`` in a row of
+    ``MIDB_ROW`` words."""
+    return row * MIDB_ROW + (4 * st + kb) * (UG_COLS // 2) + 4 * j
+
+
 # placement: the router on the last CTAs (no o task: their weights are in
 # flight from the start), the route before them, the shared gate_up past the
 # norm CTAs
 R0 = BLOCKS - R_TASKS  # 235
 RT0 = R0 - MAX_ROWS  # 219
+
+
+def route_cta0(tokens: int) -> int:
+    """The first route CTA of a ``tokens``-row build (a token a CTA, up to
+    R0): ``RT0`` up to 16 rows, 211 at 24."""
+    return R0 - max(tokens, MAX_ROWS)
+
+
 SH0 = NT  # 56
 # the first ug round from the CTAs that have no stage between o and ug (past
 # the shared gate_up's, before the route's): a narrow step's tasks start there
@@ -234,34 +306,75 @@ def first_ug(bid):
 # (a pair's half 1 before its half 0) would also be deadlock-free, but a CTA
 # could then draw either half and would have to stage x's other half (as many
 # bytes as the task's weights) in between.
+#
+# Past one token tile A16W4 has four lists, one a K quarter: list q's entry is
+# ``ug_per_cta`` (2) ug tasks' quarter q, and its CTAs stage only quarter q of
+# x. The quarter-0 task waits for quarters 1 to 3's partials; those tasks wait
+# for nothing and lists 1 to 3's CTAs run no quarter-0 task, so the argument
+# above holds for each of the three partners.
 
 
-def list_ctas(act: str) -> int:
-    """The CTAs of a task list: BLOCKS / ``ug_split``."""
-    return BLOCKS // ug_split(act)
+# Quartered (``ug_per_cta``), the quarter-0 list does the merges: in a
+# 24-row timeline at 56 experts (t189b_check_419ea6cd_1124T2051) its CTAs
+# ended ug 7 .. 9 us after the other lists' (their ug 52 us a CTA, the others'
+# 45), so it takes more CTAs: QUARTER0_CTAS, the rest QUARTER_CTAS each
+QUARTER0_CTAS = 70
+QUARTER_CTAS = (BLOCKS - QUARTER0_CTAS) // 3
+assert QUARTER0_CTAS + 3 * QUARTER_CTAS == BLOCKS
 
 
-def task_list(bid, act: str):
-    """CTA ``bid``'s (task list, placed entry): A16W4 (``first_ug`` % 2, its
-    K half; ``first_ug`` / 2, its pair), else (0, ``first_ug``); ints or
-    traced values."""
+def _ternary(cond, a, b):
+    return a if cond else b
+
+
+def list_ctas(act: str, tokens: int = 1, lst=0, select=_ternary) -> int:
+    """The CTAs of task list ``lst`` (its first round's entries): BLOCKS /
+    ``ug_split``, quartered ``QUARTER0_CTAS`` for list 0 and
+    ``QUARTER_CTAS`` else. ``select(cond, a, b)``: a traced ``lst``'s."""
+    n = ug_split(act, tokens)
+    if n == UG_QUARTERS:
+        return select(lst == 0, QUARTER0_CTAS, QUARTER_CTAS)
+    return BLOCKS // n
+
+
+def task_list(bid, act: str, tokens: int = 1, select=_ternary):
+    """CTA ``bid``'s (task list, placed entry): A16W4 halves (``first_ug`` %
+    2, its K half; ``first_ug`` / 2, its entry); quartered the first
+    ``QUARTER0_CTAS`` of ``first_ug`` list 0's (the CTAs with no stage
+    before ug), the rest dealt to lists 1 .. 3 in turn; else (0,
+    ``first_ug``). Ints, or traced values with ``select``."""
     t = first_ug(bid)
-    if ug_split(act) == 2:
-        return t & 1, t >> 1
+    n = ug_split(act, tokens)
+    if n == UG_QUARTERS:
+        r = t - QUARTER0_CTAS
+        in0 = t < QUARTER0_CTAS
+        return select(in0, 0, 1 + r % 3), select(in0, t, r // 3)
+    if n > 1:
+        return t & (n - 1), t >> (n.bit_length() - 1)
     return 0, t
 
 
-def list_down(k, ug_tasks, lst, act: str):
-    """The down task of list ``lst``'s entry k past its ``ug_tasks`` ug ones:
-    A16W4's two lists take every other down task (list h: h, h + 2, ..)."""
-    return (k - ug_tasks) * ug_split(act) + lst
+def list_down(k, ug_entries, lst, act: str, tokens: int = 1):
+    """The down task of list ``lst``'s entry k past its ``ug_entries`` ug
+    ones: A16W4's lists take every ``ug_split``-th down task (list h: h, h +
+    n, ..)."""
+    return (k - ug_entries) * ug_split(act, tokens) + lst
+
+
+def queue_lists(act: str) -> int:
+    """The task lists, so the queue words, a launch tag holds: its routed
+    format's widest build's (A16W4 4, a K quarter a list; else 1). Every
+    build of the format addresses the same words (``queue_word_offset``); a
+    narrower one uses the first ``ug_split``."""
+    return UG_QUARTERS if act == "bf16" else 1
 
 
 assert UG_GROUPS * UG_COLS == INTER_V and INTER_V % 128 == 0
 # A16W4: a CTA's ug tasks are all of one K half (its task list's) and a
 # quarter's steps start on an even step (two steps a w13 scale word)
 assert BLOCKS % 2 == 0 and W13_Q % 2 == 0 and 2 * W13_Q == W13_HALF
-assert R_KLEN == 1024 and SH0 + SH_TASKS <= RT0
+assert R_KLEN == 1024 and SH0 + SH_TASKS <= route_cta0(MAX_ROWS_A16W4)
+assert W13_Q * UG_QUARTERS * 128 == HIDDEN and XQ_ROW % 4 == 0
 assert UG_COLS * MAX_ROWS <= THREADS and SH_ROWS * MAX_ROWS <= THREADS
 
 
@@ -362,12 +475,15 @@ class P1Build:
     inter_r: int = field(default=0, metadata={"sym": "ir"})
 
     def __post_init__(self):
-        if not 1 <= self.tokens <= MAX_ROWS:
-            raise ValueError(f"tokens {self.tokens} outside 1 .. {MAX_ROWS}")
         if self.upto not in UPTO:
             raise ValueError(f"upto {self.upto!r} not in {UPTO}")
         if self.routed_act not in ROUTED_ACTS:
             raise ValueError(f"routed_act {self.routed_act!r} not in {ROUTED_ACTS}")
+        top = max_tokens(self.upto, self.routed_act)
+        if not 1 <= self.tokens <= top:
+            raise ValueError(
+                f"tokens {self.tokens} outside 1 .. {top} ({self.upto} build)"
+            )
         if self.upto == "ffn":
             RoutedPlanes(self.inter_r)
         elif self.inter_r:
@@ -436,8 +552,8 @@ def peer_bytes() -> int:
 # route [token][8] the picks' experts, then their weights (f32), top-k order
 # ugf   [ug task] a task's mid rows are stored (A16W4: a K-half pair's)
 # smid  [token][shared mid column] bf16 pairs
-# ugp   (A16W4) [pick row][ug group][mid column] the half-1 task's f32 gate
-#       and up partials, two pairs a cell
+# ugp   (A16W4) [K slice 1 ..][pick row][ug group][mid column] the half-1
+#       (quarter 1 to 3) tasks' f32 gate and up partials, two pairs a cell
 
 
 def rpart_pair(task, t, r):
@@ -454,9 +570,15 @@ def smid_pair(t, col):
     return (t * INTER_S + col) // 2
 
 
-def ugp_pair(row, g, col):
+# the K-slice partners an A16W4 slice-0 task merges: 1 (halves) or 3 (quarters)
+UGP_PARTS = UG_QUARTERS - 1
+
+
+def ugp_pair(row, g, col, part=0):
     """``ugp``'s first pair of pick row ``row``'s mid column ``col`` of ug
-    group ``g``: the gate partial, then the up's."""
+    group ``g``, K slice ``part + 1``'s: the gate partial, then the up's."""
+    if not (isinstance(part, int) and part == 0):
+        row = part * (MAX_ROWS_LAYOUT * TOPK) + row
     return ((row * UG_GROUPS + g) * UG_COLS + col) * 2
 
 
@@ -478,14 +600,18 @@ def scratch_layout(key: P1Build) -> dict:
             ("ugf", max_u(L) * UG_GROUPS),
             ("smid", L * INTER_S // 2),
             # last: the other regions' offsets are every format's
-            *((("ugp", L * TOPK * UG_GROUPS * UG_COLS * 2),) if bf16 else ()),
+            *(
+                (("ugp", UGP_PARTS * L * TOPK * UG_GROUPS * UG_COLS * 2),)
+                if bf16
+                else ()
+            ),
         )
         lay |= pair_layout(items, align=16, start=start)
         # the work queues: an i32 count a task list and launch tag, plain words
         # in a region no pair shares (the step's zeroing clears them with the
         # pairs)
         end = max(o + n for o, n in lay.values())
-        words = QUEUE_TAGS * ug_split(key.routed_act)
+        words = QUEUE_TAGS * queue_lists(key.routed_act)
         lay |= byte_layout((("queue", words * 4),), start=end)
     return lay
 
@@ -519,7 +645,7 @@ def queue_word_offset(key: P1Build, layer: int) -> int:
     adds only its list's 4 h)."""
     if not 0 <= layer < LAYERS:
         raise ValueError(f"layer {layer} outside 0 .. {LAYERS - 1}")
-    words = ug_split(key.routed_act)
+    words = queue_lists(key.routed_act)
     return scratch_layout(key)["queue"][0] + (layer + 1) * words * 4
 
 

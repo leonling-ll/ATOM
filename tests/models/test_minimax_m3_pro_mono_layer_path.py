@@ -11,14 +11,18 @@
   the wider ones (and every one with mono off) take the glue's launch where
   it applies, else the separate launches;
 * the launch (``ProMonoRunner.launch``, the compiled kernel faked): every
-  ABI argument by name, the layer's ``moe_w`` table in ``MOE_TABLE`` order;
+  ABI argument by name, the layer's ``moe_w`` table in ``MOE_TABLE`` order,
+  the lookahead into its reader's ring rows up to ``FRONT_ROWS``;
 * the segment (``ProMonoRunner.segment``, its launch faked): the lookahead in
   ``resid_in[L + 2]`` as MXFP8, production's MoE on the kernel's (x, x8) under
   ``upto = "norm"`` and none when the build writes the FFN; check mode runs
-  production on a copy of the residual first and logs every output.
+  production on a copy of the residual first and logs every output, its
+  lookahead copied out of the ring rows the kernel then writes.
 
 Needs aiter (``pro`` imports the model stack) and FlyDSL (the runner)."""
 
+import ctypes
+import weakref
 from types import SimpleNamespace
 
 import pytest
@@ -79,17 +83,18 @@ def _layer(rec, moe=True, route=None):
     state = SimpleNamespace(
         source_for=lambda *a: None,
         put=lambda lid, x, res: rec.calls.append(("put", lid)),
+        front_input=pro.ProLookaheadState.front_input,
         resid_in={},
     )
     layer._pro_state = state
     layer._mono = route
 
     class Attn:
-        qk_proj = PLAIN
-        index_qk_proj = PLAIN
+        qkv_proj = PLAIN
 
         def __call__(self, **kw):
             rec.calls.append("attn")
+            rec.attn_in = weakref.ref(kw["hidden_states"])
             return self.o_proj(self.forward_core(**kw))
 
         def forward_core(self, **kw):
@@ -98,12 +103,19 @@ def _layer(rec, moe=True, route=None):
 
         def o_proj(self, core):
             rec.calls.append("o_proj")
-            return torch.cat([core, core[:, : H - OK]], 1) * 7
+            out = torch.cat([core, core[:, : H - OK]], 1) * 7
+            rec.o_proj_out = weakref.ref(out)
+            return out
 
     layer.self_attn = Attn()
 
     def ffn(x, *args, shared_input=None, quant_down=False):
         rec.calls.append(("ffn", shared_input is not None, quant_down))
+        rec.live_in_ffn = [
+            name
+            for name in ("attn_in", "o_proj_out")
+            if getattr(rec, name, None) is not None and getattr(rec, name)() is not None
+        ]
         return x * 11
 
     def forward_glue(r, quant_down=False):
@@ -156,6 +168,16 @@ def test_mono_off_is_the_production_path(rec, route):
     assert torch.equal(out, want_out) and torch.equal(res, want_res)
     if r is not None:
         assert r.asked == [(4, N)]
+
+
+@pytest.mark.parametrize("moe", [True, False])
+def test_the_attention_rows_are_freed_before_the_ffn(rec, moe):
+    """As the inline segment did: neither the attention's input nor o_proj's
+    output [tokens, hidden] is held while the FFN runs (a prefill's would
+    raise the warmup's peak, which the KV pool is sized from)."""
+    layer = _layer(rec, moe=moe)
+    layer(None, _t(1), _t(2))
+    assert rec.live_in_ffn == []
 
 
 def test_a_dense_layer_never_asks_the_route(rec):
@@ -311,6 +333,77 @@ def test_the_default_day0_decode_starts_above_the_row_limit():
     assert variants_refusal(v, True) == "day0_decode_rows 16 within 16"
 
 
+def test_the_rows_mono_reads_stay_bf16_where_o_proj_takes_mxfp8(monkeypatch):
+    """Below the day0 decode, under ``fuse_mxfp8_quant`` with a native MXFP8 o_proj,
+    the Triton decode attention writes o_proj's input as E4M3 rows (``forward``
+    hands them on with their scales); ``forward_core``, what the mono kernel
+    reads as bf16, gets the same rows as bf16 and leaves no scale behind."""
+    heads, hd, dv, n_tok, n = 16, 256, 192, 8, 3  # padding rows past the batch
+    m = object.__new__(pro_attn.ProSparseAttentionImpl)
+    m.num_heads, m.head_dim, m.value_head_dim, m.layer_num = heads, hd, dv, 5
+    m.k_only, m.mx_out, m.index_cache = True, True, None
+    v = ProVariants(kernels=True, attn="triton", k_only=True, mono_ffn_rows=16)
+    assert v.fuse_mxfp8_quant and n < v.day0_decode_rows
+    monkeypatch.setattr(pro_attn, "variants", lambda: v)
+    monkeypatch.setattr(m, "_use_kernels", lambda v: True, raising=False)
+    md = SimpleNamespace(
+        slot_mapping=torch.zeros(n, dtype=torch.long),
+        block_tables=torch.zeros(n, 16, dtype=torch.int32),
+        cu_seqlens_q=torch.arange(0, n + 1, dtype=torch.int32),
+    )
+    fwd = SimpleNamespace(
+        context=SimpleNamespace(is_dummy_run=False, is_prefill=False),
+        attn_metadata=md,
+        kv_cache_data={
+            "layer_5": SimpleNamespace(
+                k_cache=torch.zeros(1, 1, 1, 16, hd, dtype=torch.float8_e4m3fn)
+            )
+        },
+    )
+    monkeypatch.setattr(pro_attn, "get_forward_context", lambda: fwd)
+    scales = []
+
+    def kernel(parts, pos, seq, slots, bt, layer, ic, nb, v, out, **kw):
+        scales.append(kw["mx_scale"])
+        if kw["mx_scale"] is None:
+            out.fill_(1.0)
+        else:
+            out.view(torch.uint8).fill_(0x38)  # 1.0 in e4m3
+            kw["mx_scale"].fill_(127)
+
+    monkeypatch.setattr(m, "_kernel_attention", kernel, raising=False)
+
+    class Attn:
+        impl = m
+
+        def __call__(self, q, k, iq, positions, qkv=None):
+            return self.impl.forward(
+                query=q, key=k, value=iq, position=positions, qkv=qkv
+            )
+
+    a = pro.MiniMaxM3ProAttention.__new__(pro.MiniMaxM3ProAttention)
+    nn.Module.__init__(a)
+    a.qk_sizes, a.index_qk_sizes = [heads * hd, hd], [16 * 128, 128]
+    width = sum(a.qk_sizes) + sum(a.index_qk_sizes)
+    a.qkv_proj = lambda x, x_scale: torch.zeros(x.shape[0], width, dtype=torch.bfloat16)
+    a.attn = Attn()
+    got = []
+    a.o_proj = lambda x, x_scale=None: got.append((x.dtype, x_scale)) or x
+    hidden = torch.zeros(n_tok, 64, dtype=torch.bfloat16)
+    front = (torch.zeros(2 * n_tok, 64), torch.zeros(2 * n_tok, 2))
+    args = (torch.zeros(n_tok, dtype=torch.long), hidden, None, None, None, front)
+
+    core = a.forward_core(*args)
+    assert core.dtype == torch.bfloat16 and core.shape == (n_tok, heads * dv)
+    assert (core[:n] == 1.0).all() and (core[n:] == 0).all()
+    assert scales == [None] and m.take_mx_scale() is None
+    assert not m.bf16_out  # this call only
+
+    a.forward(*args)  # production: o_proj reads the E4M3 rows and their scales
+    assert got[0][0] == torch.float8_e4m3fn and got[0][1] is not None
+    assert got[0][1].shape == (n_tok, heads * dv // 32)
+
+
 # ------------------------------------------------------------- the segment
 
 
@@ -430,18 +523,32 @@ def test_moe_table_holds_the_operands_in_the_kernels_order():
     assert MOE_TABLE[-1] == "queue" and len(set(table.tolist())) == len(MOE_TABLE)
 
 
-@pytest.mark.parametrize("reader", [6, None])
-def test_launch_passes_every_abi_argument(monkeypatch, reader):
-    from atom.models.minimax_m3.pro_mono.layout import (
-        DIMS,
-        HIDDEN,
-        P1Build,
-        queue_word_offset,
+def _state():
+    """A real ``ProLookaheadState`` (lookahead 2 from layer 2) whose layer 6 reads
+    layer 4's lookahead through a native MXFP8 indexer projection."""
+    st = pro.ProLookaheadState(
+        SimpleNamespace(
+            sparse_attention_config={
+                "sparse_indexer_lookahead_num_layers": 2,
+                "sparse_indexer_lookahead_start_layer": 2,
+            }
+        )
     )
+    st.norms[6], st.index_linears[6] = object(), (NATIVE,)
+    return st
+
+
+def _launching(monkeypatch, reader, rows, kernel=None, check=False):
+    """A runner whose ``launch`` and ``segment`` are the real ones over layer 4
+    (``reader``: its lookahead's reader) and a real ``_state()``; the compiled kernel
+    is ``kernel(args by ABI name)`` (default: record them). Returns (runner, the
+    recorded calls, the layer's ``moe_w``, the begin_step calls)."""
+    from atom.models.minimax_m3.pro_mono.layout import P1Build, queue_word_offset
 
     w = _bound()
     r = runner_mod.ProMonoRunner.__new__(runner_mod.ProMonoRunner)
-    r.debug, r.rank, r.first, r.last = False, 3, 4, 4
+    r.check, r.debug, r.rank, r.first, r.last = check, False, 3, 4, 4
+    r.state = _state()
     r.scratch_key = P1Build(tokens=1, upto="ffn", inter_r=INTER_R)
     r.scratch = torch.zeros(16, dtype=torch.uint8)
     queue = r.scratch.data_ptr() + queue_word_offset(r.scratch_key, 4)
@@ -451,13 +558,33 @@ def test_launch_passes_every_abi_argument(monkeypatch, reader):
     r.peers = SimpleNamespace(addresses=torch.zeros(8, dtype=torch.int64))
     steps = []
     r.mailboxes = SimpleNamespace(begin_step=lambda: steps.append(1))
-    kind = r.layers[4].kind
-    r.builds = {2: {kind: "launcher"}}
+    r.builds = {rows: {r.layers[4].kind: "launcher"}}
     got = []
-    monkeypatch.setattr(runner_mod, "_run_compiled", lambda *a: got.append(a))
+
+    def run(launcher, *packed):
+        got.append((launcher, *packed))
+        if kernel is not None:
+            kernel(dict(zip(runner_mod.ABI.names, packed[:-1])))
+
+    monkeypatch.setattr(runner_mod, "_run_compiled", run)
     monkeypatch.setattr(torch.cuda, "current_stream", lambda: "stream")
-    core = torch.zeros(2, DIMS.o_k, dtype=torch.bfloat16)
-    res = torch.zeros(2, HIDDEN, dtype=torch.bfloat16)
+    return r, got, table, steps
+
+
+def _inputs(rows):
+    from atom.models.minimax_m3.pro_mono.layout import DIMS, HIDDEN
+
+    core = torch.zeros(rows, DIMS.o_k, dtype=torch.bfloat16)
+    return core, torch.zeros(rows, HIDDEN, dtype=torch.bfloat16)
+
+
+@pytest.mark.parametrize("rows", [2, pro.FRONT_ROWS, pro.FRONT_ROWS + 1])
+@pytest.mark.parametrize("reader", [6, None])
+def test_launch_passes_every_abi_argument(monkeypatch, reader, rows):
+    from atom.models.minimax_m3.pro_mono.layout import HIDDEN
+
+    r, got, table, steps = _launching(monkeypatch, reader, rows)
+    core, res = _inputs(rows)
     out = r.launch(4, core, res)
     (call,) = got
     assert call[0] == "launcher" and call[-1] == "stream" and steps == [1]
@@ -468,12 +595,94 @@ def test_launch_passes_every_abi_argument(monkeypatch, reader):
     # no forward context: every row real
     assert args["nvalid"] == 0
     assert args["ffn_out"] == out["ffn_out"].data_ptr()
-    assert out["ffn_out"].shape == (2, HIDDEN)
+    assert out["ffn_out"].shape == (rows, HIDDEN)
     for name in ("la8", "la8s"):
         if reader is None:
             assert args[name] == 0 and name not in out
         else:
             assert args[name] == out[name].data_ptr()
+            assert out[name].shape == (rows, runner_mod.OUTPUTS[name][1])
+    if reader is None:
+        return
+    # up to FRONT_ROWS, the lookahead is rows [T, 2T) of its reader's ring slot, where
+    # put writes it and the reader's one front GEMM reads it; past it, new tensors
+    ring = r.state.lookahead_rows(reader, rows, res)
+    if rows <= pro.FRONT_ROWS:
+        assert (
+            args["la8"]
+            == ring[0].data_ptr()
+            == r.state.front_rows(reader, rows, res)[0][rows].data_ptr()
+        )
+        assert args["la8s"] == ring[1].data_ptr()
+        assert out["la8s"].dtype == torch.uint8
+    else:
+        assert ring is None and r.state._ring is None
+
+
+@pytest.mark.parametrize("rows", [1, 8, 16])
+def test_segment_hands_the_reader_the_ring_rows_it_reads_as_one_gemm(
+    monkeypatch, rec, rows
+):
+    """What the reader's ``front_input`` gets after a mono layer: its input norm's rows
+    and the lookahead the kernel wrote are one ring slot, so it takes all 2T rows."""
+    r, _, _, _ = _launching(monkeypatch, 6, rows)
+    layer = _layer(rec)
+    layer.layer_num = 4
+    core, res = _inputs(rows)
+    r.segment(layer, core, res, None)
+    index_src = r.state.source_for(6)
+    front = r.state.front_rows(6, rows, res)
+    x = (front[0][:rows], front[1][:rows])  # where the reader's input norm writes
+    assert pro.ProLookaheadState.front_input(front, rows, x, index_src) is front
+    assert index_src[1].dtype == torch.float8_e8m0fnu
+
+
+def test_check_mode_compares_the_kernels_lookahead_with_productions_copy(
+    monkeypatch, rec, caplog
+):
+    """Production's put and the kernel write the same ring rows: check mode must
+    compare the kernel's lookahead with a copy of production's, not with the rows
+    the kernel just overwrote."""
+    from atom.models.minimax_m3.pro_mono.layout import HIDDEN
+
+    rows = 3
+    monkeypatch.setattr(runner_mod, "capturing", lambda: False)
+
+    def kernel(args):  # writes its outputs; the lookahead differs from production's
+        for name, (dtype, cols) in runner_mod.OUTPUTS.items():
+            if args.get(name, 0):
+                fill = {"la8": 0x20, "la8s": 120}.get(name, 0)
+                size = rows * cols * torch.empty(0, dtype=dtype).element_size()
+                ctypes.memset(args[name], fill, size)
+
+    r, _, _, _ = _launching(monkeypatch, 6, rows, kernel, check=True)
+    r.rank = 0  # the rank that logs
+
+    def norm_mx(x, residual, norm, write_bf16=True, q_out=None, q_scale_out=None):
+        # production's lookahead norm, into the rows put hands it
+        assert q_out is not None and q_scale_out is not None
+        q_out.view(torch.uint8).fill_(0x10)
+        q_scale_out.view(torch.uint8).fill_(127)
+        return None, q_out, q_scale_out, None
+
+    monkeypatch.setattr(pro, "gemma_rms_norm_mxfp8", norm_mx)
+
+    def reference(res):
+        r.state.put(4, res, res)  # the real put: the ring rows of reader 6
+        z, zs = torch.zeros(rows, HIDDEN), torch.zeros(rows, HIDDEN // 32)
+        return z, z, z, z, zs  # ffn, h_mid, x, x8, x8s
+
+    layer = _layer(rec)
+    core, res = _inputs(rows)
+    with caplog.at_level("INFO", logger="atom"):
+        r.segment(layer, core, res, reference)
+    line = caplog.records[-1].getMessage()
+    assert "la8 differ 1.0000" in line and "la8s differ 1.0000" in line, line
+    # the forward goes on from the kernel's lookahead, in the reader's ring rows
+    la, la_s = r.state.resid_in[6]
+    assert la.data_ptr() == r.state.lookahead_rows(6, rows, res)[0].data_ptr()
+    assert (la.view(torch.uint8) == 0x20).all()
+    assert (la_s.view(torch.uint8) == 120).all()
 
 
 def test_the_real_row_count_is_the_forward_contexts(monkeypatch):

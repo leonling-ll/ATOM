@@ -24,6 +24,7 @@ import torch
 from minimax_m3_pro_mono_ref import (
     E2M1,
     FFN_BOUND,
+    FP8_MAX,
     ROUTE_SCALE,
     ROUTED_ACTS,
     TOPK,
@@ -36,6 +37,7 @@ from minimax_m3_pro_mono_ref import (
     logit_bound,
     mxfp4,
     mxfp8,
+    mxfp8_codes,
     near_tie_router,
     qdq_mxfp4,
     qdq_mxfp8,
@@ -140,9 +142,9 @@ def test_ffn_regions_are_disjoint_and_sized(debug, act):
     # where the other formats' do
     pairs = {k: v for k, v in s.items() if k != "queue"}
     if act == "bf16":
-        assert (L.ugp_pair(MAX_ROWS_LAYOUT * L.TOPK - 1, L.UG_GROUPS - 1, 31) + 2) * (
-            8
-        ) == s["ugp"][1]
+        # (the K quarters' three partner parts: a 24-row build's)
+        last = (MAX_ROWS_LAYOUT * L.TOPK - 1, L.UG_GROUPS - 1, 31, L.UGP_PARTS - 1)
+        assert (L.ugp_pair(*last) + 2) * 8 == s["ugp"][1]
         assert max(o for o, _ in pairs.values()) == s["ugp"][0]
     else:
         assert "ugp" not in s
@@ -238,11 +240,15 @@ def test_the_task_lists_place_one_entry_a_cta(act):
 def _run_lists(act, nu, queued, seed):
     """A model of ``ffn.run_ug`` / ``ffn.run_down``'s schedule. A CTA's loop
     iteration is two steps: first (never blocking) it claims the list entry
-    after next and publishes its previous ug task's flag; then it waits where
-    the kernel waits -- an A16W4 half-0 task for its pair's half-1 partials
-    -- and finishes the task. Before its first down task a CTA waits for
-    every pair's flag. CTAs step in a random order. Returns the tasks run in
-    order; raises on a deadlock (no CTA can step)."""
+    after next and publishes the flag of the ug task whose mids it stored
+    last; then it waits where the kernel waits and finishes the task. An
+    A16W4 half-0 CTA finishes a task a task late (``ffn.ug_merge``): its
+    epilogue waits for the half-1 partials of the task before, merges and
+    stores that one's mids (its flag due a step later), and the loop's end
+    waits for the last one's, then publishes both flags left. Before its
+    first down task a CTA waits for every pair's flag. CTAs step in a random
+    order. Returns the tasks run (A16W4 half 0: merged) in order; raises on a
+    deadlock (no CTA can step)."""
     import random
 
     rnd = random.Random(seed)
@@ -259,11 +265,25 @@ def _run_lists(act, nu, queued, seed):
     for bid in range(BLOCKS):
         h, k0 = L.task_list(bid, act)
         held = [k0, claim(h)] if queued else [k0, k0 + per]
-        ctas.append({"h": h, "held": held, "prev": None, "mid": False, "down": 0})
+        ctas.append(
+            {"h": h, "held": held, "prev": None, "pend": None, "mid": False, "down": 0}
+        )
 
     def step(c):
         """One step of CTA c, or False where it blocks."""
         h, k = c["h"], c["held"][0]
+        late = lists == 2 and h == 0
+        if k >= ug and c["down"] == 0 and c["pend"] is not None:
+            # the ug loop's end: the last merge, then its flag and the one before
+            if c["pend"] not in partial:
+                return False
+            ran.append(("ug", h, c["pend"]))
+            flag.add(c["pend"])
+            c["pend"] = None
+            if c["prev"] is not None:
+                flag.add(c["prev"])
+                c["prev"] = None
+            return True
         if k >= ug and c["down"] == 0:
             # run_down's wait_ug, the ug loop's last flag out before it
             if len(flag) < ug:
@@ -277,8 +297,17 @@ def _run_lists(act, nu, queued, seed):
                 c["prev"] = None
             c["mid"] = True
             return True
-        if k < ug and lists == 2 and h == 0 and k not in partial:
-            return False
+        if k < ug and late:
+            # the epilogue merges the task before (its partials polled)
+            if c["pend"] is not None and c["pend"] not in partial:
+                return False
+            c["mid"] = False
+            c["held"].pop(0)
+            if c["pend"] is not None:
+                ran.append(("ug", h, c["pend"]))
+                c["prev"] = c["pend"]
+            c["pend"] = k
+            return True
         c["mid"] = False
         c["held"].pop(0)
         if k >= ug:
@@ -297,7 +326,7 @@ def _run_lists(act, nu, queued, seed):
 
     def done(c):
         k = c["held"][0]
-        if k < ug or c["mid"]:
+        if k < ug or c["mid"] or c["pend"] is not None:
             return False
         # a placed build's down tasks are CTA d mod BLOCKS's (not modelled)
         return not queued or L.list_down(k, ug, c["h"], act) >= L.DOWN_TASKS
@@ -318,9 +347,10 @@ def _run_lists(act, nu, queued, seed):
 @pytest.mark.parametrize("nu", [1, 4, 13, 48])
 def test_the_queued_lists_run_every_task_once_and_never_deadlock(act, nu):
     """With claims a task ahead and CTAs at any relative speed, every ug task
-    (A16W4: every pair's two halves) and every down task runs once, and no
-    wait blocks for good: a half-1 task waits for nothing and runs on a
-    half-1 CTA, so the half-0 waits end (``layout.task_lists``)."""
+    (A16W4: every pair's two halves, a half-0 task merged a task late) and
+    every down task runs once, and no wait blocks for good: a half-1 task
+    waits for nothing and runs on a half-1 CTA, so the half-0 waits end
+    (``layout.task_lists``)."""
     lists = L.ug_split(act)
     for seed in range(3):
         ran = _run_lists(act, nu, True, seed)
@@ -412,6 +442,8 @@ def test_ffn_lds_fits_at_the_widest_build(act):
     )  # fmt: skip
     assert 4 * words <= LDS_BYTES
     if act == "bf16":
+        # the down's staged mids fit ``xs`` past the shared mid's rows
+        assert xs_row >= L.SM_ROW + L.TOPK * L.MIDB_ROW
         # whole bf16 x rows would not fit: the reason for the K-half tasks
         whole = words + s * (2 * L.XH_WORDS + 4 - xs_row)
         assert 4 * whole > LDS_BYTES
@@ -452,6 +484,47 @@ def test_a16w4_operands_follow_the_w13_and_w2_tiles():
     for g, col in itertools.product(range(L.UG_GROUPS), range(0, L.UG_COLS, 2)):
         assert 2 * L.interb_word(0, g, col) == L.UG_COLS * g + col
     assert L.interb_word(1, 0, 0) == L.INTERB_WORDS == L.INTER_V // 2
+
+
+def test_a16w4_staged_mids_are_the_down_operands_without_bank_conflicts():
+    """The down's B operands from the staged mids (``ffn.load_mids``: ``inter``
+    word w of pick row r -> LDS word r MIDB_ROW + w): ``midb_word`` is
+    ``interb_word`` in the padded row, and a lane group's 16 reads (pick rows
+    r .. r + 15, 16 B each, any first row) cover the 64 banks once."""
+    for row, st, kb, j in itertools.product(
+        range(2 * L.TOPK), range(L.W2_STEPS), range(4), range(4)
+    ):
+        w = L.interb_word(row, 4 * st + kb, 8 * j)
+        r, off = divmod(w, L.INTERB_WORDS)
+        assert r == row and L.midb_word(row, st, kb, j) == r * L.MIDB_ROW + off
+        assert off + 4 <= L.INTERB_WORDS < L.MIDB_ROW
+    for r0, st, kb, j in itertools.product(
+        range(L.TOPK), range(L.W2_STEPS), range(4), range(4)
+    ):
+        words = [L.midb_word(r0 + c, st, kb, j) for c in range(16)]
+        assert all(w % 4 == 0 for w in words)
+        banks = {(w + d) % 64 for w in words for d in range(4)}
+        assert len(banks) == 64
+
+
+def test_a16w4_down_batches_carry_no_slot_past_every_waves_union():
+    """``ffn.down_batch``: wave w takes the slots w, w + 8, .. of U a batch at
+    a time, and a slot past U still dequantizes and multiplies its zero tile.
+    An A16W4 build's batch never holds a slot that is past U for every wave
+    (1 and 2 rows: one slot), and where U can pass WAVES experts it keeps the
+    two slots of w2 in flight that the staged mids allow; W4A4 / W4A8 keep
+    ``DOWN_BATCH`` at every width."""
+    pytest.importorskip("flydsl")
+    pytest.importorskip("aiter")
+    from atom.models.minimax_m3.pro_mono.kernels import ffn
+
+    for s in range(1, MAX_ROWS + 1):
+        nb = ffn.down_batch({"routed_act": "bf16", "S": s})
+        assert WAVES * (nb - 1) < L.max_u(s), s
+        if L.max_u(s) > WAVES:
+            assert nb == L.DOWN_BATCH, s
+        for act in ("fp4", "fp8"):
+            assert ffn.down_batch({"routed_act": act, "S": s}) == L.DOWN_BATCH
 
 
 # ------------------------------------------------------------ the reference
@@ -577,6 +650,28 @@ def test_mxfp8_mid_rule():
     # the block's max fits 448 x scale, half the scale would not
     amax = y.float().view(8, 4, 32).abs().amax(-1).repeat_interleave(32, 1)
     assert (amax <= 448 * scale).all() and (amax > 224 * scale).all()
+
+
+def test_a_bf16_blocks_mxfp8_quotient_needs_no_clamp():
+    """The o stage stores e4m3 of x / 2^code for its bf16 core rows without
+    clamping to +-448 (``layer.load_core``): over every finite bf16 block max
+    the quotient is within 448, and reaches it, so the clamp the reference
+    applies never binds (a bf16 amax above 448 * 2^k is at least 450 * 2^k,
+    past 2^k after the f32(1 / 448) product's rounding)."""
+    amax = torch.arange(0x7F80, dtype=torch.int32).to(torch.int16).view(torch.bfloat16)
+    code = mxfp8_codes(amax.float())
+    quot = amax.float() * ((254 - code) << 23).view(torch.float32)
+    assert quot.max().item() == FP8_MAX
+    # and so the whole block's e4m3 is the clamped reference's, bit for bit
+    g = torch.Generator().manual_seed(5)
+    x = torch.randn(64, 1024, generator=g) * 10.0 ** (
+        torch.rand(64, 1, generator=g) * 60 - 30
+    )
+    x = x.to(torch.bfloat16)
+    q, c = mxfp8(x)
+    inv = ((254 - c.to(torch.int32)) << 23).view(torch.float32).repeat_interleave(32, 1)
+    raw = (x.float() * inv).to(torch.float8_e4m3fn)
+    assert torch.equal(raw.view(torch.uint8), q.view(torch.uint8))
 
 
 @pytest.mark.parametrize("act", ROUTED_ACTS)

@@ -51,8 +51,10 @@ def variants_refusal(v, mx_norm: bool) -> str | None:
     in-kernel AR #1 sums in the Lamport all-reduce's order, so production's
     AR #1 must be the Lamport one at every width mono serves
     (``ar_lamport_rows``), or h_mid would differ from production's. It reads
-    the attention's bf16 output, so the day0 decode, which hands o_proj E4M3
-    rows from ``day0_decode_rows`` rows, must start above the row limit."""
+    the attention's output as bf16: below the day0 decode the layers it takes
+    get bf16 (``MiniMaxM3ProAttention.forward_core``), but the day0 decode
+    hands o_proj E4M3 rows from ``day0_decode_rows`` rows, so it must start
+    above the row limit."""
     checks = [
         (not v.diag, "the diag variant"),
         (v.fuse_mxfp8_quant, "fuse_mxfp8_quant off"),
@@ -61,12 +63,12 @@ def variants_refusal(v, mx_norm: bool) -> str | None:
         (v.lookahead_src == "resid_in", f"lookahead_src {v.lookahead_src!r}"),
         (
             # a value ``latch_rows`` refuses is reported there
-            rows_refusal(v.mono_ffn_rows) is not None
+            rows_refusal(v.mono_ffn_rows, v.mono_routed_act) is not None
             or v.ar_lamport_rows >= v.mono_ffn_rows,
             f"ar_lamport_rows {v.ar_lamport_rows} below {v.mono_ffn_rows}",
         ),
         (
-            rows_refusal(v.mono_ffn_rows) is not None
+            rows_refusal(v.mono_ffn_rows, v.mono_routed_act) is not None
             or not 0 < v.day0_decode_rows <= v.mono_ffn_rows,
             f"day0_decode_rows {v.day0_decode_rows} within {v.mono_ffn_rows}",
         ),
