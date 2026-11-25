@@ -2,6 +2,7 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import logging
+from types import SimpleNamespace
 from typing import ClassVar, NamedTuple
 
 import aiter
@@ -43,7 +44,7 @@ from .mha_kv_pool import MhaKvPool
 from .pool_layout.entry_arena import EntryField, carve
 from .pool_layout.pool_rows import KvGeometry
 from .pool_layout.sub_pool_spec import SubPoolSpec, page_pool
-from .token_layout.batch_ids import build_cu_seqlens
+from .token_layout.batch_ids import build_cu_seqlens, build_query_layout
 from .token_layout.decode import (
     decode_positions,
     query_is_uniform,
@@ -52,6 +53,28 @@ from .token_layout.decode import (
 from .token_layout.slots import dcp_slot_mapping, slot_mapping
 
 logger = logging.getLogger("atom")
+
+
+# A mixed step's decode half's buffer set (`prepare_mixed`).
+MIXED_DECODE = "mixed_"
+
+
+def _decode_rows(batch: ScheduledBatch) -> SimpleNamespace:
+    """A mixed ``batch``'s decode rows, the ones after its prefill rows, as the
+    decode-only batch `stage_decode` and `finish_decode` read."""
+    p = batch.total_seqs_num_prefill
+    return SimpleNamespace(
+        req_ids=batch.req_ids[p:],
+        context_lens=batch.context_lens[p:],
+        num_scheduled_tokens=batch.num_scheduled_tokens[p:],
+        block_tables=batch.block_tables[p:],
+        total_seqs_num=batch.total_seqs_num_decode,
+        total_seqs_num_decode=batch.total_seqs_num_decode,
+        total_tokens_num_decode=batch.total_tokens_num_decode,
+        total_seqs_num_prefill=0,
+        total_tokens_num_prefill=0,
+        is_dummy_run=batch.is_dummy_run,
+    )
 
 
 def cdiv(a, b):
@@ -360,6 +383,8 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             ring_base.np[:] = -1
             ring_base.gpu.fill_(-1)
             self.model_runner.forward_vars["pro_ring_base"] = ring_base
+        if envs.ATOM_MIXED_BATCH and self._has_pro_sparse_attention:
+            self._allocate_mixed_decode_buffers(max_qlen)
         if model_runner.config.enable_tbo:
             self._allocate_ubatch_buffers(max_qlen)
 
@@ -387,19 +412,22 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
 
         return variants().index_compress
 
-    def _stage_pro_ring(self, batch, running_bs: int, group, attn_metadata) -> None:
+    def _stage_pro_ring(
+        self, batch, running_bs: int, group, attn_metadata, prefix: str = ""
+    ) -> None:
         """Each batch row's first ring row (-1: none, a dummy run's and pad rows'),
-        counted into ``group`` and hung on ``attn_metadata.pro_ring_base``."""
+        into the ``prefix`` set, counted into ``group`` and hung on
+        ``attn_metadata.pro_ring_base``."""
         if self._pro_ring_slots is None:
             return
-        buf = self.model_runner.forward_vars["pro_ring_base"]
+        buf = self.model_runner.forward_vars[f"{prefix}pro_ring_base"]
         bs = min(batch.total_seqs_num, running_bs)
         if batch.is_dummy_run or not bs:
             buf.np[:running_bs] = -1
         else:
             self._pro_ring_slots.claim_bases(batch.req_ids[:bs], buf.np)
             buf.np[bs:running_bs] = -1
-        group.set_counts({"pro_ring_base": running_bs})
+        group.set_counts({f"{prefix}pro_ring_base": running_bs})
         attn_metadata.pro_ring_base = buf.gpu[:running_bs]
         attn_metadata.pro_ring_rows = self._pro_ring_slots.num_slots * (
             self._pro_ring_slots.rows_per_slot
@@ -413,6 +441,109 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         )
         self._stage_pro_ring(batch, running_bs, group, attn_metadata)
         return attn_metadata, positions
+
+    def _allocate_mixed_decode_buffers(self, max_qlen: int) -> None:
+        """The ``mixed_`` set a mixed step's decode half stages into
+        (`prepare_mixed`): addresses of its own, apart from the step buffers the
+        prefill half stages into, so a decode graph can replay on them."""
+        var = self.model_runner.forward_vars
+        bs, tokens = self.max_bs, self.max_bs * max_qlen
+        shapes = {
+            "cu_seqlens_q": (bs + 1,),
+            "batch_id_per_q_token": (tokens,),
+            "positions": (tokens,),
+            "slot_mapping": (tokens,),
+            "context_lens": (bs,),
+            "block_tables": (bs, self.block_table_cols),
+            "kv_indptr": (bs + 1,),
+            "kv_indices": tuple(var["kv_indices"].cpu.shape),
+        }
+        if self._pro_ring_slots is not None:
+            shapes["pro_ring_base"] = (bs,)
+        if self.block_size in (256, 1024):
+            for name in PERSISTENT_WORK_BUFFERS:
+                shapes[name] = tuple(var[name].shape)
+        self._allocate_buffer_set(MIXED_DECODE, shapes)
+        if self._pro_ring_slots is not None:
+            ring = var[f"{MIXED_DECODE}pro_ring_base"]
+            ring.np[:] = -1
+            ring.gpu.fill_(-1)
+
+    def prepare_mixed(
+        self,
+        batch: ScheduledBatch,
+        running_bs: int,
+        running_tokens: int,
+        max_seqlen_q: int,
+    ):
+        """A mixed step: ``batch``'s prefill rows first, its decode rows
+        (``max_seqlen_q`` query tokens each) after.
+
+        Returns the prefill half's metadata, as `prepare_prefill` builds it for
+        the prefill rows alone, with the decode half's on ``mixed_decode``, as
+        `prepare_decode` builds it for the decode rows alone but in the
+        ``mixed_`` buffers; and the step's positions, the prefill rows' then the
+        decode rows'. The decode half runs out to the step's ``running_bs`` and
+        ``running_tokens``: the padding is its.
+        """
+        var = self.model_runner.forward_vars
+        if f"{MIXED_DECODE}slot_mapping" not in var:
+            raise NotImplementedError(
+                "a mixed prefill+decode step needs MiniMax-M3-Pro and ATOM_MIXED_BATCH=1"
+            )
+        if self.model_runner.use_mrope:
+            raise NotImplementedError("a mixed step with MRoPE positions")
+        num_prefills = batch.total_seqs_num_prefill
+        prefill_tokens = batch.total_tokens_num_prefill
+        decode = _decode_rows(batch)
+        decode_bs = running_bs - num_prefills
+        decode_tokens = running_tokens - prefill_tokens
+        assert decode_bs >= decode.total_seqs_num_decode and decode_tokens >= (
+            decode.total_tokens_num_decode
+        ), f"step of {running_bs} rows, {running_tokens} tokens: no room for its decode"
+        groups = self.model_runner.h2d_groups
+        prefill_group = groups["prefill_metadata"]
+        decode_group = groups[f"{MIXED_DECODE}metadata"]
+        # The decode half's sources, before either half writes (`stage_prefill`
+        # checks its own on entry).
+        self._check_metadata_writable(f"{MIXED_DECODE}metadata")
+        attn_metadata, _ = self.stage_prefill(
+            batch, num_prefills, prefill_tokens, prefill_group
+        )
+        # The decode half's query layout, which the step's (over both halves)
+        # cannot serve: it starts at the first decode row.
+        lens = np.asarray(decode.num_scheduled_tokens, dtype=np.int32)
+        build_query_layout(
+            lens,
+            decode_bs,
+            decode_tokens,
+            cu_seqlens_q=var[f"{MIXED_DECODE}cu_seqlens_q"].np,
+            batch_ids=var[f"{MIXED_DECODE}batch_id_per_q_token"].np,
+        )
+        decode_group.set_counts(
+            {
+                f"{MIXED_DECODE}cu_seqlens_q": decode_bs + 1,
+                f"{MIXED_DECODE}batch_id_per_q_token": decode_tokens,
+            }
+        )
+        decode_md, _ = self.stage_decode(
+            decode, decode_bs, decode_tokens, max_seqlen_q, decode_group, MIXED_DECODE
+        )
+        decode_md.batch_id_per_q_token = var[f"{MIXED_DECODE}batch_id_per_q_token"].gpu[
+            :decode_tokens
+        ]
+        var["positions"].np[prefill_tokens:running_tokens] = var[
+            f"{MIXED_DECODE}positions"
+        ].np[:decode_tokens]
+        prefill_group.set_counts({"positions": running_tokens})
+        prefill_group.publish()
+        decode_group.publish()
+        self.finish_prefill(batch, attn_metadata, num_prefills, prefill_tokens)
+        self.finish_decode(
+            decode, decode_md, decode_bs, decode_tokens, max_seqlen_q, MIXED_DECODE
+        )
+        attn_metadata.mixed_decode = decode_md
+        return attn_metadata, var["positions"].gpu[:running_tokens]
 
     def _ubatch_buffer_shapes(self) -> dict[str, tuple[int, ...]]:
         var = self.model_runner.forward_vars
@@ -837,12 +968,20 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 ],
                 extra,
             )
+        from atom.kv_transfer.offload.config import mqa_tp_replication_factor
+
+        runner = getattr(self, "model_runner", None)  # none: a bare export, sharded
         return KVTransferTensors(
             pages=pages,
-            # GQA/MQA KV heads are sharded or only partially replicated across
-            # TP. In particular MiniMax-M3 must keep one stored shard per rank;
-            # whole-object TP collapse is unsafe for this PAGE layout.
-            tp_replication_factor=1,
+            # GQA KV heads are sharded or only partially replicated across TP
+            # (MiniMax-M3 Flash keeps one stored shard per rank); one KV head for
+            # the whole model (M3.1-Pro, MQA) is the same bytes on every rank,
+            # index cache included (every rank writes every row's index keys).
+            tp_replication_factor=(
+                1
+                if runner is None
+                else mqa_tp_replication_factor(runner.config, runner.config.hf_config)
+            ),
         )
 
     def refresh_flydsl_plan(self, context_lens, *, create=False):
@@ -1150,8 +1289,16 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         running_tokens: int,
         max_seqlen_q: int,
         group,
+        prefix: str = "",
     ):
-        self._check_metadata_writable("mha_csr", "seq_metadata", "positions", "mrope")
+        """``prefix``: the buffer set to stage into, ``mixed_`` for a mixed
+        step's decode half (`prepare_mixed`)."""
+        if prefix:
+            self._check_metadata_writable(f"{prefix}metadata")
+        else:
+            self._check_metadata_writable(
+                "mha_csr", "seq_metadata", "positions", "mrope"
+            )
         scheduled_bs = batch.total_seqs_num_decode
         self.total_blocks = 0
         dropout_p = 0.0
@@ -1163,43 +1310,45 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             context_lens = self.model_runner.tokenID_processor.verify_ctx_lens(
                 context_lens
             )
-        _, lengths, cu_seqlens_q = self.decode_spans(batch)
+        _, lengths, cu_seqlens_q = self.decode_spans(batch, prefix)
         if not query_is_uniform(lengths, max_seqlen_q):
             self._refuse_ragged_on_rectangular_layers(lengths, max_seqlen_q)
         positions = decode_positions(context_lens, lengths, cu_seqlens_q)
         max_seqlen_k = int(context_lens.max(initial=0))
 
         # Before the slots, not after: `slot_mapping` reads this packed table.
-        self.prepare_block_tables(batch, running_bs)
+        self.prepare_block_tables(batch, running_bs, prefix)
 
         var = self.model_runner.forward_vars
         scheduled_tokens = batch.total_tokens_num_decode
         if self.dcp_world_size > 1:
-            var["slot_mapping"].np[:scheduled_tokens] = dcp_slot_mapping(
+            var[f"{prefix}slot_mapping"].np[:scheduled_tokens] = dcp_slot_mapping(
                 positions,
                 lengths,
-                var["block_tables"].np,
+                var[f"{prefix}block_tables"].np,
                 self.model_runner.block_size,
                 self.dcp_world_size,
                 self.dcp_rank,
                 self.cp_kv_cache_interleave_size,
             )
         else:
-            var["slot_mapping"].np[:scheduled_tokens] = slot_mapping(
+            var[f"{prefix}slot_mapping"].np[:scheduled_tokens] = slot_mapping(
                 positions,
                 lengths,
-                var["block_tables"].np,
+                var[f"{prefix}block_tables"].np,
                 self.model_runner.block_size,
                 scratch=self.token_axis_scratch,
             )
-        var["positions"].np[:scheduled_tokens] = positions
-        self._pad_tokens(scheduled_tokens, running_tokens)
-        var["context_lens"].np[:scheduled_bs] = context_lens
-        var["context_lens"].np[scheduled_bs:running_bs] = 0
+        var[f"{prefix}positions"].np[:scheduled_tokens] = positions
+        self._pad_tokens(scheduled_tokens, running_tokens, prefix)
+        var[f"{prefix}context_lens"].np[:scheduled_bs] = context_lens
+        var[f"{prefix}context_lens"].np[scheduled_bs:running_bs] = 0
 
         # Prepare kv_indptr and kv_indices for persistent attention
         build_cu_seqlens(
-            cdiv(context_lens, self.block_size), running_bs, out=var["kv_indptr"].np
+            cdiv(context_lens, self.block_size),
+            running_bs,
+            out=var[f"{prefix}kv_indptr"].np,
         )
 
         vars_used = [
@@ -1208,18 +1357,18 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             ("kv_indptr", running_bs + 1),
         ]
 
-        counts = dict(vars_used)
+        counts = {prefix + el: num for el, num in vars_used}
         if not self.model_runner.use_mrope:
-            counts["positions"] = running_tokens
+            counts[f"{prefix}positions"] = running_tokens
         group.set_counts(counts)
-        ctx = {el: var[el].gpu[:num] for el, num in vars_used}
-        ctx["block_tables"] = block_table_state(var["block_tables"]).stage(
+        ctx = {el: var[prefix + el].gpu[:num] for el, num in vars_used}
+        ctx["block_tables"] = block_table_state(var[f"{prefix}block_tables"]).stage(
             running_bs, group
         )
-        # A view: `prepare_query_metadata` already staged it this step, and
-        # nothing here writes the host copy.
-        ctx["cu_seqlens_q"] = var["cu_seqlens_q"].gpu[: running_bs + 1]
-        ctx["kv_indices"] = var["kv_indices"].gpu
+        # A view: `prepare_query_metadata` (`prepare_mixed` for a decode half)
+        # already staged it this step, and nothing here writes the host copy.
+        ctx["cu_seqlens_q"] = var[f"{prefix}cu_seqlens_q"].gpu[: running_bs + 1]
+        ctx["kv_indices"] = var[f"{prefix}kv_indices"].gpu
         attn_metadata = AttentionMetaData(
             dropout_p=dropout_p,
             max_seqlen_q=max_seqlen_q,
@@ -1227,14 +1376,14 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             min_seqlen_q=min_seqlen_q,
             **ctx,
         )
-        self._stage_pro_ring(batch, running_bs, group, attn_metadata)
+        self._stage_pro_ring(batch, running_bs, group, attn_metadata, prefix)
         mrope_positions = self._build_mrope_decode_positions(
             batch, context_lens, group, running_tokens=running_tokens
         )
         if mrope_positions is not None:
             positions = mrope_positions
         else:
-            positions = var["positions"].gpu[:running_tokens]
+            positions = var[f"{prefix}positions"].gpu[:running_tokens]
         return attn_metadata, positions
 
     def finish_decode(
@@ -1244,14 +1393,16 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         running_bs: int,
         running_tokens: int,
         max_seqlen_q: int,
+        prefix: str = "",
     ) -> None:
+        """``prefix``: the buffer set `stage_decode` staged into."""
         super().finish_decode(
             batch, attn_metadata, running_bs, running_tokens, max_seqlen_q
         )
         max_seqlen_k = attn_metadata.max_seqlen_k
         if self.block_size in (256, 1024):
             for name, value in self.set_aiter_persistent_worker_buffers(
-                running_bs, self.model_runner.forward_vars["max_qlen"]
+                running_bs, self.model_runner.forward_vars["max_qlen"], prefix
             ).items():
                 setattr(attn_metadata, name, value)
         kv_indices_generate_triton(
@@ -1265,6 +1416,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             attn_metadata.context_lens
         )
         if self._has_sparse_attention:
+            assert not prefix, "MiniMax-M3's sparse metadata is the step's"
             # Plain decode (q==1) and eagle3 spec-verify (q==num_spec+1) both run
             # the DECODE sparse path; the decode kernels handle q>1 per-token
             # causal internally via max_query_len.

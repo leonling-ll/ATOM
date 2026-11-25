@@ -217,18 +217,26 @@ def _config_has_fully_replicated_tp_pages(config: Any) -> bool:
 
     if int(config.decode_context_parallel_size) > 1:
         return False
-    if draft_owns_kv_pool(config):
+    hf_config = getattr(config, "hf_config", None)
+    tp_size = int(getattr(config, "tensor_parallel_size", 1))
+
+    def replicated(cfg) -> bool:
+        return tp_size > 1 and offcfg.mqa_tp_replication_factor(config, cfg) == tp_size
+
+    if draft_owns_kv_pool(config) and not replicated(
+        config.speculative_config.draft_model_hf_config
+    ):
         # A draft with its own KV pool (an MHA DSpark/EAGLE3 draft,
         # `draft_owns_kv_pool`) appends per-rank-sharded PAGE regions
-        # (`draft_kv.py` declares factor 1), so the complete PAGE object is not
-        # replicated even when the target's is.
+        # (`draft_kv.py` declares factor 1 unless the draft is MQA), so the
+        # complete PAGE object is not replicated even when the target's is.
         return False
-    hf_config = getattr(config, "hf_config", None)
-    # MiniMax-M3 is GQA. Some TP ranks can happen to own the same KV head when
-    # TP exceeds the global KV-head count, but the complete PAGE object is not
-    # replicated across the whole TP group and must remain one shard per rank.
+    # MiniMax-M3 Flash is GQA: some TP ranks can happen to own the same KV head
+    # when TP exceeds the global KV-head count, but the complete PAGE object is
+    # not replicated and must remain one shard per rank. M3.1-Pro is MQA (one KV
+    # head, every rank's PAGE bytes identical, index cache included).
     if offcfg._is_minimax_m3(hf_config):
-        return False
+        return replicated(hf_config)
     hf_config = getattr(hf_config, "text_config", hf_config)
     # Kimi-K3's MLA KV is replicated, but its KDA checkpoint images -- stored
     # in those same PAGE units -- hold TP-sharded heads, so every rank keeps

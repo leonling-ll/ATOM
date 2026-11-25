@@ -531,11 +531,13 @@ class MiniMaxM3MoE(nn.Module):
             return routed_output.view(orig_shape), shared.view(orig_shape)
         return (routed_output + shared).view(orig_shape)
 
-    def forward_glue(self, r: dict, quant_down: bool = False) -> torch.Tensor:
+    def forward_glue(
+        self, r: dict, quant_down: bool = False, defer_shared: bool = False
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """`forward` on the outputs of ``moe_route_glue.route`` (normed rows, their
         MXFP8 copy, the routes and their BM=16 sort, the zeroed routed output): the
         routed experts take the sort as a registered presort, so no gate, top-k or
-        sort runs here."""
+        sort runs here. ``defer_shared``: return ``(routed, shared)`` unsummed."""
         from aiter.fused_moe import register_presorted_moe
 
         from atom.models.minimax_m3 import moe_route_glue
@@ -550,6 +552,8 @@ class MiniMaxM3MoE(nn.Module):
         ):
             routed_output = routed_output * self.routed_scaling_factor
         shared = self.shared_experts(r["x_q"], r["x_scale"], quant_down=quant_down)
+        if defer_shared:
+            return routed_output, shared
         return routed_output + shared
 
 

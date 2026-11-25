@@ -425,3 +425,65 @@ def test_a_region_argument_keeps_its_named_tuple_type():
     assert type(weak) is Pair and weak.width == 64
     assert weak.values.data_ptr() == value.values.data_ptr()
     assert type(_weak((value.values, 1))) is tuple
+
+
+class PaddedPrefill(torch.nn.Module):
+    """A prefill shaped as Pro's token graph runs it: row-wise GEMMs recorded
+    at the bucket, and an eager region in the middle that, like the
+    attention, mixes only the step's real rows (a causal sum over the first
+    LIVE["rows"]) and leaves the padded rows as they are."""
+
+    def __init__(self, dim=64):
+        super().__init__()
+        self.a = torch.nn.Linear(dim, dim, device="cuda")
+        self.b = torch.nn.Linear(dim, dim, device="cuda")
+
+    @eager_region()
+    def attend(self, h: torch.Tensor):
+        rows = LIVE["rows"]
+        out = h.clone()
+        out[:rows] = torch.cumsum(h[:rows], dim=0) / rows
+        return out
+
+    def forward(self, x):
+        h = torch.relu(self.a(x))
+        return self.b(self.attend(h)) + x
+
+
+@torch.inference_mode()
+def test_a_prefill_padded_to_its_bucket_replays_to_its_eager_rows(context):
+    """A prefill of fewer rows than its bucket replays the bucket's recording
+    on its rows padded with zeros; its real rows come out bit-equal to the
+    same padded forward run eagerly, and equal to the unpadded eager forward
+    to fp32 rounding (the GEMMs run at another row count). Garbage in the
+    padded rows changes no real row."""
+    torch.manual_seed(6)
+    model = PaddedPrefill()
+    bucket = 256
+    graph = TokenGraph()
+    x = torch.zeros(bucket, 64, device="cuda")
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        context.main_stream = stream
+        _set(1.0, bucket)
+        model(x)
+        context.in_hipgraph = True
+        graph.record(model, (x,), {})
+        context.in_hipgraph = False
+    torch.cuda.current_stream().wait_stream(stream)
+    context.main_stream = torch.cuda.current_stream()
+
+    for rows in (1, 29, 141, 255, 256):
+        _set(1.0, rows)
+        real = torch.randn(rows, 64, device="cuda")
+        padded = torch.zeros(bucket, 64, device="cuda")
+        padded[:rows] = real
+        got = graph.replay((padded,), {})[:rows].clone()
+        torch.testing.assert_close(got, _eager(model, padded)[:rows], rtol=0, atol=0)
+        torch.testing.assert_close(got, _eager(model, real))
+        padded[rows:] = 1e4
+        torch.testing.assert_close(
+            graph.replay((padded,), {})[:rows].clone(), got, rtol=0, atol=0
+        )
+    graph.release_graphs()

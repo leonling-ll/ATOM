@@ -14,8 +14,10 @@
 #      or the Agentic recipe's launch (RECIPE=agentic), plus DSpark at
 #      SPEC_TOKENS draft tokens and a forced acceptance length: Pro's golden AL
 #      for that draft length unless ACCEPT_LENGTH is set,
-#   3. replays the subset at concurrency CONC for DURATION seconds,
-#   4. stops the server and prints, from aiperf's per-request records, the
+#   3. prewarms the server (PREWARM, below) so first-use compiles do not land
+#      in the measured window,
+#   4. replays the subset at concurrency CONC for DURATION seconds,
+#   5. stops the server and prints, from aiperf's per-request records, the
 #      90th-percentile E2E-normalized interactivity, tok/s/GPU, the failed
 #      request rate and how many replies differ in length from the trace's
 #      output length (also written to OUT_DIR/summary.json). The scenario sends
@@ -42,6 +44,7 @@
 #   MAX_NUM_SEQS     [16 below CONC 8, else 2 x CONC]
 #   MAX_MODEL_LEN    [MAX_CONTEXT + 1024: room for the chat template]
 #   PORT             server port [8300]
+#   SERVER_LOG       the server's log, copied to OUT_DIR [/app/logs_claude/atom_server.log]
 #   GPU_MEM_UTIL     --gpu-memory-utilization [pro 0.94, agentic 0.95]
 #   SERVER_EXTRA     more server flags, split on spaces, e.g. --load_dummy=xavier []
 #   ATOM_CUSTOM_AR_POOL_BYTES  custom all-reduce input pool [134217728]
@@ -50,6 +53,17 @@
 #                    it; agentic merges it onto the recipe's, so a caller adds
 #                    keys such as {"index": "fused", "ar_fused_rows": 128}
 #                    [RECIPE's]
+#   PREWARM          1: after the server is ready and before the client, send
+#                    prompts of PREWARM_PROMPT_TOKENS tokens (one at a time,
+#                    max_tokens 1: the prefill chunk sizes) and then, per
+#                    PREWARM_BATCHES entry, that many concurrent short prompts
+#                    that decode 64 tokens (the decode graph sizes), and wait
+#                    for every reply; a failed reply stops the run. Prompt
+#                    lengths count words, so they are approximate. [1 for
+#                    RECIPE=agentic, else 0]
+#   PREWARM_PROMPT_TOKENS  [256,512,1024,2048,4096,8192,16384,24576]
+#   PREWARM_BATCHES  [every capture size of the agentic ladder up to
+#                    MAX_NUM_SEQS]
 #   PROXY_DRY_RUN    1: print the acceptance length, the server environment and
 #                    flags, and exit before anything runs
 #   With RECIPE=pro the server inherits the rest of the environment, so CPU
@@ -75,9 +89,19 @@ RECIPE="${RECIPE:-pro}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-$((MAX_CONTEXT + 1024))}"
 PORT="${PORT:-8300}"
 TP=8
+PREWARM="${PREWARM:-$([ "$RECIPE" = agentic ] && echo 1 || echo 0)}"
+PREWARM_PROMPT_TOKENS="${PREWARM_PROMPT_TOKENS:-256,512,1024,2048,4096,8192,16384,24576}"
 if [ -z "${MAX_NUM_SEQS:-}" ]; then
     MAX_NUM_SEQS=$((2 * CONC))
     [ "$MAX_NUM_SEQS" -ge 16 ] || MAX_NUM_SEQS=16
+fi
+
+AGENTIC_CAPTURE_SIZES=1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,18,20,22,24,26,28,30,32,48,64,128,256,512
+if [ -z "${PREWARM_BATCHES:-}" ]; then
+    PREWARM_BATCHES=
+    for n in ${AGENTIC_CAPTURE_SIZES//,/ }; do
+        [ "$n" -le "$MAX_NUM_SEQS" ] && PREWARM_BATCHES="${PREWARM_BATCHES:+$PREWARM_BATCHES,}$n"
+    done
 fi
 
 # golden_al K THINKING: MiniMax-M3.1-Pro's golden acceptance length for the
@@ -111,7 +135,7 @@ if [ "$SPEC_TOKENS" -gt 0 ]; then
     spec_args=(--method dspark --num-speculative-tokens "$SPEC_TOKENS"
         --spec-decode-acceptance-length "$ACCEPT_LENGTH")
 fi
-SERVER_LOG=/app/logs_claude/atom_server.log
+SERVER_LOG="${SERVER_LOG:-/app/logs_claude/atom_server.log}"
 
 # --- server environment and flags ---
 export AITER_LOG_LEVEL=WARNING
@@ -144,11 +168,12 @@ print(json.dumps({**json.loads(sys.argv[1]), **json.loads(sys.argv[2] or "{}")})
     export LMCACHE_MAX_LOCAL_CPU_SIZE=184
     export LMCACHE_CHUNK_SIZE=256
     export PYTHONHASHSEED=0
-    export ATOM_TOKEN_GRAPH_SIZES="${ATOM_TOKEN_GRAPH_SIZES:-256,512,1024,2048}"
+    # Set but empty records no bucket: every prefill runs eagerly.
+    export ATOM_TOKEN_GRAPH_SIZES="${ATOM_TOKEN_GRAPH_SIZES-256,512,1024,2048}"
     # Graphs between 8, 16 and 32 sequences: a step replays the smallest graph
     # that holds its sequences, and padded rows cost index score time.
     recipe_args=(--cudagraph-capture-sizes
-        "[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,18,20,22,24,26,28,30,32,48,64,128,256,512]"
+        "[$AGENTIC_CAPTURE_SIZES]"
         --text-only --timeout-keep-alive 600)
     # The 1 KB stub some snapshots ship renders only the user messages.
     if [ -n "${CHAT_TEMPLATE:-}" ]; then
@@ -177,6 +202,11 @@ server_args=(--trust-remote-code
 
 if [ "${PROXY_DRY_RUN:-0}" = 1 ]; then
     echo "acceptance_length=${ACCEPT_LENGTH:-none}"
+    echo "prewarm=$PREWARM"
+    if [ "$PREWARM" = 1 ]; then
+        echo "prewarm_prompt_tokens=$PREWARM_PROMPT_TOKENS"
+        echo "prewarm_batches=$PREWARM_BATCHES"
+    fi
     env | grep -E '^(ATOM_|AITER_|GPTOSS_|LMCACHE_|PYTHONHASHSEED=|GPU_MEM_UTIL=|KV_CACHE_DTYPE=|MAX_NUM_SEQS=)' | sort
     printf 'server_args:'
     printf ' %q' "${server_args[@]}"
@@ -209,7 +239,46 @@ bash "$REPO/scripts/start_atom_server.sh" "$MODEL" "$TP" "$PORT" "${server_args[
 # start_atom_server.sh stops waiting after two minutes; loading Pro takes longer.
 bash "$REPO/scripts/wait_server_ready.sh" "$PORT" 60 30 "$SERVER_LOG"
 
-# --- 3. replay ---
+# --- 3. prewarm ---
+if [ "$PREWARM" = 1 ]; then
+    echo "proxy_bench: prewarm: prompts $PREWARM_PROMPT_TOKENS, batches $PREWARM_BATCHES"
+    python3 - "http://localhost:${PORT}/v1/chat/completions" "$MODEL"         "$PREWARM_PROMPT_TOKENS" "$PREWARM_BATCHES" <<'PY'
+import json
+import random
+import sys
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor
+
+url, model, prompt_tokens, batches = sys.argv[1:]
+rng = random.Random(0)
+words = [f"w{i}" for i in range(5000)]
+
+
+def send(words_in_prompt, max_tokens):
+    # Fresh words per prompt, so no prefix-cache hit shortens the prefill.
+    text = " ".join(rng.choices(words, k=words_in_prompt))
+    body = json.dumps({
+        "model": model,
+        "messages": [{"role": "user", "content": text}],
+        "max_tokens": max_tokens,
+        "ignore_eos": True,
+    }).encode()
+    request = urllib.request.Request(url, body, {"Content-Type": "application/json"})
+    with urllib.request.urlopen(request, timeout=1800) as reply:
+        return json.load(reply)["usage"]["completion_tokens"]
+
+
+for n in map(int, prompt_tokens.split(",")):
+    send(n, 1)
+for n in map(int, batches.split(",")):
+    with ThreadPoolExecutor(n) as pool:
+        done = list(pool.map(lambda _: send(64, 64), range(n)))
+    assert all(done), f"batch {n}: empty reply"
+print("proxy_bench: prewarm done")
+PY
+fi
+
+# --- 4. replay ---
 export AIPERF_HTTP_TCP_USER_TIMEOUT=900000
 export AIPERF_DATASET_CONFIGURATION_TIMEOUT=1800
 export AIPERF_SERVICE_PROFILE_CONFIGURE_TIMEOUT=1800
@@ -249,7 +318,7 @@ aiperf profile --scenario inferencex-agentx-mvp --unsafe-override \
 stop_server
 trap - EXIT
 
-# --- 4. summary ---
+# --- 5. summary ---
 python3 - "$REPO" "$OUT_DIR" "$CONC" "$TP" <<'PY'
 import json
 import sys

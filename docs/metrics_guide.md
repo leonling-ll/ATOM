@@ -159,11 +159,13 @@ default `0` emits no samples. See `docs/environment_variables.md`.
 | Metric | Type / unit | Definition |
 | --- | --- | --- |
 | `atom:gpu_forward_seconds` | Histogram, s | Per-step target forward device-event duration on each worker, including stream communication and waits. One observation per completed forward, pooling prefill, decode and mixed steps. Excludes `prepare_model`, sampling and MTP drafting. |
+| `atom:gpu_prefill_forward_seconds` | Histogram, s | The `atom:gpu_forward_seconds` steps that carry prefill tokens (prefill-only or mixed), observed again on their own. Subtracted from the step histogram, the rest is the decode / verify steps' time. |
 | `atom:prefill_request_gpu_forward_seconds` | Histogram, s | Per-worker sum of the batch device durations a request participated in across its initial local prefill chunks. One sample once every chunk has been measured. |
 
-Each worker exports two distributions: per-step forward time and per-request
-prefill time. Both retain their histogram buckets, count and sum for means and
-percentiles. The step histogram has no `phase` label; P/D services remain
+Each worker exports three distributions: per-step forward time, the same for
+the steps carrying prefill tokens, and per-request prefill time. All retain
+their histogram buckets, count and sum for means and percentiles. The step
+histograms have no `phase` label; P/D services remain
 distinguishable by `engine_role` or the scrape's `role` label. Queries that
 previously filtered GPU steps by `phase` must use the service role instead.
 In a standalone service, all forward modes share the same step distribution.

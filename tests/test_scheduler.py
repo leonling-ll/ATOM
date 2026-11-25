@@ -157,9 +157,36 @@ class TestCacheSection:
         """The cache section gates internally, so a disabled EngineStats
         ignores update_cache rather than the caller having to guard it."""
         stats = EngineStats(enable_prefix_caching=False)
-        stats.update_cache(4, 10, 8, 6, 9)
+        assert stats.update_cache(4, 10, 8, 6, 9) == (0, 0)
+        assert stats.revise_cache((0, 0), 4, 9, num_offload_tokens=5) == (0, 0)
         assert stats.total_requests == 0
         assert stats.total_cached_tokens == 0
+        assert stats.total_offload_tokens == 0
+
+    def test_revise_adds_the_load_without_counting_the_request_again(self):
+        """A prefill that ran to the tier's chunk boundary and parked for its
+        load is admitted twice. It is one request with one prompt: clients
+        divide both hit rates by `full_tokens`."""
+        stats = EngineStats(enable_prefix_caching=True)
+        recorded = stats.update_cache(4, 32, 4, 4, 28)
+        assert recorded == (4, 0)
+        assert stats.revise_cache(recorded, 4, 28, num_offload_tokens=20) == (4, 20)
+        assert stats.total_requests == 1
+        assert stats.total_full_tokens == 32
+        assert stats.total_reusable_tokens == 28
+        assert stats.total_cached_tokens == 4
+        assert stats.total_offload_tokens == 20
+        assert stats.cache_hit_rate + stats.lmcache_hit_rate == pytest.approx(24 / 28)
+
+    def test_revise_never_lowers_a_counter_or_overfills_reusable(self):
+        stats = EngineStats(enable_prefix_caching=True)
+        recorded = stats.update_cache(8, 32, 8, 8, 28, num_offload_tokens=12)
+        assert recorded == (8, 12)
+        assert stats.revise_cache(recorded, 2, 28, num_offload_tokens=4) == (8, 12)
+        assert stats.revise_cache(recorded, 16, 28, num_offload_tokens=30) == (16, 12)
+        assert stats.total_cached_tokens == 16
+        assert stats.total_offload_tokens == 12
+        assert stats.total_requests == 1
 
 
 # ── EngineStats: throughput section ──────────────────────────────────────────
@@ -1472,6 +1499,51 @@ class TestSchedule:
         assert seq in sched.running, "precondition: the resume must be admitted"
         assert seq.num_cached_tokens == 6, "precondition: the load was applied"
         assert seq.prefix_cache_hit_tokens == 6
+
+    def test_a_handoff_resume_counts_its_request_and_prompt_once(self, seq_factory):
+        """An unaligned HBM hit prefills to the tier's chunk boundary, parks for
+        the load, and is scheduled again on resume. Counting both passes doubled
+        its prompt in `full_tokens` and its HBM hit in `cached_tokens`, the
+        denominator and numerator of the hit rates clients report."""
+        sched = Scheduler(
+            MockConfig(
+                max_num_seqs=2,
+                max_num_batched_tokens=64,
+                num_kvcache_blocks=100,
+                enable_prefix_caching=True,
+            )
+        )
+        sched.kv_connector = _ConnectorNamespace(
+            is_offload=True,
+            build_connector_meta=lambda: None,
+        )
+        bm = sched.block_manager
+        seq = seq_factory(list(range(32)))
+        assert bm.allocate(seq, bm.can_allocate(seq))
+        # The partial prefill's pass: a one-block HBM hit, nothing loaded yet.
+        seq.num_compressed_hit_blocks = seq.num_wanted_hit_blocks = 1
+        seq.num_cached_tokens = 4
+        sched._record_cache_reuse(seq)
+        seq.offload_loaded_tokens = 24
+        sched._park_for_remote_load(seq, deque())
+        sched._count_inflight_load(seq)
+        sched.finished_recving_kv_req_ids.append(seq.id)
+        sched._resolve_offload_load(seq)
+        assert seq.num_cached_tokens == 24, "precondition: the load was applied"
+        sched.waiting.append(seq)
+
+        sched.schedule()
+
+        assert seq in sched.running, "precondition: the resume must be admitted"
+        stats = sched.engine_stats.cache_statistics()
+        assert stats["requests"] == 1
+        assert stats["full_tokens"] == 32
+        assert stats["reusable_tokens"] == 28
+        assert stats["cached_tokens"] == 4
+        assert stats["offload_tokens"] == 20
+        # A preempted request is admitted afresh, and counted afresh.
+        assert sched.preempt(seq)
+        assert seq.cache_reuse_recorded is None
 
     def test_partial_prefill_ready_for_offload_load_moves_to_waiting(self):
         class _Connector(_ConnectorStub):

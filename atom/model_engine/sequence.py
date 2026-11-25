@@ -467,6 +467,10 @@ class Sequence:
         # Prefix tokens `share_cache` routing credited this request when it
         # placed it, until its rank reports what it really reused.
         self.dp_est_cached_tokens = 0
+        # The `(cached, offload)` reuse `EngineStats` counted for the current
+        # admission, None until then; a later pass revises it rather than
+        # counting the request again (`Scheduler._record_cache_reuse`).
+        self.cache_reuse_recorded: tuple[int, int] | None = None
         self.temperature = sampling_params.temperature
         self.top_k = sampling_params.top_k
         self.top_p = sampling_params.top_p

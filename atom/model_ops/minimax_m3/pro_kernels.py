@@ -550,7 +550,7 @@ def prep(
 
 
 @triton.jit
-def _compress_pool_kernel(
+def _compress_insert_kernel(
     ik_ptr,
     pos_ptr,
     seq_ptr,
@@ -563,18 +563,26 @@ def _compress_pool_kernel(
     out_sb,
     out_sr,
     pool_scale,
+    T,
     PG: tl.constexpr,
     G: tl.constexpr,
     RR: tl.constexpr,
+    POOL: tl.constexpr,
+    STORE: tl.constexpr,
 ):
-    """One closing token (position % G == G - 1): softmax-pool its group's G keys with the
-    compress query into the group's bf16 row. A key of this step is read from ``ik``, an
-    earlier one from the request's ring, where it must carry its own position; a key
-    found in neither (no ring slot, or one taken by another request) is left out."""
+    """POOL, a closing token (position % G == G - 1): softmax-pool its group's G keys with
+    the compress query into the group's bf16 row. A key of this step is read from ``ik``,
+    an earlier one from the request's ring, where it must carry its own position; a key
+    found in neither (no ring slot, or one taken by another request) is left out.
+
+    STORE: keep a request's last RR keys of the step in its ring (row position % RR,
+    tagged with the position): a later step's groups read the ones before it from there.
+    Both in one launch only where no ring row is both pooled and stored (``max_rows``).
+    """
     t = tl.program_id(0)
     p = tl.load(pos_ptr + t)
     slot = tl.load(slot_ptr + t)
-    if (slot >= 0) & (p % G == G - 1):
+    if POOL & (slot >= 0) & (p % G == G - 1):
         s = tl.load(seq_ptr + t)
         base = tl.load(base_ptr + s)
         g = tl.arange(0, G)
@@ -589,7 +597,8 @@ def _compress_pool_kernel(
         row = base + q % RR
         rowc = tl.where(base >= 0, row, 0)
         has_ring = (base >= 0).to(tl.int32)
-        kept = (has_ring * (tl.load(ring_pos_ptr + rowc) == q).to(tl.int32)) != 0
+        ring_q = tl.load(ring_pos_ptr + rowc, mask=~mine, other=-1)  # not stored here
+        kept = (has_ring * (ring_q == q).to(tl.int32)) != 0
         from_ring = (kept.to(tl.int32) * (1 - mine.to(tl.int32))) != 0
         here = mine | kept
         d = tl.arange(0, D_IDX)
@@ -615,32 +624,13 @@ def _compress_pool_kernel(
         tl.store(
             out_ptr + blk * out_sb + r * out_sr + d, c.to(out_ptr.dtype.element_ty)
         )
-
-
-@triton.jit
-def _ring_store_kernel(
-    ik_ptr,
-    pos_ptr,
-    seq_ptr,
-    slot_ptr,
-    base_ptr,
-    ring_ptr,
-    ring_pos_ptr,
-    T,
-    RR: tl.constexpr,
-):
-    """Keep a request's last RR keys of the step in its ring (row position % RR, tagged
-    with the position): a later step's groups read the ones before it from there."""
-    t = tl.program_id(0)
-    slot = tl.load(slot_ptr + t)
     s = tl.where(
         slot >= 0, tl.load(seq_ptr + t), 0
     )  # a pad row's batch row is no index
     base = tl.load(base_ptr + s)
     nxt = tl.minimum(t + RR, T - 1)
     last = (t + RR >= T) | (tl.load(seq_ptr + nxt) != s)
-    if (slot >= 0) & (base >= 0) & last:
-        p = tl.load(pos_ptr + t)
+    if STORE & (slot >= 0) & (base >= 0) & last:
         row = (base + p % RR).to(tl.int64)
         d = tl.arange(0, D_IDX)
         tl.store(
@@ -649,8 +639,24 @@ def _ring_store_kernel(
         tl.store(ring_pos_ptr + row, p)
 
 
+# A request's n rows of a step store positions first .. first + n - 1 while its pooling
+# reads ring positions first - (GROUP - 1) .. first - 1: no ring row is in both while
+# n + GROUP - 1 <= RING_ROWS.
+FUSED_INSERT_MAX_ROWS = RING_ROWS - GROUP + 1
+
+
 def compress_insert(
-    ik, positions, seq_id, slots, ring_base, ring, ring_pos, cq, pool_scale, ic_c
+    ik,
+    positions,
+    seq_id,
+    slots,
+    ring_base,
+    ring,
+    ring_pos,
+    cq,
+    pool_scale,
+    ic_c,
+    max_rows=0,
 ):
     """Pool the groups this step closes into the compressed index cache, then keep each
     request's trailing keys in its ring.
@@ -661,33 +667,21 @@ def compress_insert(
     row's first ring row (-1: none), ``ring`` ``[R, 128]`` and ``ring_pos`` ``[R]`` int32 the
     rings and their rows' positions (-1: empty), ``cq`` ``[128]`` the layer's compress query,
     ``ic_c`` ``[pages, PAGE / GROUP, 128]`` bf16. Two launches: the pooling reads the rings
-    before this step's keys overwrite them.
+    before this step's keys overwrite them. ``max_rows``: a bound on any request's rows
+    in the step (0: none); at most ``FUSED_INSERT_MAX_ROWS``, one launch, the same bytes.
     """
     t = ik.shape[0]
     if t == 0:
         return
     assert ik.is_contiguous() and ring.is_contiguous() and ic_c.stride(-1) == 1
     assert ic_c.shape[1:] == (PAGE // GROUP, IDX_DIM) and ring.shape[1] == IDX_DIM
-    _compress_pool_kernel[(t,)](
-        ik,
-        positions,
-        seq_id,
-        slots,
-        ring_base,
-        ring,
-        ring_pos,
-        cq,
-        ic_c,
-        ic_c.stride(0),
-        ic_c.stride(1),
-        pool_scale,
-        PG=PAGE,
-        G=GROUP,
-        RR=RING_ROWS,
-    )
-    _ring_store_kernel[(t,)](
-        ik, positions, seq_id, slots, ring_base, ring, ring_pos, t, RR=RING_ROWS
-    )
+    args = (ik, positions, seq_id, slots, ring_base, ring, ring_pos, cq, ic_c)
+    args += (ic_c.stride(0), ic_c.stride(1), pool_scale, t)
+    fused = 0 < max_rows <= FUSED_INSERT_MAX_ROWS
+    for pool, store in [(True, True)] if fused else [(True, False), (False, True)]:
+        _compress_insert_kernel[(t,)](
+            *args, PG=PAGE, G=GROUP, RR=RING_ROWS, POOL=pool, STORE=store
+        )
 
 
 _fused_prep = (
@@ -2641,42 +2635,89 @@ def dcp_gather_blocks(cache, rows, gather, world):
     return g.view(world, rows.shape[0], *cache.shape[1:]).transpose(0, 1).flatten(0, 1)
 
 
-_day0_decode = (
-    None  # amd-kernels-day0's fp8_sparse_decode (day0#4); False: not installed
-)
+# aiter's minimax_m3_fp8_sparse_decode, its warm-up and the layer check it shares with the
+# prefill; False: this aiter lacks them
+_day0_decode = None
+_day0_decode_warm = None
+_day0_decode_supported = None
+_day0_decode_warmed = set()  # the (device, page, MXFP8 out) kernels compiled
 
 
 def day0_decode_available() -> bool:
-    """Whether amd-kernels-day0's FlyDSL sparse decode (``attention_day0_decode``) imports."""
-    global _day0_decode
+    """Whether aiter's FlyDSL fp8 sparse decode (``attention_day0_decode``; the kernel is
+    amd-kernels-day0's, ported into aiter) imports and serves this GPU and the layer
+    (gfx950, 16 heads on one KV head, 256 / 192, top-128 of 16-token blocks)."""
+    global _day0_decode, _day0_decode_warm, _day0_decode_supported
     if _day0_decode is None:
         try:
-            from amd_kernels.attention.fp8_sparse_prefill_gqa16_d256_v192_b16_top128.host import (
-                fp8_sparse_decode,
+            from aiter.ops.flydsl import (
+                minimax_m3_fp8_sparse_decode,
+                minimax_m3_fp8_sparse_decode_warm_up,
+                minimax_m3_fp8_sparse_prefill_supported,
             )
         except ImportError:
             _day0_decode = False
         else:
-            _day0_decode = fp8_sparse_decode
-    return bool(_day0_decode)
+            _day0_decode = minimax_m3_fp8_sparse_decode
+            _day0_decode_warm = minimax_m3_fp8_sparse_decode_warm_up
+            _day0_decode_supported = minimax_m3_fp8_sparse_prefill_supported
+    return bool(_day0_decode) and _day0_decode_supported(
+        IDX_HEADS, 1, HEAD_DIM, VALUE_DIM, TOPK, PAGE, PAGE
+    )
+
+
+def day0_decode_warm_up(device, page: int, mxfp8: bool) -> None:
+    """Compile the decode kernel for ``page``-token pages and this output (MXFP8 or bf16)
+    on ``device`` once, outside any graph capture: a capture then records the launch
+    only. No-op where the decode is unavailable or the device is not a GPU."""
+    device = torch.device(device)
+    key = (device, page, mxfp8)
+    if (
+        key in _day0_decode_warmed
+        or device.type != "cuda"
+        or not day0_decode_available()
+        or torch.cuda.is_current_stream_capturing()
+    ):
+        return
+    _day0_decode_warm(device, page, mxfp8)
+    _day0_decode_warmed.add(key)
+
+
+def day0_decode_seq_lens(positions, slots, qlen):
+    """Each request's length for ``attention_day0_decode``, ``[T / qlen]`` int32: its last
+    row's position + 1, 0 where that row's slot is -1 (a graph's padding request). The
+    same for every layer of a forward."""
+    reqs = positions.shape[0] // qlen
+    last = positions.view(reqs, qlen)[:, -1]
+    live = slots.view(reqs, qlen)[:, -1] >= 0
+    return torch.where(live, last + 1, 0).to(torch.int32)
 
 
 def attention_day0_decode(
-    q, kc4, block_tables, positions, slots, sel, out, scale, qlen, out_scale=None
+    q,
+    kc4,
+    block_tables,
+    positions,
+    slots,
+    sel,
+    out,
+    scale,
+    qlen,
+    out_scale=None,
+    seq_lens=None,
 ):
-    """``attention`` of a decode / verify batch on amd-kernels-day0's FlyDSL sparse decode (one
+    """``attention`` of a decode / verify batch on aiter's FlyDSL sparse decode (one
     workgroup a row) over the K-only cache as a plain fp8 cast (``kc4`` as ``attention_day0``
     takes it): ``q`` ``[T, 16, 256]`` (cast to fp8), ``T`` = requests x ``qlen`` rows, request
     major; ``sel`` ``[T, 128]`` block ids, valid first and -1 after (``select_logical``).
     A request's length is its last row's position + 1, 0 where that row's slot is -1 (a
     graph's padding request: its rows come out 0). ``out`` ``[T, 16 x 192]``: bf16, or with
     ``out_scale`` ``[T, 96]`` uint8 the E4M3 codes and E8M0 scales of the bf16-rounded rows
-    (``quantize_fp8``'s bytes), o_proj's MXFP8 input."""
+    (``quantize_fp8``'s bytes), o_proj's MXFP8 input. ``seq_lens``: the lengths
+    ``day0_decode_seq_lens`` gives, computed once a forward, else here."""
     t = q.shape[0]
-    reqs = t // qlen
-    last = positions.view(reqs, qlen)[:, -1]
-    live = slots.view(reqs, qlen)[:, -1] >= 0
-    seq_lens = torch.where(live, last + 1, 0).to(torch.int32)
+    if seq_lens is None:
+        seq_lens = day0_decode_seq_lens(positions, slots, qlen)
     _day0_decode(
         q.to(torch.float8_e4m3fn),
         kc4[:, 0],

@@ -44,7 +44,7 @@ from atom.model_ops.attentions.token_layout.prefill import (
 )
 from atom.model_ops.attentions.token_layout.slots import slot_mapping
 from atom.model_ops.dcp_ops import dcp_prefill_slot_mapping
-from atom.utils import CpuGpuBuffer
+from atom.utils import CpuGpuBuffer, envs
 from atom.utils.block_convert import kv_indices_generate_triton
 from atom.utils.block_tables import block_table_state
 from atom.utils.forward_context import AttentionMetaData, AttnState
@@ -686,10 +686,13 @@ class CommonAttentionBuilder(PoolRowsMixin, AttentionMetadataBuilder[T], Generic
         overrides.
         """
 
-    def prepare_block_tables(self, batch: ScheduledBatch, running_bs=None):
-        """Prepare the shared CPU snapshot, reusing unchanged page mappings."""
+    def prepare_block_tables(
+        self, batch: ScheduledBatch, running_bs=None, prefix: str = ""
+    ):
+        """Prepare the ``prefix`` set's CPU snapshot, reusing unchanged page
+        mappings."""
         return block_table_state(
-            self.model_runner.forward_vars["block_tables"]
+            self.model_runner.forward_vars[f"{prefix}block_tables"]
         ).prepare(batch.block_tables, pad_to=running_bs)
 
     def prepare_decode(
@@ -803,21 +806,7 @@ class CommonAttentionBuilder(PoolRowsMixin, AttentionMetadataBuilder[T], Generic
         var = self.model_runner.forward_vars
         for ub_idx in range(NUM_TBO_UBATCHES):
             prefix = f"ub{ub_idx}_"
-            for name, shape in self._ubatch_buffer_shapes().items():
-                src = var[name]
-                if isinstance(src, torch.Tensor):
-                    var[prefix + name] = torch.empty(
-                        shape, dtype=src.dtype, device=self.device
-                    )
-                    continue
-                var[prefix + name] = CpuGpuBuffer(
-                    *shape,
-                    dtype=src.cpu.dtype,
-                    device=self.device,
-                    publication_group=(
-                        f"{prefix}metadata" if src.publication_group else None
-                    ),
-                )
+            self._allocate_buffer_set(prefix, self._ubatch_buffer_shapes())
             # A recorded decode reads it before any step stages it.
             cu_seqlens_q = var[f"{prefix}cu_seqlens_q"]
             cu_seqlens_q.cpu.copy_(
@@ -825,6 +814,29 @@ class CommonAttentionBuilder(PoolRowsMixin, AttentionMetadataBuilder[T], Generic
                 * max_seqlen_q
             )
             cu_seqlens_q.copy_to_gpu()
+
+    def _allocate_buffer_set(
+        self, prefix: str, shapes: dict[str, tuple[int, ...]]
+    ) -> None:
+        """A ``prefix`` copy of each step buffer `shapes` names, at that shape
+        and the step buffer's dtype; a published one in the ``{prefix}metadata``
+        group."""
+        var = self.model_runner.forward_vars
+        for name, shape in shapes.items():
+            src = var[name]
+            if isinstance(src, torch.Tensor):
+                var[prefix + name] = torch.empty(
+                    shape, dtype=src.dtype, device=self.device
+                )
+                continue
+            var[prefix + name] = CpuGpuBuffer(
+                *shape,
+                dtype=src.cpu.dtype,
+                device=self.device,
+                publication_group=(
+                    f"{prefix}metadata" if src.publication_group else None
+                ),
+            )
 
     def _ubatch_decode_rows(self) -> tuple[str, ...]:
         """A TBO decode micro-batch's per-request host rows, sliced off the
@@ -1205,8 +1217,11 @@ class CommonAttentionBuilder(PoolRowsMixin, AttentionMetadataBuilder[T], Generic
         group.set_counts(counts)
         group.publish()
 
-    def decode_spans(self, batch: ScheduledBatch) -> tuple[int, np.ndarray, np.ndarray]:
-        """A pure-decode step's `(bs, per-request lengths, exclusive prefix sum)`.
+    def decode_spans(
+        self, batch: ScheduledBatch, prefix: str = ""
+    ) -> tuple[int, np.ndarray, np.ndarray]:
+        """A pure-decode step's `(bs, per-request lengths, exclusive prefix sum)`,
+        the sum from the ``prefix`` set (a mixed step's decode half stages its own).
 
         One place, so no caller can pair a length vector with someone else's
         cumsum: both come off `num_scheduled_tokens` and the buffer
@@ -1217,7 +1232,7 @@ class CommonAttentionBuilder(PoolRowsMixin, AttentionMetadataBuilder[T], Generic
         return (
             bs,
             batch.num_scheduled_tokens[:bs],
-            self.model_runner.forward_vars["cu_seqlens_q"].np[: bs + 1],
+            self.model_runner.forward_vars[f"{prefix}cu_seqlens_q"].np[: bs + 1],
         )
 
     def _stage_prefill_seq_lens(
@@ -1292,13 +1307,16 @@ class CommonAttentionBuilder(PoolRowsMixin, AttentionMetadataBuilder[T], Generic
             scratch=self.token_axis_scratch,
         )
 
-    def _pad_tokens(self, scheduled_tokens: int, running_tokens: int) -> None:
-        """The padding tokens `[scheduled_tokens, running_tokens)`: position 0
-        and no KV slot. The builder that writes the scheduled tokens' entries
-        calls it and publishes both buffers out to `running_tokens`."""
+    def _pad_tokens(
+        self, scheduled_tokens: int, running_tokens: int, prefix: str = ""
+    ) -> None:
+        """The padding tokens `[scheduled_tokens, running_tokens)` of the
+        ``prefix`` set: position 0 and no KV slot. The builder that writes the
+        scheduled tokens' entries calls it and publishes both buffers out to
+        `running_tokens`."""
         var = self.model_runner.forward_vars
-        var["positions"].np[scheduled_tokens:running_tokens] = 0
-        var["slot_mapping"].np[scheduled_tokens:running_tokens] = -1
+        var[f"{prefix}positions"].np[scheduled_tokens:running_tokens] = 0
+        var[f"{prefix}slot_mapping"].np[scheduled_tokens:running_tokens] = -1
 
     def _prefill_block_table_rows(
         self, batch: PrefillBatch, running_bs: int, has_cached: bool
@@ -1667,7 +1685,15 @@ class CommonAttentionBuilder(PoolRowsMixin, AttentionMetadataBuilder[T], Generic
             self.execute_paged_state_copies(
                 state_ops.checkpoint_stores, state_ops.checkpoint_restores
             )
-        if is_prefill:
+        if (
+            is_prefill
+            and batch.total_seqs_num_decode
+            and batch.total_seqs_num_prefill
+            and envs.ATOM_MIXED_BATCH
+        ):
+            assert not ubatch_slices and not pcp_groups, "a mixed step is not split"
+            built = self.prepare_mixed(batch, running_bs, running_tokens, max_seqlen_q)
+        elif is_prefill:
             built = self.prepare_prefill(
                 batch, running_bs, running_tokens, ubatch_slices, pcp_groups
             )
@@ -1682,6 +1708,20 @@ class CommonAttentionBuilder(PoolRowsMixin, AttentionMetadataBuilder[T], Generic
                 "batch_id_per_q_token"
             ].gpu[:running_tokens]
         return built
+
+    def prepare_mixed(
+        self,
+        batch: ScheduledBatch,
+        running_bs: int,
+        running_tokens: int,
+        max_seqlen_q: int,
+    ):
+        """A mixed step's metadata: ``batch``'s prefill rows first, its decode
+        rows (``max_seqlen_q`` query tokens each) after. Only a builder that
+        overrides it runs one."""
+        raise NotImplementedError(
+            f"{type(self).__name__} builds no mixed prefill+decode step"
+        )
 
     # Whether a prefill replays token graphs (`ForwardMode.token_graph`): every
     # launch outside the model's eager regions is sized by the token count
