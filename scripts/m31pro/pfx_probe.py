@@ -24,12 +24,14 @@ ATOM has no reset endpoint), the twins: ``cold2`` (cold again: the noise floor),
 
 Greedy decoding on this stack is not reproducible: a prompt sent cold twice parts after
 the answer, at tokens whose top two are 0.5 or more apart, with chosen-token logprobs up
-to ~0.4 apart before that. So a hit is judged against that floor, ``cold2`` against
-``cold`` at the same length and concurrency. Pass: every answer right, and each hit's
-answer (its text up to the 8-hex value) the same as its twin's; per phase, at most the
-floor's divergences plus 2, at most its off-tie divergences (where the twin's top-1
-minus top-2 is 0.5 or more) plus 2, and a largest chosen-token logprob difference before
-the first divergence of at most the floor's plus 0.25. The near-tie and 0.05 limits are
+to ~1.3 apart before that. So a hit is judged against that floor, ``cold2`` against
+``cold``. Pass: every answer right, and each hit's answer (its text up to the 8-hex
+value) the same as its twin's; per phase, at most the floor's divergences plus 2 and at
+most its off-tie divergences (where the twin's top-1 minus top-2 is 0.5 or more) plus 2,
+at the same length and concurrency; and a largest chosen-token logprob difference before
+the first divergence of at most the largest floor's plus 0.25, over every length,
+concurrency and run judged together (one run's floor swings with its noise: 0.23-0.49
+in one run, up to 1.30 in another of the same prompts). The near-tie and 0.05 limits are
 reported, not judged. A request counts only where the cache did what its phase needs: a
 hit has the shared length cached (to a block, less one), turn2 more than turn1's prompt,
 a twin nothing. Turn 1's answer goes into turn 2 as the ids its logprobs report; where
@@ -37,11 +39,14 @@ those leave a token out (a special token), turn 2 cannot reach the answer's bloc
 is left out of that check. Per phase it reports DSpark's acceptance length and the cached
 share from ``/metrics``, read once the server has refreshed them after the phase.
 
-``snapshot`` saves the server's ``atom:`` counters; ``pair`` compares two lm-eval
-``--log_samples`` runs of the same prompts (prefix caching on, off): the flips and the
-exact two-sided McNemar p, with the cached share and acceptance length from snapshots.
+``judge`` re-judges the logs of several runs together (twins paired by key: a phase's
+log is in completion order). ``snapshot`` saves the server's ``atom:`` counters;
+``pair`` compares two lm-eval ``--log_samples`` runs of the same prompts (prefix caching
+on, off): the flips and the exact two-sided McNemar p, with the cached share and
+acceptance length from snapshots.
 
   pfx_probe.py probe --port 8000 --model /data/models/m3-pro --out probe.jsonl
+  pfx_probe.py judge --run a/probe32.jsonl a/probe64.jsonl --run b/probe32.jsonl ...
   pfx_probe.py snapshot --port 8000 --out before.json
   pfx_probe.py pair --on on/samples.jsonl --off off/samples.jsonl --on-metrics b.json a.json
 """
@@ -371,57 +376,82 @@ class Probe:
               f"{time.time() - t0:.0f}s", flush=True)  # fmt: skip
 
     def judge(self):
-        """Per (length, conc, phase): accuracy, divergences against the twin set against
-        the cold2 floor, and whether the cache did what the phase needs."""
-        rows, bad, invalid = [], [], []
-        twins = {"cold2": "cold", **PAIRS}
-        for (length, conc, name), recs in self.res.items():
-            row = {"length": length, "conc": conc, "phase": name,
-                   "acc": f"{sum(r['ok'] for r in recs)}/{len(recs)}",
-                   "req_cached": sum(r["cached"] for r in recs),
-                   "req_prompt": sum(r["prompt_tokens"] for r in recs),
-                   **self.phase_stats[(length, conc, name)]}  # fmt: skip
-            tag = f"{length}/c{conc}/{name}"
-            if not all(r["ok"] for r in recs):
-                bad.append(f"{tag}: wrong answers")
-            judged = [r for r in recs if not r.get("answer_gap")]
-            if name == "turn2":
-                row["answer_gaps"] = len(recs) - len(judged)
-                if not judged:
-                    invalid.append(f"{tag}: every turn-1 answer has a gap")
-            invalid += [
-                f"{tag}/{r['key']}: cached {r['cached']}"
-                for r in judged
-                if not cache_ok(name, r)
-            ]
-            twin = self.res.get((length, conc, twins.get(name)))
-            if twin is not None:
-                cmp = [compare(t["toks"], r["toks"]) for t, r in zip(twin, recs)]
-                row["divergences"] = sum(c["diverged"] for c in cmp)
-                row["off_tie"] = sum(c["off_tie"] for c in cmp)
-                row["max_dlp"] = round(max(c["dlp"] for c in cmp), 4)
-                row["strict_fail"] = sum(not c["strict"] for c in cmp)
-                row["answer_diff"] = sum(
-                    answer_span(t["text"]) != answer_span(r["text"])
-                    for t, r in zip(twin, recs)
-                )
-                if name in PAIRS and row["answer_diff"]:
-                    bad.append(f"{tag}: {row['answer_diff']} answers differ")
-            rows.append(row)
+        return judge([(self.res, self.phase_stats)])[0]
+
+
+def judge_run(res, stats):
+    """One run's rows: per (length, conc, phase) accuracy, divergences against the twin
+    (paired by key and prompt length: a phase's log is in completion order) and whether
+    the cache did what the phase needs; with the failures that need no floor."""
+    rows, bad, invalid = [], [], []
+    twins = {"cold2": "cold", **PAIRS}
+    for (length, conc, name), recs in res.items():
+        row = {"length": length, "conc": conc, "phase": name,
+               "acc": f"{sum(r['ok'] for r in recs)}/{len(recs)}",
+               "req_cached": sum(r["cached"] for r in recs),
+               "req_prompt": sum(r["prompt_tokens"] for r in recs),
+               **stats.get((length, conc, name), {})}  # fmt: skip
+        tag = f"{length}/c{conc}/{name}"
+        if not all(r["ok"] for r in recs):
+            bad.append(f"{tag}: wrong answers")
+        judged = [r for r in recs if not r.get("answer_gap")]
+        if name == "turn2":
+            row["answer_gaps"] = len(recs) - len(judged)
+            if not judged:
+                invalid.append(f"{tag}: every turn-1 answer has a gap")
+        invalid += [
+            f"{tag}/{r['key']}: cached {r['cached']}"
+            for r in judged
+            if not cache_ok(name, r)
+        ]
+        twin = res.get((length, conc, twins.get(name)))
+        if twin is not None:
+            by = {(t["key"], t["prompt_tokens"]): t for t in twin}
+            pairs = [(by.get((r["key"], r["prompt_tokens"])), r) for r in recs]
+            invalid += [f"{tag}/{r['key']}: no twin" for t, r in pairs if t is None]
+            pairs = [(t, r) for t, r in pairs if t is not None]
+            cmp = [compare(t["toks"], r["toks"]) for t, r in pairs]
+            row["divergences"] = sum(c["diverged"] for c in cmp)
+            row["off_tie"] = sum(c["off_tie"] for c in cmp)
+            row["max_dlp"] = round(max((c["dlp"] for c in cmp), default=0.0), 4)
+            row["strict_fail"] = sum(not c["strict"] for c in cmp)
+            row["answer_diff"] = sum(
+                answer_span(t["text"]) != answer_span(r["text"]) for t, r in pairs
+            )
+            if name in PAIRS and row["answer_diff"]:
+                bad.append(f"{tag}: {row['answer_diff']} answers differ")
+        rows.append(row)
+    return rows, bad, invalid
+
+
+def judge(runs):
+    """Each run's (rows, failures, invalid) against the cold2 floor. Divergences and
+    off-tie ones are judged against the floor of the same run, length and concurrency;
+    the largest logprob gap against the largest cold2 gap of all the runs and cells
+    judged together, which itself spans 0.23-1.30 over two runs of the same prompts
+    (the #66 ruling of 11-25)."""
+    out = [judge_run(res, stats) for res, stats in runs]
+    dlp_floor = max(
+        (r["max_dlp"] for rows, _, _ in out for r in rows
+         if r["phase"] == "cold2" and "max_dlp" in r),
+        default=None,
+    )  # fmt: skip
+    for rows, bad, _ in out:
         floor = {(r["length"], r["conc"]): r for r in rows if r["phase"] == "cold2"}
         for r in rows:
             f = floor.get((r["length"], r["conc"]))
             if r["phase"] not in PAIRS or f is None or "divergences" not in r:
                 continue
             tag = f"{r['length']}/c{r['conc']}/{r['phase']}"
-            r["floor"] = {k: f[k] for k in ("divergences", "off_tie", "max_dlp")}
+            r["floor"] = {k: f[k] for k in ("divergences", "off_tie")}
+            r["floor"]["max_dlp"] = dlp_floor
             for k in ("divergences", "off_tie"):
                 if r[k] > f[k] + SLACK:
                     bad.append(f"{tag}: {k} {r[k]} > {f[k]} + {SLACK}")
-            if r["max_dlp"] > f["max_dlp"] + DLP_MARGIN:
-                bad.append(f"{tag}: max_dlp {r['max_dlp']} > {f['max_dlp']} + "
+            if r["max_dlp"] > dlp_floor + DLP_MARGIN:
+                bad.append(f"{tag}: max_dlp {r['max_dlp']} > {dlp_floor} + "
                            f"{DLP_MARGIN}")  # fmt: skip
-        return rows, bad, invalid
+    return out
 
 
 def cache_ok(phase, r):
@@ -452,12 +482,36 @@ def run_probe(a, client, codec):
         p.flush()
         for (length, conc), plan in plans.items():
             p.post(length, conc, plan)
-    rows, bad, invalid = p.judge()
+    return report(*p.judge())
+
+
+def report(rows, bad, invalid, label=""):
     for r in rows:
         print("ROW " + json.dumps(r), flush=True)
     verdict = "INVALID" if invalid else "FAIL" if bad else "PASS"
-    print(f"RESULT {verdict} " + json.dumps({"fail": bad, "invalid": invalid[:20]}))
+    print(f"RESULT {label}{verdict} "
+          + json.dumps({"fail": bad, "invalid": invalid[:20]}))  # fmt: skip
     return {"PASS": 0, "FAIL": 1, "INVALID": 2}[verdict]
+
+
+def read_probe_log(paths):
+    """A run's requests from ``probe --out`` logs, as ``Probe.res`` holds them."""
+    res = {}
+    for path in paths:
+        with open(path) as f:
+            for line in f:
+                r = json.loads(line)
+                res.setdefault((r["length"], r["conc"], r["phase"]), []).append(r)
+    return res
+
+
+def run_judge(a):
+    """Re-judge logged runs together: each run's verdict, then the worst."""
+    out = judge([(read_probe_log(paths), {}) for paths in a.run])
+    codes = [report(*o, label=f"run{i} ") for i, o in enumerate(out)]
+    worst = max(codes)
+    print("RESULT " + {0: "PASS", 1: "FAIL", 2: "INVALID"}[worst])
+    return worst
 
 
 def read_samples(path, filt):
@@ -532,6 +586,9 @@ def main(argv=None, codec=None):
     p.add_argument("--flush", type=float, default=1.5, help="pool turnovers")
     p.add_argument("--max-model-len", type=int, default=132096)
     p.add_argument("--seed", type=int, default=0)
+    j = sub.add_parser("judge", help="re-judge logged probe runs together")
+    j.add_argument("--run", nargs="+", action="append", required=True,
+                   help="one run's probe logs (repeat per run)")  # fmt: skip
     s = sub.add_parser("snapshot")
     s.add_argument("--port", type=int, required=True)
     s.add_argument("--out", required=True)
@@ -547,6 +604,8 @@ def main(argv=None, codec=None):
     a = ap.parse_args(argv)
     if a.cmd == "pair":
         return run_pair(a)
+    if a.cmd == "judge":
+        return run_judge(a)
     if a.cmd == "snapshot":
         with open(a.out, "w") as f:
             json.dump(Client(a.port, "").settled_metrics(), f)

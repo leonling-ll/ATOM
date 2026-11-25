@@ -322,3 +322,57 @@ def test_pair(tmp_path, capsys, flips, share, rc):
     assert res["right_to_wrong"] == flips and res["wrong_to_right"] == 1
     assert res["on"]["cached_share"] == pytest.approx(share)
     assert res["on"]["al"] == pytest.approx(3.0)
+
+
+def _log(path, cold2_dlp, hit_dlp=0.0, cold2_flips=0, hit_flips=0):
+    """A logged run of one cell (400 tokens, c1, 3 depths): cold, hit and cold2, with
+    ``*_dlp`` added to one chosen-token logprob before any parting and the first
+    ``*_flips`` requests turning a confident token after the answer. The hit lines
+    are written in reverse, as a c8 phase's log is in completion order."""
+
+    def rec(phase, d, dlp, flip, cached):
+        text = f" {d:08x}." + "\nQuestion: next" * 4
+        toks = [[c.encode().hex(), -0.01, [-0.01, -5.0]] for c in text[:40]]
+        toks[6][1] -= dlp
+        if flip:
+            toks[12][0] = b"#".hex()
+        return {"length": 400, "conc": 1, "phase": phase, "key": f"k{d}",
+                "want": f"{d:08x}", "ok": True, "cached": cached,
+                "prompt_tokens": 400, "text": text, "completion_tokens": 40,
+                "toks": toks}  # fmt: skip
+
+    recs = [rec("cold", d, 0.0, False, 0) for d in range(3)]
+    recs += [rec("hit", d, hit_dlp, d < hit_flips, 384) for d in reversed(range(3))]
+    recs += [rec("cold2", d, cold2_dlp, d < cold2_flips, 0) for d in range(3)]
+    path.write_text("".join(json.dumps(r) + "\n" for r in recs))
+    return str(path)
+
+
+def _judge(capsys, *runs):
+    argv = ["judge"]
+    for r in runs:
+        argv += ["--run", r]
+    rc = probe.main(argv)
+    out = capsys.readouterr().out
+    rows = [json.loads(x[4:]) for x in out.splitlines() if x.startswith("ROW ")]
+    return rc, out, rows
+
+
+def test_dlp_floor_is_the_largest_cold2_over_runs(tmp_path, capsys):
+    quiet = _log(tmp_path / "a.jsonl", cold2_dlp=0.1, hit_dlp=0.6)
+    loud = _log(tmp_path / "b.jsonl", cold2_dlp=1.3, cold2_flips=3)
+    # alone, the hit's gap is past this run's floor
+    rc, out, _ = _judge(capsys, quiet)
+    assert rc == 1 and "400/c1/hit: max_dlp 0.6 > 0.1 + 0.25" in out
+    # with a second run of the same prompts, the floor is the larger cold2 gap
+    rc, out, rows = _judge(capsys, quiet, loud)
+    assert rc == 0, out
+    hit = [r for r in rows if r["phase"] == "hit"]
+    assert [r["floor"]["max_dlp"] for r in hit] == [1.3, 1.3]
+    # twins pair by key: the reversed hit log parts nowhere
+    assert [r["divergences"] for r in hit] == [0, 0]
+    # divergences and off-tie ones stay judged against the same run's floor
+    flips = _log(tmp_path / "c.jsonl", cold2_dlp=0.1, hit_flips=3)
+    rc, out, _ = _judge(capsys, flips, loud)
+    assert rc == 1
+    assert "run0 FAIL" in out and "400/c1/hit: off_tie 3 > 0 + 2" in out
