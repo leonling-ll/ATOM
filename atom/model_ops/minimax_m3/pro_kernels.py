@@ -2976,6 +2976,97 @@ def dcp_local_selection(sel, rank, world):
     return local.gather(1, order).to(torch.int32)
 
 
+@triton.jit
+def _dcp_local_keys_kernel(
+    score_ptr,
+    stride_s,
+    sel_ptr,
+    stride_sel,
+    pos_ptr,
+    keys_ptr,
+    R,
+    W: tl.constexpr,
+    K: tl.constexpr,
+):
+    t = tl.program_id(0)
+    e = tl.arange(0, K)
+    j = tl.load(sel_ptr + t.to(tl.int64) * stride_sel + e)
+    # a row with no causal block on this rank selected nothing (and wrote nothing)
+    ok = (j >= 0) & (e < tl.where(tl.load(pos_ptr + t) >= 0, K, 0))
+    s = tl.load(
+        score_ptr + t.to(tl.int64) * stride_s + j, mask=ok, other=float("-inf")
+    )
+    b = s.to(tl.int32, bitcast=True)
+    key = (b ^ ((b >> 31) & 0x7FFFFFFF)).to(tl.int64) << 32
+    key = key | (0x7FFFFFFF - (j * W + R)).to(tl.int64)
+    tl.store(keys_ptr + t.to(tl.int64) * K + e, tl.where(ok, key, -(2**63)))
+
+
+@triton.jit
+def _dcp_merge_keys_kernel(
+    keys_ptr, T, sel_ptr, stride_sel, R, W: tl.constexpr, K: tl.constexpr
+):
+    t = tl.program_id(0)
+    q = tl.arange(0, W * K)
+    top = tl.topk(tl.load(keys_ptr + ((q // K) * T + t).to(tl.int64) * K + q % K), K)
+    g = (0x7FFFFFFF - (top & 0x7FFFFFFF)).to(tl.int32)
+    mine = ((top >> 32) > _NEG_INF_KEY) & (g % W == R)
+    m = mine.to(tl.int32)
+    e = tl.arange(0, K)
+    base = sel_ptr + t.to(tl.int64) * stride_sel
+    tl.store(base + tl.cumsum(m, axis=0) - m, g // W, mask=mine)
+    tl.store(base + e, tl.full([K], -1, tl.int32), mask=e >= tl.sum(m, axis=0))
+
+
+def dcp_local_keys(score, sel, positions, rank, world):
+    """A rank's ``select_logical`` picks ``sel`` of its own ``score`` (``[T, NBl]``, at
+    its local ``positions``) as ``_block_keys``' sort keys of their global blocks:
+    ``[T, k]`` int64, best first, padded below every block's."""
+    t, k = sel.shape
+    keys = torch.empty(t, k, dtype=torch.int64, device=sel.device)
+    if t:
+        _dcp_local_keys_kernel[(t,)](
+            score,
+            score.stride(0),
+            sel,
+            sel.stride(0),
+            positions,
+            keys,
+            rank,
+            W=world,
+            K=k,
+        )
+    return keys
+
+
+def dcp_merge_keys(gathered, rank, world):
+    """The best ``k`` of every rank's ``dcp_local_keys`` (all-gathered rank-major,
+    ``[world * T, k]``), cut to ``rank``'s blocks as ``dcp_local_selection`` cuts
+    ``select_logical``'s: local block ids in selection order leading each row, -1
+    after."""
+    k = gathered.shape[1]
+    t = gathered.shape[0] // world
+    assert (world * k) & (world * k - 1) == 0, (world, k)
+    sel = torch.empty(t, k, dtype=torch.int32, device=gathered.device)
+    if t:
+        _dcp_merge_keys_kernel[(t,)](
+            gathered.contiguous(), t, sel, sel.stride(0), rank, W=world, K=k
+        )
+    return sel
+
+
+def dcp_select(score, positions, k, rank, world, gather, split=False):
+    """``dcp_local_selection(select_logical(...))`` over every rank's scores, bit for bit,
+    without gathering them: a block in the row's best ``k`` is in its own rank's best
+    ``k`` (fewer blocks outrank it there) and the keys are distinct, so the best ``k`` of
+    the ranks' best ``k`` are the row's. ``score``: this rank's ``[T, NBl]`` pinned
+    (``dcp_pin``); ``positions``: local (``dcp_local_positions``); ``gather``: the
+    all-gather on dim 0."""
+    sel = select_logical(score, positions, k, split=split)
+    keys = dcp_local_keys(score, sel, positions, rank, world)
+    return dcp_merge_keys(gather(keys), rank, world)
+
+
 def dcp_prefill_plan(block_tables, context_lens, world):
     """What gathering a prefill's sequences' blocks from every rank needs: ``rows`` the
     local blocks (``[E]``, every entry of every sequence in order), and ``tables``

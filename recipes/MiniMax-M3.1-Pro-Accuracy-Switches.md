@@ -37,6 +37,8 @@ don't need an accuracy run:
   selections are all-gathered. Every row's selection is computed exactly as before.
 - `score_tq`, `score_tq_causal`: the same scores, more rows per program and only causal tiles.
 - `topk: "split"`: the same picks as `select_logical`.
+- `dcp_topk_merge` (DCP only): each rank's best `topk` blocks merged as sort keys, the same picks
+  as `select_logical` over the all-gathered scores.
 - `fuse_mxfp8_quant`: the norms write the same MXFP8 bytes `quantize_fp8` would.
 - `AITER_REUSE_IDENTICAL_COMM_GROUPS`, `ATOM_ONLINE_QUANT_STREAMING` (weights hash-identical),
   `--text-only`, `ATOM_CACHE_AWARE_ADMISSION`, LMCache: no numerics change.
@@ -49,6 +51,10 @@ don't need an accuracy run:
 These are switchable on their branches and will be listed above once they are merged:
 
 - `ATOM_SHARDED_SAMPLING` (vocab-sharded sampling): same distribution, greedy bit-identical.
+- `--decode-context-parallel-size 8` (with DSpark): decode attends with the Triton attention and a
+  log-sum-exp merge instead of the day0 decode, and each rank scores its own blocks (within fp32
+  rounding of the single-rank scores, so a near-tie can pick another block). The draft's numerics
+  are unchanged. GSM8K DCP8 against DCP1 not run yet.
 - `--enable-tbo` with F1 split collectives: changes all-reduce grouping in prefill.
 - amd-kernels shuffle16 decode GEMMs: cosine ≥ 0.9999999, relative L2 ≤ 4.2e-5 per GEMM.
 - F4, routed + shared expert outputs written in one pass: heavier error tail at the atomic stage-2 rows.

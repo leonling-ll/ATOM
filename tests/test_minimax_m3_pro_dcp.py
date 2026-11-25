@@ -140,6 +140,43 @@ def test_scores_select_as_single_rank(K, reading, tq, per_seq):
     assert torch.equal(sel.sort(dim=1).values, want.sort(dim=1).values)
 
 
+@pytest.mark.parametrize("split", [False, True])
+@pytest.mark.parametrize("per_seq", [1, 6])
+def test_topk_merge_selects_as_the_gathered_scores(K, split, per_seq):
+    """``dcp_topk_merge``: each rank's best k, all-gathered as sort keys and merged, is
+    the gathered scores' selection cut to the rank, order included: with ties, -inf
+    blocks, pins, junk past a rank's causal blocks (pinned too), rows with fewer than k
+    causal blocks and rows with none on a rank."""
+    world, k, init, local = 4, 8, 1, 2
+    c = Split([300, 517, 70, 20], world)
+    seq, pos = c.rows(per_seq)
+    g = torch.Generator().manual_seed(5)
+    parts, qpos = [], []
+    for r in range(world):
+        s = torch.randint(0, 6, (len(pos), c.ne), generator=g).float()
+        s[torch.rand(s.shape, generator=g) < 0.1] = float("-inf")
+        parts.append(K.dcp_pin(s.to(DEV), pos, r, world, init, local))
+        qpos.append(K.dcp_local_positions(pos, r, world))
+    assert (qpos[world - 1] < 0).any()  # the 20-token sequence: nothing on rank 3
+    full = K.dcp_interleave(torch.cat(parts), world)
+    want = K.select_logical(full, pos, k, split=split)
+    valid = (want >= 0).sum(dim=1)
+    assert valid.max() == k and valid.min() < k
+    picks = [K.select_logical(parts[r], qpos[r], k, split=split) for r in range(world)]
+    keys = [
+        K.dcp_local_keys(parts[r], picks[r], qpos[r], r, world) for r in range(world)
+    ]
+    gathered = torch.cat(keys)  # the all-gather, rank-major
+    for r in range(world):
+
+        def gather(x, r=r):
+            assert torch.equal(x, keys[r])
+            return gathered
+
+        got = K.dcp_select(parts[r], qpos[r], k, r, world, gather, split=split)
+        assert torch.equal(got, K.dcp_local_selection(want, r, world))
+
+
 @pytest.mark.parametrize("splits", [1, 4])
 # "spread": every rank holds some of each token's selection; "empty": a sequence shorter
 # than `world` blocks and a selection that skips the last rank, which then sees no key

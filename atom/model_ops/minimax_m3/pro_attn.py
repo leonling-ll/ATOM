@@ -200,6 +200,11 @@ class ProVariants:
     # (fused / split / aiter): its cost follows the context, not the block table's width.
     # Always so in decode / verify graphs of up to pro_kernels.QTILE_ROWS rows.
     score_tq_causal: bool = False
+    # Under DCP a decode / verify selects without all-gathering the scores (``[rows,
+    # max_model_len / 16 / DCP]`` fp32 a rank and layer): each rank selects its own best
+    # ``topk`` blocks and the ranks all-gather those as sort keys (``[rows, topk]`` int64)
+    # and merge them (``dcp_select``). Bit for bit the same selection.
+    dcp_topk_merge: bool = False
     # vLLM's compressed index cache: every 4 index keys softmax-pooled into one bf16 row
     # (ic_c [pages, 4, 128]), written after prep; the scorer reads those rows only.
     index_compress: bool = False
@@ -1560,11 +1565,23 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
             tq=min(v.score_tq, rps & -rps) if rps > 1 else 0,
         )
         pro_kernels.dcp_pin(score, positions, r, w, init, local)
-        score = pro_kernels.dcp_interleave(dcp_all_gather(group, score, 0), w)
-        sel = pro_kernels.select_logical(
-            score, positions, min(self.topk, nbl * w), split=v.topk == "split"
-        )
-        sel = pro_kernels.dcp_local_selection(sel, r, w)
+        k = min(self.topk, nbl * w)
+        if v.dcp_topk_merge:
+
+            def gather(keys):  # as fp32 pairs: aiter's all-gather takes float dtypes
+                return dcp_all_gather(group, keys.view(torch.float32), 0).view(
+                    keys.dtype
+                )
+
+            sel = pro_kernels.dcp_select(
+                score, qpos, k, r, w, gather, split=v.topk == "split"
+            )
+        else:
+            score = pro_kernels.dcp_interleave(dcp_all_gather(group, score, 0), w)
+            sel = pro_kernels.select_logical(
+                score, positions, k, split=v.topk == "split"
+            )
+            sel = pro_kernels.dcp_local_selection(sel, r, w)
         qf = dcp_all_gather_query_heads(group, q)
         h = qf.shape[1]
         dv = self.value_head_dim
