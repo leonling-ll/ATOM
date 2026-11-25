@@ -35,6 +35,7 @@ from atom.utils import CpuGpuBuffer
 
 PRO_SPEC = DraftKvPoolSpec(flash_layout=False, own_scales=True)
 FP8 = torch.float8_e4m3fnuz
+DEV = "cuda" if torch.cuda.is_available() else "cpu"
 # the Pro draft's attention, one KV head a rank, at a CPU-sized head
 DRAFT = {"layers": 2, "num_kv_heads": 1, "head_dim": 64, "block_size": 16}
 
@@ -264,6 +265,7 @@ def test_the_dcp8_block_writes_and_reads_what_the_dcp1_block_does(
         anchors[i] = rng.choice([rng.randrange(0, 3), rng.randrange(0, max_model_len - T - 1)])
         need = (int(anchors[i]) + 1) // 128 + 1
         alloc8.append(min(w8, max(1, need + rng.choice([-1, 0, 1]))))
+    wide, t16, anchors = (x.to(DEV) for x in (wide, t16, anchors))
     dcp8, d8 = _block(wide, alloc8, anchors, scheduled_bs, T, 128, max_model_len)
     dcp1, d1 = _block(t16, [8 * a for a in alloc8], anchors, scheduled_bs, T, 16, max_model_len)
     assert d8._block_rows_p == d1._block_rows_p == 8 * w8
