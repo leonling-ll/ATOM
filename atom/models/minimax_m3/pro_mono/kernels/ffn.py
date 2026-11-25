@@ -287,6 +287,28 @@ def wait_x(c):
 # ------------------------------------------------------------ router
 
 
+@traced
+def load_xr(c, q, xrow):
+    """Router K slice q of every token's bf16 x -> ``xl`` (``xrow`` a row),
+    polled from the norm's tagged ``xr`` pairs: two pairs (four columns) a
+    thread a row, threads 256 h + m on rows h, h + 2, .. (the last row again
+    past S, not stored). One round trip after the slice's norm CTAs, where the
+    ``xrdy`` flags then x's loads took two after every norm CTA."""
+    s, tid = c["S"], c["tid"]
+    h, m = tid // (THREADS // 2), tid % (THREADS // 2)
+    rows = [fx.min(h + 2 * k, s - 1) for k in range(-(-s // 2))]
+    got = c["poll"](
+        [(c["xr"], (t * HIDDEN + q * R_KLEN) // 2 + 2 * m, 2) for t in rows]
+    )
+    for k in range_constexpr(len(rows)):
+        if h + 2 * k < s:
+            fx.ptr_store(
+                fx.Vector.from_elements(got[k], fx.Int32),
+                c["xl"] + (rows[k] * xrow + 4 * m) // 2,
+            )
+    gpu.barrier()
+
+
 def router_loads(c, task):
     """Router task ``task``'s weights for this wave: rows 16 i .. of the
     rank's band, K slice q (``R_KLEN``), one 128-column chunk a wave."""
@@ -316,10 +338,7 @@ def stage_router(c, task, ops):
     s, tid, lane, wave = c["S"], c["tid"], c["lane"], c["wave"]
     i, q = task // R_PARTS, task % R_PARTS
     xrow = R_KLEN + gemv.LDS_PAD
-    wait_x(c)
-    gemv.rows_to_lds(
-        tid, c["x"], R_KLEN, s, c["xl"], xrow, CM_DEV, ldk=HIDDEN, k0=q * R_KLEN
-    )
+    load_xr(c, q, xrow)
     tiles = token_tiles(s)
     for k in range_constexpr(tiles):
         t0, n = tile_span(s, k)

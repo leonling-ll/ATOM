@@ -548,6 +548,7 @@ def peer_bytes() -> int:
 
 # ---------------------------------------------------------- scratch regions
 # Tagged pairs at device scope (one GPU), a FFN build's only:
+# xr    [token][column pair] the norm's bf16 x, the router's B operand
 # xrdy  [AR task] a norm CTA's x / x8 / x4 columns are stored
 # route [token][8] the picks' experts, then their weights (f32), top-k order
 # ugf   [ug task] a task's mid rows are stored (A16W4: a K-half pair's)
@@ -591,6 +592,7 @@ def scratch_layout(key: P1Build) -> dict:
         start = max((o + n for o, n in lay.values()), default=0)
         items = (
             ("xrdy", NT),
+            ("xr", L * HIDDEN // 2),
             ("route", L * 2 * TOPK),
             ("ugf", max_u(L) * UG_GROUPS),
             ("smid", L * INTER_S // 2),
@@ -682,7 +684,7 @@ def plain_bytes(key: P1Build) -> int:
 
 
 NORM_REGIONS = ("rs", "ag", "agsq")
-FFN_REGIONS = ("xrdy", "rlog", "route", "ugf", "smid", "ugp")
+FFN_REGIONS = ("xrdy", "xr", "rlog", "route", "ugf", "smid", "ugp")
 # every region a build may touch: a debug record names its region by its
 # index here (``region_ids``)
 REGIONS = NORM_REGIONS + FFN_REGIONS
@@ -698,6 +700,8 @@ def decls(key: P1Build) -> list[RegionDecl]:
     if key.upto == "ffn":
         out += [
             RegionDecl("xrdy", Space.SCRATCH, "norm"),
+            # the router polls its K slice of x itself: no flag round trip
+            RegionDecl("xr", Space.SCRATCH, "norm"),
             RegionDecl("rlog", Space.PEER, "router"),
             RegionDecl("route", Space.SCRATCH, "route"),
             RegionDecl("ugf", Space.SCRATCH, "ug"),
