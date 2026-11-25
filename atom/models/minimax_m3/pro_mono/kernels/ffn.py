@@ -291,15 +291,16 @@ def wait_x(c):
 def load_xr(c, q, xrow):
     """Router K slice q of every token's bf16 x -> ``xl`` (``xrow`` a row),
     polled from the norm's tagged ``xr`` pairs: two pairs (four columns) a
-    thread a row, threads 256 h + m on rows h, h + 2, .. (the last row again
+    thread a row, threads 2 m + h on rows h, h + 2, .. (the last row again
     past S, not stored). One round trip after the slice's norm CTAs, where the
-    ``xrdy`` flags then x's loads took two after every norm CTA."""
+    ``xrdy`` flags then x's loads took two after every norm CTA. The row
+    is a lane's (h = tid % 2), not a wave's: wave-uniform rows held their
+    offsets in SGPRs across the poll's spin."""
     s, tid = c["S"], c["tid"]
-    h, m = tid // (THREADS // 2), tid % (THREADS // 2)
+    h, m = tid % 2, tid // 2
     rows = [fx.min(h + 2 * k, s - 1) for k in range(-(-s // 2))]
-    got = c["poll"](
-        [(c["xr"], (t * HIDDEN + q * R_KLEN) // 2 + 2 * m, 2) for t in rows]
-    )
+    xr = c["xr"]()
+    got = c["poll"]([(xr, (t * HIDDEN + q * R_KLEN) // 2 + 2 * m, 2) for t in rows])
     for k in range_constexpr(len(rows)):
         if h + 2 * k < s:
             fx.ptr_store(
