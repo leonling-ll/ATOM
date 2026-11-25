@@ -125,7 +125,8 @@ def test_a_wrong_declaration_is_caught(traced, wrong, msg):
         ({"ugf": {"writer": "down"}}, "ugf put by ug, its writer is down"),
         ({"rlog": {"space": Space.SCRATCH}}, "rlog in router as peer"),
         ({"route": {"writer": "union"}}, "route put by route, its writer is union"),
-        ({"rpart": {"exchange": False}}, "rpart polled by its own writer router"),
+        # the router polls its K slice of x as the norm put it
+        ({"xr": {"writer": "router"}}, "xr put by norm, its writer is router"),
         # A16W4 (the default): the half-0 task polls its half-1 task's partials
         ({"ugp": {"exchange": False}}, "ugp polled by its own writer ug"),
         ({"ugp": {"writer": "down"}}, "ugp put by ug, its writer is down"),
