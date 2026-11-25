@@ -839,13 +839,15 @@ def is_minimax_m3_pro_config(hf_config: PretrainedConfig) -> bool:
 def admit_minimax_m3_pro_dcp(config: "Config") -> None:
     """MiniMax-M3-Pro under decode context parallelism: its KV and index caches are
     interleaved a whole 16-token sparse block at a time (``dcp_config.interleave_size``
-    = the block size; a block lives on one rank), with no speculative draft (the
-    MiniMax-M3.1 DSpark draft does not run under DCP)."""
+    = the block size; a block lives on one rank). The one speculative draft is its
+    DSpark, whose pool sits outside the DCP group (``MiniMaxM3ProDSpark.kv_pool_spec``):
+    every rank holds the draft's whole token axis."""
     dcp, page = config.dcp_config, config.kv_cache_block_size
-    if config.speculative_config is not None:
+    spec = config.speculative_config
+    if spec is not None and spec.method != "dspark":
         raise ValueError(
-            "MiniMax-M3-Pro under --decode-context-parallel-size runs without a "
-            "speculative draft: the MiniMax-M3.1 DSpark draft does not support DCP"
+            "MiniMax-M3-Pro under --decode-context-parallel-size drafts with its "
+            f"DSpark only (--method dspark), got --method {spec.method}"
         )
     if dcp.interleave_size == 1 and page > 1:
         dcp.interleave_size = page
