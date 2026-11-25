@@ -3991,7 +3991,17 @@ class Scheduler:
             )
             hbm_cached_tokens = min(cached_tokens, wanted_tokens)
             offload_tokens = cached_tokens - hbm_cached_tokens
-            self.engine_stats.update_cache(
+            # A prefill that ran to the tier's chunk boundary and parked for
+            # the load comes back through here on resume: one request.
+            if seq.cache_reuse_recorded is not None:
+                seq.cache_reuse_recorded = self.engine_stats.revise_cache(
+                    seq.cache_reuse_recorded,
+                    hbm_cached_tokens,
+                    num_reusable_tokens,
+                    num_offload_tokens=offload_tokens,
+                )
+                return
+            seq.cache_reuse_recorded = self.engine_stats.update_cache(
                 hbm_cached_tokens,
                 seq.num_tokens,
                 seq.num_compressed_hit_blocks * hbs,
@@ -4648,6 +4658,7 @@ class Scheduler:
         # Routing credit describes the old allocation, which is surrendered.
         # A new admission must recheck HBM and tier availability.
         seq.dp_est_cached_tokens = 0
+        seq.cache_reuse_recorded = None
         seq.status = SequenceStatus.WAITING
         # Strip the placeholder tokens postprocess appended, so the recompute
         # restarts from real context only.

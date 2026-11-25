@@ -308,8 +308,11 @@ class EngineStats:
         num_wanted_tokens: int,
         num_reusable_tokens: int,
         num_offload_tokens: int = 0,
-    ) -> None:
+    ) -> tuple[int, int]:
         """Record cache stats for one prefill sequence.
+
+        Returns the `(cached, offload)` pair it recorded, after clamping; a
+        later admission pass of the same request hands it to `revise_cache`.
 
         The first five are required because the reported rates are differences
         between them: `cached <= wanted <= compressed <= reusable <= full`. A
@@ -328,7 +331,7 @@ class EngineStats:
         would break the nesting -- see `_schedule_prefill_seq`.
         """
         if not self.cache_enabled:
-            return
+            return 0, 0
         ordered = (
             num_cached_tokens
             <= num_wanted_tokens
@@ -401,6 +404,41 @@ class EngineStats:
         if self.total_requests % self._cache_log_interval == 0:
             self._log_cache()
             self._reset_cache_interval()
+        return num_cached_tokens, num_offload_tokens
+
+    def revise_cache(
+        self,
+        recorded: tuple[int, int],
+        num_cached_tokens: int,
+        num_reusable_tokens: int,
+        num_offload_tokens: int = 0,
+    ) -> tuple[int, int]:
+        """Raise one request's recorded `(cached, offload)` to a later figure.
+
+        For a request `update_cache` already counted that is scheduled again
+        without a new admission: a prefill that ran up to the CPU tier's chunk
+        boundary and parked for the load comes back when the load lands, and
+        only then knows what the tier served. A second `update_cache` would
+        count its request, prompt and HBM hit twice.
+
+        Never lowers either figure, since both feed exported counters, and keeps
+        `cached + offload <= reusable`. The recent-requests window keeps the
+        first figure.
+        """
+        if not self.cache_enabled:
+            return recorded
+        old_cached, old_offload = recorded
+        cached = max(
+            old_cached, min(num_cached_tokens, num_reusable_tokens - old_offload)
+        )
+        offload = max(
+            old_offload, min(num_offload_tokens, num_reusable_tokens - cached)
+        )
+        self.total_cached_tokens += cached - old_cached
+        self._cache_interval_cached_tokens += cached - old_cached
+        self.total_offload_tokens += offload - old_offload
+        self._cache_interval_offload_tokens += offload - old_offload
+        return cached, offload
 
     @property
     def cache_hit_rate(self) -> float:
