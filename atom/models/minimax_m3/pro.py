@@ -174,6 +174,16 @@ class ProLookaheadState:
         slot = reader % (self.ahead + 1)
         return self._ring[0][slot, : 2 * rows], self._ring[1][slot, : 2 * rows]
 
+    def lookahead_rows(
+        self, reader: int, rows: int, like: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        """Where ``reader``'s MXFP8 lookahead input goes: rows ``[rows, 2 * rows)`` of its
+        ring slot ``(q, q_scale)`` (``front_rows``), or None past ``FRONT_ROWS``. Whoever
+        writes the lookahead (``put``, the mono layer kernel) writes it here, so the
+        reader's ``front_input`` finds it."""
+        front = self.front_rows(reader, rows, like)
+        return None if front is None else (front[0][rows:], front[1][rows:])
+
     @staticmethod
     def front_input(
         front: tuple[torch.Tensor, torch.Tensor] | None,
@@ -266,15 +276,14 @@ class ProLookaheadState:
                     and _native_a8(*linears)
                     and _aiter_mx_norm()
                 ):
-                    rows = resid.shape[0]
-                    front = self.front_rows(reader, rows, resid)
+                    la = self.lookahead_rows(reader, resid.shape[0], resid)
                     _, q, q_scale, _ = gemma_rms_norm_mxfp8(
                         resid,
                         None,
                         norm,
                         write_bf16=False,
-                        q_out=None if front is None else front[0][rows:],
-                        q_scale_out=None if front is None else front[1][rows:],
+                        q_out=None if la is None else la[0],
+                        q_scale_out=None if la is None else la[1],
                     )
                     self.resid_in[reader] = (q, q_scale)
                 else:

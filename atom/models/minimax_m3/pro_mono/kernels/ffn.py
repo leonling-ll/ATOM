@@ -23,7 +23,7 @@ x8, which the shared expert also reads, and MXFP8 mids, ``quantize_fp8``'s
 rule; the gfx950 f8f6f4 MFMA with the MXFP4 weight as A, cbsz 4, and the
 MXFP8 activation as B, blgp 0), and production's MXFP8 shared expert::
 
-    logit  = bf16(x @ w_gate^T)                       (fp32 accumulate)
+    logit  = x @ w_gate^T                    (fp32 accumulate, kept fp32)
     s      = sigmoid(logit); picks = top-4 of s + bias (lower expert on a tie)
     w_k    = s_k / (s_0 + s_1 + s_2 + s_3) * 2.0      (rank order sum)
     xa     = x               (A16W4: the norm's bf16 x)
@@ -308,8 +308,10 @@ def router_loads(c, task):
 def stage_router(c, task, ops):
     """Router task (i, q) = (task / R_PARTS, task % R_PARTS): its rows against
     x's K slice q (bf16 MFMA, fp32). Parts q > 0 publish their fp32 partials;
-    part 0 adds them in part order, rounds to bf16 (the gate's output dtype)
-    and sends the logits to every rank's ``rlog``."""
+    part 0 adds them in part order and sends the fp32 logits to every rank's
+    ``rlog``, unrounded as production's ``moe_route_glue`` keeps them: a bf16
+    rounding here picks another 4th expert where the 4th and 5th scores are
+    closer than its error."""
     s, tid, lane, wave = c["S"], c["tid"], c["lane"], c["wave"]
     i, q = task // R_PARTS, task % R_PARTS
     xrow = R_KLEN + gemv.LDS_PAD
@@ -340,7 +342,6 @@ def stage_router(c, task, ops):
                 )
                 for p in range_constexpr(R_PARTS - 1):
                     v = v + _f32_of(got[p][0])
-                v = bf16_round(v)
                 for p in range_constexpr(TP):
                     c["put"](c["rlog"][p], rlog_pair(c["rank"], t, i * R_ROWS + r), v)
     gpu.barrier()
@@ -1198,15 +1199,12 @@ def run_ug(c, bid, nu):
     # route as a value of its own, the quartered list's selects spilled the
     # 24-row debug build's SGPRs)
     task = task_list(bid, act, s, _sel)[1] if quartered(c) else c["k0"]
-    # the claim before the loads: its return waits behind none of them
-    got = take_ahead(c) if q else fx.Int32(0)
     t0 = fx.min(task, last)
     live0 = task < total
     parts = range(len(ug_parts(c)))
     ops = [ug_loads(c, wave_task(c, t0), p, live0) for p in parts]
-    if const_expr(q):
-        put_claim(c, got)
-        gpu.barrier()
+    # the first claim was taken and stored before the route's poll
+    # (``run_ffn``), its LDS word past ``load_route``'s barriers
     nxt = read_claim(c) if q else task + per
     if const_expr(q):
         # every thread has read it before the loop's first claim lands there
@@ -1902,15 +1900,17 @@ def run_ffn(c, bid):
     lst, c["k0"] = task_list(bid, c["routed_act"], s, _sel)
     if const_expr(bf16_routed(c)):
         c["ugh"] = lst
-    nu = load_route(c)
-    load_xb(c)
-    c["stamp"](7)
-    enter_stage("ug")
-    # the routed and shared planes' bases, loaded once: a load in a task
-    # loop would wait (``vmcnt`` in issue order) for every weight load in
-    # flight
-    # (quartered: the down's after the ug loop, which held them as SGPRs it
-    # had not got, ``ug_tile1``)
+    # What needs no route goes out before the route's poll, while the route
+    # is in flight (every CTA waits there for the route CTAs): the routed and
+    # shared planes' bases (loaded once: a load in a task loop would wait,
+    # ``vmcnt`` in issue order, for every weight load in flight), the first
+    # claim of the list's queue word (``run_ug``) and the routed B operands
+    # (x is in at the norm, the route an all-gather of the logits later).
+    # After the route's poll, the union alone is left before the first ug
+    # weights go out; before, the x poll, x's loads, the table's load and the
+    # claim's atomic (every CTA of a list on one word at once) came between.
+    # Quartered, the down's bases are loaded after the ug loop instead, which
+    # held them as SGPRs it had not got (``ug_tile1``).
     later = ("w2", "s2", "w_sd", "s_sd") if quartered(c) else ()
     c |= {
         n: weight(c, n)
@@ -1919,6 +1919,14 @@ def run_ffn(c, bid):
     }
     # the list's queue word: the launch's words are one a list, in list order
     c["qword"] = c["queue"] + fx.Int64(lst) * 4 if bf16_routed(c) else c["queue"]
+    got = take_ahead(c) if queued(s) else fx.Int32(0)
+    load_xb(c)
+    if const_expr(queued(s)):
+        # read past ``load_route``'s barriers (``run_ug``)
+        put_claim(c, got)
+    nu = load_route(c)
+    c["stamp"](7)
+    enter_stage("ug")
     task, nxt = run_ug(c, bid, nu)
     c |= {n: weight(c, n) for n in later}
     c["stamp"](8)
