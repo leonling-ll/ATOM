@@ -425,7 +425,7 @@ the uncapped corpus at 1M context and DSpark k=5 at AL 2.89, and no request fail
 | Section 1's launch (in-process LMCache, 184 GiB a rank) | 3600 s | 3,698 | 7.53 | 322 / 405 s |
 | One LMCache server, 2,240 GiB, section 1's variants + `score_tq_causal` (*) | 3600 s | 15,241 | 40.90 | 3.0 / 99.6 s |
 | vLLM, #225's launch (2.4 TB CPU offload) | 3600 s | 12,360 | 35.88 | 64 / 100 s |
-| This launch | 3600 s | pending | | |
+| This launch | 3600 s | **16,360** | **43.30** | 2.6 / 91.7 s |
 
 Single steps, 600 s each on one node. 600 s runs of one launch differ by up to about 10% run to run.
 
@@ -445,7 +445,8 @@ served about 30% from HBM and 66% from the CPU tier, vLLM 7% and 84%. The in-pro
 recomputed most of its prompts and queued: its median TTFT was 322 s.
 
 GSM8K for the second row's launch (DSpark k=5 at real acceptance, 3 runs): 0.9439 64-shot,
-0.9353 on vLLM's 5-shot protocol, where vLLM scores 0.9174 with DSpark.
+0.9353 on vLLM's 5-shot protocol, where vLLM scores 0.9174 with DSpark. For this launch, one run:
+0.9416 ± 0.0065 64-shot and 0.9249 ± 0.0073 5-shot, acceptance length 3.84.
 
 ## CONC 32
 
