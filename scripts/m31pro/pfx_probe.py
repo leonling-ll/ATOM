@@ -428,8 +428,7 @@ def judge(runs):
     """Each run's (rows, failures, invalid) against the cold2 floor. Divergences and
     off-tie ones are judged against the floor of the same run, length and concurrency;
     the largest logprob gap against the largest cold2 gap of all the runs and cells
-    judged together, which itself spans 0.23-1.30 over two runs of the same prompts
-    (the #66 ruling of 11-25)."""
+    judged together, which itself spans 0.23-1.30 over two runs of the same prompts."""
     out = [judge_run(res, stats) for res, stats in runs]
     dlp_floor = max(
         (r["max_dlp"] for rows, _, _ in out for r in rows

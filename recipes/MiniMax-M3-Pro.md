@@ -340,16 +340,26 @@ split over the ranks and the FlyDSL / aiter decode, three checks cover hits:
     --off off/*/samples_gsm8k_pfx_*.jsonl --on-metrics before.json after.json
   ```
 
-Results (MI355X TP8; tests unchanged since 6384a207). The hit test: 44 passed / 20 skipped in the
-interpreter, 40 passed on GPU. gsm8k_pfx at 5812c071, both servers with the Agentic variants without
-`ATOM_TOKEN_GRAPH_SIZES`: 0.9325 with prefix caching, 0.9196 without, 34 questions right to wrong and 51
-wrong to right (McNemar p 0.082), cached share 0.993, measured AL 4.10 on both (golden 2.94). Both are
-below `pair`'s absolute 0.94 bar. The probe at 05f18899, two runs of the same prompts (one with
-`ATOM_TOKEN_GRAPH_SIZES=256,512,1024,2048`, one without) judged together: every warm phase's largest
-logprob gap is within the 1.30 floor + 0.25 (at most 1.12), and 239 of 240 warm answers are right.
-Both runs still fail the other checks: with token graphs, 64k c1 `half` answers one key with the
-value of a similar key; without, 32k c8 `half` differs from its cold twin (the twin is the wrong
-one) and 32k c1 `turn2` has 3 off-tie divergences against a floor of 0 + 2.
+Results (MI355X TP8):
+
+* The hit test passes on one MI355X with every GPU variant, the 32k and 64k hits included.
+* The probe at 05f18899, two runs of the same prompts (one with
+  `ATOM_TOKEN_GRAPH_SIZES=256,512,1024,2048`, one without) judged together: every warm phase's largest
+  logprob gap is within the 1.30 floor + 0.25 (at most 1.12). Three cells exceed the divergence or
+  answer checks; a chunk-matched comparison at 250dcb03
+  ([#66](https://github.com/zhuyuhua-v/ATOM-M3/issues/66#issuecomment-7168136893)) reads them as
+  run-to-run noise, not a hit-path effect. In every layer where two cold prefills of a prompt are bitwise
+  equal (layers 0-4; from layer 5 on they already differ), a hit is bitwise equal to a cold prefill
+  chunked at the hit boundary: attention output on every row, the selected blocks, and the prefix K,
+  scale and index pages. No launch wrote a shared page, and the first-token logprob gap of a hit against
+  cold is within the gap of cold against cold. That run prefilled over cached pages with Triton and
+  aiter's paged attention; the hit test covers the day0 prefill over cached pages.
+* gsm8k_pfx at 5812c071, both servers with the Agentic variants without `ATOM_TOKEN_GRAPH_SIZES`: 0.9325
+  with prefix caching, 0.9196 without, 34 questions right to wrong and 51 wrong to right (McNemar
+  p 0.082), cached share 0.993, measured AL 4.10 on both (golden 2.94). Both are below `pair`'s absolute
+  0.94 bar, and the fixed 64-shot set is the harder prompt: on one tree (d502c42f) and server, standard
+  GSM8K scored 0.9462 and 0.9424, gsm8k_pfx 0.9310 and 0.9318
+  ([#66](https://github.com/zhuyuhua-v/ATOM-M3/issues/66#issuecomment-7162771310)).
 
 ## CPU KV offload
 
