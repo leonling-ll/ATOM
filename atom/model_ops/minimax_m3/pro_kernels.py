@@ -1166,22 +1166,33 @@ def _load_block_keys(
     BB: tl.constexpr,
     DI: tl.constexpr,
     PG: tl.constexpr,
+    CLAMP: tl.constexpr = False,
 ):
     """Keys ``[BB*PG, DI]`` of blocks ``j0..j0+BB-1`` of sequence ``seq`` up to block ``last``,
-    and which rows are live. Past ``last`` the rows read block ``last``'s keys again (a page
-    in the pool, every score taken from them discarded) rather than masked loads, which the
-    compiler splits into a branch an element."""
+    and which rows are loaded (0 elsewhere). ``CLAMP``: past ``last`` the rows read block
+    ``last``'s keys again (a page in the pool; every score taken from them is discarded)
+    instead of masked loads, which the compiler splits into a branch an element: 3-5 us a
+    layer faster in _score_qtile_kernel's strided loop at 16-24 rows and 128k, 1.6% slower
+    one tile a program (a 2048-row prefill chunk), on MI355X."""
     r = tl.arange(0, BB * PG)
     jr = j0 + r // PG
-    lastc = tl.minimum(last, NB - 1)
-    phys = tl.load(bt_ptr + seq * stride_bt + tl.minimum(jr, lastc)).to(tl.int64)
-    ik = tl.load(
-        ic_ptr
-        + phys[:, None] * ic_sb
-        + (r % PG)[:, None] * ic_so
-        + tl.arange(0, DI)[None, :]
-    )
-    return ik, jr <= lastc
+    ar_d = tl.arange(0, DI)
+    if CLAMP:
+        lastc = tl.minimum(last, NB - 1)
+        live = jr <= lastc
+        phys = tl.load(bt_ptr + seq * stride_bt + tl.minimum(jr, lastc)).to(tl.int64)
+        ik = tl.load(
+            ic_ptr + phys[:, None] * ic_sb + (r % PG)[:, None] * ic_so + ar_d[None, :]
+        )
+    else:
+        live = (jr <= last) & (jr < NB)
+        phys = tl.load(bt_ptr + seq * stride_bt + jr, mask=live, other=0).to(tl.int64)
+        ik = tl.load(
+            ic_ptr + phys[:, None] * ic_sb + (r % PG)[:, None] * ic_so + ar_d[None, :],
+            mask=live[:, None],
+            other=0.0,
+        )
+    return ik, live
 
 
 @triton.jit
@@ -1401,7 +1412,19 @@ def _score_qtile_kernel(
         iq = _load_q_rows(iq_ptr, trc, rmask, TQ, NI, DI)
         for j0 in range(first, tl.minimum(last + 1, NB), tl.num_programs(1) * BB):
             ik, live = _load_block_keys(
-                ic_ptr, ic_sb, ic_so, bt_ptr, stride_bt, seq, j0, last, NB, BB, DI, RPB
+                ic_ptr,
+                ic_sb,
+                ic_so,
+                bt_ptr,
+                stride_bt,
+                seq,
+                j0,
+                last,
+                NB,
+                BB,
+                DI,
+                RPB,
+                True,
             )
             score = _row_tile_scores(
                 iq,
