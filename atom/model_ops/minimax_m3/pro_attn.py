@@ -254,6 +254,24 @@ class ProVariants:
     # ... and its epilogue writes o_proj's MXFP8 input (E4M3 + E8M0 of the bf16-rounded rows,
     # quantize_fp8's bytes) where o_proj is a native group32 FP8 GEMM: no separate quant.
     day0_decode_mxfp8: bool = True
+    # Mono decode phase 1 (``models/minimax_m3/pro_mono``): the most graph rows a decode /
+    # verify forward may have for its MoE layers' o_proj .. FFN segment to run as one
+    # persistent kernel; 0 (default) off, at most ``pro_mono.config.MAX_ROWS``. Wider
+    # forwards keep production's segment (``moe_route_glue`` where it is on). The layers
+    # mono takes get the decode attention's output as bf16; a ``day0_decode_rows`` at or
+    # below the limit (its epilogue writes E4M3) turns mono off. Latched once, at the
+    # first forward (``pro_mono.route``, agreed over the TP group): a later edit of the
+    # file does not change it. Off by default until its acceptance gates pass with it
+    # on (accuracy: the
+    # exposure and official GSM8K 3-run means, AIME26 avg@16 >= 0.95 twice,
+    # retrieval 40/40; speed: a faster measured layer and >= 10% proxy TPOT at c1/c4).
+    mono_ffn_rows: int = 0
+    # The mono FFN's routed experts' activations: "bf16" (A16W4: bf16 x and mids against
+    # the MXFP4 experts dequantized in the kernel, production's a16w4 numerics at these
+    # widths), "fp8" (W4A8: the norm's MXFP8 x and MXFP8 mids, gfx950's f8f6f4 MFMA) or
+    # "fp4" (W4A4, aiter a4w4 numerics); the last two quantize the activations, a
+    # numerics change. Latched with ``mono_ffn_rows`` and agreed over the TP group.
+    mono_routed_act: str = "bf16"
     # Developer profile, not an attention switch (the attention path never reads it): count
     # the distinct routed experts each MoE layer reads in every forward (TP rank 0) into
     # ``<diag_tag>_experts.jsonl`` (``eplb.ExpertCountProfile``). A counting run, not a
@@ -432,6 +450,10 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
     # MXFP8 output (take_mx_scale)
     mx_out = False
     _mx_scale = None
+    # set for one call by ``MiniMaxM3ProAttention.forward_core``: the mono layer kernel
+    # reads the attention's output as bf16, so the Triton / aiter rows below the day0
+    # decode stay bf16 (the day0 decode's epilogue keeps ``day0_decode_mxfp8``)
+    bf16_out = False
 
     is_indexed_sparse_attention = True
     k_only = False  # the pool is ``ProKOnlyLayout`` (no V cache)
@@ -841,8 +863,8 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
         it (``mx_out``). ``day0_dec``: the batch is the day0 decode's (``_day0_decode``),
         whose epilogue writes it under ``day0_decode_mxfp8``. Below that, under
         ``fuse_mxfp8_quant``: the Triton attention always, aiter's where its gluon decode
-        takes ``output_scale``. Off under decode context parallelism (``dcp_world`` > 1),
-        the day0 decode included."""
+        takes ``output_scale``, unless the call is ``bf16_out``'s. Off under decode context
+        parallelism (``dcp_world`` > 1), the day0 decode included."""
         if self.dcp_world > 1:
             return False
         if not self.mx_out:
@@ -850,7 +872,8 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
         if day0_dec:
             return v.day0_decode_mxfp8
         return (
-            v.fuse_mxfp8_quant
+            not self.bf16_out
+            and v.fuse_mxfp8_quant
             and self.value_head_dim % 32 == 0
             and (not self._aiter_attn(v, n) or pro_kernels.aiter_mxfp8_out_available())
         )

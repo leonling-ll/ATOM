@@ -283,6 +283,7 @@ def _layers(load, monkeypatch, num_layers=3, end_layer=None):
             h, residual = layer(None, h, residual)
         return h, residual, list(seen)
 
+    run.layers, run.state = layers, state
     return run
 
 
@@ -305,3 +306,26 @@ def test_a_pipeline_stages_last_layer_adds_its_own(load, monkeypatch):
     got_h, got_res, deferred = run(ar_fused_rows=256, moe_tail_ar=True)
     assert {norm for norm, add in deferred if add is not None} == {(1, "in")}
     assert torch.equal(got_res, want_res) and torch.equal(got_h, want_h)
+
+
+def test_mono_check_modes_reference_segment_sums_and_leaves_no_tail(load, monkeypatch):
+    """``_segment``, production's segment that mono's check mode runs as the
+    kernel's reference, returns the summed FFN partial under ``moe_tail_ar`` and
+    leaves no tail: the forward goes on from the kernel's summed output, so a tail
+    left here would be added again by the next layer's input all-reduce."""
+    pro_attn = load("atom.model_ops.minimax_m3.pro_attn")
+    run = _layers(load, monkeypatch)
+    layer, state = run.layers[0], run.state
+    o, residual = _rows(6, seed=3), _rows(6, seed=5)
+
+    def segment(**variants):
+        v = pro_attn.ProVariants(**variants)
+        monkeypatch.setattr(pro_attn, "_variants", v)
+        state.moe_tail = None
+        ffn, *_ = layer._segment(o, residual.clone(), v, True, True)
+        return ffn, state.take_moe_tail()
+
+    want, _ = segment()
+    got, tail = segment(moe_tail_ar=True)
+    assert tail is None
+    assert torch.equal(got, want)

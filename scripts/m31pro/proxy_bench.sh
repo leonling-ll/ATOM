@@ -10,8 +10,9 @@
 # Run it inside the ATOM image (aiperf from agentx-harness on PATH) with this
 # tree importable, under the node's end-to-end lock. It
 #   1. writes the session subset (trace_subset.py) to OUT_DIR/traces,
-#   2. starts the server with the Pro recipe's fast configuration (RECIPE=pro)
-#      or the Agentic recipe's launch (RECIPE=agentic), plus DSpark at
+#   2. starts the server with the Pro recipe's fast configuration (RECIPE=pro),
+#      the Agentic recipe's launch (RECIPE=agentic) or its small-concurrency
+#      launch (RECIPE=agentic_sc), plus DSpark at
 #      SPEC_TOKENS draft tokens and a forced acceptance length: Pro's golden AL
 #      for that draft length unless ACCEPT_LENGTH is set,
 #   3. replays the subset at concurrency CONC for DURATION seconds,
@@ -35,19 +36,22 @@
 #   RECIPE           pro: recipes/MiniMax-M3-Pro.md's fast configuration;
 #                    agentic: the launch in recipes/Agentic-MiniMax-M3.1-Pro.md's
 #                    "1. Start the ATOM server", every env and flag of it
-#                    (tests/test_m31pro_proxy_bench.py diffs the two) [pro]
-#   CHAT_TEMPLATE    agentic: --chat-template file; unset, a checkpoint
+#                    (tests/test_m31pro_proxy_bench.py diffs the two);
+#                    agentic_sc: the same recipe's "Small concurrency (CONC
+#                    1-16)" launch, section 1 without LMCache, cache-aware
+#                    admission and index_compress [pro]
+#   CHAT_TEMPLATE    agentic*: --chat-template file; unset, a checkpoint
 #                    chat_template.jinja without the thinking_mode switch (the
 #                    1 KB stub) is refused []
 #   MAX_NUM_SEQS     [16 below CONC 8, else 2 x CONC]
 #   MAX_MODEL_LEN    [MAX_CONTEXT + 1024: room for the chat template]
 #   PORT             server port [8300]
-#   GPU_MEM_UTIL     --gpu-memory-utilization [pro 0.94, agentic 0.95]
+#   GPU_MEM_UTIL     --gpu-memory-utilization [pro 0.94, agentic* 0.95]
 #   SERVER_EXTRA     more server flags, split on spaces, e.g. --load_dummy=xavier []
 #   ATOM_CUSTOM_AR_POOL_BYTES  custom all-reduce input pool [134217728]
-#   GPTOSS_SWIGLU_MXFP4_BF16_BOUND  agentic: bf16 MoE activation bound [1040]
+#   GPTOSS_SWIGLU_MXFP4_BF16_BOUND  agentic*: bf16 MoE activation bound [1040]
 #   ATOM_M3PRO_VARIANTS  Pro attention variants: pro replaces its variants with
-#                    it; agentic merges it onto the recipe's, so a caller adds
+#                    it; agentic* merge it onto the recipe's, so a caller adds
 #                    keys such as {"index": "fused", "ar_fused_rows": 128}
 #                    [RECIPE's]
 #   PROXY_DRY_RUN    1: print the acceptance length, the server environment and
@@ -125,10 +129,13 @@ pro)
     default_variants='{"kernels": true, "attn": "aiter", "topk": "fused"}'
     export GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.94}"
     ;;
-agentic)
+agentic | agentic_sc)
     # ar_lamport_rows needs the Lamport path.
     unset AITER_CUSTOM_AR_DISABLE_LAMPORT
-    recipe_variants='{"kernels": true, "attn": "aiter", "topk": "split", "prep": "aiter", "index_split": true, "score_tq": 8, "ar_lamport_rows": 16, "k_only": true, "k_plain_fp8": true, "prefill_attn": "day0", "index_split_decode": 64, "moe_route_glue": true, "index_compress": true}'
+    recipe_variants='{"kernels": true, "attn": "aiter", "topk": "split", "prep": "aiter", "index_split": true, "score_tq": 8, "ar_lamport_rows": 16, "k_only": true, "k_plain_fp8": true, "prefill_attn": "day0", "index_split_decode": 64, "moe_route_glue": true'
+    # Up to 16 rows the centroid writes cost more than the faster scoring saves.
+    [ "$RECIPE" = agentic_sc ] || recipe_variants+=', "index_compress": true'
+    recipe_variants+='}'
     default_variants=$(python3 -c 'import json, sys
 print(json.dumps({**json.loads(sys.argv[1]), **json.loads(sys.argv[2] or "{}")}))'         "$recipe_variants" "${ATOM_M3PRO_VARIANTS:-}")
     unset ATOM_M3PRO_VARIANTS
@@ -138,12 +145,16 @@ print(json.dumps({**json.loads(sys.argv[1]), **json.loads(sys.argv[2] or "{}")})
     export GPTOSS_SWIGLU_MXFP4_BF16_BOUND="${GPTOSS_SWIGLU_MXFP4_BF16_BOUND:-1040}"
     export ATOM_WARMUP_TOKENS=auto
     export ATOM_ONLINE_QUANT_STREAMING=1
-    export ATOM_CACHE_AWARE_ADMISSION=1
-    export ATOM_KV_OFFLOAD=lmcache
-    export LMCACHE_LOCAL_CPU=True
-    export LMCACHE_MAX_LOCAL_CPU_SIZE=184
-    export LMCACHE_CHUNK_SIZE=256
-    export PYTHONHASHSEED=0
+    # Up to CONC 16 the HBM pool holds the sessions' prefixes; offload and
+    # admission cost interactivity there.
+    if [ "$RECIPE" = agentic ]; then
+        export ATOM_CACHE_AWARE_ADMISSION=1
+        export ATOM_KV_OFFLOAD=lmcache
+        export LMCACHE_LOCAL_CPU=True
+        export LMCACHE_MAX_LOCAL_CPU_SIZE=184
+        export LMCACHE_CHUNK_SIZE=256
+        export PYTHONHASHSEED=0
+    fi
     export ATOM_TOKEN_GRAPH_SIZES="${ATOM_TOKEN_GRAPH_SIZES:-256,512,1024,2048}"
     # Graphs between 8, 16 and 32 sequences: a step replays the smallest graph
     # that holds its sequences, and padded rows cost index score time.
@@ -160,7 +171,7 @@ print(json.dumps({**json.loads(sys.argv[1]), **json.loads(sys.argv[2] or "{}")})
     fi
     ;;
 *)
-    echo "proxy_bench: RECIPE must be pro or agentic, not $RECIPE" >&2
+    echo "proxy_bench: RECIPE must be pro, agentic or agentic_sc, not $RECIPE" >&2
     exit 1
     ;;
 esac
