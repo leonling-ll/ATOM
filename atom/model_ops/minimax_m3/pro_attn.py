@@ -1115,6 +1115,9 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
             and v.topk in ("fused", "split")
             and self.num_heads == 16
             and self.topk == pro_kernels.TOPK
+            # its block list is TOPK wide: a dense prefill past TOPK blocks (dense_only)
+            # attends every block with the Triton / aiter attention instead
+            and (not v.dense_only or nb <= self.topk)
             and pro_kernels.day0_prefill_available(kc4.shape[-2])
         )
 

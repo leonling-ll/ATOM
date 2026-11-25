@@ -1751,6 +1751,58 @@ class TestImplGlue:
         assert (sel[valid] <= qb[valid]).all()
         assert torch.equal(valid.sum(1), torch.clamp(c.pos // PG + 1, max=8))
 
+    @pytest.mark.parametrize("lens", [[150, 97], [128, 97]])
+    def test_dense_only_day0_prefill_attends_every_block(self, lens, monkeypatch):
+        # dense_only beside prefill_attn="day0": the day0 kernel takes a TOPK-wide block
+        # list, so a prefill past TOPK blocks (150 tokens: 10 blocks of 16, TOPK 8) must
+        # still attend all of them; one within TOPK keeps the day0 prefill (dispatch
+        # only: the attention kernels are recorders)
+        c = Case(lens, topk=8, seed=3, kv_dtype=FP8, k_only=True)
+        c.impl.k_only = True
+        self._impl_with_rope(c, ProVariants())
+        monkeypatch.setattr(K, "TOPK", 8)
+        monkeypatch.setattr(K, "day0_prefill_available", lambda page=K.PAGE: True)
+        seen = {}
+
+        def day0_kernel(q, kc, sel, bt, seq, pos, scale, out):
+            seen["day0"] = sel.clone()
+
+        def triton_attention(q, kc4, bt, seq, pos, sel, out, scale, *a, **k):
+            seen["triton"] = (sel, k.get("n_blocks"))
+            return out
+
+        monkeypatch.setattr(K, "_day0_prefill", day0_kernel)
+        monkeypatch.setattr(K, "attention", triton_attention)
+        kw = {"topk": "fused", "k_only": True, "dense_only": True}
+        kw.update(k_plain_fp8=True, prefill_attn="day0")
+        nb = c.bt.shape[1]
+        out = torch.zeros(c.T, H * VD, dtype=DT, device=DEV)
+        c.impl._kernel_attention(
+            c.qkv,
+            c.pos,
+            c.seq,
+            c.slot,
+            c.bt,
+            c.layer,
+            c.ic,
+            nb,
+            ProVariants(**kw),
+            out,
+        )
+        j = torch.arange(nb, device=DEV)
+        want = j[None, :] <= (c.pos // PG)[:, None]  # [T, nb]: every causal block
+        if "day0" in seen:
+            sel = seen["day0"].long()
+            got = torch.zeros_like(want)
+            for r in range(c.T):
+                got[r, sel[r][sel[r] >= 0]] = True
+        else:
+            sel, n_blocks = seen["triton"]
+            assert sel is None
+            got = want & (j[None, :] < n_blocks)
+        assert torch.equal(got, want)
+        assert ("day0" in seen) == (nb <= 8)  # a prefill within TOPK stays on day0
+
     def _reference(self, c, v, seen, v_cache=False):
         k_all, ik_all = c.cached()
         v_all = c.cached_v() if v_cache else None
