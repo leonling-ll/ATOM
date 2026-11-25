@@ -2042,7 +2042,9 @@ def _merge_keys(base, count, K: tl.constexpr, VOLATILE: tl.constexpr):
 
 
 # SPAN is a runtime argument: a long prefill's SPAN grows with its context (a value per
-# 16k-token band), and as a constexpr each new value compiled this large kernel again
+# 16k-token band), and as a constexpr each new value compiled this large kernel again.
+# WIDE (SPAN > CHUNK) stays a constexpr: spans of one chunk (decode, short prefills) run
+# a kernel compiled without the chunk loop, smaller and faster; one more serves the rest
 @triton.jit(
     do_not_specialize=[
         "stride_s",
@@ -2074,7 +2076,10 @@ def _select_split_kernel(
     FUSED: tl.constexpr,
     IS_HIP: tl.constexpr,
     LOGICAL: tl.constexpr = False,
+    WIDE: tl.constexpr = True,
 ):
+    if not WIDE:  # a chunk a span: a constant, so no chunk loop is compiled
+        SPAN = CHUNK
     t = tl.program_id(0)
     part = tl.program_id(1)
     qpos = tl.load(pos_ptr + t)
@@ -2268,6 +2273,7 @@ def select_rows_split(
         FUSED=fused,
         IS_HIP=dev.type == "cuda" and torch.version.hip is not None,
         LOGICAL=logical,
+        WIDE=span > chunk,
         num_warps=num_warps,
     )
     if not fused and parts > 1:

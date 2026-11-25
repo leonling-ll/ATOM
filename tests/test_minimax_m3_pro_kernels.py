@@ -982,8 +982,9 @@ class TestSelectRowsSplit:
     @pytest.mark.parametrize("fused", [True, False])
     def test_one_compile_serves_every_context(self, fused):
         # 512+ rows run one span over the whole row, so a prefill's span grows a 16k-token
-        # band at a time (fewer rows: 2 to 9 spans of 1024-3072 blocks). Every one of them
-        # must run on the kernels compiled for the first: a compile is seconds of stall
+        # band at a time (fewer rows: 2 to 9 spans of 1024-3072 blocks). A compile is
+        # seconds of stall: the span kernel compiles once for one-chunk spans and once
+        # for every wider one, the merge once, whatever the context
         dev = torch.cuda.current_device()
         kernels = (K._select_split_kernel, K._select_merge_kernel)
         for kernel in kernels:
@@ -1000,7 +1001,7 @@ class TestSelectRowsSplit:
                     width,
                 )
         compiled = [len(kernel.device_caches[dev][0]) for kernel in kernels]
-        assert compiled == [1, 0 if fused else 1]
+        assert compiled == [2, 0 if fused else 1]
 
     @pytest.mark.skipif(not GPU, reason="CUDA graphs need a GPU")
     @pytest.mark.parametrize("t", [4, 32])
