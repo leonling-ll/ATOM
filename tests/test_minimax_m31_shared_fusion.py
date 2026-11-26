@@ -204,9 +204,30 @@ def test_refuses_eplb_routed_shared_expert():
         staging_mod.SharedExpertStaging(layer, None, H, I_LOCAL)
 
 
-def test_refuses_online_requant_of_the_routed_experts(monkeypatch):
-    """The shared slot is written as MXFP4, so the routed experts must stay it."""
+def _online_target(quant_type, quant_dtype):
+    spec = SimpleNamespace(quant_type=quant_type, quant_dtype=quant_dtype)
+    return SimpleNamespace(get_layer_quant_config=lambda *_, **__: spec)
+
+
+def test_refuses_online_requant_of_the_routed_experts_to_non_mxfp4(monkeypatch):
+    """The shared slot is written as MXFP4, so the routed experts must end up it."""
+    from aiter import QuantType, dtypes
+
     layer = _fused_mxfp4_layer()
     monkeypatch.setattr(staging_mod, "will_online_requant", lambda *_: True)
     with pytest.raises(NotImplementedError, match="online_quant_config"):
-        staging_mod.SharedExpertStaging(layer, None, H, I_LOCAL)
+        staging_mod.SharedExpertStaging(
+            layer, _online_target(QuantType.per_1x32, dtypes.fp8), H, I_LOCAL
+        )
+
+
+def test_accepts_online_requant_of_the_routed_experts_to_mxfp4(monkeypatch):
+    """MiniMax-M3.1-Pro: NVFP4 routed experts become MXFP4 online, before `fuse`."""
+    from aiter import QuantType, dtypes
+
+    layer = _fused_mxfp4_layer()
+    monkeypatch.setattr(staging_mod, "will_online_requant", lambda *_: True)
+    staging = staging_mod.SharedExpertStaging(
+        layer, _online_target(QuantType.per_1x32, dtypes.fp4x2), H, I_LOCAL
+    )
+    assert staging.staged["w13_weight"].shape == (SHARED, 2 * I_LOCAL, H)
