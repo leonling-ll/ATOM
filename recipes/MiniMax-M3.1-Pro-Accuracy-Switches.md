@@ -56,6 +56,14 @@ over the 9 run pairs between two arms; the repeats inside one arm give 0.04-1.00
     Triton attention's level. GSM8K 0.9454 / 0.9363 / 0.9409, mean 0.9409, against 0.9414 without
     it, McNemar p 0.25-1.00: no shift. Gain: one rank's attention 4-6× faster (23-45 against
     90-238 µs a layer at 256-768 rows); part of the DCP 8 CONC 64 row's +6.5%.
+  - `index_compress` + `dcp_index_day0` (both off by default): the bf16 centroid index cache under
+    DCP (each rank pools the blocks it holds), and a prefill's split indexer runs `index_day0` over
+    the centroids the prefill gathers: the same kernel on the same pages as DCP 1's `index_day0`,
+    so the same picks (checked on all 8 ranks). GSM8K with both on top of the recipe's variants:
+    0.9393 / 0.9416 / 0.9348, mean 0.9386, against 0.9409 with `dcp_day0_decode`, McNemar p
+    0.11-1.00 (0.25-1.00 against the three switches above, 0.17-1.00 against plain DCP 8): no
+    shift. Gain: one rank's prefill indexer 6.2-7.7× faster at 16K-row steps (311 against 2412 µs
+    a layer at 16K rows, 124K context).
 
 ## Bit-identical switches
 
