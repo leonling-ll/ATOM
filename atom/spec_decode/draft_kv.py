@@ -54,21 +54,33 @@ class DraftKvPoolSpec:
 
     Declaring one says the draft sits outside the DCP group, so every rank
     stores every position a target block id covers. An entry is then
-    `block_size * dcp` tokens, which only the FLASH order reads, and the block
-    is the scheduler's, the unit the target's block tables count in. The
-    proposer's addressing and the pool's geometry both key on the declaration,
-    so they cannot disagree.
+    `block_size * dcp` tokens, and the block is the scheduler's, the unit the
+    target's block tables count in. The proposer's addressing and the pool's
+    geometry both key on the declaration, so they cannot disagree.
+
+    `flash_layout` reads an entry in the FLASH order. False keeps the SHUFFLE
+    order at block granularity: an entry is `dcp` blocks end to end, so slot
+    `entry * entry_tokens + off` is block `slot // block_size` of the pool,
+    for a draft whose writer and reader are page kernels.
 
     `kv_scale` is the one per-tensor scale K and V are stored at, which
-    `DraftKvBuilder` places at bind. Only 1.0 is accepted: the pool has no
-    scale planes and nothing loads a scale into it.
+    `DraftKvBuilder` places at bind. Only 1.0 is accepted: nothing loads a
+    scale into the pool. `own_scales` binds the SHUFFLE pool's per-token fp8
+    scale planes instead, as the generic pool does (MiniMax-M3-Pro's draft
+    writes and reads them).
     """
 
     kv_scale: float = 1.0
+    flash_layout: bool = True
+    own_scales: bool = False
+
+    def __post_init__(self):
+        if self.own_scales and self.flash_layout:
+            raise ValueError("a FLASH-layout pool has no per-token scale planes")
 
     def pool_kwargs(self, dcp: int) -> dict:
         """What `make_kv_pool` takes beyond the geometry."""
-        return {"blocks_per_entry": dcp, "flash_layout": True}
+        return {"blocks_per_entry": dcp, "flash_layout": self.flash_layout}
 
     def block_size(self, config) -> int:
         """The block the pool is built at, the scheduler's. The target's
@@ -138,7 +150,7 @@ def draft_kv_builder(model_runner, draft_hf, model):
         dcp = model_runner.config.decode_context_parallel_size
         spec_kwargs = spec.pool_kwargs(dcp)
         block_size = spec.block_size(model_runner.config)
-        kv_scale = spec.kv_scale
+        kv_scale = None if spec.own_scales else spec.kv_scale
     make_pool = partial(
         backend.make_kv_pool,
         draft_hf,
@@ -175,8 +187,8 @@ class DraftKvBuilder(PoolRowsMixin):
     builder's, which does not exist yet when this is constructed.
 
     `kv_scale` is the per-tensor scale the draft's `kv_pool_spec` declares;
-    None, for a draft that declares no spec, binds the pool's own fp8 scale
-    planes instead.
+    None, for a draft that declares no spec or one with `own_scales`, binds the
+    pool's own fp8 scale planes instead.
     """
 
     def __init__(

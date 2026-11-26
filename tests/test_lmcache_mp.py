@@ -177,6 +177,44 @@ def test_dcp8_keeps_shards_and_uses_global_block_boundaries(monkeypatch, nested)
         deployment._validate_mp_config(config)
 
 
+def _m3_pro(**kwargs):
+    """MiniMax-M3-Pro (one KV head, its KV shared) with its DSpark draft, which
+    caches into a pool of its own."""
+    config = _config(**kwargs)
+    config.kv_cache_block_size = 16
+    config.dcp_config = SimpleNamespace(interleave_size=16)
+    config.hf_config.num_key_value_heads = 1
+    config.hf_config.sparse_attention_config = {
+        "use_sparse_attention": True,
+        "sparse_enable_kv_share": True,
+    }
+    config.speculative_config = SimpleNamespace(
+        method="dspark",
+        draft_model_hf_config=SimpleNamespace(num_key_value_heads=1),
+    )
+    return config
+
+
+def test_dcp8_admits_minimax_m3_pro_with_its_draft_pool():
+    """M3-Pro at TP8+DCP8: each rank's object is its shard of the target and the whole
+    draft, in the same block ids, so every rank keeps its own (no collapse) at 128-token
+    global blocks."""
+    config = _m3_pro(tp=8, dcp=8)
+    assert deployment._validate_mp_config(config) == (8, 1)
+    assert deployment._tp_replication_factor(config) == 1
+    worker = mp_worker.LMCacheMPConnector(config)
+    assert worker.block_size == 128
+    req = LMCacheReqMeta(req_id=1, token_ids=list(range(512)), block_ids=[7, 3, 9, 4])
+    assert worker._block_slice(req, 256, 512) == [9, 4]
+    extra = config.kv_transfer_config["kv_connector_extra_config"]
+    extra["lmcache.mp.tp_rank_collapse"] = True
+    with pytest.raises(ValueError, match="discard DCP shards"):
+        deployment._tp_replication_factor(config)
+    for kwargs in ({"tp": 8, "dcp": 4}, {"tp": 8, "dcp": 8, "dp": 2}):
+        with pytest.raises(NotImplementedError, match="does not support DCP"):
+            deployment._validate_mp_config(_m3_pro(**kwargs))
+
+
 @pytest.mark.parametrize(
     "kwargs",
     [

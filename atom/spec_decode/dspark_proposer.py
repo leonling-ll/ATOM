@@ -772,7 +772,8 @@ class DSparkProposer(Drafter):
                     "target's slots can't address (DCP > 1), so the target's "
                     "attention metadata builder must publish its context "
                     "slots as forward_vars['draft_ctx_slots'] (the Kimi MLA/GDN "
-                    "builders in kimi_mla_gdn_attn.py do); this target's does not."
+                    "and AITER MHA builders do, through DraftCtxSlotsMixin); this "
+                    "target's does not."
                 )
             slot_mapping = ctx_slots.gpu[:num_rows]
         else:
@@ -1018,7 +1019,15 @@ class DSparkProposer(Drafter):
         if builds_block:
             # The positions, slots and lengths below and the draft's own
             # per-row tables, in one launch into the same buffers (MiniMax-
-            # M3.1, non-DCP and non-MLA by construction).
+            # M3.1, non-MLA by construction; under DCP its pool is outside the
+            # group, `entry_tokens` a block id).
+            entry_tokens = self._draft_entry_tokens
+            if entry_tokens != block_size:
+                # The target's table is `max_model_len / block_size` wide; the
+                # draft's per-row tables are as many pages as it has columns.
+                block_tables = block_tables[
+                    :, : triton.cdiv(self.config.max_model_len, entry_tokens)
+                ]
             slots = self._blk_slots[: running_bs * T]
             ctx_lens = self._blk_ctx_lens[:running_bs]
             self.model.build_paged_block(
@@ -1030,7 +1039,7 @@ class DSparkProposer(Drafter):
                 ctx_lens,
                 block_table_state(self.runner.forward_vars["block_tables"]).lengths,
                 scheduled_bs,
-                self._draft_entry_tokens,
+                entry_tokens,
                 self._paged_pad_ctx_len,
             )
             self._publish_paged_block(

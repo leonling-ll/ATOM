@@ -15,6 +15,7 @@ from atom.model_ops.utils import _has_module
 from atom.quant_spec import (
     fuses_mxfp8_shared_into_mxfp4,
     fuses_ptpc_shared_into_online_ptpc,
+    loaded_routed_spec,
 )
 from atom.utils import envs
 from atom.utils.custom_register import direct_register_custom_op
@@ -72,7 +73,10 @@ def is_rocm_aiter_fusion_shared_expert_enabled_for_quant_config(
                 and shared_spec.quant_type == routed_spec.quant_type
                 and shared_spec.is_dynamic == routed_spec.is_dynamic
             )
-            or fuses_mxfp8_shared_into_mxfp4(shared_spec, routed_spec)
+            or fuses_mxfp8_shared_into_mxfp4(
+                shared_spec,
+                loaded_routed_spec(quant_config, routed_expert_prefix, routed_spec),
+            )
             or (
                 routed_expert_prefix is not None
                 # The FP8 online method has no all2all shared-expert dispatch.

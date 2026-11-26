@@ -256,6 +256,15 @@ class ProVariants:
     # minimax_m3_fp8_sparse_prefill; needs k_plain_fp8, 16 local heads and an aiter that
     # has it, else "triton").
     prefill_attn: str = "triton"
+    # A split prefill's indexer (``index_split``) on aiter's FlyDSL minimax_m3_index_top128
+    # (amd-kernels-day0's index_top128, vLLM's prefill indexer, ported into aiter): this
+    # rank's rows scored and selected over the compressed index cache in two launches (after
+    # a gather of the centroids into its 64-token pages) instead of the score_tq scores and
+    # the split selection, picks valid first for the day0 prefill attention. Its scores are
+    # fp16 (the Triton ones fp32), so a near-tie can pick another block, as in vLLM. Needs
+    # index_compress, "max" heads, prefill_attn "day0" and no DCP; with an aiter that lacks
+    # it (or off gfx950) the Triton kernels run.
+    index_day0: bool = False
     # Decode / verify batches of at least this many rows attend with amd-kernels-day0's FlyDSL
     # sparse decode as ported into aiter, aiter.ops.flydsl's minimax_m3_fp8_sparse_decode
     # (one workgroup a row: ahead of the paged attention from ~24 rows), on the K-only plain
@@ -342,6 +351,7 @@ def assemble_rows(gathered: torch.Tensor, seg: int, n: int, tp: int) -> torch.Te
 _variants = ProVariants()
 _variants_src = None  # (string or path, mtime) the live `_variants` came from
 _variants_checked = 0.0
+_day0_index_warned = set()  # the reasons index_day0 did not run, logged once
 
 
 def _parse_variants(obj: dict) -> ProVariants:
@@ -561,6 +571,7 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
         from atom.config import get_current_atom_config
 
         self.dcp_world = get_current_atom_config().decode_context_parallel_size
+        self.max_model_len = get_current_atom_config().max_model_len
         if self.k_only:
             from atom.config import kv_cache_torch_dtype
 
@@ -1119,9 +1130,6 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
             k_scale=ks,
             v_scale=vs,
         )
-        if self.dcp_world > 1 and not static:
-            # prep wrote this rank's blocks; the prefill reads every rank's
-            kc4, ks, ic, block_tables = self._dcp_prefill_caches(kc4, ks, ic)
         if compress:
             # the groups this step closes, before any score reads them (a prefill chunk's
             # later rows read its earlier, older-than-local blocks)
@@ -1144,6 +1152,10 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
                 ic,
                 max_rows=max_rows if v.index_compress_fused else 0,
             )
+        if self.dcp_world > 1 and not static:
+            # prep and compress_insert wrote this rank's blocks, at its slots; the
+            # prefill reads every rank's
+            kc4, ks, ic, block_tables = self._dcp_prefill_caches(kc4, ks, ic)
         scale = self.scale * v.scale_mult
         nblk = v.attn_nblk
         # MI355X, decode over top-128 (opt/kv/bench_decode_attn.py, valid_first, nblk 4):
@@ -1283,6 +1295,25 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
             # every row scores alone, so this rank's rows come out as they would in full
             idx, seg, n_rows, tp = split
             rq, rseq, rpos = iq[idx], seq_id[idx], positions[idx]
+            plan = (
+                self._day0_index_plan(block_tables, split)
+                if day0 and self._day0_index_ok(v, ic, init, local)
+                else None
+            )
+            if plan is not None:
+                from aiter.dist.communication_op import tensor_model_parallel_all_gather
+
+                # the rows past this rank's (the last segments' padding) are dropped
+                mine = torch.empty(2 * seg, k, dtype=torch.int32, device=iq.device)
+                pro_kernels.index_day0(
+                    rq, ic, plan, sc * self.index_head_dim**-0.5, init, local, mine
+                )
+                valid_first = True
+                return attend(
+                    assemble_rows(
+                        tensor_model_parallel_all_gather(mine, dim=0), seg, n_rows, tp
+                    ).contiguous()
+                )
         if self._fused_index(v, static, split, ic, n, dsplit, nb):
             # each group of `rows` rows is one sequence's: k + 1 a verify, so the
             # largest power of two (at most 8) dividing them
@@ -1462,6 +1493,7 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
             )
         qpos = cached[1]
         nbl = -(-block_tables.shape[1] // w)
+        rps = n // block_tables.shape[0]
         score = pro_kernels.scores(
             iq,
             ic,
@@ -1477,7 +1509,8 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
             head_mode=head_mode,
             pool_temp=v.pool_scale,
             causal=True,
-            tq=v.score_tq if n > block_tables.shape[0] else 0,
+            # tiles of one sequence's rows, as without DCP
+            tq=min(v.score_tq, rps & -rps) if rps > 1 else 0,
         )
         pro_kernels.dcp_pin(score, positions, r, w, init, local)
         score = pro_kernels.dcp_interleave(dcp_all_gather(group, score, 0), w)
@@ -1593,6 +1626,45 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
                 )
                 plan = (idx, seg, n, tp)
         md._m3pro_split = plan
+        return plan
+
+    def _day0_index_ok(self, v, ic, init, local) -> bool:
+        """Whether a split prefill's indexer runs ``index_day0`` (the variant, on a model and
+        caches it serves)."""
+        if not (
+            v.index_day0
+            and v.index_compress
+            and v.head_reduce == "max"
+            and self.dcp_world == 1
+            and ic.dtype == torch.bfloat16
+        ):
+            return False
+        why = pro_kernels.day0_index_blocker(init, local, self.max_model_len)
+        if why is not None and why not in _day0_index_warned:
+            _day0_index_warned.add(why)
+            logger.warning("M3-Pro index_day0: Triton indexer (%s)", why)
+        return why is None
+
+    def _day0_index_plan(self, block_tables, split):
+        """This forward's ``day0_index_plan`` of this rank's ``split`` rows (its two
+        ``row_split_index`` segments), built at the first layer."""
+        md = get_forward_context().attn_metadata
+        plan = getattr(md, "_m3pro_day0_index", False)
+        if plan is False:
+            from aiter.dist.parallel_state import get_tensor_model_parallel_rank
+
+            _, seg, n, tp = split
+            rank = get_tensor_model_parallel_rank()
+            mirror = 2 * tp - 1 - rank
+            # the first segment is always whole, so the second's rows start at row seg
+            ranges = (
+                (rank * seg, (rank + 1) * seg),
+                (mirror * seg, min(n, (mirror + 1) * seg)),
+            )
+            assert ranges[0][1] <= n, (n, seg, tp)
+            cu, ctx = self._cpu_lengths(md)
+            plan = pro_kernels.day0_index_plan(block_tables, cu, ctx, ranges)
+            md._m3pro_day0_index = plan
         return plan
 
     def _cpu_lengths(self, md):

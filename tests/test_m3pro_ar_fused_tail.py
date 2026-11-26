@@ -180,6 +180,35 @@ def test_fused_rows_off_never_calls_the_lamport_op(tp_ar):
     assert [c[0] for c in tp_ar.calls] == ["fused"]
 
 
+@pytest.mark.parametrize("rows", [4, 17])
+def test_reduced_rows_take_the_tp1_norm_into_the_callers_rows(
+    tp_ar, monkeypatch, rows
+):
+    # TP MegaMoE all-reduced the MoE output in-kernel: only the add + norm run
+    seen = []
+
+    def norm_mx(x, residual, norm, write_bf16=True, q_out=None, q_scale_out=None):
+        seen.append((x, q_out, q_scale_out))
+        return x, q_out, q_scale_out, residual
+
+    monkeypatch.setattr(tp_ar.layernorm, "_lamport_ar_on", lambda: True)
+    monkeypatch.setattr(tp_ar.layernorm, "gemma_rms_norm_mxfp8", norm_mx)
+    layernorm = tp_ar.layernorm
+    assert layernorm.fused_allreduce_gemma_rms_norm_mxfp8_writes_out(
+        rows, _NORM, 16, reduced=True
+    )
+    x, res = _rows(rows, seed=1), _rows(rows, seed=2)
+    q_out = torch.zeros(rows, 64, dtype=torch.uint8)
+    q_scale_out = torch.zeros(rows, 2, dtype=torch.uint8)
+    layernorm.fused_allreduce_gemma_rms_norm_mxfp8(
+        x, res, _NORM, 16, 16, q_out=q_out, q_scale_out=q_scale_out, reduced=True
+    )
+    assert tp_ar.calls == []
+    assert len(seen) == 1
+    got_x, got_q, got_s = seen[0]
+    assert got_x is x and got_q is q_out and got_s is q_scale_out
+
+
 class _Shared(nn.Module):
     def forward(self, x, x_scale=None, quant_down=False):
         return x * 0.37 + 1.0
@@ -245,6 +274,7 @@ def _layers(load, monkeypatch, num_layers=3, end_layer=None):
         addend=None,
         q_out=None,
         q_scale_out=None,
+        reduced=False,
     ):
         seen.append((norm.layer, addend))
         h = _ar_ref(x if addend is None else x + addend, residual)

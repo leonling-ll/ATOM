@@ -261,6 +261,10 @@ def config_refusal(atom_config) -> str | None:
         * (getattr(hf, "partial_rotary_factor", 1.0) or 1.0)
     )
     checks = [(envs.ATOM_MONO_ENABLE, "switched off")]
+    # A mono layer hands on its FFN's TP partial, which the next input norm no
+    # longer reduces once TP MegaMoE owns the MoE layers.
+    backend = getattr(atom_config, "moe_backend", None)
+    checks += [(backend != "mega", "--moe-backend mega")]
     # Decode CP is harmless: the attention, the only reader of the KV split,
     # stays on the production path (``common_refusals``' docstring).
     checks += common_refusals(

@@ -100,6 +100,7 @@ from atom.quant_spec import (
     LayerQuantConfig,
     fuses_mxfp8_shared_into_mxfp4,
     fuses_ptpc_shared_into_online_ptpc,
+    loaded_routed_spec,
     should_skip_online_quant,
     should_stream_online_quant,
     validate_nvfp4_global_scales,
@@ -2779,8 +2780,9 @@ class MegaMxfp4MoEMethod(Mxfp4MoEMethod):
 def _make_mxfp4_moe_method(
     quant_config: LayerQuantConfig, moe: FusedMoEConfig
 ) -> Mxfp4MoEMethod:
-    # Under SP, `mega` runs SP MegaMoE over the native weights instead.
-    if get_current_atom_config().moe_backend == "mega" and not sp_is_enabled():
+    # Without EP, `mega` runs SP / TP MegaMoE over the native weights instead.
+    config = get_current_atom_config()
+    if config.moe_backend == "mega" and config.enable_expert_parallel:
         return MegaMxfp4MoEMethod(quant_config, moe)
     return Mxfp4MoEMethod(quant_config, moe)
 
@@ -3756,7 +3758,10 @@ class FusedMoE(torch.nn.Module):
         )
         stage_shared = stage_shared_ptpc or bool(
             shared_spec is not None
-            and fuses_mxfp8_shared_into_mxfp4(shared_spec, layer_quant_config)
+            and fuses_mxfp8_shared_into_mxfp4(
+                shared_spec,
+                loaded_routed_spec(quant_config, prefix, layer_quant_config),
+            )
         )
 
         eplb_enabled = self.use_ep and getattr(atom_config, "eplb_enable", False)
@@ -4081,13 +4086,24 @@ class FusedMoE(torch.nn.Module):
         )
 
     def process_weights_after_loading(self):
+        if (
+            getattr(self, "online_quant", False)
+            and self.shared_expert_staging is not None
+            and torch.cuda.is_available()
+        ):
+            # Return the previous layer's freed source buffers and shuffle
+            # temporaries: each conversion allocates larger targets than those
+            # holes (MiniMax-M3.1-Pro with a fused shared expert ran out at load
+            # with ~70 GB reserved but unallocated).
+            torch.cuda.empty_cache()
         self._online_quant()
         if self.shared_expert_staging is not None:
             self.shared_expert_staging.fuse(self)
         self._validate_moe_backend()
 
     def _validate_moe_backend(self) -> None:
-        if get_current_atom_config().moe_backend != "mega" or sp_is_enabled():
+        config = get_current_atom_config()
+        if config.moe_backend != "mega" or not config.enable_expert_parallel:
             return
         if not isinstance(self.quant_method, MegaMxfp4MoEMethod):
             raise TypeError(
@@ -4412,14 +4428,18 @@ class FusedMoE(torch.nn.Module):
             # EPLB redundant replicas are exempt: fill_redundant copies them
             # from their base experts only after this conversion has run, so
             # their slots still hold the zero placeholder here.
+            # The fused shared slots after the replicas are checked too, unless
+            # SharedExpertStaging writes them (from MXFP8) after this conversion.
             n_base = self.num_local_base_experts
-            replicas_end = self.expert_layout.routed_physical_per_rank
+            shared_lo = self.expert_layout.routed_physical_per_rank
+            staged = getattr(self, "shared_expert_staging", None) is not None
             for what, scale_2 in (
                 ("w13_weight_scale_2", old_w13_scale_2),
                 ("w2_weight_scale_2", old_w2_scale_2),
             ):
+                shared = scale_2[shared_lo:shared_lo] if staged else scale_2[shared_lo:]
                 validate_nvfp4_global_scales(
-                    torch.cat((scale_2[:n_base], scale_2[replicas_end:])),
+                    torch.cat((scale_2[:n_base], shared)),
                     self.layer_name,
                     what,
                 )
