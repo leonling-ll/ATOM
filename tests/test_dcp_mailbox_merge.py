@@ -39,7 +39,7 @@ def _group(world=4):
 def a2a_calls(monkeypatch):
     calls = []
 
-    def fake_a2a(out, lse, group, owned_counts=None, quant_dtype=None):
+    def fake_a2a(attn_out, lse, group, owned_counts=None, quant_dtype=None, out=None):
         calls.append(quant_dtype)
         return "a2a"
 

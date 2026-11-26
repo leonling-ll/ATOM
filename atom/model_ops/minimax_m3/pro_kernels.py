@@ -1685,6 +1685,8 @@ def _attn_kernel(
     EP2: tl.constexpr = 1,
     MX: tl.constexpr = False,
     WRITE_LSE: tl.constexpr = False,
+    QDT: tl.constexpr = None,
+    LSE_REP: tl.constexpr = 1,
 ):
     t = tl.program_id(0)
     sp = tl.program_id(1)
@@ -1704,6 +1706,8 @@ def _attn_kernel(
     q1 = tl.load(qrow + 64 + ar_c[None, :])
     q2 = tl.load(qrow + 128 + ar_c[None, :])
     q3 = tl.load(qrow + 192 + ar_c[None, :])
+    if QDT is not None:  # an fp8 q, read back in the output's dtype (exactly)
+        q0, q1, q2, q3 = q0.to(QDT), q1.to(QDT), q2.to(QDT), q3.to(QDT)
 
     m_i = tl.full([16], float("-inf"), tl.float32)
     l_i = tl.zeros([16], tl.float32)
@@ -1784,10 +1788,10 @@ def _attn_kernel(
     if SPLITS == 1:
         if WRITE_LSE:  # a token with no visible key here: output 0, lse -inf
             inv = tl.where(l_i > 0, 1.0 / l_i, 0.0)
-            tl.store(
-                lse_ptr + t.to(tl.int64) * H + hbase + ar_h,
-                tl.where(l_i > 0, m_i + tl.log(l_i), float("-inf")),
-            )
+            lse = tl.where(l_i > 0, m_i + tl.log(l_i), float("-inf"))
+            lb = lse_ptr + (t.to(tl.int64) * H + hbase + ar_h) * LSE_REP
+            for r in tl.static_range(LSE_REP):
+                tl.store(lb + r, lse)
         else:
             inv = 1.0 / l_i
         if MX:
@@ -1834,6 +1838,7 @@ def _combine_kernel(
     SP2: tl.constexpr,
     MX: tl.constexpr = False,
     WRITE_LSE: tl.constexpr = False,
+    LSE_REP: tl.constexpr = 1,
 ):
     t = tl.program_id(0)
     h = tl.program_id(1)
@@ -1857,10 +1862,9 @@ def _combine_kernel(
     o = tl.sum(acc * w[:, None], axis=0) / ltot
     if WRITE_LSE:
         o = tl.where(ltot > 0, o, 0.0)
-        tl.store(
-            lse_ptr + t.to(tl.int64) * H + h,
-            tl.where(ltot > 0, mx + tl.log(ltot), float("-inf")),
-        )
+        lse = tl.where(ltot > 0, mx + tl.log(ltot), float("-inf"))
+        for r in tl.static_range(LSE_REP):
+            tl.store(lse_ptr + (t.to(tl.int64) * H + h) * LSE_REP + r, lse)
     if MX:
         # quantize_fp8 of the bf16 row: 6 groups of 32 (the 2 past 192 are dropped)
         q, code, _ = fp8_groups(tl.reshape(o.to(tl.bfloat16).to(tl.float32), (8, 32)))
@@ -1903,6 +1907,7 @@ def attention(
     valid_first=False,
     out_scale=None,
     lse=None,
+    lse_rep=1,
 ):
     """Attention of every token's local heads over its selected blocks.
 
@@ -1913,15 +1918,23 @@ def attention(
     per-token scales ``k_scale`` ``[N, 1, page]``. ``valid_first``: ``sel``'s valid blocks
     lead each row (``select_logical``), and the splits divide those. ``lse`` ``[T, H]``
     fp32: also write each head's log-sum-exp (natural base), -inf with output 0 where the
-    token sees no key, for a log-sum-exp merge of partial outputs.
+    token sees no key, for a log-sum-exp merge of partial outputs; ``lse_rep``: each
+    written that many times in a row, ``[T, H * lse_rep]`` as ``repeat_interleave``.
     ``out_scale`` ``[T, H * 6]`` uint8: ``out`` is E4M3 and the two are ``quantize_fp8`` of
-    the bf16 output, bit for bit (E8M0 codes a group of 32).
+    the bf16 output, bit for bit (E8M0 codes a group of 32). An fp8 ``q`` (a plain cast)
+    attends as its values in ``out``'s dtype (bf16 with ``out_scale``) would.
     """
     t, h, _ = q.shape
     mx = out_scale is not None
     assert not mx or (out.element_size() == 1 and out_scale.dtype == torch.uint8)
     assert not (mx and lse is not None), "MXFP8 output and lse are never combined"
+    assert lse is None or (lse.shape == (t, h * lse_rep) and lse.is_contiguous())
     assert h % 16 == 0 and kc4.stride(-1) == 1 and q.stride(-1) == 1
+    qdt = None
+    if q.element_size() == 1:
+        qdt = {torch.float32: tl.float32, torch.float16: tl.float16}.get(
+            out.dtype, tl.bfloat16
+        )
     fp8 = kc4.element_size() == 1
     assert k_scale is not None or not fp8
     dense = sel is None
@@ -1974,6 +1987,8 @@ def attention(
         EP2=triton.next_power_of_2(n_entries),
         MX=mx,
         WRITE_LSE=lse is not None,
+        QDT=qdt,
+        LSE_REP=lse_rep,
     )
     if splits > 1:
         _combine_kernel[(t, h)](
@@ -1990,6 +2005,7 @@ def attention(
             SP2=triton.next_power_of_2(splits),
             MX=mx,
             WRITE_LSE=lse is not None,
+            LSE_REP=lse_rep,
         )
     return out
 
@@ -2115,21 +2131,26 @@ def _store_rows(
     K: tl.constexpr,
     PG: tl.constexpr,
     LOGICAL: tl.constexpr = False,
+    KEY_R: tl.constexpr = 0,
+    KEY_W: tl.constexpr = 0,
 ):
     """A token's page table from its ``K`` best keys, as ``_rows_kernel``: the full
     blocks in key order, the token's own block last, cut by the context length.
     ``LOGICAL``: the block ids themselves, best first, the valid ones leading and -1
-    after (no page table, no ``ctx``)."""
+    after (no page table, no ``ctx``); with ``KEY_W``, ``dcp_local_keys``' int64 keys
+    of them on rank ``KEY_R`` of ``KEY_W`` instead."""
     qb = qpos // PG
     jj = (0x7FFFFFFF - (top & 0x7FFFFFFF)).to(tl.int32)
     valid = (top >> 32) > _NEG_INF_KEY  # fewer than K causal blocks leave -inf ones in
     # a key read back from the scratch must be one this launch wrote: a causal block
     tl.device_assert(~valid | ((jj >= 0) & (jj <= qb)), "selected block out of range")
     if LOGICAL:
-        tl.store(
-            rows_ptr + t.to(tl.int64) * stride_rows + tl.arange(0, K),
-            tl.where(valid, jj, -1),
-        )
+        rb = rows_ptr + t.to(tl.int64) * stride_rows + tl.arange(0, K)
+        if KEY_W:  # the score's bits as they are, the global block below them
+            g = (0x7FFFFFFF - (jj * KEY_W + KEY_R)).to(tl.int64)
+            tl.store(rb, tl.where(valid, ((top >> 32) << 32) | g, -(2**63)))
+        else:
+            tl.store(rb, tl.where(valid, jj, -1))
         return
     full = (valid & (jj < qb)).to(tl.int32)
     n_full = tl.sum(full, axis=0)
@@ -2159,6 +2180,8 @@ def _select_rows_kernel(
     BW: tl.constexpr,
     PG: tl.constexpr,
     LOGICAL: tl.constexpr,
+    KEY_R: tl.constexpr = 0,
+    KEY_W: tl.constexpr = 0,
 ):
     t = tl.program_id(0)
     seq = tl.load(seq_ptr + t)
@@ -2179,6 +2202,8 @@ def _select_rows_kernel(
         K,
         PG,
         LOGICAL,
+        KEY_R,
+        KEY_W,
     )
 
 
@@ -2296,6 +2321,8 @@ def _select_split_kernel(
     GUARD: tl.constexpr = False,
     rowlen_ptr=None,  # GUARD: [T] int32, each row's causal block count, for the long rows'
     LONG_FROM=0,  # GUARD: rows of at least this many blocks are left to another selector
+    KEY_R: tl.constexpr = 0,
+    KEY_W: tl.constexpr = 0,
 ):
     if not WIDE:  # a chunk a span: a constant, so no chunk loop is compiled
         SPAN = CHUNK
@@ -2310,6 +2337,12 @@ def _select_split_kernel(
             return
     lo = part * SPAN
     if lo >= hi:  # past the token's causal blocks: the cost follows the context
+        if KEY_W:  # noqa: SIM102 (a constexpr, then the program id)
+            if part == 0:  # no causal block on this rank: keys below every block's
+                tl.store(
+                    rows_ptr + t.to(tl.int64) * stride_rows + tl.arange(0, K),
+                    tl.full([K], -(2**63), tl.int64),
+                )
         return
     score_row = score_ptr + t.to(tl.int64) * stride_s
     seq = tl.load(seq_ptr + t)
@@ -2329,6 +2362,8 @@ def _select_split_kernel(
             K,
             PG,
             LOGICAL,
+            KEY_R,
+            KEY_W,
         )
         return
     best = _span_keys(score_row, lo, tl.minimum(lo + SPAN, hi), K, CHUNK)
@@ -2362,6 +2397,8 @@ def _select_split_kernel(
                 K,
                 PG,
                 LOGICAL,
+                KEY_R,
+                KEY_W,
             )
             tl.atomic_xchg(count_ptr + t, 0, sem="relaxed", scope="gpu")
 
@@ -2385,6 +2422,8 @@ def _select_merge_kernel(
     K: tl.constexpr,
     PG: tl.constexpr,
     LOGICAL: tl.constexpr = False,
+    KEY_R: tl.constexpr = 0,
+    KEY_W: tl.constexpr = 0,
 ):
     t = tl.program_id(0)
     qpos = tl.load(pos_ptr + t)
@@ -2410,6 +2449,8 @@ def _select_merge_kernel(
         K,
         PG,
         LOGICAL,
+        KEY_R,
+        KEY_W,
     )
 
 
@@ -2451,6 +2492,7 @@ def select_rows_split(
     ctx=None,
     long_from=0,
     row_lens=None,
+    dcp_keys=None,
 ):
     """``select_rows``' tables (bit for bit), each row's causal blocks split into ``parts``
     spans that separate programs reduce to their ``k`` best, merged per row by the last
@@ -2459,12 +2501,17 @@ def select_rows_split(
     width; the grid depends only on the shapes, so a graph can hold it. Any width (block
     ids below 2**31). ``long_from`` > 0 (fused merge only): rows of at least that many
     causal blocks are skipped (their ``rows`` left as they are, for another selector), and
-    every row's causal block count is written to ``row_lens`` ([T] int32)."""
+    every row's causal block count is written to ``row_lens`` ([T] int32). ``dcp_keys``
+    ``(rank, world)``, ``logical`` only: ``rows`` int64, ``dcp_local_keys``' keys of the
+    selection instead of its ids."""
     assert k & (k - 1) == 0 and chunk >= 4 * k and chunk & (chunk - 1) == 0, (k, chunk)
+    assert dcp_keys is None or logical
     t, nb = score.shape
     dev = score.device
+    key_r, key_w = dcp_keys or (0, 0)
     if rows is None:  # else the caller's: any row stride, unit column stride
-        rows = torch.empty(t, k, dtype=torch.int32, device=dev)
+        dt = torch.int64 if key_w else torch.int32
+        rows = torch.empty(t, k, dtype=dt, device=dev)
     if ctx is None:
         ctx = torch.empty(t, dtype=torch.int32, device=dev)
     assert rows.shape == (t, k) and rows.stride(1) == 1 and ctx.shape == (t,)
@@ -2505,6 +2552,8 @@ def select_rows_split(
         "FUSED": fused,
         "IS_HIP": dev.type == "cuda" and torch.version.hip is not None,
         "LOGICAL": logical,
+        "KEY_R": key_r,
+        "KEY_W": key_w,
         "num_warps": num_warps,
     }
     guard = {}
@@ -2513,7 +2562,7 @@ def select_rows_split(
         assert row_lens is not None and row_lens.shape == (t,), row_lens
         guard = {"GUARD": True, "rowlen_ptr": row_lens, "LONG_FROM": long_from}
     _select_split_kernel[(t, parts)](*args, WIDE=span > chunk, **meta, **guard)
-    warm = (dev, k, chunk, fused, logical, num_warps)
+    warm = (dev, k, chunk, fused, logical, key_r, key_w, num_warps)
     if span <= chunk and warm not in _wide_warmed:
         # the first one-chunk launch of these constants (the startup warmup's forwards
         # and graph captures) also compiles, without running, the wide kernel: its
@@ -2537,20 +2586,27 @@ def select_rows_split(
             K=k,
             PG=PAGE,
             LOGICAL=logical,
+            KEY_R=key_r,
+            KEY_W=key_w,
             num_warps=num_warps,
         )
     return rows, ctx
 
 
-def select_logical(score, positions, k, num_warps=8, split=False, long_from=0):
+def select_logical(
+    score, positions, k, num_warps=8, split=False, long_from=0, dcp_keys=None
+):
     """``select_rows``' selection as block ids, for the Triton attention: ``[T, k]`` int32,
     best first, the token's valid (causal) blocks leading and -1 after. ``split``: by
     ``select_rows_split`` (same ids; its cost follows the context, not the width).
     ``long_from`` > 0 (with ``split``): rows of at least that many causal blocks select on
     aiter's FlyDSL top-k (``tie="low"``: the same keys, so the same ids; its cost follows
     the row's length, not the width), the shorter ones on ``select_rows_split``; both
-    launch in every forward, so a graph holds the pair. Off on an aiter without it."""
+    launch in every forward, so a graph holds the pair. Off on an aiter without it.
+    ``dcp_keys`` ``(rank, world)``: ``dcp_local_keys``' int64 keys of the selection
+    instead, bit for bit, in the same launch."""
     assert k & (k - 1) == 0, k
+    assert not (long_from and dcp_keys), "the long rows' selector stores block ids"
     if split:
         served = bool(long_from) and long_rows_selector_serves(score, k)
         if long_from:
@@ -2575,9 +2631,13 @@ def select_logical(score, positions, k, num_warps=8, split=False, long_from=0):
             )
             return sel
         # no page table in this mode: the positions stand in for the unread seq ids
-        return select_rows_split(score, score, positions, positions, k, logical=True)[0]
+        return select_rows_split(
+            score, score, positions, positions, k, logical=True, dcp_keys=dcp_keys
+        )[0]
     t, nb = score.shape
-    sel = torch.empty(t, k, dtype=torch.int32, device=score.device)
+    key_r, key_w = dcp_keys or (0, 0)
+    dt = torch.int64 if key_w else torch.int32
+    sel = torch.empty(t, k, dtype=dt, device=score.device)
     _select_rows_kernel[(t,)](
         score,
         score.stride(0),
@@ -2593,6 +2653,8 @@ def select_logical(score, positions, k, num_warps=8, split=False, long_from=0):
         BW=max(triton.next_power_of_2(nb), k),
         PG=PAGE,
         LOGICAL=True,
+        KEY_R=key_r,
+        KEY_W=key_w,
         num_warps=num_warps,
     )
     return sel
@@ -2949,13 +3011,54 @@ def dcp_local_positions(positions, rank, world):
     return torch.where(qb >= rank, local, -PAGE)
 
 
+@triton.jit
+def _dcp_pin_kernel(
+    score_ptr,
+    stride_s,
+    pos_ptr,
+    NB,
+    R,
+    init,
+    local,
+    W: tl.constexpr,
+    BI: tl.constexpr,
+    BL: tl.constexpr,
+    PG: tl.constexpr,
+):
+    t = tl.program_id(0)
+    qb = tl.load(pos_ptr + t) // PG
+    lo = qb + 1 - local  # the local window's first global block
+    row = score_ptr + t.to(tl.int64) * stride_s
+    j = tl.arange(0, BI)
+    g = j * W + R
+    # an init block inside the window takes the window's pin, as scores' order leaves it
+    pin = (g < init) & (g < lo) & (j < NB)
+    tl.store(row + j, tl.full([BI], 1e30, tl.float32), mask=pin)
+    jl = tl.maximum(lo - R + W - 1, 0) // W + tl.arange(0, BL)
+    gl = jl * W + R
+    tl.store(row + jl, tl.full([BL], 1e29, tl.float32), mask=(gl <= qb) & (jl < NB))
+
+
 def dcp_pin(score, positions, rank, world, init, local):
-    """``scores``' pins on a rank's local columns, in place: the forced init blocks
-    above every score, the local window below them, by global block index."""
-    j = torch.arange(score.shape[1], device=score.device) * world + rank
-    qb = (positions // PAGE)[:, None]
-    score.masked_fill_(j < init, 1e30)
-    score.masked_fill_(j >= qb + 1 - local, 1e29)
+    """``scores``' pins on a rank's local columns, in place, by global block index: the
+    forced init blocks above every score, the local window below them. Only the causal
+    columns, the ones a selection reads, are written."""
+    t, nb = score.shape
+    assert score.stride(1) == 1
+    if t and (init or local):
+        _dcp_pin_kernel[(t,)](
+            score,
+            score.stride(0),
+            positions,
+            nb,
+            rank,
+            init,
+            local,
+            W=world,
+            BI=triton.next_power_of_2(-(-init // world) + 1),
+            BL=triton.next_power_of_2(-(-local // world) + 1),
+            PG=PAGE,
+        )
     return score
 
 
@@ -2974,6 +3077,98 @@ def dcp_local_selection(sel, rank, world):
     order = torch.where(mine, ar, ar + k).argsort(dim=1)
     local = torch.where(mine, torch.div(sel, world, rounding_mode="floor"), -1)
     return local.gather(1, order).to(torch.int32)
+
+
+@triton.jit
+def _dcp_local_keys_kernel(
+    score_ptr,
+    stride_s,
+    sel_ptr,
+    stride_sel,
+    pos_ptr,
+    keys_ptr,
+    R,
+    W: tl.constexpr,
+    K: tl.constexpr,
+):
+    t = tl.program_id(0)
+    e = tl.arange(0, K)
+    j = tl.load(sel_ptr + t.to(tl.int64) * stride_sel + e)
+    # a row with no causal block on this rank selected nothing (and wrote nothing)
+    ok = (j >= 0) & (e < tl.where(tl.load(pos_ptr + t) >= 0, K, 0))
+    s = tl.load(score_ptr + t.to(tl.int64) * stride_s + j, mask=ok, other=float("-inf"))
+    b = s.to(tl.int32, bitcast=True)
+    key = (b ^ ((b >> 31) & 0x7FFFFFFF)).to(tl.int64) << 32
+    key = key | (0x7FFFFFFF - (j * W + R)).to(tl.int64)
+    tl.store(keys_ptr + t.to(tl.int64) * K + e, tl.where(ok, key, -(2**63)))
+
+
+@triton.jit
+def _dcp_merge_keys_kernel(
+    keys_ptr, T, sel_ptr, stride_sel, R, W: tl.constexpr, K: tl.constexpr
+):
+    t = tl.program_id(0)
+    q = tl.arange(0, W * K)
+    top = tl.topk(tl.load(keys_ptr + ((q // K) * T + t).to(tl.int64) * K + q % K), K)
+    g = (0x7FFFFFFF - (top & 0x7FFFFFFF)).to(tl.int32)
+    mine = ((top >> 32) > _NEG_INF_KEY) & (g % W == R)
+    m = mine.to(tl.int32)
+    e = tl.arange(0, K)
+    base = sel_ptr + t.to(tl.int64) * stride_sel
+    tl.store(base + tl.cumsum(m, axis=0) - m, g // W, mask=mine)
+    tl.store(base + e, tl.full([K], -1, tl.int32), mask=e >= tl.sum(m, axis=0))
+
+
+def dcp_local_keys(score, sel, positions, rank, world):
+    """A rank's ``select_logical`` picks ``sel`` of its own ``score`` (``[T, NBl]``, at
+    its local ``positions``) as ``_block_keys``' sort keys of their global blocks:
+    ``[T, k]`` int64, best first, padded below every block's."""
+    t, k = sel.shape
+    keys = torch.empty(t, k, dtype=torch.int64, device=sel.device)
+    if t:
+        _dcp_local_keys_kernel[(t,)](
+            score,
+            score.stride(0),
+            sel,
+            sel.stride(0),
+            positions,
+            keys,
+            rank,
+            W=world,
+            K=k,
+        )
+    return keys
+
+
+def dcp_merge_keys(gathered, rank, world):
+    """The best ``k`` of every rank's ``dcp_local_keys`` (all-gathered rank-major,
+    ``[world * T, k]``), cut to ``rank``'s blocks as ``dcp_local_selection`` cuts
+    ``select_logical``'s: local block ids in selection order leading each row, -1
+    after."""
+    k = gathered.shape[1]
+    t = gathered.shape[0] // world
+    assert (world * k) & (world * k - 1) == 0, (world, k)
+    sel = torch.empty(t, k, dtype=torch.int32, device=gathered.device)
+    if t:
+        _dcp_merge_keys_kernel[(t,)](
+            gathered.contiguous(), t, sel, sel.stride(0), rank, W=world, K=k
+        )
+    return sel
+
+
+def dcp_select(score, positions, k, rank, world, gather, split=False, fold=False):
+    """``dcp_local_selection(select_logical(...))`` over every rank's scores, bit for bit,
+    without gathering them: a block in the row's best ``k`` is in its own rank's best
+    ``k`` (fewer blocks outrank it there) and the keys are distinct, so the best ``k`` of
+    the ranks' best ``k`` are the row's. ``score``: this rank's ``[T, NBl]`` pinned
+    (``dcp_pin``); ``positions``: local (``dcp_local_positions``); ``gather``: the
+    all-gather on dim 0. ``fold``: the selection stores its keys itself (one launch)."""
+    if fold:
+        keys = select_logical(score, positions, k, split=split, dcp_keys=(rank, world))
+    else:
+        sel = select_logical(score, positions, k, split=split)
+        keys = dcp_local_keys(score, sel, positions, rank, world)
+    return dcp_merge_keys(gather(keys), rank, world)
 
 
 def dcp_prefill_plan(block_tables, context_lens, world):
@@ -3094,6 +3289,72 @@ def attention_day0_decode(
         scale,
         out.view(t, IDX_HEADS, VALUE_DIM),
         out_scale,
+    )
+    return out
+
+
+# aiter's minimax_m3_fp8_sparse_decode_dcp and its warm-up; False: this aiter lacks them
+_dcp_day0 = None
+_dcp_day0_warm = None
+_dcp_day0_warmed = set()  # the (device, page, LSE repeats) kernels compiled
+DCP_DAY0_HEADS = 128  # the query heads it attends (all of them, gathered)
+
+
+def dcp_day0_decode_available() -> bool:
+    """Whether aiter's FlyDSL DCP decode (``attention_dcp_day0``) imports and serves this
+    GPU and the layer (``day0_decode_available``'s check)."""
+    global _dcp_day0, _dcp_day0_warm
+    if _dcp_day0 is None:
+        try:
+            from aiter.ops.flydsl import (
+                minimax_m3_fp8_sparse_decode_dcp,
+                minimax_m3_fp8_sparse_decode_dcp_warm_up,
+            )
+        except ImportError:
+            _dcp_day0 = False
+        else:
+            _dcp_day0 = minimax_m3_fp8_sparse_decode_dcp
+            _dcp_day0_warm = minimax_m3_fp8_sparse_decode_dcp_warm_up
+    return bool(_dcp_day0) and day0_decode_available()
+
+
+def dcp_day0_decode_warm_up(device, page: int, lse_rep: int) -> None:
+    """Compile the DCP decode for ``page``-token pages and ``lse_rep`` on ``device`` once,
+    outside any graph capture. No-op where it is unavailable or the device is not a GPU.
+    """
+    device = torch.device(device)
+    key = (device, page, lse_rep)
+    if (
+        key in _dcp_day0_warmed
+        or device.type != "cuda"
+        or not dcp_day0_decode_available()
+        or torch.cuda.is_current_stream_capturing()
+    ):
+        return
+    _dcp_day0_warm(device, page, lse_rep)
+    _dcp_day0_warmed.add(key)
+
+
+def attention_dcp_day0(
+    q, kc4, block_tables, seq_id, positions, sel, out, scale, lse, lse_rep
+):
+    """``attention`` of a decode / verify step under DCP on aiter's FlyDSL DCP decode (all
+    heads of a row, 64 a workgroup) over the K-only cache as a plain fp8 cast (``kc4`` as
+    ``attention_day0`` takes it): ``q`` ``[T, 128, 256]`` e4m3, every head;
+    ``seq_id`` and ``positions`` (``dcp_local_positions``) int32 ``[T]``; ``sel`` this
+    rank's local blocks, valid first (``dcp_local_selection``). ``out`` ``[T, 128 x 192]``
+    and ``lse`` ``[T, 128 x lse_rep]`` as ``attention`` writes them with ``lse``."""
+    _dcp_day0(
+        q,
+        kc4[:, 0],
+        sel,
+        block_tables,
+        seq_id,
+        positions,
+        scale,
+        out,
+        lse,
+        lse_rep=lse_rep,
     )
     return out
 

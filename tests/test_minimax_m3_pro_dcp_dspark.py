@@ -258,15 +258,13 @@ def test_the_dcp8_block_writes_and_reads_what_the_dcp1_block_does(
     # the target's table under DCP 8: as wide as at DCP 1, its tail never allocated
     wide = torch.randint(0, 4000, (max_bs, 8 * w8), dtype=torch.int32, generator=g)
     wide[:, :w8] = t128
-    t16 = t128.repeat_interleave(8, dim=1) * 8 + torch.arange(
-        8, dtype=torch.int32
-    ).repeat(w8)
+    lanes = torch.arange(8, dtype=torch.int32).repeat(w8)
+    t16 = t128.repeat_interleave(8, dim=1) * 8 + lanes
     anchors = torch.zeros(running_bs, dtype=torch.int64)
     alloc8 = []
     for i in range(scheduled_bs):
-        anchors[i] = rng.choice(
-            [rng.randrange(0, 3), rng.randrange(0, max_model_len - T - 1)]
-        )
+        near, far = rng.randrange(0, 3), rng.randrange(0, max_model_len - T - 1)
+        anchors[i] = rng.choice([near, far])
         need = (int(anchors[i]) + 1) // 128 + 1
         alloc8.append(min(w8, max(1, need + rng.choice([-1, 0, 1]))))
     wide, t16, anchors = (x.to(DEV) for x in (wide, t16, anchors))

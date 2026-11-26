@@ -200,6 +200,37 @@ class ProVariants:
     # (fused / split / aiter): its cost follows the context, not the block table's width.
     # Always so in decode / verify graphs of up to pro_kernels.QTILE_ROWS rows.
     score_tq_causal: bool = False
+    # Under DCP a decode / verify selects without all-gathering the scores (``[rows,
+    # max_model_len / 16 / DCP]`` fp32 a rank and layer): each rank selects its own best
+    # ``topk`` blocks and the ranks all-gather those as sort keys (``[rows, topk]`` int64)
+    # and merge them (``dcp_select``). Bit for bit the same selection.
+    dcp_topk_merge: bool = False
+    # Under DCP a graph-captured decode / verify step of at most this many rows (0: off)
+    # merges the heads' partial outputs with aiter's mailbox combine: one launch storing
+    # into the peers' memory, at a rank's 16 heads x 192, straight into the output,
+    # instead of pack, all-to-all and combine at 48 x 64 (the LSE repeated to match) and
+    # a copy. Wider steps keep the all-to-all. Needs comm_backend "mailbox" (gfx950's
+    # default); read once, when the layers are built. The same weighted sum, other
+    # rounding.
+    dcp_mailbox: int = 0
+    # Under DCP a decode / verify step all-gathers its query heads as a plain fp8 cast
+    # (the e4m3 values the day0 decode reads at DCP 1) instead of bf16: half the bytes.
+    # The Triton attention reads them back exactly, so q rounds as at DCP 1's day0 decode
+    # (not bit for bit the bf16 DCP decode).
+    dcp_q_fp8: bool = False
+    # Under DCP a decode / verify step attends with aiter's FlyDSL DCP decode
+    # (minimax_m3_fp8_sparse_decode_dcp: amd-kernels-day0's fp8 sparse decode on all
+    # 128 heads over this rank's picks, two workgroups a row) instead of the Triton
+    # attention, on the K-only plain fp8 cache, its query gathered as dcp_q_fp8 gathers
+    # it. The same output and LSE layouts (dcp_fold's included). Not bit for bit the
+    # Triton attention: q rounds to e4m3, scores in base 2, P in bf16 as at DCP 1's day0
+    # decode. Without the kernel in aiter (or off gfx950) the Triton attention serves.
+    dcp_day0_decode: bool = False
+    # Under DCP a decode / verify step's selection stores the sort keys it all-gathers
+    # itself, the all-to-all merge writes the output itself, and (without dcp_mailbox,
+    # which reads each head's LSE once) the attention stores the LSE once a 64-wide part,
+    # as that merge reads it: up to three launches fewer a layer, bit for bit.
+    dcp_fold: bool = False
     # vLLM's compressed index cache: every 4 index keys softmax-pooled into one bf16 row
     # (ic_c [pages, 4, 128]), written after prep; the scorer reads those rows only.
     index_compress: bool = False
@@ -595,11 +626,16 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
         # Bound by `AiterAttentionMetadataBuilder.build_kv_cache_tensor`:
         # the index-key cache, (blocks, page, index_head_dim).
         self.index_cache: torch.Tensor | None = None
-        self.k_only = refresh_variants(force=True).k_only
+        variants = refresh_variants(force=True)
+        self.k_only = variants.k_only
         from atom.config import get_current_atom_config
 
         self.dcp_world = get_current_atom_config().decode_context_parallel_size
         self.max_model_len = get_current_atom_config().max_model_len
+        # collective: every DCP rank builds the same layers in the same order
+        self.dcp_mailbox = self.dcp_world > 1 and self._prepare_dcp_mailbox(
+            variants.dcp_mailbox
+        )
         if self.k_only:
             from atom.config import kv_cache_torch_dtype
 
@@ -917,6 +953,25 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
             and n % reqs == 0
             and pro_kernels.day0_decode_available()
         )
+
+    def _dcp_day0(self, v: ProVariants, k_cache: torch.Tensor) -> bool:
+        """Whether a decode / verify step under DCP attends with aiter's FlyDSL DCP decode
+        (``dcp_day0_decode``): on the K-only plain fp8 cache of whole 16-token blocks a
+        page, with 128 query heads gathered."""
+        return (
+            v.dcp_day0_decode
+            and self.k_only
+            and k_cache.element_size() == 1
+            and v.k_plain_fp8
+            and self.page % pro_kernels.PAGE == 0
+            and self.num_heads * self.dcp_world == pro_kernels.DCP_DAY0_HEADS
+            and pro_kernels.dcp_day0_decode_available()
+        )
+
+    def _dcp_lse_rep(self, v: ProVariants) -> int:
+        """The times a DCP decode's attention writes each head's LSE: once a 64-wide part
+        under ``dcp_fold`` without the mailbox merge (the all-to-all reads it so)."""
+        return self.value_head_dim // 64 if v.dcp_fold and not self.dcp_mailbox else 1
 
     def take_mx_scale(self) -> torch.Tensor:
         """The E8M0 scales ``[T, H x 192 / 32]`` of the MXFP8 output this forward returned (the
@@ -1485,6 +1540,49 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
         return attend(sel)
 
     # ------------------------------------------------- decode context parallel --
+    def _prepare_dcp_mailbox(self, rows):
+        """Map the mailbox combine's peer buffer for decode merges of up to ``rows`` rows
+        (``dcp_mailbox``) while every rank builds the same layer (collective, before the
+        KV cache is sized; one for all the layers). False: they merge by all-to-all."""
+        from atom.config import get_current_atom_config
+        from atom.distributed.dcp_utils import get_dcp_group
+        from atom.model_ops.dcp_ops import dcp_mailbox_max_tokens, prepare_dcp_mailbox
+
+        config = get_current_atom_config()
+        if rows <= 0 or config.dcp_config.comm_backend != "mailbox":
+            return False
+        group, heads, dim = get_dcp_group(), self.num_heads, self.value_head_dim
+        rows = min(rows, dcp_mailbox_max_tokens(config))
+        # the variant's rows, not the default cap's (measured on other models' shapes)
+        cap = rows * group.world_size * heads * dim
+        return prepare_dcp_mailbox(group, heads, dim, rows, max_elems=cap)
+
+    def _dcp_merge(self, group, of, lse, out, fold=False):
+        """The log-sum-exp merge of every head's partial output ``of`` ``[n, W * 16 *
+        192]`` (``lse`` ``[n, W * 16]``, or repeated once a 64-wide part) into this
+        rank's heads' ``out`` ``[n, 16 * 192]``; ``fold``: the merge writes ``out``."""
+        from atom.config import get_current_atom_config
+        from atom.model_ops.dcp_ops import dcp_lse_merge, dcp_mailbox_merge
+
+        n, dv = out.shape[0], self.value_head_dim
+        h = of.shape[1] // dv
+        if self.dcp_mailbox and lse.shape[1] == h:
+            res = out.view(n, -1, dv)
+            if dcp_mailbox_merge(of.view(n, h, dv), lse, group, res) is not None:
+                return out
+        # the all-to-all takes power-of-two head widths: each head's 192 as three of 64
+        parts = dv // 64
+        merged = dcp_lse_merge(
+            of.view(n, h * parts, 64),
+            lse.repeat_interleave(parts, dim=1) if lse.shape[1] == h else lse,
+            group,
+            backend=get_current_atom_config().dcp_config.comm_backend,
+            out=out.view(n, -1, 64) if fold else None,
+        )
+        if not fold:
+            out.copy_(merged.reshape(n, -1))
+        return out
+
     def _dcp_prefill_caches(self, kc4, ks, ic):
         """A prefill's caches under DCP: every block of its sequences, all-gathered from
         the ranks that hold them, and the block tables into those (the plan is the
@@ -1516,13 +1614,8 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
         all-gathered so each rank selects from all of them as without DCP, each rank
         attends all query heads over the selected blocks it holds, and a log-sum-exp
         merge returns this rank's heads."""
-        from atom.config import get_current_atom_config
         from atom.distributed.dcp_utils import get_dcp_group
-        from atom.model_ops.dcp_ops import (
-            dcp_all_gather,
-            dcp_all_gather_query_heads,
-            dcp_lse_merge,
-        )
+        from atom.model_ops.dcp_ops import dcp_all_gather, dcp_all_gather_query_heads
 
         pool, init, local, sc, block_mode, head_mode = score_args
         group = get_dcp_group()
@@ -1560,45 +1653,75 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
             tq=min(v.score_tq, rps & -rps) if rps > 1 else 0,
         )
         pro_kernels.dcp_pin(score, positions, r, w, init, local)
-        score = pro_kernels.dcp_interleave(dcp_all_gather(group, score, 0), w)
-        sel = pro_kernels.select_logical(
-            score, positions, min(self.topk, nbl * w), split=v.topk == "split"
-        )
-        sel = pro_kernels.dcp_local_selection(sel, r, w)
+        k = min(self.topk, nbl * w)
+        if v.dcp_topk_merge:
+
+            def gather(keys):  # as fp32 pairs: aiter's all-gather takes float dtypes
+                return dcp_all_gather(group, keys.view(torch.float32), 0).view(
+                    keys.dtype
+                )
+
+            sel = pro_kernels.dcp_select(
+                score, qpos, k, r, w, gather, split=v.topk == "split", fold=v.dcp_fold
+            )
+        else:
+            score = pro_kernels.dcp_interleave(dcp_all_gather(group, score, 0), w)
+            sel = pro_kernels.select_logical(
+                score, positions, k, split=v.topk == "split"
+            )
+            sel = pro_kernels.dcp_local_selection(sel, r, w)
+        day0 = self._dcp_day0(v, kc4)
+        if v.dcp_q_fp8 or day0:
+            q = q.to(torch.float8_e4m3fn)
         qf = dcp_all_gather_query_heads(group, q)
         h = qf.shape[1]
         dv = self.value_head_dim
-        of = q.new_empty(n, h * dv)
-        lse = torch.empty(n, h, dtype=torch.float32, device=q.device)
-        # a rank holds about 1/w of the selected blocks, for w times the heads
-        splits = max(
-            1, (v.attn_splits or (32 if n <= 16 else 16 if n <= 32 else 8)) // w
-        )
-        pro_kernels.attention(
-            qf,
-            kc4,
-            block_tables,
-            seq_id,
-            qpos,
-            sel,
-            of,
-            self.scale * v.scale_mult,
-            splits,
-            nblk=v.attn_nblk,
-            k_scale=ks,
-            valid_first=True,
-            lse=lse,
-        )
-        # the merge takes power-of-two head widths: each head's 192 as three of 64
-        parts = dv // 64
-        merged = dcp_lse_merge(
-            of.view(n, h * parts, 64),
-            lse.repeat_interleave(parts, dim=1),
-            group,
-            backend=get_current_atom_config().dcp_config.comm_backend,
-        )
-        out.copy_(merged.reshape(n, -1))
-        return out
+        of = torch.empty(n, h * dv, dtype=out.dtype, device=q.device)
+        rep = self._dcp_lse_rep(v)
+        lse = torch.empty(n, h * rep, dtype=torch.float32, device=q.device)
+        if day0:
+            # its row metadata as int32, once a forward
+            c32 = getattr(md, "_m3pro_dcp_i32", None)
+            if c32 is None or c32[0] != capturing or c32[1].shape[0] != n:
+                md._m3pro_dcp_i32 = c32 = (
+                    capturing,
+                    qpos.to(torch.int32),
+                    seq_id.to(torch.int32),
+                )
+            pro_kernels.attention_dcp_day0(
+                qf,
+                kc4,
+                block_tables,
+                c32[2],
+                c32[1],
+                sel,
+                of,
+                self.scale * v.scale_mult,
+                lse,
+                rep,
+            )
+        else:
+            # a rank holds about 1/w of the selected blocks, for w times the heads
+            splits = max(
+                1, (v.attn_splits or (32 if n <= 16 else 16 if n <= 32 else 8)) // w
+            )
+            pro_kernels.attention(
+                qf,
+                kc4,
+                block_tables,
+                seq_id,
+                qpos,
+                sel,
+                of,
+                self.scale * v.scale_mult,
+                splits,
+                nblk=v.attn_nblk,
+                k_scale=ks,
+                valid_first=True,
+                lse=lse,
+                lse_rep=rep,
+            )
+        return self._dcp_merge(group, of, lse, out, fold=v.dcp_fold)
 
     # ---------------------------------------------------------------- forward --
     def decode_split(self, n: int, v: ProVariants, seqs: int = 0):
@@ -1773,6 +1896,10 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
                     if self._mxfp8_out(v, v.day0_decode_rows, day0_dec=True)
                     else ""
                 )
+            if self.dcp_world > 1:
+                attn_impl += "; DCP decode " + (
+                    "day0" if self._dcp_day0(v, layer.k_cache) else "triton"
+                )
             # the Triton / aiter rows, below the day0 decode
             mx_impl = (
                 "off"
@@ -1822,6 +1949,10 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
                 # compiled here, in the eager forward a capture runs first, not in the capture
                 pro_kernels.day0_decode_warm_up(
                     query.device, layer.k_cache.shape[-2], mx
+                )
+            if static and self.dcp_world > 1 and self._dcp_day0(v, layer.k_cache):
+                pro_kernels.dcp_day0_decode_warm_up(
+                    query.device, layer.k_cache.shape[-2], self._dcp_lse_rep(v)
                 )
             # the kernels write every row they compute in full: zero only the others
             width = h * self.value_head_dim

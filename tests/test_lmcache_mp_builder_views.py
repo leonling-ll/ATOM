@@ -551,3 +551,84 @@ def test_minimax_m3_pro_k_only_pages_cover_every_block_byte(
     ]
     assert hit == [(2 * layers + 1, 2)]
     assert index_region.unit_bytes == 16 * index_bytes
+
+
+@pytest.mark.parametrize("dcp", [1, 8])
+def test_minimax_m3_pro_dcp_block_carries_its_rank_shard_and_whole_draft_entry(
+    mha_export_method, pro_k_only_layout, monkeypatch, dcp
+):
+    # Under DCP a block id is 16 tokens of this rank's share of the target and the
+    # DSpark draft's whole 16 * dcp-token entry (its pool is outside the DCP group,
+    # MiniMaxM3ProDSpark.kv_pool_spec): one unit of every region, so the chunk a rank
+    # saves restores both on that rank.
+    from atom.kv_transfer.offload.hybrid.dsv4.codec import DSV4PageSlotCodec
+    from atom.kv_transfer.offload.page_codec import pure_page_codec
+    from atom.spec_decode.draft_kv import DraftKvPoolSpec
+
+    num_blocks, layers, fp8 = 4, 3, torch.float8_e4m3fn
+    pool = MhaKvPool(
+        layers=layers,
+        block_size=16,
+        num_kv_heads=1,
+        head_dim=256,
+        kv_dtype=fp8,
+        extra_fields=(EntryField("index", layers, (16 * 128,), torch.uint8),),
+        layout=pro_k_only_layout(fp8),
+    )
+    pool.allocate(num_blocks, "cpu")
+    spec = DraftKvPoolSpec(flash_layout=False, own_scales=True)
+    draft = MhaKvPool(
+        layers=2,
+        block_size=16,
+        num_kv_heads=1,
+        head_dim=256,
+        kv_dtype=fp8,
+        **spec.pool_kwargs(dcp),
+    )
+    draft.allocate(num_blocks, "cpu")
+    rows = {type("Layer", (), {"layer_num": n})(): n for n in range(layers)}
+    builder = SimpleNamespace(
+        kv_pools={"konly": pool},
+        pool_rows={"konly": rows, "index": rows},
+        block_size=16,
+        block_ratio=1,
+        _index_cache_spec=lambda entry_tokens: SimpleNamespace(
+            view_dtype=torch.float8_e4m3fn, view_shape=(-1, 16, 128)
+        ),
+    )
+    draft_rows = {type("Layer", (), {"layer_num": layers + n})(): n for n in range(2)}
+    draft_builder = SimpleNamespace(
+        kv_pools={"draft": draft},
+        pool_rows={"draft": draft_rows},
+        block_size=16,
+        block_ratio=1,
+        _index_cache_spec=lambda entry_tokens: None,
+    )
+    transfer = mha_export_method(builder)
+    transfer.merge_pages(mha_export_method(draft_builder))
+    transfer.set_block_count(num_blocks)
+    monkeypatch.setattr(
+        DSV4PageSlotCodec, "has_fused_chunk_major_staging", property(lambda _: True)
+    )
+    codec = pure_page_codec(transfer)
+
+    assert codec.num_blocks == num_blocks
+    target_bytes = layers * 16 * (256 + 4 + 128)
+    draft_bytes = 2 * dcp * 16 * (2 * 256 + 2 * 4)
+    assert codec.bytes_per_block == target_bytes + draft_bytes
+    # Block 2's target index keys (layer 1) and every page-16 block of its draft
+    # entry (K, draft layer 1): in unit 2 of their own regions and nowhere else.
+    pool.field_view("index", 1, torch.uint8, (num_blocks, -1))[2].fill_(9)
+    draft_k = draft.field_view("k", 1, torch.uint8, (num_blocks * dcp, -1))
+    draft_k[2 * dcp : 3 * dcp].fill_(9)
+    views = transfer.block_tensor_views
+    hit = [
+        (i, block)
+        for i, view in enumerate(views)
+        for block in range(num_blocks)
+        if view[block].view(torch.uint8).eq(9).any()
+    ]
+    draft_k1 = 3 * layers + 1
+    assert hit == [(2 * layers + 1, 2), (draft_k1, 2)]
+    assert codec.page_regions[draft_k1].unit_bytes == dcp * 16 * 256
+    assert bool(views[draft_k1][2].view(torch.uint8).eq(9).all())
