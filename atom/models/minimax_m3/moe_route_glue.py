@@ -30,7 +30,7 @@ _COMMS: dict[tuple[int, int, int], object] = {}
 _SMALL: dict[tuple[int, int, int], object] = {}
 
 
-def build(hidden: int, experts: int, topk: int) -> bool:
+def build(hidden: int, experts: int, topk: int, small: bool = False) -> bool:
     """Make the op's buffers for this TP group once; False where it cannot run (an
     aiter without the op or without the generic presort, or an unsupported TP size)."""
     key = (hidden, experts, topk)
@@ -56,9 +56,10 @@ def build(hidden: int, experts: int, topk: int) -> bool:
     _COMMS[key] = AllReduceRmsnormMoeRoute(
         tp.cpu_group, MAX_ROWS, hidden, experts, topk, router_fp32=False
     )
-    _SMALL[key] = AllReduceRmsnormMoeRoute(
-        tp.cpu_group, SMALL_ROWS, hidden, experts, topk, router_fp32=False
-    )
+    if small:
+        _SMALL[key] = AllReduceRmsnormMoeRoute(
+            tp.cpu_group, SMALL_ROWS, hidden, experts, topk, router_fp32=False
+        )
     logger.info(
         "M3-Pro moe_route_glue: fused all-reduce + norm + router + top-k + sort, "
         "up to %d rows (hidden %d, %d experts, top-%d)",

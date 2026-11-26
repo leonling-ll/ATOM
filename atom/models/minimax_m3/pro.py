@@ -1020,7 +1020,10 @@ class MiniMaxM3ProForCausalLM(MiniMaxM3SparseForCausalLM):
         if variants().moe_route_glue:
             # the op's IPC buffers: collective, and before any decode graph is captured
             moe_route_glue.build(
-                text.hidden_size, text.num_local_experts, text.num_experts_per_tok
+                text.hidden_size,
+                text.num_local_experts,
+                text.num_experts_per_tok,
+                small=variants().moe_route_glue_small,
             )
         # The forced-acceptance verify head (``bind_verify_head``); None: the
         # runner's logits path.

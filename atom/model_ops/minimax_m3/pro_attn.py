@@ -176,6 +176,10 @@ class ProVariants:
     # up to 512 rows; six launches a MoE layer fewer. Read when the model is built
     # (the op's IPC buffers) and at each forward.
     moe_route_glue: bool = False
+    # moe_route_glue on a second set of buffers sized for steps of up to 128 rows
+    # (fewer reduce CTAs reserved, so every router task gets a CTA). Read when the
+    # model is built.
+    moe_route_glue_small: bool = False
     # Prefill indexer split over the TP ranks: each rank scores and selects only its share
     # of a long prefill's rows (``row_split_index``), then the page tables are all-gathered.
     # Every row is computed as before, so the selection is the same bit for bit. Needs the
