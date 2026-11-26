@@ -37,6 +37,7 @@ Shapes are fixed by the model: head_dim 256, rotary 64, value 192, index 16 x 12
 import functools
 import inspect
 
+import numpy as np
 import torch
 import triton
 import triton.language as tl
@@ -2954,5 +2955,136 @@ def attention_day0_decode(
         scale,
         out.view(t, IDX_HEADS, VALUE_DIM),
         out_scale,
+    )
+    return out
+
+
+# ------------------------------------------------------- aiter's FlyDSL indexer --
+# ``index_day0``: aiter's minimax_m3_index_top128 (amd-kernels-day0's index_top128, vLLM's
+# prefill indexer, ported into aiter) over the compressed index cache. It reads 64-token pages
+# of 16 centroid rows: a forward lists each sequence's 16-token pages, 4 a 64-token page
+# (``day0_index_plan``), and each layer gathers its centroids so.
+DAY0_INDEX_PAGES = 4  # 16-token pages a page of index_top128
+
+_day0_index = None  # aiter's minimax_m3_index_top128; False: this aiter lacks it
+_day0_index_blocker = None
+
+
+@functools.cache
+def day0_index_blocker(init, local, max_model_len):
+    """Why aiter's FlyDSL ``minimax_m3_index_top128`` does not serve the compressed index
+    cache with ``init`` / ``local`` forced blocks, or None: it does."""
+    global _day0_index, _day0_index_blocker
+    if _day0_index is None:
+        try:
+            from aiter.ops.flydsl import (
+                minimax_m3_index_top128,
+                minimax_m3_index_top128_blocker,
+            )
+        except ImportError:
+            _day0_index = False
+        else:
+            _day0_index = minimax_m3_index_top128
+            _day0_index_blocker = minimax_m3_index_top128_blocker
+    if not _day0_index:
+        return "this aiter has no minimax_m3_index_top128"
+    return _day0_index_blocker(
+        num_index_heads=IDX_HEADS,
+        index_head_dim=IDX_DIM,
+        block_size=PAGE,
+        compress_ratio=GROUP,
+        topk_blocks=TOPK,
+        init_blocks=init,
+        local_blocks=local,
+        max_model_len=max_model_len,
+        kv_page_tokens=DAY0_INDEX_PAGES * PAGE,
+    )
+
+
+def day0_index_plan(block_tables, cu, ctx, ranges):
+    """What ``index_day0`` needs of a prefill's rows (once a forward), or None: no rows.
+
+    ``cu`` / ``ctx``: the host ``cu_seqlens_q`` / ``context_lens`` (each sequence's length
+    after the step). ``ranges``: the ``[lo, hi)`` rows scored, back to back (this rank's two
+    ``row_split_index`` segments). Cut at the sequences' ends they are index_top128's
+    requests, the rows of each the last of a sequence of ``seq_len`` = its last position + 1.
+    ``(pages, table, cu_q, seq_lens, max_q, max_seq, rows)``: ``pages`` the 16-token pages
+    whose centroids make the gathered 64-token pages, each sequence's first ``4 P`` in order
+    (those past its length repeat its last: never visible); ``table`` ``[requests, max P]``
+    int32 the requests' pages in that gather; ``rows`` the rows scored."""
+    pieces = []  # (sequence, tokens before the piece, rows)
+    for lo, hi in ranges:
+        for s in range(len(cu) - 1):
+            a, b = max(lo, cu[s]), min(hi, cu[s + 1])
+            if b > a:
+                pieces.append((s, ctx[s] - cu[s + 1] + a, b - a))
+    if not pieces:
+        return None
+    big = DAY0_INDEX_PAGES * PAGE
+    need = {}  # sequence -> its 64-token pages
+    for s, c, r in pieces:
+        need[s] = max(need.get(s, 0), -(-(c + r) // big))
+    base, off = {}, 0
+    for s, p in need.items():
+        base[s], off = off, off + p
+    seqs = np.repeat(
+        np.fromiter(need, np.int64), [DAY0_INDEX_PAGES * p for p in need.values()]
+    )
+    cols = np.concatenate(
+        [
+            np.minimum(np.arange(DAY0_INDEX_PAGES * p), -(-ctx[s] // PAGE) - 1)
+            for s, p in need.items()
+        ]
+    )
+    dev = block_tables.device
+    pages = block_tables[
+        torch.from_numpy(seqs).to(dev), torch.from_numpy(cols).to(dev)
+    ].long()
+    table = np.zeros((len(pieces), max(need.values())), np.int32)
+    for i, (s, c, r) in enumerate(pieces):
+        p = -(-(c + r) // big)
+        table[i, :p] = base[s] + np.arange(p)
+    lens = np.array([r for _, _, r in pieces], np.int32)
+    seq_lens = np.array([c + r for _, c, r in pieces], np.int32)
+    cu_q = np.concatenate([[0], np.cumsum(lens)]).astype(np.int32)
+    meta = torch.from_numpy(np.concatenate([cu_q, seq_lens, table.ravel()])).to(dev)
+    cu_d, len_d, table_d = meta.split([cu_q.size, seq_lens.size, table.size])
+    return (
+        pages,
+        table_d.view(table.shape),
+        cu_d,
+        len_d,
+        int(lens.max()),
+        int(seq_lens.max()),
+        int(cu_q[-1]),
+    )
+
+
+def index_day0(q, ic, plan, sm_scale, init, local, out):
+    """aiter's FlyDSL ``minimax_m3_index_top128`` over the compressed index cache ``ic``
+    ``[pages, 4, 128]`` bf16: the top-128 block ids of ``plan``'s rows (``q`` ``[>= rows,
+    16 x 128]`` bf16) into ``out[:rows]`` int32, the forced blocks first and -1 after (valid
+    first, as ``select_logical``). The scores are fp16 (vLLM's): a near-tie can pick another
+    block than the fp32 ``scores``."""
+    pages, table, cu_q, seq_lens, max_q, max_seq, rows = plan
+    cache = ic.index_select(0, pages).view(
+        -1, DAY0_INDEX_PAGES * CENTROID_ROWS, IDX_DIM
+    )
+    # in blocks, a multiple of 16 (vLLM's buffer)
+    width = -(-max_seq // (PAGE * 16)) * 16
+    score = torch.empty(rows, width, dtype=torch.float16, device=q.device)
+    _day0_index(
+        q[:rows].view(rows, IDX_HEADS, IDX_DIM),
+        cache,
+        table,
+        cu_q,
+        seq_lens,
+        max_q,
+        max_seq,
+        score,
+        out[:rows],
+        sm_scale,
+        init,
+        local,
     )
     return out
