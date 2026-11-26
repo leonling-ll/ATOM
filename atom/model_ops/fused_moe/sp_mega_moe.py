@@ -95,6 +95,7 @@ def _unsupported_layer(layer, reduced=False):
     hidden = layer.hidden_size
     inter = layer.intermediate_size_per_partition
     experts = layer.local_num_experts
+
     def shuffled(rows, cols):
         # aiter's shuffle_scale pads E8M0 scales to 256 rows x 8 columns
         # (MiniMax-M3.1-Pro: 640 / 32 = 20 -> 24)

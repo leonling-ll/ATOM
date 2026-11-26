@@ -447,9 +447,7 @@ class MiniMaxM3MoE(nn.Module):
             # +1/5 routed-expert memory, all of it taken from the KV pool); aiter
             # serves 640 with the FlyDSL a16w4 kernels. Flash keeps the default,
             # except under TP MegaMoE, whose MegaMoeTP reads unpadded tables.
-            pad_align=(
-                128 if is_minimax_m3_pro_config(config) or tp_megamoe else None
-            ),
+            pad_align=(128 if is_minimax_m3_pro_config(config) or tp_megamoe else None),
         )
         if hasattr(self.experts.quant_method, "intermediate_pad"):
             # MiniMax-M3 pads expert weights at load time; computing the full
@@ -834,6 +832,9 @@ class MiniMaxM3SparseAttention(nn.Module):
 
 
 class MiniMaxM3DecoderLayer(nn.Module):
+    ffn_output_reduced = False
+    input_reduced = False
+
     def __init__(
         self,
         config: PretrainedConfig,
