@@ -690,11 +690,17 @@ def decode(monkeypatch):
     def attention(q, kc4, bt, seq, pos, sel, out, *a, **kw):
         calls["attention"] = (q, out, kw)
 
+    def attention_day0(q, kc4, bt, seq, pos, sel, out, scale, lse, rep):
+        calls["day0"] = (q, kc4, seq, pos, out, lse, rep)
+
     monkeypatch.setattr(P, "dcp_select", select)
     monkeypatch.setattr(dcp_ops, "dcp_all_gather_query_heads", gather_q)
     monkeypatch.setattr(P, "attention", attention)
+    monkeypatch.setattr(P, "attention_dcp_day0", attention_day0)
+    monkeypatch.setattr(P, "dcp_day0_decode_available", lambda: True)
     impl = object.__new__(pro_attn.ProSparseAttentionImpl)
     impl.dcp_world, impl.topk, impl.scale, impl.value_head_dim = 8, 128, 0.1, 192
+    impl.k_only, impl.page, impl.num_heads = True, 16, 16
 
     def merge(group, of, lse, out, fold=False):
         calls["merge"] = (of, lse, fold)
@@ -702,7 +708,7 @@ def decode(monkeypatch):
 
     impl._dcp_merge = merge
 
-    def run(mailbox=False, **variants):
+    def run(mailbox=False, kc4=None, **variants):
         impl.dcp_mailbox = mailbox
         v = pro_attn.ProVariants(dcp_topk_merge=True, topk="split", **variants)
         n = 12
@@ -714,7 +720,7 @@ def decode(monkeypatch):
         iq = torch.zeros(n, 16, 128)
         score_args = (False, 1, 2, 1.0, 0, 0)
         got = impl._dcp_decode(
-            q, iq, pos, seq, tables, None, None, None, v, out, score_args
+            q, iq, pos, seq, tables, kc4, None, None, v, out, score_args
         )
         assert got is out
         return q, out
@@ -755,3 +761,47 @@ def test_dcp_fold_asks_for_the_keys_the_lse_as_merged_and_the_output(
     assert kw["lse_rep"] == rep and kw["lse"].shape == (12, 128 * rep)
     m_of, m_lse, m_fold = calls["merge"]
     assert m_of is of and m_lse is kw["lse"] and m_fold is bool(fold)
+
+
+@pytest.mark.parametrize("fold, mailbox, rep", [(0, 0, 1), (1, 0, 3), (1, 1, 1)])
+def test_dcp_day0_decode_attends_the_e4m3_query_in_the_tritons_stead(
+    decode, fold, mailbox, rep
+):
+    """``dcp_day0_decode``: the all-gather takes the query's e4m3 cast, aiter's DCP decode
+    attends it over the plain fp8 cache (the rows' positions and sequences as int32), and
+    its output and LSE (repeated as the merge reads it) go to the merge."""
+    run, calls = decode
+    kc4 = torch.zeros(4, 1, 16, 256, dtype=torch.float8_e4m3fn)
+    q, _ = run(
+        mailbox=bool(mailbox),
+        kc4=kc4,
+        dcp_day0_decode=True,
+        k_plain_fp8=True,
+        dcp_fold=bool(fold),
+    )
+    assert "attention" not in calls
+    sent = calls["gather"]
+    assert torch.equal(
+        sent.view(torch.uint8), q.to(torch.float8_e4m3fn).view(torch.uint8)
+    )
+    qa, k, seq, pos, of, lse, r = calls["day0"]
+    assert qa.dtype == torch.float8_e4m3fn and qa.shape == (12, 128, 256) and k is kc4
+    assert seq.dtype == pos.dtype == torch.int32
+    assert torch.equal(pos, torch.arange(12, dtype=torch.int32) + 100)
+    assert of.shape == (12, 128 * 192) and r == rep and lse.shape == (12, 128 * rep)
+    m_of, m_lse, m_fold = calls["merge"]
+    assert m_of is of and m_lse is lse and m_fold is bool(fold)
+
+
+@pytest.mark.parametrize(
+    "plain, dtype", [(False, torch.float8_e4m3fn), (True, torch.bfloat16)]
+)
+def test_dcp_day0_decode_keeps_triton_off_the_plain_fp8_cache(decode, plain, dtype):
+    """Without ``k_plain_fp8``, or on a bf16 cache, the Triton attention serves."""
+    run, calls = decode
+    run(
+        kc4=torch.zeros(4, 1, 16, 256, dtype=dtype),
+        dcp_day0_decode=True,
+        k_plain_fp8=plain,
+    )
+    assert "attention" in calls and "day0" not in calls

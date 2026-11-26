@@ -3293,6 +3293,72 @@ def attention_day0_decode(
     return out
 
 
+# aiter's minimax_m3_fp8_sparse_decode_dcp and its warm-up; False: this aiter lacks them
+_dcp_day0 = None
+_dcp_day0_warm = None
+_dcp_day0_warmed = set()  # the (device, page, LSE repeats) kernels compiled
+DCP_DAY0_HEADS = 128  # the query heads it attends (all of them, gathered)
+
+
+def dcp_day0_decode_available() -> bool:
+    """Whether aiter's FlyDSL DCP decode (``attention_dcp_day0``) imports and serves this
+    GPU and the layer (``day0_decode_available``'s check)."""
+    global _dcp_day0, _dcp_day0_warm
+    if _dcp_day0 is None:
+        try:
+            from aiter.ops.flydsl import (
+                minimax_m3_fp8_sparse_decode_dcp,
+                minimax_m3_fp8_sparse_decode_dcp_warm_up,
+            )
+        except ImportError:
+            _dcp_day0 = False
+        else:
+            _dcp_day0 = minimax_m3_fp8_sparse_decode_dcp
+            _dcp_day0_warm = minimax_m3_fp8_sparse_decode_dcp_warm_up
+    return bool(_dcp_day0) and day0_decode_available()
+
+
+def dcp_day0_decode_warm_up(device, page: int, lse_rep: int) -> None:
+    """Compile the DCP decode for ``page``-token pages and ``lse_rep`` on ``device`` once,
+    outside any graph capture. No-op where it is unavailable or the device is not a GPU.
+    """
+    device = torch.device(device)
+    key = (device, page, lse_rep)
+    if (
+        key in _dcp_day0_warmed
+        or device.type != "cuda"
+        or not dcp_day0_decode_available()
+        or torch.cuda.is_current_stream_capturing()
+    ):
+        return
+    _dcp_day0_warm(device, page, lse_rep)
+    _dcp_day0_warmed.add(key)
+
+
+def attention_dcp_day0(
+    q, kc4, block_tables, seq_id, positions, sel, out, scale, lse, lse_rep
+):
+    """``attention`` of a decode / verify step under DCP on aiter's FlyDSL DCP decode (all
+    heads of a row, 64 a workgroup) over the K-only cache as a plain fp8 cast (``kc4`` as
+    ``attention_day0`` takes it): ``q`` ``[T, 128, 256]`` e4m3, every head;
+    ``seq_id`` and ``positions`` (``dcp_local_positions``) int32 ``[T]``; ``sel`` this
+    rank's local blocks, valid first (``dcp_local_selection``). ``out`` ``[T, 128 x 192]``
+    and ``lse`` ``[T, 128 x lse_rep]`` as ``attention`` writes them with ``lse``."""
+    _dcp_day0(
+        q,
+        kc4[:, 0],
+        sel,
+        block_tables,
+        seq_id,
+        positions,
+        scale,
+        out,
+        lse,
+        lse_rep=lse_rep,
+    )
+    return out
+
+
 # ------------------------------------------------------- aiter's FlyDSL indexer --
 # ``index_day0``: aiter's minimax_m3_index_top128 (amd-kernels-day0's index_top128, vLLM's
 # prefill indexer, ported into aiter) over the compressed index cache. It reads 64-token pages

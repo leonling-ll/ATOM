@@ -218,6 +218,14 @@ class ProVariants:
     # The Triton attention reads them back exactly, so q rounds as at DCP 1's day0 decode
     # (not bit for bit the bf16 DCP decode).
     dcp_q_fp8: bool = False
+    # Under DCP a decode / verify step attends with aiter's FlyDSL DCP decode
+    # (minimax_m3_fp8_sparse_decode_dcp: amd-kernels-day0's fp8 sparse decode on all
+    # 128 heads over this rank's picks, two workgroups a row) instead of the Triton
+    # attention, on the K-only plain fp8 cache, its query gathered as dcp_q_fp8 gathers
+    # it. The same output and LSE layouts (dcp_fold's included). Not bit for bit the
+    # Triton attention: q rounds to e4m3, scores in base 2, P in bf16 as at DCP 1's day0
+    # decode. Without the kernel in aiter (or off gfx950) the Triton attention serves.
+    dcp_day0_decode: bool = False
     # Under DCP a decode / verify step's selection stores the sort keys it all-gathers
     # itself, the all-to-all merge writes the output itself, and (without dcp_mailbox,
     # which reads each head's LSE once) the attention stores the LSE once a 64-wide part,
@@ -946,6 +954,25 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
             and pro_kernels.day0_decode_available()
         )
 
+    def _dcp_day0(self, v: ProVariants, k_cache: torch.Tensor) -> bool:
+        """Whether a decode / verify step under DCP attends with aiter's FlyDSL DCP decode
+        (``dcp_day0_decode``): on the K-only plain fp8 cache of whole 16-token blocks a
+        page, with 128 query heads gathered."""
+        return (
+            v.dcp_day0_decode
+            and self.k_only
+            and k_cache.element_size() == 1
+            and v.k_plain_fp8
+            and self.page % pro_kernels.PAGE == 0
+            and self.num_heads * self.dcp_world == pro_kernels.DCP_DAY0_HEADS
+            and pro_kernels.dcp_day0_decode_available()
+        )
+
+    def _dcp_lse_rep(self, v: ProVariants) -> int:
+        """The times a DCP decode's attention writes each head's LSE: once a 64-wide part
+        under ``dcp_fold`` without the mailbox merge (the all-to-all reads it so)."""
+        return self.value_head_dim // 64 if v.dcp_fold and not self.dcp_mailbox else 1
+
     def take_mx_scale(self) -> torch.Tensor:
         """The E8M0 scales ``[T, H x 192 / 32]`` of the MXFP8 output this forward returned (the
         model hands them to o_proj with it), dropped here."""
@@ -1643,34 +1670,57 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
                 score, positions, k, split=v.topk == "split"
             )
             sel = pro_kernels.dcp_local_selection(sel, r, w)
-        if v.dcp_q_fp8:
+        day0 = self._dcp_day0(v, kc4)
+        if v.dcp_q_fp8 or day0:
             q = q.to(torch.float8_e4m3fn)
         qf = dcp_all_gather_query_heads(group, q)
         h = qf.shape[1]
         dv = self.value_head_dim
         of = torch.empty(n, h * dv, dtype=out.dtype, device=q.device)
-        rep = dv // 64 if v.dcp_fold and not self.dcp_mailbox else 1
+        rep = self._dcp_lse_rep(v)
         lse = torch.empty(n, h * rep, dtype=torch.float32, device=q.device)
-        # a rank holds about 1/w of the selected blocks, for w times the heads
-        splits = max(
-            1, (v.attn_splits or (32 if n <= 16 else 16 if n <= 32 else 8)) // w
-        )
-        pro_kernels.attention(
-            qf,
-            kc4,
-            block_tables,
-            seq_id,
-            qpos,
-            sel,
-            of,
-            self.scale * v.scale_mult,
-            splits,
-            nblk=v.attn_nblk,
-            k_scale=ks,
-            valid_first=True,
-            lse=lse,
-            lse_rep=rep,
-        )
+        if day0:
+            # its row metadata as int32, once a forward
+            c32 = getattr(md, "_m3pro_dcp_i32", None)
+            if c32 is None or c32[0] != capturing or c32[1].shape[0] != n:
+                md._m3pro_dcp_i32 = c32 = (
+                    capturing,
+                    qpos.to(torch.int32),
+                    seq_id.to(torch.int32),
+                )
+            pro_kernels.attention_dcp_day0(
+                qf,
+                kc4,
+                block_tables,
+                c32[2],
+                c32[1],
+                sel,
+                of,
+                self.scale * v.scale_mult,
+                lse,
+                rep,
+            )
+        else:
+            # a rank holds about 1/w of the selected blocks, for w times the heads
+            splits = max(
+                1, (v.attn_splits or (32 if n <= 16 else 16 if n <= 32 else 8)) // w
+            )
+            pro_kernels.attention(
+                qf,
+                kc4,
+                block_tables,
+                seq_id,
+                qpos,
+                sel,
+                of,
+                self.scale * v.scale_mult,
+                splits,
+                nblk=v.attn_nblk,
+                k_scale=ks,
+                valid_first=True,
+                lse=lse,
+                lse_rep=rep,
+            )
         return self._dcp_merge(group, of, lse, out, fold=v.dcp_fold)
 
     # ---------------------------------------------------------------- forward --
@@ -1846,6 +1896,10 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
                     if self._mxfp8_out(v, v.day0_decode_rows, day0_dec=True)
                     else ""
                 )
+            if self.dcp_world > 1:
+                attn_impl += "; DCP decode " + (
+                    "day0" if self._dcp_day0(v, layer.k_cache) else "triton"
+                )
             # the Triton / aiter rows, below the day0 decode
             mx_impl = (
                 "off"
@@ -1895,6 +1949,10 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
                 # compiled here, in the eager forward a capture runs first, not in the capture
                 pro_kernels.day0_decode_warm_up(
                     query.device, layer.k_cache.shape[-2], mx
+                )
+            if static and self.dcp_world > 1 and self._dcp_day0(v, layer.k_cache):
+                pro_kernels.dcp_day0_decode_warm_up(
+                    query.device, layer.k_cache.shape[-2], self._dcp_lse_rep(v)
                 )
             # the kernels write every row they compute in full: zero only the others
             width = h * self.value_head_dim
