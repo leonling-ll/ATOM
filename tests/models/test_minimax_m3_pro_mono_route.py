@@ -32,6 +32,7 @@ def _variants(**over):
         "mono_routed_act": "bf16",
         "day0_decode_rows": 24,
         "ar_fused_rows": 0,
+        "ar_fused_min_rows": 0,
         # read by production's segment, not the route (served as they are)
         "moe_tail_ar": False,
         "moe_two_stream_rows": 0,
@@ -203,6 +204,25 @@ def test_variants_the_hand_off_cannot_serve_latch_off(monkeypatch, caplog, over,
     assert h.created == 0 and h.route.rows == 0
     # the off line names the refusal, not the 0 it latched
     assert f"mono FFN off: {why}" in caplog.text
+
+
+@pytest.mark.parametrize(
+    "over, why",
+    [
+        ({"ar_fused_rows": 128, "ar_fused_min_rows": 16}, None),
+        ({"ar_fused_rows": 128, "ar_fused_min_rows": 24}, None),
+        ({"ar_fused_rows": 128, "ar_fused_min_rows": 8}, "ar_fused_rows 128 overlaps 9 .. 16"),
+        ({"ar_fused_rows": 0, "ar_fused_min_rows": 8}, None),
+    ],
+)
+def test_ar_fused_rows_above_the_row_limit_keep_mono(monkeypatch, over, why):
+    """ar_fused_min_rows at or above mono's rows leaves mono's AR #1 on the Lamport route."""
+    assert variants_refusal(_variants(**over), True) == why
+    h = Harness(monkeypatch, **over)
+    if why is None:
+        assert h.take(16) is h.runner and h.route.rows == 16
+    else:
+        assert h.take(1) is None and h.route.rows == 0
 
 
 @pytest.mark.parametrize("day0, rows", [(24, 16), (17, 16), (0, 16), (9, 8)])

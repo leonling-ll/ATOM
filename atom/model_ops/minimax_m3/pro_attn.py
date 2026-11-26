@@ -227,6 +227,11 @@ class ProVariants:
     # with ``tensor_model_parallel_fused_allreduce_rmsnorm_lamport`` (else the sites keep
     # their route); 0 turns it off.
     ar_fused_rows: int = 0
+    # Rows (tokens) at or below which ``ar_fused_rows`` does not apply (those sites keep
+    # the routes above): the one-launch kernel then takes ``ar_fused_min_rows + 1 ..
+    # ar_fused_rows`` rows only. At or above ``mono_ffn_rows`` it leaves mono's widths
+    # their Lamport AR #1, so the two can be on together (``pro_mono.route``).
+    ar_fused_min_rows: int = 0
     # A MoE layer hands its routed and shared-expert outputs over unsummed, and the next
     # layer's input all-reduce adds them (``routed + shared`` rounded to bf16, the bytes
     # of the separate add): inside the ``ar_fused_rows`` kernel up to its rows, as a

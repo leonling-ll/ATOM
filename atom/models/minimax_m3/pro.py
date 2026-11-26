@@ -84,6 +84,12 @@ HEAD_MAX_REQUESTS = 16
 FRONT_ROWS = 16
 
 
+def _ar_fused_rows(v, rows: int) -> int:
+    """``ProVariants.ar_fused_rows`` for a call of ``rows`` rows: 0 (the one-launch op off)
+    at or below ``ar_fused_min_rows``, the rows mono's AR #1 keeps on the Lamport route."""
+    return v.ar_fused_rows if rows > getattr(v, "ar_fused_min_rows", 0) else 0
+
+
 def _quantized_once(x: torch.Tensor, x_scale: torch.Tensor | None, linears) -> tuple:
     """``x`` (and its scale) for ``linears`` that share it: quantised here, once, when
     every one runs the native group32 FP8 GEMM, which would quantise it the same way
@@ -716,7 +722,7 @@ class MiniMaxM3ProDecoderLayer(MiniMaxM3DecoderLayer):
                     residual,
                     self.input_layernorm,
                     v.ar_lamport_rows,
-                    v.ar_fused_rows,
+                    _ar_fused_rows(v, rows),
                     addend=moe_tail,
                     q_out=x_out[0],
                     q_scale_out=x_out[1],
@@ -848,7 +854,7 @@ class MiniMaxM3ProDecoderLayer(MiniMaxM3DecoderLayer):
                 residual,
                 self.post_attention_layernorm,
                 v.ar_lamport_rows,
-                v.ar_fused_rows,
+                _ar_fused_rows(v, hidden_states.shape[0]),
             )
         hidden_states, residual = fused_allreduce_gemma_rms_norm(
             hidden_states, residual, self.post_attention_layernorm

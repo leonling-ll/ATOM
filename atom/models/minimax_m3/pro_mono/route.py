@@ -57,7 +57,8 @@ def variants_refusal(v, mx_norm: bool) -> str | None:
     above the row limit. ``ar_fused_rows`` sends production's AR #1 of 1 ..
     ``ar_fused_rows`` rows to the one-launch two-shot Lamport kernel (the
     fused 1-stage kernel's bytes, not the Lamport all-reduce's sum and norm),
-    so any positive value refuses, as a short ``ar_lamport_rows`` does.
+    so a positive value refuses, as a short ``ar_lamport_rows`` does, unless
+    ``ar_fused_min_rows`` keeps it above the row limit.
 
     Served as they are: ``moe_tail_ar`` (a mono layer hands on the summed FFN
     partial and leaves no tail; an earlier layer's tail is added by the input
@@ -85,8 +86,10 @@ def variants_refusal(v, mx_norm: bool) -> str | None:
         ),
         (
             rows_refusal(v.mono_ffn_rows, v.mono_routed_act) is not None
-            or v.ar_fused_rows <= 0,
-            f"ar_fused_rows {v.ar_fused_rows} overlaps 1 .. {v.mono_ffn_rows}",
+            or v.ar_fused_rows <= 0
+            or v.ar_fused_min_rows >= v.mono_ffn_rows,
+            f"ar_fused_rows {v.ar_fused_rows} overlaps "
+            f"{v.ar_fused_min_rows + 1} .. {v.mono_ffn_rows}",
         ),
     ]
     return next((why for ok, why in checks if not ok), None)
