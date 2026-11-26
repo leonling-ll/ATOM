@@ -93,7 +93,8 @@ from atom.models.minimax_m3.pro_mono.config import (
     max_rows,
 )
 from atom.mono.plan.check import RegionDecl
-from atom.mono.plan.execution import BLOCKS, THREADS, WAVES as WAVES_PER_CTA
+from atom.mono.plan.execution import BLOCKS, THREADS
+from atom.mono.plan.execution import WAVES as WAVES_PER_CTA
 from atom.mono.plan.layout import byte_layout, pair_layout
 from atom.mono.plan.trace import Space
 

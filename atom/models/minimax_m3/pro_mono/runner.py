@@ -330,7 +330,12 @@ class ProMonoRunner:
         return out
 
     def segment(
-        self, layer, core: torch.Tensor, residual: torch.Tensor, reference, core_scale=None
+        self,
+        layer,
+        core: torch.Tensor,
+        residual: torch.Tensor,
+        reference,
+        core_scale=None,
     ):
         """Decoder layer ``layer``'s post-attention segment on the kernel:
         ``(FFN partial, residual_mid)``. ``reference(residual)``: production's

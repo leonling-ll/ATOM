@@ -98,6 +98,7 @@ from atom.models.minimax_m3.pro_mono.layout import (
     W2_STEPS,
     W13_HALF,
     W13_Q,
+    WAVE_PICKS,
     X4_ROW,
     X4_WORDS,
     X8_ROW,
@@ -110,7 +111,6 @@ from atom.models.minimax_m3.pro_mono.layout import (
     max_u,
     midb_word,
     mids_staged,
-    WAVE_PICKS,
     mxfp8_tile_dword,
     queued,
     rlog_pair,
@@ -1687,7 +1687,9 @@ def stage_slots(c, areas, firsts, counts):
             it = fx.min(lane + 64 * p, fx.max(n - 1, 0))
             r, w = it // (INTERB_WORDS // 4), it % (INTERB_WORDS // 4) * 4
             v = fx.Vector(
-                ld_dev(c["plain"], c["pw"]["inter"] + (firsts[j] + r) * INTERB_WORDS + w, 4)
+                ld_dev(
+                    c["plain"], c["pw"]["inter"] + (firsts[j] + r) * INTERB_WORDS + w, 4
+                )
             )
             loads.append((j, lane + 64 * p < n, r, w, v))
     rocdl.sched_barrier(0)

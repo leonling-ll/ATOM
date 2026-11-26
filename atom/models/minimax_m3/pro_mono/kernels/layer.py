@@ -71,6 +71,7 @@ from atom.models.minimax_m3.pro_mono.layout import (
     TL_POINTS,
     TOKEN_TILE,
     TP,
+    WAVE_STAGE_WORDS,
     X4_ROW,
     X8_ROW,
     XSC_WORDS,
@@ -80,7 +81,6 @@ from atom.models.minimax_m3.pro_mono.layout import (
     max_u,
     mids_staged,
     peer_layout,
-    WAVE_STAGE_WORDS,
     plain_layout,
     rs_pair,
     scratch_layout,
@@ -676,7 +676,9 @@ def build(key: P1Build):
             # no staged mids to size ``xs``: room for ``red1`` past the
             # o stage's and the x slices' rows, and for the down waves' own
             # mid rows past the shared mid's (whole 16 B a token row)
-            need = -(-(max(o_end, x_end, s * SM_ROW + WAVE_STAGE_WORDS) + red_words) // s)
+            need = -(
+                -(max(o_end, x_end, s * SM_ROW + WAVE_STAGE_WORDS) + red_words) // s
+            )
             xs_row = max(xs_row, (need + 3) // 4 * 4)
         assert max(o_end, x_end) <= s * xs_row - red_words, (o_end, x_end)
 

@@ -785,9 +785,11 @@ class MiniMaxM3ProDecoderLayer(MiniMaxM3DecoderLayer):
                 core,
                 residual,
                 lambda res: self._segment(
-                    attn.o_proj(core)
-                    if core_scale is None
-                    else attn.o_proj(core, x_scale=core_scale),
+                    (
+                        attn.o_proj(core)
+                        if core_scale is None
+                        else attn.o_proj(core, x_scale=core_scale)
+                    ),
                     res,
                     v,
                     mx_norm,
