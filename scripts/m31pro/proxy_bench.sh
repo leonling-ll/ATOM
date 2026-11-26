@@ -162,7 +162,13 @@ pro)
 agentic | agentic_sc)
     # ar_lamport_rows needs the Lamport path.
     unset AITER_CUSTOM_AR_DISABLE_LAMPORT
-    recipe_variants='{"kernels": true, "attn": "aiter", "topk": "split", "prep": "aiter", "index_split": true, "score_tq": 8, "ar_lamport_rows": 16, "k_only": true, "k_plain_fp8": true, "prefill_attn": "day0", "index_split_decode": 64, "moe_route_glue": true'
+    # The decode indexer splits over the TP ranks from this many graph rows.
+    # Small concurrency: from 3 sequences of k7 verify rows, where every rank
+    # scoring and selecting every row costs more than one sequence a rank and
+    # the all-gather.
+    split_decode=64
+    [ "$RECIPE" = agentic_sc ] && split_decode=24
+    recipe_variants='{"kernels": true, "attn": "aiter", "topk": "split", "prep": "aiter", "index_split": true, "score_tq": 8, "ar_lamport_rows": 16, "k_only": true, "k_plain_fp8": true, "prefill_attn": "day0", "index_split_decode": '"$split_decode"', "moe_route_glue": true'
     # Up to 16 rows the centroid writes cost more than the faster scoring saves;
     # there the decode scores of a 1M-wide block table take aiter's fp8 scorer.
     if [ "$RECIPE" = agentic_sc ]; then

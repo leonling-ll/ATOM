@@ -326,7 +326,7 @@ def test_agentic_sc_serves_from_hbm_without_index_compress(tmp_path):
     served = json.loads(values["ATOM_M3PRO_VARIANTS"])
     agentic = json.loads(_recipe_launch()[0]["ATOM_M3PRO_VARIANTS"])
     del agentic["index_compress"]
-    assert served == {**agentic, "index": "fused"}
+    assert served == {**agentic, "index": "fused", "index_split_decode": 24}
     assert values["GPU_MEM_UTIL"] == "0.95"
     assert values["ATOM_ONLINE_QUANT_STREAMING"] == "1"
 
