@@ -315,9 +315,14 @@ class ProVariants:
     # a gather of the centroids into its 64-token pages) instead of the score_tq scores and
     # the split selection, picks valid first for the day0 prefill attention. Its scores are
     # fp16 (the Triton ones fp32), so a near-tie can pick another block, as in vLLM. Needs
-    # index_compress, "max" heads, prefill_attn "day0" and no DCP; with an aiter that lacks
-    # it (or off gfx950) the Triton kernels run.
+    # index_compress, "max" heads, prefill_attn "day0" and no DCP (``dcp_index_day0``: under DCP
+    # too); with an aiter that lacks it (or off gfx950) the Triton kernels run.
     index_day0: bool = False
+    # ... and under DCP: a prefill's split indexer runs index_top128 over the caches the
+    # prefill gathers (``_dcp_prefill_caches``: every block of its sequences, the block
+    # tables into them), which hold the single rank's centroids page for page, so it
+    # selects what the single rank's index_day0 selects. Needs index_compress under DCP.
+    dcp_index_day0: bool = False
     # Decode / verify batches of at least this many rows attend with amd-kernels-day0's FlyDSL
     # sparse decode as ported into aiter, aiter.ops.flydsl's minimax_m3_fp8_sparse_decode
     # (one workgroup a row: ahead of the paged attention from ~24 rows), on the K-only plain
@@ -1837,7 +1842,7 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
             v.index_day0
             and v.index_compress
             and v.head_reduce == "max"
-            and self.dcp_world == 1
+            and (self.dcp_world == 1 or v.dcp_index_day0)
             and ic.dtype == torch.bfloat16
         ):
             return False

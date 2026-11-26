@@ -706,12 +706,16 @@ class AiterAttentionMetadataBuilder(DraftCtxSlotsMixin, CommonAttentionBuilder):
             from atom.model_ops.minimax_m3.pro_kernels import GROUP
 
             # vLLM's compressed index cache: a bf16 centroid of every GROUP keys, so a
-            # block's page is block_size / GROUP rows whatever --index-cache-dtype says
-            if self.block_size % GROUP or config.decode_context_parallel_size > 1:
+            # block's page is block_size / GROUP rows whatever --index-cache-dtype says.
+            # Under DCP a rank pools the groups of the blocks it holds, so a group's
+            # keys must be one rank's: whole blocks a rank.
+            dcp = config.decode_context_parallel_size
+            interleave = config.dcp_config.interleave_size if dcp > 1 else 0
+            if self.block_size % GROUP or interleave % self.block_size:
                 raise ValueError(
                     "the compressed index cache needs a block of whole groups of "
-                    f"{GROUP} and no DCP (block {self.block_size}, "
-                    f"DCP {config.decode_context_parallel_size})"
+                    f"{GROUP} and, under DCP, whole blocks a rank (block "
+                    f"{self.block_size}, DCP {dcp} interleave {interleave})"
                 )
             return _IndexCacheSpec(
                 rows,
