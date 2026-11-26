@@ -90,10 +90,14 @@ def _ar_fused_rows(v, rows: int, bound: int = 0) -> int:
     return v.ar_fused_rows if rows > bound else 0
 
 
-def _folds(rows: int, bound: int = 0) -> bool:
+def _folds(v, rows: int, bound: int = 0) -> bool:
     """Whether a step of ``rows`` rows takes ``moe_glue_fold`` / ``moe_tail_ar``: above
-    ``bound`` only, so the widths at or below it keep today's launches and bytes."""
-    return rows > bound
+    ``bound`` only, so the widths at or below it keep today's launches and bytes; with
+    ``ar_fused_min_rows`` set, also only up to ``ar_fused_rows``, where the one-launch
+    all-reduce takes the shared add (wider steps keep today's launches too)."""
+    if rows <= bound:
+        return False
+    return v.ar_fused_min_rows <= 0 or rows <= v.ar_fused_rows
 
 
 def _quantized_once(x: torch.Tensor, x_scale: torch.Tensor | None, linears) -> tuple:
@@ -843,7 +847,7 @@ class MiniMaxM3ProDecoderLayer(MiniMaxM3DecoderLayer):
             mx = None
             if (
                 v.moe_glue_fold
-                and _folds(hidden_states.shape[0], self._fold_bound(v))
+                and _folds(v, hidden_states.shape[0], self._fold_bound(v))
                 and moe_route_glue.takes_lookahead()
             ):
                 mx = state.mx_target(self.layer_num, hidden_states)
@@ -910,7 +914,7 @@ class MiniMaxM3ProDecoderLayer(MiniMaxM3DecoderLayer):
             defer = (
                 hand_tail
                 and v.moe_glue_fold
-                and _folds(hidden_states.shape[0], self._fold_bound(v))
+                and _folds(v, hidden_states.shape[0], self._fold_bound(v))
                 and self.layer_num + 1 < state.end_layer
             )
             out = ffn.forward_glue(routes, quant_down=True, defer_shared=defer)
@@ -925,7 +929,7 @@ class MiniMaxM3ProDecoderLayer(MiniMaxM3DecoderLayer):
             defer = (
                 hand_tail
                 and v.moe_tail_ar
-                and _folds(hidden_states.shape[0], self._fold_bound(v))
+                and _folds(v, hidden_states.shape[0], self._fold_bound(v))
                 and ffn.shared_experts is not None
                 and self.layer_num + 1 < state.end_layer
             )

@@ -231,7 +231,8 @@ class ProVariants:
     # ``moe_glue_fold`` do not apply (those steps keep today's launches), raised to mono's
     # latched row limit when mono is on: the one-launch kernel then takes only the rows
     # above both, mono's widths keep their Lamport AR #1, and the two can be on together
-    # (``pro_mono.route``). 0: off (``ar_fused_rows`` from 1 row, mono refused).
+    # (``pro_mono.route``); the two folds then also stop above ``ar_fused_rows``. 0: off
+    # (``ar_fused_rows`` from 1 row, mono refused, the folds at every width).
     ar_fused_min_rows: int = 0
     # A MoE layer hands its routed and shared-expert outputs over unsummed, and the next
     # layer's input all-reduce adds them (``routed + shared`` rounded to bf16, the bytes

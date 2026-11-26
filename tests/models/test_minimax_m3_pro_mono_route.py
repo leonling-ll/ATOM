@@ -226,6 +226,21 @@ def test_ar_fused_rows_above_the_row_limit_keep_mono(monkeypatch, over, why):
         assert h.take(1) is None and h.route.rows == 0
 
 
+@pytest.mark.parametrize("min_rows", [16, 32])
+def test_mono_to_32_rows_with_the_one_launch_ar_above_it_keeps_mono(min_rows):
+    """mono to 32 rows (a wider build), the one-launch AR and the folds above it: no refusal
+    from these variants (the width a build supports is the latch's, not checked here).
+    """
+    over = {
+        "mono_ffn_rows": 32,
+        "ar_lamport_rows": 32,
+        "ar_fused_rows": 128,
+        "ar_fused_min_rows": min_rows,
+        "day0_decode_rows": 48,
+    }
+    assert variants_refusal(_variants(**over), True) is None
+
+
 @pytest.mark.parametrize("day0, rows", [(24, 16), (17, 16), (0, 16), (9, 8)])
 def test_a_day0_decode_above_the_row_limit_or_off_is_served(monkeypatch, day0, rows):
     """The Agentic recipe's 24 against mono's 16, or the day0 decode off."""
