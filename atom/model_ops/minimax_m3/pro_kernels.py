@@ -722,6 +722,17 @@ def _takes_kv_unit_scale(op) -> bool:
     return "kv_unit_scale" in inspect.signature(op).parameters
 
 
+def aiter_prep_q8_available() -> bool:
+    """Whether this aiter's prep writes an E4M3 ``q_out`` (torch's cast of its rounded q
+    rows, ``prep_aiter``'s ``q8``): its module says so with ``Q_OUT_FP8``."""
+    op = _aiter_prep()
+    if not op:
+        return False
+    import sys
+
+    return bool(getattr(sys.modules.get(op.__module__), "Q_OUT_FP8", False))
+
+
 def prep_aiter_fits(qkv, heads) -> bool:
     """Whether ``prep_aiter`` takes these rows: 2-D, rows 16-byte (q, k) / 8-byte (index)
     aligned (its vector loads)."""
@@ -757,11 +768,15 @@ def prep_aiter(
     k_scale=None,
     v_scale=None,
     k_unit=False,
+    q8=False,
 ):
     """``prep`` in one launch of aiter's ``fused_qk_norm_rope_cache_mqa``: the same arguments
     and results (rows as ``prep_aiter_fits`` takes them), any number of heads. The op takes
     the norm weights and cos / sin in the activation dtype; others go to ``prep``.
     ``k_unit`` (``prep``'s) is the op's ``kv_unit_scale`` (``aiter_prep_available(True)``).
+    ``q8`` (``aiter_prep_q8_available()``): q comes out ``float8_e4m3fn``, the bytes
+    ``q.to(torch.float8_e4m3fn)`` makes of the bf16 rows (the day0 decode's input); the
+    Triton fallback keeps bf16 q, which the decode then casts.
     """
     q, k, iq, ik = _split_rows(qkv, heads)
     if any(t.dtype != q.dtype for t in (wq, wk, wiq, wik, cos, sin)):
@@ -788,6 +803,10 @@ def prep_aiter(
     fp8 = kc4.element_size() == 1
     # passed only when set: an aiter without kv_unit_scale still serves the scaled cache
     unit = {"kv_unit_scale": True} if k_unit else {}
+    if q8:
+        unit["q_out"] = torch.empty(
+            q.shape[0], heads, HEAD_DIM, dtype=torch.float8_e4m3fn, device=q.device
+        )
     return _aiter_prep()(
         q,
         k,

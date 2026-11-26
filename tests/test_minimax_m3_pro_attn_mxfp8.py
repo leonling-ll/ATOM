@@ -504,6 +504,40 @@ class TestDay0Decode:
         self._run(c, 4, got, slots=slots)
         assert torch.isfinite(got[:-8].float()).all() and (got[-8:] == 0).all()
 
+    @pytest.mark.parametrize("n_seqs", [24, 40, 64])
+    @pytest.mark.parametrize("mx", [False, True])
+    def test_prep_q8_gives_the_same_bytes(self, n_seqs, mx, monkeypatch):
+        # prep_q8: aiter's prep writes the decode's E4M3 q itself instead of the
+        # decode casting the bf16 q; the impl's output (bf16, or the MXFP8
+        # epilogue) is bit-equal
+        if not (K.aiter_prep_available(k_unit=True) and K.aiter_prep_q8_available()):
+            pytest.skip("this aiter's prep has no kv_unit_scale / E4M3 q_out")
+        c, v, m, _, args, nb = TestImpl._decode_case(n_seqs, True, prep="aiter")
+        m.__dict__["index_cache"] = c.ic
+        assert m._day0_decode(v, c.S, c.S, True) and m._aiter_prep(v)
+        seen, real = [], K.prep_aiter
+
+        def spy(*a, **kw):
+            seen.append(kw.get("q8", False))
+            return real(*a, **kw)
+
+        monkeypatch.setattr(K, "prep_aiter", spy)
+        outs = []
+        for q8 in (False, True):
+            if mx:
+                o, sc = _mx_out(c.S)
+            else:
+                o, sc = torch.zeros(c.S, H * DV, dtype=torch.bfloat16, device=DEV), None
+            m._kernel_attention(
+                *args, nb, replace(v, prep_q8=q8), o, static=True, mx_scale=sc
+            )
+            outs.append((o, sc))
+        assert seen == [False, True]
+        raw = lambda t: t.view(torch.uint8)
+        assert torch.equal(raw(outs[0][0]), raw(outs[1][0]))
+        if mx:
+            assert torch.equal(outs[0][1], outs[1][1])
+
     @pytest.mark.parametrize("n_seqs", [24, 40])
     def test_impl_matches_the_attention_below_it(self, n_seqs):
         # the impl's static decode: the day0 decode at day0_decode_rows, against the same

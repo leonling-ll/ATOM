@@ -281,6 +281,12 @@ class ProVariants:
     # ... and its epilogue writes o_proj's MXFP8 input (E4M3 + E8M0 of the bf16-rounded rows,
     # quantize_fp8's bytes) where o_proj is a native group32 FP8 GEMM: no separate quant.
     day0_decode_mxfp8: bool = True
+    # ... and aiter's prep (``prep_aiter``) writes the q rows the day0 decode reads as
+    # E4M3 itself, the bytes the decode's ``q.to(torch.float8_e4m3fn)`` would make of
+    # its bf16 rows (torch's cast), instead of that separate cast launch a layer. Where
+    # this aiter's prep lacks an E4M3 ``q_out`` the cast stays. Off by default (the c8
+    # launch turns it on).
+    prep_q8: bool = False
     # Mono decode phase 1 (``models/minimax_m3/pro_mono``): the most graph rows a decode /
     # verify forward may have for its MoE layers' o_proj .. FFN segment to run as one
     # persistent kernel; 0 turns it off, at most ``pro_mono.config.max_rows``. Wider
@@ -1109,10 +1115,21 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
             ratio = (1.0 if v.mscale == "hf" else float(v.mscale)) / aiter_m
         eps = self.q_norm.variance_epsilon
         k_unit = fp8 and v.k_plain_fp8
+        # decode / verify: FlyDSL sparse decode from day0_decode_rows rows
+        day0_dec = static and self._day0_decode(v, n, block_tables.shape[0], fp8)
         prep = functools.partial(pro_kernels.prep, k_unit=k_unit)
         if self._aiter_prep(v):
             if pro_kernels.prep_aiter_fits(qkv, self.num_heads):
-                prep = functools.partial(pro_kernels.prep_aiter, k_unit=k_unit)
+                prep = functools.partial(
+                    pro_kernels.prep_aiter,
+                    k_unit=k_unit,
+                    # the day0 decode reads E4M3 q: prep writes it (prep_q8); the DCP
+                    # decode reads q itself, so it keeps bf16
+                    q8=day0_dec
+                    and self.dcp_world == 1
+                    and v.prep_q8
+                    and pro_kernels.aiter_prep_q8_available(),
+                )
             elif not getattr(self, "_warned_prep", False):
                 self._warned_prep = True
                 logger.warning(
@@ -1201,8 +1218,6 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
             and pro_kernels.day0_prefill_available(kc4.shape[-2])
         )
 
-        # decode / verify: FlyDSL sparse decode from day0_decode_rows rows
-        day0_dec = static and self._day0_decode(v, n, block_tables.shape[0], fp8)
         assert mx_scale is None or static, "prefill attention writes bf16"
 
         valid_first = False  # set where the selection is select_logical's

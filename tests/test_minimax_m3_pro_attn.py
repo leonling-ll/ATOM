@@ -472,3 +472,22 @@ class TestPrepRouting:
         monkeypatch.setattr(K, "_fused_prep", _op_scaled)
         self._prep_aiter(K)
         assert "kv_unit_scale" not in _op_scaled.calls[-1]
+
+    def test_prep_aiter_q8_hands_the_op_an_e4m3_q_out(self, K):
+        self._prep_aiter(K, k_unit=True, q8=True)
+        q_out = _op_unit.calls[-1]["q_out"]
+        assert q_out.dtype == torch.float8_e4m3fn and tuple(q_out.shape) == (2, 16, 256)
+
+    def test_prep_aiter_leaves_q_out_to_the_op_by_default(self, K):
+        self._prep_aiter(K, k_unit=True)
+        assert "q_out" not in _op_unit.calls[-1]
+
+    def test_q8_needs_the_ops_module_to_say_so(self, K, monkeypatch):
+        import sys
+
+        assert not K.aiter_prep_q8_available()  # this module has no Q_OUT_FP8
+        mod = sys.modules[_op_unit.__module__]
+        monkeypatch.setattr(mod, "Q_OUT_FP8", True, raising=False)
+        assert K.aiter_prep_q8_available()
+        monkeypatch.setattr(K, "_fused_prep", False)
+        assert not K.aiter_prep_q8_available()

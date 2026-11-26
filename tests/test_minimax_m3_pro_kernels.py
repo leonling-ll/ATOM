@@ -2332,6 +2332,51 @@ class TestDay0Decode:
             # valid first, -1 after
             assert (valid.int().diff(dim=1) <= 0).all()
 
+    @pytest.mark.parametrize(
+        "rows_min,prep_q8,want_q8",
+        [(24, True, True), (24, False, False), (25, True, False)],
+    )
+    def test_prep_q8_hands_the_day0_decode_e4m3_q(
+        self, monkeypatch, rows_min, prep_q8, want_q8
+    ):
+        # prep_q8: aiter's prep writes the q the day0 decode reads as E4M3 (the
+        # decode's own cast is then a no-op); other batches, prep_q8 off or an aiter
+        # without it: bf16 q
+        c, tok, seq, _qlen = self._verify_case()
+        c.impl.__dict__["index_cache"] = c.ic  # _aiter_prep reads its dtype
+        monkeypatch.setattr(K, "TOPK", 8)
+        monkeypatch.setattr(K, "aiter_value_rows_available", lambda: True)
+        monkeypatch.setattr(K, "day0_decode_available", lambda: True)
+        monkeypatch.setattr(K, "aiter_prep_available", lambda k_unit=False: True)
+        monkeypatch.setattr(K, "aiter_prep_q8_available", lambda: True)
+        monkeypatch.setattr(K, "prep_aiter_fits", lambda qkv, heads: True)
+        got = {}
+
+        def fake_prep_aiter(*a, q8=False, **kw):
+            got["q8"] = q8
+            q, iq = K.prep(*a, **kw)
+            return (q.to(torch.float8_e4m3fn) if q8 else q), iq
+
+        def fake_day0(q, kc4, bt, pos, slots, sel, out, scale, ql, out_scale=None):
+            got["q_dtype"] = q.dtype
+            return out
+
+        monkeypatch.setattr(K, "prep_aiter", fake_prep_aiter)
+        monkeypatch.setattr(K, "attention_day0_decode", fake_day0)
+        monkeypatch.setattr(K, "attention_aiter", lambda *a, **k: a[5])
+        kw = {"topk": "split", "attn": "aiter", "k_only": True, "k_plain_fp8": True}
+        v = ProVariants(**kw, prep="aiter", day0_decode_rows=rows_min, prep_q8=prep_q8)
+        n = tok.numel()
+        wide = torch.cat([c.bt, torch.zeros_like(c.bt).repeat(1, 3)], dim=1)
+        out = torch.zeros(n, H * VD, dtype=DT, device=DEV)
+        c.impl._kernel_attention(
+            c.qkv[tok], c.pos[tok], seq, c.slot[tok], wide, c.layer, c.ic,
+            wide.shape[1], v, out, static=True,
+        )  # fmt: skip
+        assert got["q8"] is want_q8
+        if rows_min <= n:
+            assert got["q_dtype"] == (torch.float8_e4m3fn if want_q8 else DT)
+
     def _impl(self, mx_out):
         m = object.__new__(ProSparseAttentionImpl)
         m.num_heads, m.head_dim, m.value_head_dim, m.layer_num = H, D, VD, 1

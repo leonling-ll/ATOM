@@ -474,3 +474,26 @@ if __name__ == "__main__":
         bench(a.heads, a.kv, a.ic, tokens, a.iters, a.k_only)
     else:
         raise SystemExit(pytest.main([__file__, "-q"]))
+
+
+@pytest.mark.parametrize("wide", [False, True])
+@pytest.mark.parametrize("t", [1, 8, 24, 32, 64])
+def test_q8_is_the_cast_of_the_bf16_q(t, wide):
+    """``prep_aiter(q8=True)`` (``prep_q8``): the E4M3 q the day0 decode reads,
+    written by the prep itself, holds the bytes of ``q.to(torch.float8_e4m3fn)`` of its
+    bf16 q (the decode's cast, which then is a no-op); every cache and the index q are
+    unchanged. ``wide``: q-norm gains from 1e-7 to 3e3, so fp8 denormals and the NaN
+    range (>= 480) are hit too."""
+    if not K.aiter_prep_q8_available():
+        pytest.skip("this aiter's fused_qk_norm_rope_cache_mqa has no E4M3 q_out")
+    c = Case(t, 16, "fp8", "fp8", packed=True, seed=t + 21, k_only=True)
+    if wide:
+        c.wq = (10 ** torch.linspace(-7, 3.5, D) - 1).to(DT).to(DEV)
+    want, got = c.run(K.prep_aiter), c.run(functools.partial(K.prep_aiter, q8=True))
+    assert got.q.dtype == torch.float8_e4m3fn and got.q.shape == want.q.shape
+    assert torch.equal(_raw(got.q), _raw(want.q.to(torch.float8_e4m3fn)))
+    for name in ("iq", "kc4", "ks", "ic"):
+        assert torch.equal(_raw(getattr(got, name)), _raw(getattr(want, name))), name
+    if wide:
+        codes = _raw(got.q).view(torch.uint8) & 0x7F
+        assert (codes == 0x7F).any() and ((codes > 0) & (codes < 8)).any()
