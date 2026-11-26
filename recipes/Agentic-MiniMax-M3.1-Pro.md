@@ -463,7 +463,7 @@ GSM8K for the second row's launch (DSpark k=5 at real acceptance, 3 runs): 0.943
 The full-workload CONC 64 launch with decode context parallelism 8 (`--decode-context-parallel-size 8`,
 see [`MiniMax-M3-Pro.md`](MiniMax-M3-Pro.md#decode-context-parallelism-dcp-8)). Each GPU holds every
 eighth block of the target's K and index K, so the KV pool holds about 4.9× the tokens (the DSpark
-draft's KV is not sharded), and at CONC 64 nothing queues: the GPU prefix hit is 0.89 against 0.24 at
+draft's KV is not sharded), and at CONC 64 nothing queues: the GPU prefix hit is 0.90 against 0.24 at
 DCP=1. It changes these things in the DCP=1 launch above:
 
 - **`--decode-context-parallel-size 8`** and **DSpark 3 draft tokens at AL 2.53**, the golden AL for
@@ -565,22 +565,24 @@ Check the startup log: the `ATOM_KV_OFFLOAD` line with `"lmcache.mp.tp_rank_coll
 ### Measured (full workload, CONC 64, DCP=8)
 
 The official client (InferenceX `e1999621`, agentx-harness 1.0.14), uncapped corpus at 1M context,
-one run per row, no request failed. The DCP=8 rows ran on ATOM `yuhzhu/attn9-dcp` `782d18cd` (the
-DCP code of this recipe's commit before its merge) with aiter-M3's sync tree plus the DCP decode op
-(`84822644e`, the op merged in aiter-M3#36); the DCP=1 row is the full-workload launch above.
+one run per row, no request failed. The rows of this launch ran on ATOM `yuhzhu/attn9-dcp` `782d18cd`
+(the DCP code of this recipe's commit before its merge) with aiter-M3's sync tree plus the DCP decode
+op (`84822644e`, the op merged in aiter-M3#36); the last row ran on `7c636337` with the sync tree
+alone, and the DCP=1 row is the full-workload launch above.
 
 | Launch | Duration | tok/s/GPU | P90 / P50 interactivity | TTFT p50 / p90 | Requests | GPU prefix hit |
 |---|---|---:|---:|---:|---:|---:|
-| This launch | 600 s | **18,469** | 19.9 / 29.2 | 0.48 / 2.38 s | 923 | 0.892 |
-| This launch without decode protection, `dcp_mailbox`, `dcp_fold`, `dcp_q_fp8` and `dcp_day0_decode` (ATOM `7c636337`, second node) | 600 s | 17,344 | 18.2 / 28.4 | 0.34 / 2.00 s | 872 | 0.893 |
-| DCP=1: the full-workload CONC 64 launch above | 3600 s | 16,798 | 44.65 / 64.6 | 2.7 / 84.1 s | 4,210 | 0.242 (+ 0.716 CPU) |
+| This launch (node B) | 3600 s | **19,681** | 17.74 / 23.75 | 0.6 / 2.5 s | 4,876 | 0.903 |
+| DCP=1: the full-workload CONC 64 launch above (node A) | 3600 s | 16,798 | 44.65 / 64.6 | 2.7 / 84.1 s | 4,210 | 0.242 (+ 0.716 CPU) |
+| This launch (node A) | 600 s | 18,469 | 19.9 / 29.2 | 0.48 / 2.38 s | 923 | 0.892 |
+| This launch without decode protection, `dcp_mailbox`, `dcp_fold`, `dcp_q_fp8` and `dcp_day0_decode` (ATOM `7c636337`, node B) | 600 s | 17,344 | 18.2 / 28.4 | 0.34 / 2.00 s | 872 | 0.893 |
 
-DCP=8 trades per-user speed for no queueing: P90 and P50 interactivity are about 2.2× lower than at
-DCP=1, but TTFT p90 is 2.4 s instead of 84 s and the GPU serves 0.89 of the prompt tokens from
-HBM instead of 0.24. The 600 s rows are not 3600 s rows: 600 s runs of one launch differ by up to
-about 10%, and the first two rows ran on different nodes. Against the second row, this launch's
-decode step costs 1.39 ms a sequence instead of 1.51 (−8%) and prefill 51.5 µs a token instead of
-55.0.
+Over the hour DCP=8 gives 17% more tok/s/GPU than DCP=1 and trades per-user speed for no queueing:
+P90 and P50 interactivity are 2.5× and 2.7× lower, but TTFT p90 is 2.5 s instead of 84 s and the
+GPU serves 0.90 of the prompt tokens from HBM instead of 0.24. The two 3600 s rows ran on different
+nodes. The 600 s rows are not 3600 s rows: 600 s runs of one launch differ by up to about 10%.
+Against the last row, this launch's decode step costs 1.39 ms a sequence instead of 1.51 (−8%) and
+prefill 51.5 µs a token instead of 55.0 (600 s each, different nodes).
 
 GSM8K (64-shot, DSpark k=5 at real acceptance, 3 runs, DCP=8 with `dcp_topk_merge`, fp8 index
 cache): 0.9414 without the DCP cuts, 0.9391 with `dcp_mailbox` 768, `dcp_fold` and `dcp_q_fp8`,
