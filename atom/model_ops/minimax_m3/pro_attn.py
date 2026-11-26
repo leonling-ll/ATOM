@@ -309,9 +309,11 @@ class ProVariants:
 # table's whole width (past QTILE_ROWS rows). Below it Triton's causal scores are
 # faster at short contexts and slower at long ones, and a graph cannot see the
 # context, so the block table's width (the server's max-model-len) decides: from
-# _FUSED_MIN_BLOCKS_FP8 blocks wide, aiter's. MI355X, 68 layers, us a layer, fp8
-# Triton vs aiter: 8 rows 8.55 vs 13.52 at 64k, 31.90 vs 21.95 at 340k; 16 rows
-# 12.09 vs 15.60 at 64k, 51.40 vs 33.93 at 340k.
+# _FUSED_MIN_BLOCKS_FP8 blocks wide (192k, past the 8-row crossover), aiter's.
+# MI355X, 68 layers, us a layer, fp8 Triton vs aiter: 8 rows 8.56 vs 13.42 at 64k,
+# 16.08 vs 16.33 at 160k, 31.66 vs 21.98 at 340k; 16 rows cross near 98k, 24 rows
+# near 70k. Launching both, each guarded on the context, costs an idle launch
+# (2.1 us for aiter's) and saves less on the official agentic mix.
 _FUSED_MIN_ROWS_FP8 = 32
 _FUSED_MIN_BLOCKS_FP8 = 12288
 
