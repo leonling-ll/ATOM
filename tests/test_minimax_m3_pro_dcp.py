@@ -805,3 +805,34 @@ def test_dcp_day0_decode_keeps_triton_off_the_plain_fp8_cache(decode, plain, dty
         k_plain_fp8=plain,
     )
     assert "attention" in calls and "day0" not in calls
+
+
+# -- the push merge (``dcp_push_merge``) ----------------------------------------
+
+
+def test_dcp_merge_takes_the_push_merge_where_it_fits(mailbox, monkeypatch):
+    """``dcp_push_merge``: ``_dcp_merge`` hands a step within the push rows to the push
+    merge (which writes the layer's output), else merges as before."""
+    impl, _, _, calls, group = mailbox
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+
+    class Merge:
+        def fits(self, of, lse, out):
+            return lse.shape[1] == 128
+
+        def __call__(self, of, lse, out):
+            calls["push"] = (of, lse, out)
+            return out.fill_(5)
+
+    impl.dcp_push = SimpleNamespace(rows=8, merge=Merge())
+    g = torch.Generator().manual_seed(0)
+    for rows, takes in ((8, True), (9, False)):
+        calls.clear()
+        of = torch.randn(rows, 8 * 16 * 192, generator=g).to(torch.bfloat16)
+        lse = torch.randn(rows, 8 * 16, generator=g)
+        out = torch.zeros(rows, 16 * 192, dtype=torch.bfloat16)
+        assert impl._dcp_merge(group, of, lse, out) is out
+        assert ("push" in calls) is takes and ("a2a" in calls) is not takes
+        if takes:
+            assert calls["push"][0] is of and calls["push"][1] is lse
+            assert (out == 5).all()
