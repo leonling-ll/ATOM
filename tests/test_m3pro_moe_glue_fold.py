@@ -224,6 +224,22 @@ def test_ar_fused_min_rows_keeps_todays_launches_at_or_below_it(
     assert (norm_ran, added) == ((False, 3) if folds else (True, 0))
 
 
+@pytest.mark.parametrize("rows, folds", [(20, False), (24, False), (30, True)])
+def test_the_bound_follows_monos_latched_rows(load, monkeypatch, rows, folds):
+    """mono latched at 24 rows (a launch's mono_ffn_rows) raises ar_fused_min_rows 16 to 24:
+    the widths mono serves keep today's launches whatever the knob says."""
+    run, log, _ = _layers(load, monkeypatch)
+    want_h, want_res = run(rows)
+    pro = load("atom.models.minimax_m3.pro")
+    mono = SimpleNamespace(rows=24, take=lambda layer, rows: None)
+    monkeypatch.setattr(pro.MiniMaxM3ProDecoderLayer, "_mono", mono)
+    got_h, got_res = run(rows, moe_glue_fold=True, ar_fused_min_rows=16)
+    assert torch.equal(got_h, want_h) and torch.equal(got_res, want_res)
+    norm_ran = {(2, "in"), (3, "in")} <= set(log.norm)
+    added = sum(add is not None for _, add in log.ar)
+    assert (norm_ran, added) == ((False, 3) if folds else (True, 0))
+
+
 def test_an_aiter_without_the_lookahead_keeps_the_norm_and_still_defers(
     load, monkeypatch
 ):

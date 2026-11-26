@@ -211,12 +211,13 @@ def test_variants_the_hand_off_cannot_serve_latch_off(monkeypatch, caplog, over,
     [
         ({"ar_fused_rows": 128, "ar_fused_min_rows": 16}, None),
         ({"ar_fused_rows": 128, "ar_fused_min_rows": 24}, None),
-        ({"ar_fused_rows": 128, "ar_fused_min_rows": 8}, "ar_fused_rows 128 overlaps 9 .. 16"),
+        # production follows the latched limit (16 here), whatever the knob
+        ({"ar_fused_rows": 128, "ar_fused_min_rows": 8}, None),
         ({"ar_fused_rows": 0, "ar_fused_min_rows": 8}, None),
     ],
 )
 def test_ar_fused_rows_above_the_row_limit_keep_mono(monkeypatch, over, why):
-    """ar_fused_min_rows at or above mono's rows leaves mono's AR #1 on the Lamport route."""
+    """ar_fused_min_rows set: mono stays on; production keeps the one-launch op above its rows."""
     assert variants_refusal(_variants(**over), True) == why
     h = Harness(monkeypatch, **over)
     if why is None:
