@@ -4617,6 +4617,10 @@ class ModelRunner:
             from atom.model_ops.dcp_ops import check_dcp_mailbox_launches
 
             check_dcp_mailbox_launches()
+        # the DCP push workspaces (none: nothing to check)
+        from atom.model_ops.dcp_push import check_dcp_push_launches
+
+        check_dcp_push_launches()
 
         # How much GPU memory the CUDA graph capture consumed (pool = reserved
         # delta; the allocated delta is what the graphs pin live).

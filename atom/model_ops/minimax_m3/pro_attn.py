@@ -213,6 +213,12 @@ class ProVariants:
     # default); read once, when the layers are built. The same weighted sum, other
     # rounding.
     dcp_mailbox: int = 0
+    # Under DCP8 a decode / verify step of at most this many rows (0: off) merges with
+    # ATOM's push merge (``dcp_push.PushMerge``): each rank stores its heads' partials
+    # and LSEs into every peer's uncached buffer and the peers merge in the same launch,
+    # ahead of the mailbox / all-to-all merge. Bit for bit the all-to-all merge (the
+    # ranks' terms added in its combine's order). Read once, when the layers are built.
+    dcp_push_merge: int = 0
     # Under DCP a decode / verify step all-gathers its query heads as a plain fp8 cast
     # (the e4m3 values the day0 decode reads at DCP 1) instead of bf16: half the bytes.
     # The Triton attention reads them back exactly, so q rounds as at DCP 1's day0 decode
@@ -555,6 +561,7 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
     # The decode context parallel group's size: each rank holds every W-th 16-token block
     # of the KV and index caches (``pro_kernels.dcp_local_positions``).
     dcp_world = 1
+    dcp_push = None  # the group's ``DcpPush`` (``dcp_push_merge``)
 
     def __init__(
         self,
@@ -635,6 +642,11 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
         # collective: every DCP rank builds the same layers in the same order
         self.dcp_mailbox = self.dcp_world > 1 and self._prepare_dcp_mailbox(
             variants.dcp_mailbox
+        )
+        self.dcp_push = (
+            self._prepare_dcp_push(variants.dcp_push_merge)
+            if self.dcp_world > 1
+            else None
         )
         if self.k_only:
             from atom.config import kv_cache_torch_dtype
@@ -1557,6 +1569,23 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
         cap = rows * group.world_size * heads * dim
         return prepare_dcp_mailbox(group, heads, dim, rows, max_elems=cap)
 
+    def _prepare_dcp_push(self, rows):
+        """The push merge's workspace (``dcp_push_merge``) for decode steps of up to
+        ``rows`` rows, mapped while every rank builds the same layer (collective, before
+        the KV cache is sized; one for all the layers), or None: off."""
+        from atom.config import get_current_atom_config
+        from atom.distributed.dcp_utils import get_dcp_group
+        from atom.model_ops.dcp_ops import dcp_mailbox_max_tokens
+        from atom.model_ops.dcp_push import prepare_dcp_push
+
+        group = get_dcp_group()
+        if rows <= 0 or group.world_size != 8:
+            return None
+        rows = min(rows, dcp_mailbox_max_tokens(get_current_atom_config()))
+        return prepare_dcp_push(
+            group, rows, self.num_heads, self.head_dim, self.value_head_dim, self.topk
+        )
+
     def _dcp_merge(self, group, of, lse, out, fold=False):
         """The log-sum-exp merge of every head's partial output ``of`` ``[n, W * 16 *
         192]`` (``lse`` ``[n, W * 16]``, or repeated once a 64-wide part) into this
@@ -1566,6 +1595,9 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
 
         n, dv = out.shape[0], self.value_head_dim
         h = of.shape[1] // dv
+        push = self.dcp_push
+        if push is not None and n <= push.rows and push.merge.fits(of, lse, out):
+            return push.merge(of, lse, out)
         if self.dcp_mailbox and lse.shape[1] == h:
             res = out.view(n, -1, dv)
             if dcp_mailbox_merge(of.view(n, h, dv), lse, group, res) is not None:
