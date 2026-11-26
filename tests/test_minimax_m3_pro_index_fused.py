@@ -198,6 +198,31 @@ def test_fp8_cache_takes_the_fused_scorer_from_32_rows(
     assert calls == ([8] if fused else [])
 
 
+@pytest.mark.parametrize(
+    "n,nb,fused",
+    [
+        (8, 8256, False),  # a k7 verify, max-model-len 128k: Triton's
+        (24, 8256, False),
+        (32, 8256, True),  # from 32 rows aiter's at any width
+        (8, pro_attn._FUSED_MIN_BLOCKS_FP8 - 1, False),
+        (8, pro_attn._FUSED_MIN_BLOCKS_FP8, True),
+        (8, 65536, True),  # max-model-len 1M: a c1 verify takes aiter's
+        (16, 65536, True),
+        (24, 65536, True),
+        (1, 65536, True),
+    ],
+)
+def test_fp8_small_graphs_take_the_fused_scorer_on_a_wide_block_table(
+    monkeypatch, n, nb, fused
+):
+    """Below 32 rows an fp8 cache takes aiter's scorer when the block table is at
+    least _FUSED_MIN_BLOCKS_FP8 wide (long contexts possible), Triton's otherwise."""
+    monkeypatch.setattr(K, "_fused_scorer", lambda *a, **kw: None)
+    ic = torch.zeros(8, PG, DI, device=DEV).to(torch.float8_e4m3fn)
+    v = ProVariants(kernels=True, attn="aiter", topk="split", index="fused")
+    assert _gate_impl()._fused_index(v, True, None, ic, n, None, nb) is fused
+
+
 def test_default_index_is_triton():
     assert ProVariants().index == "triton"
 
@@ -217,6 +242,9 @@ def _real_scorer_available():
         ([65536, 30000, 700], 4, None),  # k3 verify
         ([131072], 8, 8256),  # 128k, the served table width
         ([5000, 6000, 7000, 9000], 1, 600),  # plain decode
+        ([348160], 8, 65536),  # c1: a k7 verify at 340k, max-model-len 1M
+        ([200000, 120000], 8, 65536),
+        ([90000, 150000, 210000], 8, 65536),
     ],
 )
 def test_fused_picks_equal_the_triton_picks(nvfp4, lens, rps, width):
@@ -254,6 +282,44 @@ def test_fused_picks_equal_the_triton_picks(nvfp4, lens, rps, width):
     assert torch.equal(r0.gather(1, own), r1.gather(1, own))
     l0, l1 = (K.select_logical(s, b.pos, 128, split=True) for s in (today, fused))
     assert torch.equal(l0.sort(1).values, l1.sort(1).values)
+
+
+@pytest.mark.skipif(
+    not _real_scorer_available(), reason="aiter's FlyDSL Pro scorer on gfx950"
+)
+@pytest.mark.parametrize("lens", [[348160], [150000, 90000], [70000, 20000, 200000]])
+def test_fused_scores_equal_the_torch_reference_on_a_wide_table(lens):
+    """k7 verify groups of 1-3 sequences over a 1M-wide block table, the graphs that
+    take aiter's scorer on an fp8 cache below 32 rows: every causal block's score is
+    the torch path's pool4 / max score of the fp8 keys (to fp32 rounding), the
+    pinned blocks pinned."""
+    init, local = 1, 9
+    b = _batch(lens, 8, seed=len(lens), width=65536)
+    ic = b.ic.to(torch.float8_e4m3fn)
+    v = ProVariants()
+    fused = K.scores_fused(
+        b.iq, ic, b.bt, b.seq, b.pos, b.nb, b.cq, init, local, 1.0, v.pool_scale, 8
+    )
+    impl = object.__new__(ProSparseAttentionImpl)
+    impl.page, impl.index_head_dim = PG, DI
+    impl.__dict__["index_compress_query"] = SimpleNamespace(data=b.cq)
+    for s, length in enumerate(lens):
+        nblk = (length + PG - 1) // PG
+        keys = ic[b.bt[s, :nblk].long()].reshape(nblk * PG, DI).float()
+        rows = (b.seq == s).nonzero().flatten()
+        ref = pro_attn._reduce_heads(
+            impl._block_max(b.iq[rows], keys, None, v), "max", 1.0
+        )
+        for r, row in enumerate(rows.tolist()):
+            qb = int(b.pos[row]) // PG
+            want = ref[r, : qb + 1].clone()
+            want[:init] = 1e30
+            want[max(0, qb + 1 - local) :] = 1e29
+            got = fused[row, : qb + 1]
+            free = slice(init, max(init, qb + 1 - local))
+            assert torch.equal(got[:init], want[:init])
+            assert torch.equal(got[free.stop :], want[free.stop :])
+            torch.testing.assert_close(got[free], want[free], rtol=1e-4, atol=2e-4)
 
 
 def _gate_impl():
@@ -367,12 +433,12 @@ def test_static_path_hands_its_decode_split_to_the_gate(monkeypatch):
     impl, _, args = _mini_impl(b, 4, monkeypatch)
     asked = []
 
-    def gate(v, static, split, ic, n, dsplit=None):
-        asked.append(dsplit)
+    def gate(v, static, split, ic, n, dsplit=None, nb=0):
+        asked.append((dsplit, nb))
         raise _Asked
 
     monkeypatch.setattr(impl, "_fused_index", gate)
     v = ProVariants(kernels=True, attn="aiter", topk="split", index="fused")
     with pytest.raises(_Asked):
         impl._kernel_attention(*args, v, None, static=True, dsplit=(0, 8))
-    assert asked == [(0, 8)]
+    assert asked == [((0, 8), b.nb)]
