@@ -3,7 +3,8 @@
 This recipe runs the SemiAnalysis/Weka AgentX replay workload against MiniMax-M3.1-Pro
 with ATOM on 8×AMD MI355X GPUs. It is tuned for **CONC 64**: sections 1 and 2 are the launch the
 CONC 64 proxy measured, and the current best CONC 64 launch on the full workload (1M context) is in
-[CONC 64 on the full workload](#conc-64-on-the-full-workload). The current best **CONC 32** launch is in [CONC 32](#conc-32),
+[CONC 64 on the full workload](#conc-64-on-the-full-workload); the same workload at DCP=8 is in
+[CONC 64 with DCP=8](#conc-64-with-dcp8). The current best **CONC 32** launch is in [CONC 32](#conc-32),
 and the CONC 1-16 launch is in [Small concurrency](#small-concurrency-conc-1-16).
 The configuration of sections 1 and 2 uses:
 
@@ -457,6 +458,135 @@ GSM8K for the second row's launch (DSpark k=5 at real acceptance, 3 runs): 0.943
 0.9431 ± 0.0064 64-shot and 0.9356 ± 0.0068 5-shot, acceptance length 3.85 (without `index_day0`:
 0.9416 and 0.9249, 3.84). AIME 2026 for this launch: avg@16 0.9625 ± 0.0029, pass@16 0.9667.
 
+## CONC 64 with DCP=8
+
+The full-workload CONC 64 launch with decode context parallelism 8 (`--decode-context-parallel-size 8`,
+see [`MiniMax-M3-Pro.md`](MiniMax-M3-Pro.md#decode-context-parallelism-dcp-8)). Each GPU holds every
+eighth block of the target's K and index K, so the KV pool holds about 4.9× the tokens (the DSpark
+draft's KV is not sharded), and at CONC 64 nothing queues: the GPU prefix hit is 0.89 against 0.24 at
+DCP=1. It changes these things in the DCP=1 launch above:
+
+- **`--decode-context-parallel-size 8`** and **DSpark 3 draft tokens at AL 2.53**, the golden AL for
+  3 tokens with thinking on, as vLLM's TP8 + DCP8 launch runs it.
+- **The DCP variants**: `dcp_topk_merge`, `dcp_mailbox` 768, `dcp_fold`, `dcp_q_fp8` and
+  `dcp_day0_decode`, which attends decode and verify steps with aiter-M3's FlyDSL
+  `minimax_m3_fp8_sparse_decode_dcp` instead of the Triton attention. `index_compress` is off: the
+  measured runs used the fp8 index cache. `index_day0` is in the JSON as it ran, but it needs
+  `index_compress` and DCP=1, so the split prefills run the Triton indexer. `index_compress_fused`
+  and `day0_decode_rows` are not set.
+- **Decode protection**: `ATOM_PREFILL_DECODE_INTERVAL=4` runs at least 4 scheduler passes for decode
+  after each prefill forward. Without it a DP=1 server is prefill first, and at DCP=8 the pool has room
+  for every waiting prefill, so prefill steps stop all decodes (one run without it had two minutes with
+  no decode step). `ATOM_PREFILL_DELAYER_TARGET_FILL=0.01` and `ATOM_PREFILL_DELAYER_STALL_TICKS=1`
+  let a held prefill go as soon as the interval allows instead of waiting to fill a chunk.
+- **LMCache MP under DCP**: `lmcache.mp.tp_rank_collapse` is `false`, since each rank's pages are its
+  own shard (ATOM refuses collapse under DCP); 16 saves in flight; 8 GPU workers on the LMCache
+  server. The DCP=1 launch's `OFFLOAD_MP_SAVE_SAME_STEP`, `OFFLOAD_MIN_LOAD_TOKENS` and
+  `OFFLOAD_MP_TRANSFER_THREAD` are not set, as in the measured runs.
+
+The aiter is aiter-M3 `yuhua/m3.1-pro` at `d76a4587f` (aiter-M3#36), which adds
+`minimax_m3_fp8_sparse_decode_dcp`, built as in section 0. On an aiter without it the server's
+`M3-Pro attention:` line says `triton` where it should say `DCP decode day0 attention`, and decode
+runs the Triton attention. `amd_kernels` is not needed.
+
+```bash
+export MODEL_PATH="${MODEL_PATH:-/data/models/m3-pro}"
+export CHAT_TEMPLATE="${CHAT_TEMPLATE:-}"     # the 237eada chat_template.jinja, as in section 1
+export PORT="${PORT:-8000}"
+export CONC="${CONC:-64}"
+export LMCACHE_PORT="${LMCACHE_PORT:-5555}"
+
+# One LMCache server for the host, started before ATOM; its L1 pool grows lazily up to 2,240 GiB.
+lmcache server --host 127.0.0.1 --port "${LMCACHE_PORT}" --chunk-size 256 --null-block-id -1 \
+  --separate-object-groups --supported-transfer-mode lmcache_driven \
+  --l1-size-gb 2240 --l1-use-lazy --l1-read-ttl-seconds 900 \
+  --eviction-policy LRU --eviction-trigger-watermark 0.98 --max-cpu-workers 4 --max-gpu-workers 8 \
+  > lmcache-server.log 2>&1 &
+until (exec 3<>"/dev/tcp/127.0.0.1/${LMCACHE_PORT}") 2>/dev/null; do sleep 2; done
+
+export AITER_LOG_LEVEL=WARNING
+unset AITER_CUSTOM_AR_DISABLE_LAMPORT          # ar_lamport_rows needs the Lamport path
+export ATOM_M3PRO_VARIANTS='{"kernels":true,"attn":"aiter","topk":"split","prep":"aiter","index_split":true,"score_tq":8,"ar_lamport_rows":16,"k_only":true,"k_plain_fp8":true,"prefill_attn":"day0","index_split_decode":64,"moe_route_glue":true,"index_compress":false,"score_tq_causal":true,"index_day0":true,"dcp_topk_merge":true,"ar_fused_rows":128,"moe_tail_ar":true,"moe_glue_fold":true,"dcp_mailbox":768,"dcp_fold":true,"dcp_q_fp8":true,"dcp_day0_decode":true}'
+export ATOM_WARMUP_TOKENS=auto
+export ATOM_ONLINE_QUANT_STREAMING=1
+export ATOM_CACHE_AWARE_ADMISSION=1
+export AITER_REUSE_IDENTICAL_COMM_GROUPS=1
+export ATOM_CUSTOM_AR_POOL_BYTES=134217728
+export GPTOSS_SWIGLU_MXFP4_BF16_BOUND=1040
+export ATOM_TOKEN_GRAPH_SIZES=256,512,1024,2048,3072,4096
+
+# decode protection
+export ATOM_PREFILL_DECODE_INTERVAL=4
+export ATOM_PREFILL_DELAYER_TARGET_FILL=0.01
+export ATOM_PREFILL_DELAYER_STALL_TICKS=1
+
+# KV offload to the LMCache server; under DCP every rank stores its own shard
+export ATOM_KV_OFFLOAD=lmcache_mp
+export ATOM_KV_OFFLOAD_EXTRA_CONFIG="{\"lmcache.mp.host\": \"tcp://127.0.0.1\", \"lmcache.mp.port\": ${LMCACHE_PORT}, \"lmcache.mp.tp_rank_collapse\": false, \"lmcache.mp.transfer_deadline_s\": 120}"
+export LMCACHE_CHUNK_SIZE=256
+export OFFLOAD_MAX_PENDING_SAVES=16
+export PYTHONHASHSEED=0
+
+rm -rf ~/.cache/atom/*
+
+python3 -m atom.entrypoints.openai_server \
+  --model "${MODEL_PATH}" \
+  --served-model-name minimax-m3-pro \
+  --trust-remote-code \
+  --tensor-parallel-size 8 \
+  --decode-context-parallel-size 8 \
+  --server-port "${PORT}" \
+  --kv_cache_dtype fp8 \
+  --index-cache-dtype fp8 \
+  --block-size 16 \
+  --level 0 \
+  --max-model-len 1048576 \
+  --max-num-seqs $((2 * CONC)) \
+  --max-num-batched-tokens 16384 \
+  --cudagraph-capture-sizes "[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,18,20,22,24,26,28,30,32,48,64,128,256,512]" \
+  --gpu-memory-utilization 0.95 \
+  --online_quant_config '{"layer_quant_config": {"*.experts": "mxfp4"}}' \
+  --method dspark \
+  --num-speculative-tokens 3 \
+  --spec-decode-acceptance-length 2.53 \
+  --text-only \
+  --timeout-keep-alive 900 \
+  ${CHAT_TEMPLATE:+--chat-template "${CHAT_TEMPLATE}"} \
+  2>&1 | tee "server-m31pro-agentx-dcp8-c${CONC}.log"
+```
+
+Check the startup log: the `ATOM_KV_OFFLOAD` line with `"lmcache.mp.tp_rank_collapse": false`,
+`Forced speculative acceptance ON: mean acceptance length 2.5300 over 3 draft positions`, and an
+`M3-Pro attention:` line a rank with `DCP decode day0 attention`. The client is the one of
+[CONC 64 on the full workload](#conc-64-on-the-full-workload), with the served name
+`minimax-m3-pro`. The measured runs also set `OFFLOAD_PROFILE=1` and
+`ATOM_ENABLE_METRICS_DEVICE_TIMER=1`, which only add logging.
+
+### Measured (full workload, CONC 64, DCP=8)
+
+The official client (InferenceX `e1999621`, agentx-harness 1.0.14), uncapped corpus at 1M context,
+one run per row, no request failed. The DCP=8 rows ran on ATOM `yuhzhu/attn9-dcp` `782d18cd` (the
+DCP code of this recipe's commit before its merge) with aiter-M3's sync tree plus the DCP decode op
+(`84822644e`, the op merged in aiter-M3#36); the DCP=1 row is the full-workload launch above.
+
+| Launch | Duration | tok/s/GPU | P90 / P50 interactivity | TTFT p50 / p90 | Requests | GPU prefix hit |
+|---|---|---:|---:|---:|---:|---:|
+| This launch | 600 s | **18,469** | 19.9 / 29.2 | 0.48 / 2.38 s | 923 | 0.892 |
+| This launch without decode protection, `dcp_mailbox`, `dcp_fold`, `dcp_q_fp8` and `dcp_day0_decode` (ATOM `7c636337`, second node) | 600 s | 17,344 | 18.2 / 28.4 | 0.34 / 2.00 s | 872 | 0.893 |
+| DCP=1: the full-workload CONC 64 launch above | 3600 s | 16,798 | 44.65 / 64.6 | 2.7 / 84.1 s | 4,210 | 0.242 (+ 0.716 CPU) |
+
+DCP=8 trades per-user speed for no queueing: P90 and P50 interactivity are about 2.2× lower than at
+DCP=1, but TTFT p90 is 2.4 s instead of 84 s and the GPU serves 0.89 of the prompt tokens from
+HBM instead of 0.24. The 600 s rows are not 3600 s rows: 600 s runs of one launch differ by up to
+about 10%, and the first two rows ran on different nodes. Against the second row, this launch's
+decode step costs 1.39 ms a sequence instead of 1.51 (−8%) and prefill 51.5 µs a token instead of
+55.0.
+
+GSM8K (64-shot, DSpark k=5 at real acceptance, 3 runs, DCP=8 with `dcp_topk_merge`, fp8 index
+cache): 0.9414 without the DCP cuts, 0.9391 with `dcp_mailbox` 768, `dcp_fold` and `dcp_q_fp8`,
+0.9409 with `dcp_day0_decode`, none apart beyond the repeats
+([`MiniMax-M3.1-Pro-Accuracy-Switches.md`](MiniMax-M3.1-Pro-Accuracy-Switches.md)).
+
 ## CONC 32
 
 The current best CONC 32 configuration, as `scripts/m31pro/proxy_bench.sh` launches it with
@@ -783,5 +913,6 @@ verify steps are 129-256 rows, where tuned a16w4 is within 3-5% of a4w4 per MoE 
 - CONC 32 with the full 237eada chat template (#182), and at aiter-M3 `5bc8d81ec`.
 - A 3600 s run with `GPTOSS_SWIGLU_MXFP4_BF16_BOUND=1040`; the 3600 s row above is without it.
 - The intermittent LMCache start hang (see Host memory for LMCache) is not fixed in the launcher.
-- DCP=8, which shards the target's K and index K over the eight GPUs (about 4.9× the cached
-  tokens with the DSpark draft unsharded), is being brought up and is not part of this recipe.
+- DCP=8 has its CONC 64 launch ([CONC 64 with DCP=8](#conc-64-with-dcp8)), measured on the
+  pre-merge tree; a run on the merged commits, other concurrencies and `index_compress` at DCP=8
+  are not measured yet.

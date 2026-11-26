@@ -438,7 +438,14 @@ interleave is set to the block size), and a block-table entry covers 128 tokens.
 scores each rank's own blocks, all-gathers the scores and selects the same top-128 blocks on every
 rank as without DCP; each rank then attends all 128 query heads over the selected blocks it holds,
 and the partial outputs are merged by log-sum-exp. A prefill all-gathers its sequences' blocks and
-runs as without DCP. It needs the kernel path and runs the Triton attention.
+runs as without DCP. It needs the kernel path. Decode and DSpark verify steps attend with aiter-M3's
+FlyDSL `minimax_m3_fp8_sparse_decode_dcp` (the `dcp_day0_decode` variant: day0's fp8 sparse decode
+over one rank's blocks, all 128 heads, with the LSE for the merge; the query goes to e4m3 before the
+all-gather) on the K-only plain fp8 cache, 4-6× faster than the Triton attention it replaces
+(23-45 against 90-238 µs a layer at 256-768 rows). With the variant off, or on an aiter without the
+op, the Triton attention runs; the `M3-Pro attention:` log line says which. The CONC 64 AgentX
+launch at DCP 8 and its numbers are in
+[`Agentic-MiniMax-M3.1-Pro.md`](Agentic-MiniMax-M3.1-Pro.md#conc-64-with-dcp8).
 
 Add to the server's arguments `--decode-context-parallel-size 8`. The DCP group shares the TP
 group's communicator (ATOM sets `AITER_REUSE_IDENTICAL_COMM_GROUPS=1` unless it is set; see

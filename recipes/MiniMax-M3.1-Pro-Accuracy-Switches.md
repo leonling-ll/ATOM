@@ -28,6 +28,35 @@ single runs are noise. The gate is ≥ 0.933. Retrieval is the 32k / 64k key-val
 | aiter MXFP8 GEMM rows (the c64 retune merged with day0's) | built into aiter `yuhua/m3.1-pro` | none (config rows) | Picks a different kernel / tile / split-K per shape. | fp32 accumulation order only. | Batch 1: 0.9424 | Part of batch 1. |
 | `index_day0` | `true` in the CONC 64 launch | `false` | A split prefill's index scores and top-128 come from aiter-M3's FlyDSL `minimax_m3_index_top128` (amd-kernels-day0's `index_top128`, vLLM's prefill indexer, aiter-M3#24) instead of the Triton kernels. The scores are fp16 and the top-128 runs on 16-bit score keys, as in vLLM; the Triton path scores in fp32. | A block whose score ties the 128th within fp16 rounding can be swapped. The port matches amd-kernels-day0 bit for bit on 11 of 11 inputs. | GSM8K 0.9431 64-shot, 0.9356 5-shot (one run); AIME 2026 avg@16 0.9625 ± 0.0029. With day0's own kernel: 0.9439 / 0.9353 (3 runs). | CONC 64, 3600 s on one node: 16,360 → 16,798 tok/s/GPU (+2.7%), p90 43.30 → 44.65 (+3.1%). 600 s runs do not resolve it. |
 
+## DCP 8
+
+GSM8K here is 64-shot flexible-extract, DSpark k=5 at real acceptance, 3 runs, with the fp8 index
+cache (`index_compress` off) and `dcp_topk_merge`. "Recipe" is the
+[CONC 64 with DCP=8](Agentic-MiniMax-M3.1-Pro.md#conc-64-with-dcp8) launch. McNemar p-values are
+over the 9 run pairs between two arms; the repeats inside one arm give 0.04-1.00.
+
+- `--decode-context-parallel-size 8` (with DSpark): decode attends with a log-sum-exp merge of the
+  eight ranks' partial outputs, and each rank scores its own blocks (within fp32 rounding of the
+  single-rank scores, so a near-tie can pick another block). The draft's numerics are unchanged.
+  GSM8K 0.9439 / 0.9401 / 0.9401, mean 0.9414, against DCP 1 0.9507 / 0.9378 / 0.9431, mean 0.9439,
+  McNemar p 0.10-1.00: no shift beyond the repeats. The two arms are not a like-for-like pair: the
+  DCP 1 run had `index_compress` on and ran on another tree (`8169708a`).
+  - `dcp_mailbox` (rows; recipe 768): the merge in aiter's mailbox combine for captured steps up to
+    that many rows, the same weighted sum in another order (bf16 output within one rounding).
+  - `dcp_q_fp8` (recipe on): the decode query all-gathered as a plain e4m3 cast, as DCP1's day0
+    decode reads it (q rounded to fp8; the bf16 DCP decode does not round it).
+  - `dcp_fold` (recipe on): the selection stores the sort keys it all-gathers, the attention the
+    LSE as the all-to-all merge reads it, and that merge the layer's output: the same bits.
+  - The three above together: GSM8K 0.9363 / 0.9386 / 0.9424, mean 0.9391, against 0.9414 without
+    them, McNemar p 0.25-0.90: no shift.
+  - `dcp_day0_decode` (recipe on): decode and verify steps attend with aiter-M3's FlyDSL
+    `minimax_m3_fp8_sparse_decode_dcp` instead of the Triton attention. q rounds to e4m3 (as with
+    `dcp_q_fp8` and DCP 1's day0 decode) and P stays bf16 as in the Triton attention; the
+    accumulation order differs. Op check against the reference: rel L2 1.9e-3, LSE within 4e-5, the
+    Triton attention's level. GSM8K 0.9454 / 0.9363 / 0.9409, mean 0.9409, against 0.9414 without
+    it, McNemar p 0.25-1.00: no shift. Gain: one rank's attention 4-6× faster (23-45 against
+    90-238 µs a layer at 256-768 rows); part of the DCP 8 CONC 64 row's +6.5%.
+
 ## Bit-identical switches
 
 These produce the same bits as their off position by construction (each has a CPU test), so they
@@ -51,16 +80,6 @@ don't need an accuracy run:
 These are switchable on their branches and will be listed above once they are merged:
 
 - `ATOM_SHARDED_SAMPLING` (vocab-sharded sampling): same distribution, greedy bit-identical.
-- `--decode-context-parallel-size 8` (with DSpark): decode attends with the Triton attention and a
-  log-sum-exp merge instead of the day0 decode, and each rank scores its own blocks (within fp32
-  rounding of the single-rank scores, so a near-tie can pick another block). The draft's numerics
-  are unchanged. GSM8K DCP8 against DCP1 not run yet.
-  - `dcp_mailbox` (rows): the merge in aiter's mailbox combine for captured steps up to that
-    many rows, the same weighted sum in another order (bf16 output within one rounding).
-  - `dcp_q_fp8`: the decode query all-gathered as a plain e4m3 cast, as DCP1's day0 decode
-    reads it (q rounded to fp8; the bf16 DCP decode does not round it).
-  - `dcp_fold`: the selection stores the sort keys it all-gathers, the attention the LSE
-    as the all-to-all merge reads it, and that merge the layer's output: the same bits.
 - `--enable-tbo` with F1 split collectives: changes all-reduce grouping in prefill.
 - amd-kernels shuffle16 decode GEMMs: cosine ≥ 0.9999999, relative L2 ≤ 4.2e-5 per GEMM.
 - F4, routed + shared expert outputs written in one pass: heavier error tail at the atomic stage-2 rows.
