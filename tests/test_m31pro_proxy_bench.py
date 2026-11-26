@@ -51,11 +51,11 @@ def _clean_env():
     }
 
 
-def _dry_run(tmp_path, **env):
+def _dry_run(tmp_path, conc=32, **env):
     clean = _clean_env()
     clean.update(env, PROXY_DRY_RUN="1", HOME=str(tmp_path))
     done = subprocess.run(
-        ["bash", str(BENCH), "32", str(tmp_path / "out")],
+        ["bash", str(BENCH), str(conc), str(tmp_path / "out")],
         env=clean,
         check=False,
         capture_output=True,
@@ -225,13 +225,26 @@ LAUNCH_ONLY_ENV = {
 }
 
 
-def _recipe_launch(heading=AGENTIC_LAUNCHES["agentic"]):
-    """Exports, unsets and server flags of one server launch in the Agentic recipe."""
+def _recipe_launch(heading=AGENTIC_LAUNCHES["agentic"], conc=16):
+    """Exports, unsets and server flags of one server launch in the Agentic recipe,
+    at CONC ``conc`` where the launch branches on ``if [ "$CONC" -ge N ]``."""
     text = AGENTIC.read_text(encoding="utf-8")
     section = text.split(f"\n## {heading}\n", 1)[1]
     block = section.split("```bash\n", 1)[1].split("\n```", 1)[0]
     env, unset = {}, set()
+    taken = None  # inside an `if [ "$CONC" -ge N ]`: whether this branch applies
     for line in block.splitlines():
+        branch = re.fullmatch(r'if \[ "\$CONC" -ge (\d+) \]; then', line)
+        if branch:
+            taken = conc >= int(branch[1])
+            continue
+        if taken is not None:
+            if line in ("else", "fi"):
+                taken = None if line == "fi" else not taken
+                continue
+            if not taken:
+                continue
+            line = line.strip()
         if not line.startswith(("export ", "unset ")):
             continue
         words = shlex.split(line, comments=True)
@@ -249,13 +262,20 @@ def _recipe_launch(heading=AGENTIC_LAUNCHES["agentic"]):
     return env, unset, _flags(shlex.split(command))
 
 
-@pytest.mark.parametrize("recipe", AGENTIC_LAUNCHES)
-def test_agentic_launch_is_the_recipe_launch(tmp_path, recipe):
+# (RECIPE, CONC): the CONC 32 launch, and the small-concurrency one on each side
+# of its CONC 8 branch.
+AGENTIC_POINTS = [("agentic", 32)] + [("agentic_sc", c) for c in (1, 4, 8, 16)]
+
+
+@pytest.mark.parametrize("recipe, conc", AGENTIC_POINTS)
+def test_agentic_launch_is_the_recipe_launch(tmp_path, recipe, conc):
     template = tmp_path / "chat_template.jinja"
     template.write_text("{% if thinking_mode %}{% endif %}")
-    done, values, args = _dry_run(tmp_path, RECIPE=recipe, CHAT_TEMPLATE=str(template))
+    done, values, args = _dry_run(
+        tmp_path, conc, RECIPE=recipe, CHAT_TEMPLATE=str(template)
+    )
     assert done.returncode == 0, done.stdout + done.stderr
-    env, unset, flags = _recipe_launch(AGENTIC_LAUNCHES[recipe])
+    env, unset, flags = _recipe_launch(AGENTIC_LAUNCHES[recipe], conc)
 
     variants = env.pop("ATOM_M3PRO_VARIANTS")
     assert json.loads(values["ATOM_M3PRO_VARIANTS"]) == json.loads(variants)
@@ -290,7 +310,7 @@ def test_agentic_variants_add_onto_the_recipe(tmp_path, recipe):
     )
     assert done.returncode == 0, done.stdout + done.stderr
     served = json.loads(values["ATOM_M3PRO_VARIANTS"])
-    launch = _recipe_launch(AGENTIC_LAUNCHES[recipe])[0]
+    launch = _recipe_launch(AGENTIC_LAUNCHES[recipe], 32)[0]
     assert served == {**json.loads(launch["ATOM_M3PRO_VARIANTS"]), **extra}
 
 
@@ -317,15 +337,30 @@ def test_agentic_refuses_the_stub_template(tmp_path, recipe, template, ok):
         assert "CHAT_TEMPLATE" in done.stderr
 
 
-def test_agentic_sc_serves_from_hbm_without_index_compress(tmp_path):
-    done, values, _ = _dry_run(tmp_path, RECIPE="agentic_sc")
+@pytest.mark.parametrize("conc", [1, 4, 8, 16])
+def test_agentic_sc_serves_from_hbm_with_compress_or_mono_by_concurrency(
+    tmp_path, conc
+):
+    done, values, _ = _dry_run(tmp_path, conc, RECIPE="agentic_sc")
     assert done.returncode == 0, done.stdout + done.stderr
     for name in ("ATOM_KV_OFFLOAD", "ATOM_CACHE_AWARE_ADMISSION", "PYTHONHASHSEED"):
         assert name not in values, name
     assert not [name for name in values if name.startswith("LMCACHE_")]
     served = json.loads(values["ATOM_M3PRO_VARIANTS"])
     agentic = json.loads(_recipe_launch()[0]["ATOM_M3PRO_VARIANTS"])
-    assert served == {k: v for k, v in agentic.items() if k != "index_compress"}
+    if conc < 8:
+        # mono (default 16 rows) serves; the fp8 index cache on aiter's scorer
+        del agentic["index_compress"]
+        assert served == {**agentic, "index": "fused", "index_split_decode": 24}
+    else:
+        # the c8 / c16 tail is past mono's 16 rows; the compressed index cache
+        assert served == {
+            **agentic,
+            "index_compress_fused": True,
+            "index": "triton",
+            "index_split_decode": 24,
+            "mono_ffn_rows": 0,
+        }
     assert values["GPU_MEM_UTIL"] == "0.95"
     assert values["ATOM_ONLINE_QUANT_STREAMING"] == "1"
 

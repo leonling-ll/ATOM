@@ -181,9 +181,7 @@ def test_fused_rows_off_never_calls_the_lamport_op(tp_ar):
 
 
 @pytest.mark.parametrize("rows", [4, 17])
-def test_reduced_rows_take_the_tp1_norm_into_the_callers_rows(
-    tp_ar, monkeypatch, rows
-):
+def test_reduced_rows_take_the_tp1_norm_into_the_callers_rows(tp_ar, monkeypatch, rows):
     # TP MegaMoE all-reduced the MoE output in-kernel: only the add + norm run
     seen = []
 
