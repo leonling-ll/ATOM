@@ -1041,12 +1041,14 @@ def fused_allreduce_gemma_rms_norm(
     residual: torch.Tensor,
     norm: GemmaRMSNorm,
     addend: torch.Tensor | None = None,
+    reduced: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """MiniMax-M3 helper for delayed TP all-reduce followed by Gemma RMSNorm, of
-    ``hidden_states + addend`` when ``addend`` is given."""
+    ``hidden_states + addend`` when ``addend`` is given (``reduced``: already
+    all-reduced, so only add + norm)."""
     if addend is not None:
         hidden_states = hidden_states + addend
-    if get_tensor_model_parallel_world_size() > 1:
+    if get_tensor_model_parallel_world_size() > 1 and not reduced:
         return tensor_model_parallel_fused_allreduce_rmsnorm(
             hidden_states.contiguous(),
             residual,
@@ -1061,9 +1063,11 @@ def fused_allreduce_gemma_rms_norm_quant(
     hidden_states: torch.Tensor,
     residual: torch.Tensor,
     norm: GemmaRMSNorm,
+    reduced: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """MiniMax-M3 helper for AR + Gemma RMSNorm + per-token FP8 quant."""
-    if get_tensor_model_parallel_world_size() > 1:
+    """MiniMax-M3 helper for AR + Gemma RMSNorm + per-token FP8 quant
+    (``reduced``: already all-reduced, so only add + norm + quant)."""
+    if get_tensor_model_parallel_world_size() > 1 and not reduced:
         out_fp8, residual_out, scale_out = (
             tensor_model_parallel_fused_allreduce_rmsnorm_quant(
                 hidden_states.contiguous(),
@@ -1188,13 +1192,13 @@ def _lamport_route(rows: int, lamport_rows: int) -> bool:
 
 
 def fused_allreduce_gemma_rms_norm_mxfp8_writes_out(
-    rows: int, norm: GemmaRMSNorm, lamport_rows: int = 0
+    rows: int, norm: GemmaRMSNorm, lamport_rows: int = 0, reduced: bool = False
 ) -> bool:
     """Whether ``fused_allreduce_gemma_rms_norm_mxfp8`` of ``rows`` rows takes
     ``q_out`` / ``q_scale_out``: the Lamport route at TP > 1 and
-    ``gemma_rms_norm_mxfp8`` at TP 1 do; the all-reduce epilogue and the unfused
-    pair allocate their own."""
-    if get_tensor_model_parallel_world_size() > 1:
+    ``gemma_rms_norm_mxfp8`` at TP 1 (or ``reduced``) do; the all-reduce epilogue
+    and the unfused pair allocate their own."""
+    if get_tensor_model_parallel_world_size() > 1 and not reduced:
         return _lamport_route(rows, lamport_rows)
     return not (norm.use_fused_quant or norm.fused_allreduce)
 
@@ -1239,6 +1243,7 @@ def fused_allreduce_gemma_rms_norm_mxfp8(
     addend: torch.Tensor | None = None,
     q_out: torch.Tensor | None = None,
     q_scale_out: torch.Tensor | None = None,
+    reduced: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """``fused_allreduce_gemma_rms_norm`` of ``hidden_states`` (``+ addend`` when given,
     added in bf16 first) with its output also as MXFP8 (the bytes of ``quantize_fp8`` of
@@ -1251,14 +1256,15 @@ def fused_allreduce_gemma_rms_norm_mxfp8(
     all-reduce + ``add_rmsnorm_mxfp8``.
     ``q_out`` / ``q_scale_out``: where the MXFP8 output goes, on a route that takes
     them (``fused_allreduce_gemma_rms_norm_mxfp8_writes_out``); the one-launch route
-    copies its output there."""
+    copies its output there.
+    ``reduced``: already all-reduced (TP MegaMoE), so the TP 1 forms."""
     from atom.model_ops.blockscale import quantize_fp8
 
     rows = hidden_states.shape[0]
     assert q_out is None or fused_allreduce_gemma_rms_norm_mxfp8_writes_out(
-        rows, norm, lamport_rows
+        rows, norm, lamport_rows, reduced
     ), "this route allocates its own MXFP8 output"
-    tp = get_tensor_model_parallel_world_size()
+    tp = 1 if reduced else get_tensor_model_parallel_world_size()
     if tp > 1 and 0 < rows <= fused_rows:
         outs = _lamport_fused_ar_rms_norm_mxfp8(hidden_states, residual, norm, addend)
         if outs is not None:
@@ -1300,7 +1306,7 @@ def fused_allreduce_gemma_rms_norm_mxfp8(
     if norm.use_fused_quant or norm.fused_allreduce:
         # this norm's own forward is not forward_cuda, which the MX kernel mirrors
         out, residual_out = fused_allreduce_gemma_rms_norm(
-            hidden_states, residual, norm
+            hidden_states, residual, norm, reduced=reduced
         )
         q, q_scale = quantize_fp8(out)
         return out, q, q_scale, residual_out

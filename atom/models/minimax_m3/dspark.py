@@ -487,7 +487,7 @@ class MiniMaxM3DSpark(DSparkDraftModel):
 
     def __init__(self, atom_config: "Config", layer_offset: int = 0) -> None:
         super().__init__()
-        if atom_config.decode_context_parallel_size > 1:
+        if atom_config.decode_context_parallel_size > 1 and self.kv_pool_spec is None:
             raise NotImplementedError(
                 "The MiniMax-M3.1 DSpark draft does not support DCP."
             )

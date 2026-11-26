@@ -689,7 +689,7 @@ class MiniMaxM3ProDecoderLayer(MiniMaxM3DecoderLayer):
             and not attn.qkv_proj.runs_bf16
             and v.lookahead_src == "resid_in"
             and fused_allreduce_gemma_rms_norm_mxfp8_writes_out(
-                rows, self.input_layernorm, v.ar_lamport_rows
+                rows, self.input_layernorm, v.ar_lamport_rows, self.input_reduced
             )
             else None
         )
@@ -720,11 +720,16 @@ class MiniMaxM3ProDecoderLayer(MiniMaxM3DecoderLayer):
                     addend=moe_tail,
                     q_out=x_out[0],
                     q_scale_out=x_out[1],
+                    reduced=self.input_reduced,
                 )
             )
         else:
             hidden_states, residual = fused_allreduce_gemma_rms_norm(
-                hidden_states, residual, self.input_layernorm, addend=moe_tail
+                hidden_states,
+                residual,
+                self.input_layernorm,
+                addend=moe_tail,
+                reduced=self.input_reduced,
             )
         aux_hidden_state = residual.clone() if capture_aux else None
 

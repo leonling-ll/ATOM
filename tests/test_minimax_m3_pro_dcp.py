@@ -107,10 +107,12 @@ READINGS = {
 
 @pytest.mark.parametrize("reading", list(READINGS))
 @pytest.mark.parametrize("tq", [0, 2])
-def test_scores_select_as_single_rank(K, reading, tq):
+# a decode's two rows, and a k=5 verify's six (`_dcp_decode`'s tile: 2)
+@pytest.mark.parametrize("per_seq", [2, 6])
+def test_scores_select_as_single_rank(K, reading, tq, per_seq):
     world, topk, init, local = 4, 8, 1, 2
     c = Split([300, 517, 70], world)
-    seq, pos = c.rows(2)
+    seq, pos = c.rows(per_seq)
     bmode, hmode, sc = READINGS[reading]
     g = torch.Generator().manual_seed(1)
     iq = torch.randn(len(pos), NI, DI, generator=g).to(DT).to(DEV)
@@ -142,10 +144,11 @@ def test_scores_select_as_single_rank(K, reading, tq):
 # "spread": every rank holds some of each token's selection; "empty": a sequence shorter
 # than `world` blocks and a selection that skips the last rank, which then sees no key
 @pytest.mark.parametrize("case", ["spread", "empty"])
-def test_attention_merge_as_single_rank(K, splits, case):
+@pytest.mark.parametrize("per_seq", [2, 6])
+def test_attention_merge_as_single_rank(K, splits, case, per_seq):
     world, topk = 4, 8
     c = Split([300, 517, 70] if case == "spread" else [40, 517], world, seed=2)
-    seq, pos = c.rows(2)
+    seq, pos = c.rows(per_seq)
     g = torch.Generator().manual_seed(3)
     q = torch.randn(len(pos), 16, D, generator=g).to(DT).to(DEV)
     # a selection as the indexer leaves it: valid blocks first (own block included), -1 after
@@ -182,7 +185,9 @@ def test_attention_merge_as_single_rank(K, splits, case):
         )
         assert torch.isfinite(out).all()
         empty = (mine < 0).all(dim=1)
-        assert empty.any() == (case == "empty" and r == world - 1)
+        if per_seq == 2:
+            # six rows' random selections also skip some rank in "spread"
+            assert empty.any() == (case == "empty" and r == world - 1)
         assert (out[empty] == 0).all() and (lse[empty] == float("-inf")).all()
         outs.append(out.float().view(len(pos), 16, 192))
         lses.append(lse)
@@ -251,7 +256,93 @@ def test_config_interleaves_whole_blocks():
     cfg = _config()
     admit_minimax_m3_pro_dcp(cfg)
     assert cfg.dcp_config.interleave_size == 16
-    with pytest.raises(ValueError, match="speculative"):
-        admit_minimax_m3_pro_dcp(_config(speculative_config=object()))
     with pytest.raises(ValueError, match="interleave_size"):
         admit_minimax_m3_pro_dcp(_config(dcp_config=DCPConfig(interleave_size=4)))
+
+
+def test_config_admits_the_dspark_draft_only():
+    cfg = _config(speculative_config=SimpleNamespace(method="dspark"))
+    admit_minimax_m3_pro_dcp(cfg)
+    assert cfg.dcp_config.interleave_size == 16
+    for method in ("mtp", "eagle3"):
+        with pytest.raises(ValueError, match="DSpark only"):
+            admit_minimax_m3_pro_dcp(
+                _config(speculative_config=SimpleNamespace(method=method))
+            )
+
+
+def test_compressed_index_pooled_per_rank_gathers_to_the_single_ranks(K):
+    """``index_compress`` under DCP: every rank runs the step's keys, pooling and ringing
+    only the blocks it holds (its slots, -1 elsewhere); a prefill's gather of those
+    caches (`_dcp_prefill_caches`, after `compress_insert`) holds every closed group's
+    row as the single rank's pooling of the whole cache does, through prefill chunks,
+    a k=5 verify and single decodes."""
+    world = 4
+    PGc, G, RR = K.PAGE, K.GROUP, K.RING_ROWS
+    lens = [300, 517, 70]
+    c = Split(lens, world, seed=5)
+    g = torch.Generator().manual_seed(6)
+    cq = torch.randn(DI, generator=g).to(DEV)
+    B = len(lens)
+
+    def caches(n):
+        return SimpleNamespace(
+            ic=torch.full(
+                (n, PGc // G, DI), float("nan"), dtype=torch.bfloat16, device=DEV
+            ),
+            ring=torch.zeros(B * RR, DI, dtype=torch.bfloat16, device=DEV),
+            ring_pos=torch.full((B * RR,), -1, dtype=torch.int32, device=DEV),
+        )
+
+    one = caches(c.kc.shape[0])
+    ranks = [caches(rk.kc.shape[0]) for rk in c.ranks]
+    base = torch.arange(B, dtype=torch.int32, device=DEV) * RR
+    # each request's step boundaries: prefill chunks, then a verify's 6 rows and decodes
+    cuts = [[0, 150, 290, 296, 297, 300], [0, 400, 511, 517], [0, 40, 64, 70]]
+    for step in range(max(len(x) for x in cuts) - 1):
+        runs = [(x[min(step, len(x) - 1)], x[min(step + 1, len(x) - 1)]) for x in cuts]
+        pos = [p for a, b in runs for p in range(a, b)]
+        seq = [s for s, (a, b) in enumerate(runs) for _ in range(a, b)]
+        ik = (torch.randn(len(pos), DI, generator=g) * 2).to(torch.bfloat16).to(DEV)
+
+        def insert(cache, slots, pos=pos, seq=seq, ik=ik):
+            K.compress_insert(
+                ik,
+                torch.tensor(pos, dtype=torch.int64, device=DEV),
+                torch.tensor(seq, dtype=torch.int32, device=DEV),
+                torch.tensor(slots, dtype=torch.int64, device=DEV),
+                base,
+                cache.ring,
+                cache.ring_pos,
+                cq,
+                DI**-0.5,
+                cache.ic,
+            )
+
+        insert(one, [int(c.bt[s, p // PGc]) * PGc + p % PGc for s, p in zip(seq, pos)])
+        for r, (rk, own) in enumerate(zip(c.ranks, ranks)):
+            j = [p // PGc for p in pos]
+            insert(
+                own,
+                [
+                    int(rk.bt[s, b // world]) * PGc + p % PGc if b % world == r else -1
+                    for s, b, p in zip(seq, j, pos)
+                ],
+            )
+        done = [b for _, b in runs]
+        plans = [K.dcp_prefill_plan(rk.bt, done, world) for rk in c.ranks]
+        for (rows, tables), own in zip(plans, ranks):
+
+            def gather(x, rows=rows, plans=plans):
+                return torch.cat([o.ic[p[0]] for o, p in zip(ranks, plans)])
+
+            ic = K.dcp_gather_blocks(own.ic, rows, gather, world)
+            for s, n in enumerate(done):
+                for g0 in range(0, n - G + 1, G):
+                    j, row = g0 // PGc, (g0 % PGc) // G
+                    torch.testing.assert_close(
+                        ic[int(tables[s, j]), row],
+                        one.ic[int(c.bt[s, j]), row],
+                        atol=0,
+                        rtol=0,
+                    )

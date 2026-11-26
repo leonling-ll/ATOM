@@ -217,6 +217,14 @@ def test_the_switch_turns_it_off(servable, monkeypatch):
     assert config_refusal(_atom_config()) == "switched off"
 
 
+def test_mega_moe_turns_it_off(servable):
+    # TP MegaMoE all-reduces a MoE layer's output in-kernel, so the next input
+    # norm skips the all-reduce a mono layer's partial needs
+    cfg = _atom_config()
+    cfg.moe_backend = "mega"
+    assert config_refusal(cfg) == "--moe-backend mega"
+
+
 @pytest.mark.parametrize("rows", [0, 1, 8, MAX_ROWS])
 def test_rows_in_range_latch(rows):
     assert rows_refusal(rows) is None

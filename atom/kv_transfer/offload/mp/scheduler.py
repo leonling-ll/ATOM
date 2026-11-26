@@ -18,6 +18,7 @@ from atom.kv_transfer.disaggregation.types import (
 )
 from atom.kv_transfer.offload import config as offcfg
 from atom.kv_transfer.offload._offload_common import (
+    max_pending_saves,
     tier_lookup_kwargs,
     validated_kv_role,
 )
@@ -45,6 +46,10 @@ from atom.utils import envs
 
 logger = logging.getLogger("atom")
 
+# Saves in flight under DCP unless OFFLOAD_MAX_PENDING_SAVES or the connector
+# config's "max_pending_saves" sets it.
+_DCP_MAX_PENDING_SAVES = 16
+
 
 class LMCacheMPConnectorScheduler(ChunkedOffloadSchedulerBase):
     """Scheduler-side LMCache MP connector for generic PAGE offload."""
@@ -56,6 +61,14 @@ class LMCacheMPConnectorScheduler(ChunkedOffloadSchedulerBase):
     # `note_scheduled_tokens`). A subclass whose save reads more than the
     # PAGE blocks that forward writes turns it off.
     _supports_same_step_save = True
+    # Under DCP, bound the saves in flight and look up only requests that may
+    # load (`__init__`). A subclass that bounds its own saves and needs every
+    # lookup turns it off.
+    _bounds_dcp_traffic = True
+    # What `__init__` sets under DCP; a scheduler built without it runs as at
+    # DCP 1: every lookup, saves unbounded.
+    _dcp_lookups_for_loads = False
+    _max_pending_saves: int | None = None
 
     def __init__(
         self, config: Any, *, checkpoint_spec: Any = None, images: bool = True
@@ -133,18 +146,90 @@ class LMCacheMPConnectorScheduler(ChunkedOffloadSchedulerBase):
                 "or a layout that does not support them)",
                 type(self).__name__,
             )
+        # Under DCP every rank keeps its own shard: a save is dcp_size server
+        # stores and a lookup dcp_size key rows a chunk, on one server process.
+        # Saves past what it stores queue there until one outlives the transfer
+        # deadline, which stops the engine; a lookup whose answer cannot load
+        # anything only refreshes the tier's LRU, at that price.
+        dcp_size = int(getattr(config, "decode_context_parallel_size", 1) or 1)
+        self._dcp_lookups_for_loads = self._bounds_dcp_traffic and dcp_size > 1
+        if self._dcp_lookups_for_loads:
+            asked = (
+                "max_pending_saves" in extra
+                or envs.OFFLOAD_MAX_PENDING_SAVES is not None
+            )
+            self._max_pending_saves = (
+                max_pending_saves(kvc, envs.OFFLOAD_COPY_WORKERS)
+                if asked
+                else _DCP_MAX_PENDING_SAVES
+            )
+            logger.info(
+                "LMCache MP at DCP %d: at most %d saves in flight; lookups only "
+                "for requests the HBM prefix leaves a load for",
+                dcp_size,
+                self._max_pending_saves,
+            )
+
+    def _may_emit_save(self) -> bool:
+        cap = self._max_pending_saves
+        return cap is None or len(self._save_inflight) < cap
+
+    # -- lookups under DCP -----------------------------------------------------
+
+    def prefetch_lookups(self, seqs: Any) -> None:
+        """Under DCP, not for a request whose HBM prefix leaves no load: its
+        admission detaches the lookup (`detach_lookup`), which then is not sent."""
+        if self._dcp_lookups_for_loads:
+            seqs = [seq for seq in seqs if not self._detaches_at_admission(seq)]
+        super().prefetch_lookups(seqs)
+
+    def _detaches_at_admission(self, seq: Any) -> bool:
+        """What admission's detach check (`Scheduler._can_detach_tier_lookup`)
+        should answer: an HBM hit, and `_load_ruled_out` at it. Read from the
+        block manager's read-only prefix walk, memoised per request."""
+        resident = getattr(self._block_manager, "resident_prefix_blocks", None)
+        if resident is None:
+            return False
+        blocks = int(resident(seq))
+        if blocks <= 0:
+            return False
+        hbm = blocks * int(self._block_manager.hash_block_size)
+        return self._load_ruled_out(seq, hbm)
+
+    def detach_lookup(self, seq: Any, num_hbm_tokens: int) -> bool:
+        """Under DCP, admit without the lookup no prefetch sent. The save floor
+        stays at the HBM prefix: nothing reports a shorter tier hit for
+        `reconcile_detached_lookups` to lower it to."""
+        sid = str(seq.id)
+        if not self._dcp_lookups_for_loads or sid in self._lookup_client.pending_ids():
+            return super().detach_lookup(seq, num_hbm_tokens)
+        if not self.can_detach_lookup(seq, num_hbm_tokens):
+            return False
+        self._lookup_defer_since.pop(sid, None)
+        self._forget_tier_hit(sid)
+        floor = self._chunk_floor(max(0, int(num_hbm_tokens)))
+        if floor > 0:
+            self._hit_save_floors[sid] = floor
+        self._perf_bump("lookup_detached_unsent")
+        self._perf_bump("lookup_detached")
+        return True
 
     # -- lookups offered on arrival -----------------------------------------
 
     def offer_lookups(self, seqs: Any) -> None:
         """Start tier lookups for newly arrived requests (input IO thread).
 
-        A no-op unless the lookup driver runs. Prefetch and admission are
-        unchanged: whichever sends a request's lookup first, the others find
-        it in flight.
+        A no-op unless the lookup driver runs, and under DCP, where nothing on
+        arrival tells which requests may load (`prefetch_lookups` does). Prefetch
+        and admission are unchanged: whichever sends a request's lookup first,
+        the others find it in flight.
         """
         client = self._lookup_client
-        if not self._do_load or not getattr(client, "driving", False):
+        if (
+            not self._do_load
+            or not getattr(client, "driving", False)
+            or self._dcp_lookups_for_loads
+        ):
             return
         for seq in seqs:
             if self._lookup_len(seq) <= 0:

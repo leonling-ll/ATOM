@@ -40,6 +40,7 @@ from .backends import (
     AttentionBackend,
     CommonAttentionBuilder,
 )
+from .draft_ctx_slots import DraftCtxSlotsMixin
 from .mha_kv_pool import MhaKvPool
 from .pool_layout.entry_arena import EntryField, carve
 from .pool_layout.pool_rows import KvGeometry
@@ -216,7 +217,7 @@ class AiterBackend(AttentionBackend):
         )
 
 
-class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
+class AiterAttentionMetadataBuilder(DraftCtxSlotsMixin, CommonAttentionBuilder):
     # Whose kernels this builder feeds. Read for `attn_block_size` below, so a
     # subclass that names another backend gets that backend's rule -- naming
     # this one outright would size the pool at one block and index it at
@@ -387,6 +388,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             self._allocate_mixed_decode_buffers(max_qlen)
         if model_runner.config.enable_tbo:
             self._allocate_ubatch_buffers(max_qlen)
+        self._declare_draft_ctx_slots(model_runner)
 
     def h2d_group_members(self) -> dict[str, tuple[str, ...]]:
         # Ready together before the CSR kernel, sharing prefill destinations
@@ -402,7 +404,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         if self._pro_ring_slots is not None:
             for phase in ("decode_metadata", "prefill_metadata"):
                 members[phase] = members.get(phase, ()) + ("pro_ring_base",)
-        return members
+        return self._draft_ctx_h2d(members)
 
     def _pro_index_compress(self) -> bool:
         """MiniMax-M3-Pro with its compressed index cache (``index_compress``)."""
@@ -440,6 +442,12 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             batch, running_bs, running_tokens, group
         )
         self._stage_pro_ring(batch, running_bs, group, attn_metadata)
+        self._stage_draft_ctx_slots(
+            batch,
+            batch.num_scheduled_tokens[: batch.total_seqs_num_prefill],
+            running_tokens,
+            group,
+        )
         return attn_metadata, positions
 
     def _allocate_mixed_decode_buffers(self, max_qlen: int) -> None:
@@ -528,6 +536,16 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         )
         decode_md, _ = self.stage_decode(
             decode, decode_bs, decode_tokens, max_seqlen_q, decode_group, MIXED_DECODE
+        )
+        # The draft writes the step's rows in one go: its slots are the step's,
+        # the decode half's after the prefill rows, up with the prefill half.
+        self._stage_draft_ctx_slots(
+            decode,
+            lens,
+            running_tokens,
+            prefill_group,
+            MIXED_DECODE,
+            first=prefill_tokens,
         )
         decode_md.batch_id_per_q_token = var[f"{MIXED_DECODE}batch_id_per_q_token"].gpu[
             :decode_tokens
@@ -1377,6 +1395,9 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             **ctx,
         )
         self._stage_pro_ring(batch, running_bs, group, attn_metadata, prefix)
+        if not prefix:
+            # a mixed step's decode half stages its own (`prepare_mixed`)
+            self._stage_draft_ctx_slots(batch, lengths, running_tokens, group)
         mrope_positions = self._build_mrope_decode_positions(
             batch, context_lens, group, running_tokens=running_tokens
         )

@@ -285,13 +285,14 @@ class _Norms:
         addend=None,
         q_out=None,
         q_scale_out=None,
+        reduced=False,
     ):
         assert addend is None  # moe_tail_ar is off here
         _, q, s, _ = self.mx(h, None, norm, False, q_out, q_scale_out)
         return h + residual, q, s, h + residual
 
     @staticmethod
-    def ar_plain(h, residual, norm, addend=None):
+    def ar_plain(h, residual, norm, addend=None, reduced=False):
         assert addend is None
         return h + residual, h + residual
 
