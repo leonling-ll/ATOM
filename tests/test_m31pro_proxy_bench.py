@@ -227,16 +227,18 @@ LAUNCH_ONLY_ENV = {
 
 def _recipe_launch(heading=AGENTIC_LAUNCHES["agentic"], conc=16):
     """Exports, unsets and server flags of one server launch in the Agentic recipe,
-    at CONC ``conc`` where the launch branches on ``if [ "$CONC" -ge N ]``."""
+    at CONC ``conc`` where the launch branches on ``if [ "$CONC" -ge N ]`` or
+    ``if [ "$CONC" = N ]``."""
     text = AGENTIC.read_text(encoding="utf-8")
     section = text.split(f"\n## {heading}\n", 1)[1]
     block = section.split("```bash\n", 1)[1].split("\n```", 1)[0]
     env, unset = {}, set()
     taken = None  # inside an `if [ "$CONC" -ge N ]`: whether this branch applies
     for line in block.splitlines():
-        branch = re.fullmatch(r'if \[ "\$CONC" -ge (\d+) \]; then', line)
+        branch = re.fullmatch(r'if \[ "\$CONC" (-ge|=) (\d+) \]; then', line)
         if branch:
-            taken = conc >= int(branch[1])
+            n = int(branch[2])
+            taken = conc >= n if branch[1] == "-ge" else conc == n
             continue
         if taken is not None:
             if line in ("else", "fi"):
@@ -264,6 +266,23 @@ def _recipe_launch(heading=AGENTIC_LAUNCHES["agentic"], conc=16):
 
 # (RECIPE, CONC): the CONC 32 launch, and the small-concurrency one on each side
 # of its CONC 8 branch.
+# The small-concurrency launch's own variants at CONC 8, on top of CONC 8 and 16's.
+CONC8_VARIANTS = {
+    "index": "fused",
+    "mono_ffn_rows": 32,
+    "ar_lamport_rows": 32,
+    "day0_decode_rows": 24,
+    "ar_fused_rows": 64,
+    "ar_fused_min_rows": 16,
+    "moe_glue_fold": True,
+    "index_split_decode": 32,
+    "select_long_rows": 2048,
+    "mono_o_mx8": True,
+    "qk_pair": True,
+    "index_compress": True,
+    "index_compress_fused": True,
+    "moe_route_glue_small": True,
+}
 AGENTIC_POINTS = [("agentic", 32)] + [("agentic_sc", c) for c in (1, 4, 8, 16)]
 
 
@@ -354,13 +373,18 @@ def test_agentic_sc_serves_from_hbm_with_compress_or_mono_by_concurrency(
         assert served == {**agentic, "index": "fused", "index_split_decode": 24}
     else:
         # the c8 / c16 tail is past mono's 16 rows; the compressed index cache
-        assert served == {
+        want = {
             **agentic,
             "index_compress_fused": True,
             "index": "triton",
             "index_split_decode": 24,
             "mono_ffn_rows": 0,
         }
+        # CONC 8's own settings on top, CONC 8 only
+        assert served == ({**want, **CONC8_VARIANTS} if conc == 8 else want)
+    conc8_env = {"AITER_M3PRO_DECODE_SPLIT": "auto", "AITER_MOE_ROUTE_ONESHOT_CAP": "1"}
+    for name, value in conc8_env.items():
+        assert values.get(name) == (value if conc == 8 else None), name
     assert values["GPU_MEM_UTIL"] == "0.95"
     assert values["ATOM_ONLINE_QUANT_STREAMING"] == "1"
 

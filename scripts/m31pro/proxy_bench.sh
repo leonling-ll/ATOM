@@ -48,7 +48,8 @@
 #                    agentic_sc: the same recipe's "Small concurrency (CONC
 #                    1-16)" launch, section 1 without LMCache and cache-aware
 #                    admission; below CONC 8 without index_compress, from
-#                    CONC 8 with mono off [pro]
+#                    CONC 8 with mono off; at CONC 8 its own settings on
+#                    top [pro]
 #   CHAT_TEMPLATE    agentic*: --chat-template file; unset, a checkpoint
 #                    chat_template.jinja without the thinking_mode switch (the
 #                    1 KB stub) is refused []
@@ -184,8 +185,15 @@ agentic | agentic_sc)
         recipe_variants+=', "index": "fused"'
     fi
     recipe_variants+='}'
+    # CONC 8 (only): the measured CONC 8 settings on top of the ones above.
+    c8_variants='{}'
+    if [ "$RECIPE" = agentic_sc ] && [ "$CONC" = 8 ]; then
+        c8_variants='{"index": "fused", "mono_ffn_rows": 32, "ar_lamport_rows": 32, "day0_decode_rows": 24, "ar_fused_rows": 64, "ar_fused_min_rows": 16, "moe_glue_fold": true, "index_split_decode": 32, "select_long_rows": 2048, "mono_o_mx8": true, "qk_pair": true, "index_compress": true, "index_compress_fused": true, "moe_route_glue_small": true}'
+        export AITER_M3PRO_DECODE_SPLIT="${AITER_M3PRO_DECODE_SPLIT:-auto}"
+        export AITER_MOE_ROUTE_ONESHOT_CAP="${AITER_MOE_ROUTE_ONESHOT_CAP:-1}"
+    fi
     default_variants=$(python3 -c 'import json, sys
-print(json.dumps({**json.loads(sys.argv[1]), **json.loads(sys.argv[2] or "{}")}))'         "$recipe_variants" "${ATOM_M3PRO_VARIANTS:-}")
+print(json.dumps({**json.loads(sys.argv[1]), **json.loads(sys.argv[2]), **json.loads(sys.argv[3] or "{}")}))'         "$recipe_variants" "$c8_variants" "${ATOM_M3PRO_VARIANTS:-}")
     unset ATOM_M3PRO_VARIANTS
     export GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.95}"
     export AITER_REUSE_IDENTICAL_COMM_GROUPS=1

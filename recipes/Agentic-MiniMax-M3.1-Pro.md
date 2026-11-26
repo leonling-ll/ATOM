@@ -645,7 +645,7 @@ the window: 203 s eager, 163 s here.
 
 The CONC 1, 4, 8 and 16 launch, as `scripts/m31pro/proxy_bench.sh` starts it with
 `RECIPE=agentic_sc` (`tests/test_m31pro_proxy_bench.py` diffs the two). It is the section 1 launch
-and aiter (section 0) with LMCache and admission off, the decode indexer split from 24 rows, and a smaller `--max-num-seqs` below CONC 8. It branches at CONC 8: CONC 1 and 4 keep mono and the fp8 index cache on the fused decode scorer; CONC 8 and 16 take the compressed index cache with mono off:
+and aiter (section 0) with LMCache and admission off, the decode indexer split from 24 rows, and a smaller `--max-num-seqs` below CONC 8. It branches at CONC 8: CONC 1 and 4 keep mono and the fp8 index cache on the fused decode scorer; CONC 8 and 16 take the compressed index cache with mono off. CONC 8 then takes its own settings on top (the CONC 8 row), which replace the CONC 8 values of the rows above:
 
 | Setting | Here | Why |
 |---|---|---|
@@ -656,6 +656,7 @@ and aiter (section 0) with LMCache and admission off, the decode indexer split f
 | `index_split_decode` | 24 (section 1: 64) | From 3 sequences of k7 verify rows, each rank scores and selects one sequence and the rows are all-gathered (the same selection bit for bit), instead of every rank doing every row. Below 64 rows nothing split before, and the 24-56-row graphs carry the CONC 8 / 16 tail. On the 11-25 official steplogs (before #300) the 8-sequence round, which split, cost less than the 7-sequence one, which did not: 26.6 vs 35.6 ms at CONC 16, 22.5 vs 32.0 ms at CONC 8. Measurement: [#304](https://github.com/zhuyuhua-v/ATOM-M3/issues/304). |
 | `ar_fused_rows` | 0 (unset) | Up to 16 rows the all-reduce already runs on the Lamport path (`ar_lamport_rows` 16), and the mono decode path (#55) refuses an `ar_fused_rows` above 0. At CONC 8 and 16, where mono is off, it has not been measured on this launch. |
 | `--max-num-seqs` | 16 below CONC 8, else 2 × CONC | `proxy_bench.sh`'s rule for every small-concurrency point. |
+| CONC 8 | variants `{"index": "fused", "mono_ffn_rows": 32, "ar_lamport_rows": 32, "day0_decode_rows": 24, "ar_fused_rows": 64, "ar_fused_min_rows": 16, "moe_glue_fold": true, "index_split_decode": 32, "select_long_rows": 2048, "mono_o_mx8": true, "qk_pair": true, "index_compress": true, "index_compress_fused": true, "moe_route_glue_small": true}` on top; `AITER_M3PRO_DECODE_SPLIT=auto`, `AITER_MOE_ROUTE_ONESHOT_CAP=1` | The CONC 8 launch that passed the CONC 8 GSM8K accuracy gate: mono and the Lamport all-reduce up to 32 rows, the fused all-reduce tail from 16 to 64 rows, the MoE glue fold, long-row selection on aiter's top-k, the MXFP8 o_proj in mono, the q/k pair, the decode index split from 32 rows, the fused index scorer with the compressed index cache, moe_route_glue's 128-row buffers, aiter's sparse decode split on auto and the route op's one-shot inbox cap. CONC 8 only; CONC 16 keeps the values above. |
 
 The rest of section 1 stays, including `moe_route_glue`. In #145 it raised P90 E2E-normalized interactivity
 by 14.8% at CONC 1, 9.6% at CONC 4 and 8.2% at CONC 16, on the #33 launch at util 0.87. The chat
@@ -681,6 +682,12 @@ export ATOM_CUSTOM_AR_POOL_BYTES=134217728   # 128 MiB custom all-reduce pool
 export GPTOSS_SWIGLU_MXFP4_BF16_BOUND=1040
 export ATOM_TOKEN_GRAPH_SIZES=256,512,1024,2048
 # no LMCache, no cache-aware admission
+# CONC 8: its own settings on top (the CONC 8 row)
+if [ "$CONC" = 8 ]; then
+  export ATOM_M3PRO_VARIANTS='{"kernels": true, "attn": "aiter", "topk": "split", "prep": "aiter", "index_split": true, "score_tq": 8, "ar_lamport_rows": 32, "k_only": true, "k_plain_fp8": true, "prefill_attn": "day0", "index_split_decode": 32, "moe_route_glue": true, "index_compress": true, "index_compress_fused": true, "index": "fused", "mono_ffn_rows": 32, "day0_decode_rows": 24, "ar_fused_rows": 64, "ar_fused_min_rows": 16, "moe_glue_fold": true, "select_long_rows": 2048, "mono_o_mx8": true, "qk_pair": true, "moe_route_glue_small": true}'
+  export AITER_M3PRO_DECODE_SPLIT=auto
+  export AITER_MOE_ROUTE_ONESHOT_CAP=1
+fi
 
 rm -rf ~/.cache/atom/*
 
