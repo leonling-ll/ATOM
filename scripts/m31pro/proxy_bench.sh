@@ -175,7 +175,7 @@ agentic | agentic_sc)
     elif [ "$CONC" -ge 8 ]; then
         # CONC 8 and 16: the tail decodes at 5-7 sequences (40-56 rows), where
         # the compressed index scores faster and mono (up to 16 rows) does not
-        # serve.
+        # serve. GSM8K 64-shot on this set: mean 0.9419 over 3 runs (#313).
         recipe_variants+=', "index_compress": true, "index_compress_fused": true, "index": "triton", "mono_ffn_rows": 0'
     else
         # Up to 16 rows the centroid writes cost more than the faster scoring
