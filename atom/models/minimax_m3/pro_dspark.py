@@ -54,6 +54,7 @@ from atom.models.minimax_m3.dspark import (
     MiniMaxM3DSpark,
 )
 from atom.models.minimax_m3.pro import _aiter_mx_norm, _native_a8
+from atom.spec_decode.draft_kv import DraftKvPoolSpec
 
 logger = logging.getLogger("atom")
 
@@ -201,3 +202,8 @@ class MiniMaxM3ProDSpark(MiniMaxM3DSpark):
     # Drafts its trained block (`dspark_block_size`, 7) whole when
     # --num-speculative-tokens is smaller; the verify reads the first k.
     drafts_trained_block: ClassVar[bool] = True
+    # Outside the DCP group, in the page-16 order and per-token fp8 scales its
+    # page kernels read; at DCP 1 the generic pool's geometry exactly.
+    kv_pool_spec: ClassVar[DraftKvPoolSpec] = DraftKvPoolSpec(
+        flash_layout=False, own_scales=True
+    )

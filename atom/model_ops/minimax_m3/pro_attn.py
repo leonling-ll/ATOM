@@ -1119,9 +1119,6 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
             k_scale=ks,
             v_scale=vs,
         )
-        if self.dcp_world > 1 and not static:
-            # prep wrote this rank's blocks; the prefill reads every rank's
-            kc4, ks, ic, block_tables = self._dcp_prefill_caches(kc4, ks, ic)
         if compress:
             # the groups this step closes, before any score reads them (a prefill chunk's
             # later rows read its earlier, older-than-local blocks)
@@ -1144,6 +1141,10 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
                 ic,
                 max_rows=max_rows if v.index_compress_fused else 0,
             )
+        if self.dcp_world > 1 and not static:
+            # prep and compress_insert wrote this rank's blocks, at its slots; the
+            # prefill reads every rank's
+            kc4, ks, ic, block_tables = self._dcp_prefill_caches(kc4, ks, ic)
         scale = self.scale * v.scale_mult
         nblk = v.attn_nblk
         # MI355X, decode over top-128 (opt/kv/bench_decode_attn.py, valid_first, nblk 4):
@@ -1481,6 +1482,7 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
             )
         qpos = cached[1]
         nbl = -(-block_tables.shape[1] // w)
+        rps = n // block_tables.shape[0]
         score = pro_kernels.scores(
             iq,
             ic,
@@ -1496,7 +1498,8 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
             head_mode=head_mode,
             pool_temp=v.pool_scale,
             causal=True,
-            tq=v.score_tq if n > block_tables.shape[0] else 0,
+            # tiles of one sequence's rows, as without DCP
+            tq=min(v.score_tq, rps & -rps) if rps > 1 else 0,
         )
         pro_kernels.dcp_pin(score, positions, r, w, init, local)
         score = pro_kernels.dcp_interleave(dcp_all_gather(group, score, 0), w)

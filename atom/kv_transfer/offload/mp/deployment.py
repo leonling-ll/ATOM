@@ -136,18 +136,27 @@ def _validate_mp_config(config: Any) -> tuple[int, int]:
     if pp_size != 1:
         raise NotImplementedError("lmcache_mp does not support PP yet")
     if dcp_size != 1:
+        from atom.config import is_minimax_m3_pro_config
+
         hf = getattr(config, "hf_config", None)
-        hf = getattr(hf, "text_config", hf)
+        mla = getattr(getattr(hf, "text_config", hf), "model_type", None) in (
+            "glm_moe_dsa",
+            "kimi_linear",
+        ) and not draft_owns_kv_pool(config)
+        # MiniMax-M3-Pro's DSpark pool sits outside the DCP group: whole on every
+        # rank, in the same block ids, so a rank's object is its target shard
+        # and the whole draft.
+        pro = hf is not None and is_minimax_m3_pro_config(hf)
         if (
             (tp_size, dcp_size) != (8, 8)
-            or getattr(hf, "model_type", None) not in ("glm_moe_dsa", "kimi_linear")
+            or not (mla or pro)
             or getattr(config, "enable_dp_attention", False)
             or dp_size != 1
-            or draft_owns_kv_pool(config)
         ):
             raise NotImplementedError(
                 "lmcache_mp does not support DCP outside GLM DSA / K3 "
-                "TP8+DCP8 with DP=1, no DP attention or separate draft pool"
+                "TP8+DCP8 without a separate draft pool, or MiniMax-M3-Pro "
+                "TP8+DCP8, with DP=1 and no DP attention"
             )
         block_size = offcfg._strict_integer(
             "LMCache MP block size", config.kv_cache_block_size, minimum=1

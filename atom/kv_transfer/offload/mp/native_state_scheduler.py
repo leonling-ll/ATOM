@@ -73,6 +73,10 @@ class NativeStateLMCacheMPConnectorScheduler(LMCacheMPConnectorScheduler):
 
     _supports_early_block_release = True
 
+    # Its saves are bounded by `_max_pending_saves` at any DCP, and a lookup
+    # also answers for the state image.
+    _bounds_dcp_traffic = False
+
     def __init__(self, config: Any) -> None:
         # The layout is known only after BlockManager builds the native pool.
         # Defer connecting so scheduler and workers use the same namespace.

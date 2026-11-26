@@ -374,8 +374,12 @@ runs as without DCP. It needs the kernel path and runs the Triton attention.
 Add to the server's arguments `--decode-context-parallel-size 8`. The DCP group shares the TP
 group's communicator (ATOM sets `AITER_REUSE_IDENTICAL_COMM_GROUPS=1` unless it is set; see
 [communicator memory](../docs/environment_variables.md#communicator-memory)): with `0` aiter builds it
-one of its own over the same GPUs, and the KV pool loses it. The DSpark draft does not run under DCP
-yet (#78), so the server has no `--method dspark`.
+one of its own over the same GPUs, and the KV pool loses it. The DSpark draft runs under DCP with the
+same `--method dspark --num-speculative-tokens` arguments; other speculative methods are refused. Its
+KV pool sits outside the DCP group, so every rank holds the draft's KV for the whole context: at DCP 8
+the draft's KV is 2,600 of the 5,898 bytes a token takes on a rank. With the LMCache MP tier each rank
+stores its shard of the target's KV and the whole draft, and the scheduler keeps at most 16 saves in
+flight (`OFFLOAD_MAX_PENDING_SAVES` or the connector's `max_pending_saves` sets it).
 
 Measured on the 15-minute agentic proxy (`SPEC_TOKENS=0 scripts/m31pro/proxy_bench.sh 32`) with the K-only
 cache, CPU KV offload on and `AITER_REUSE_IDENTICAL_COMM_GROUPS=1`, both arms on one tree, without
