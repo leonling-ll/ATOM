@@ -3175,18 +3175,21 @@ def dcp_prefill_plan(block_tables, context_lens, world):
     """What gathering a prefill's sequences' blocks from every rank needs: ``rows`` the
     local blocks (``[E]``, every entry of every sequence in order), and ``tables``
     ``[S, world * max entries]`` int32, each sequence's global blocks in the gathered
-    caches (``dcp_gather_blocks``)."""
+    caches (``dcp_gather_blocks``). Built in numpy: torch's CPU ops run OpenMP regions
+    that stall 40-100 ms when 8 ranks and the offload workers share the host's cores."""
     dev = block_tables.device
     ne = [-(-int(c) // (PAGE * world)) for c in context_lens]
-    seq = torch.repeat_interleave(torch.arange(len(ne)), torch.tensor(ne))
-    ent = torch.cat([torch.arange(n) for n in ne])
-    rows = block_tables[seq.to(dev), ent.to(dev)].long()
-    tables = torch.zeros(len(ne), world * max(max(ne), 1), dtype=torch.int32)
+    seq = np.repeat(np.arange(len(ne)), ne)
+    ent = np.concatenate([np.arange(n) for n in ne])
+    rows = block_tables[
+        torch.from_numpy(seq).to(dev), torch.from_numpy(ent).to(dev)
+    ].long()
+    tables = np.zeros((len(ne), world * max(max(ne), 1)), np.int32)
     off = 0
     for s, n in enumerate(ne):
-        tables[s, : world * n] = torch.arange(world * off, world * (off + n))
+        tables[s, : world * n] = np.arange(world * off, world * (off + n))
         off += n
-    return rows, tables.to(dev)
+    return rows, torch.from_numpy(tables).to(dev)
 
 
 def dcp_gather_blocks(cache, rows, gather, world):
