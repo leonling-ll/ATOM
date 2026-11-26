@@ -569,9 +569,8 @@ class MiniMaxM3ProAttention(nn.Module):
         """The attention up to o_proj as bf16 [M, heads x 192], what the mono layer
         kernel reads (``front`` as in ``forward``). The Triton / aiter decode
         attention writes this call's rows as bf16 where ``forward``'s would be
-        o_proj's MXFP8 input (``ProSparseAttentionImpl.bf16_out``). The day0
-        decode's epilogue still writes E4M3 from ``day0_decode_rows`` rows, so mono
-        refuses a row limit that reaches it (``pro_mono.route.variants_refusal``)."""
+        o_proj's MXFP8 input (``ProSparseAttentionImpl.bf16_out``), the day0 decode
+        included (its epilogue's E4M3 rows are what the mono o stage makes of these)."""
         impl = self.attn.impl
         impl.bf16_out = True
         try:

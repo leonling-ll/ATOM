@@ -186,9 +186,6 @@ def test_a_failed_runner_turns_it_off_for_good(monkeypatch):
         ({"lookahead_src": "resid"}, "lookahead_src 'resid'"),
         ({"ar_lamport_rows": 8}, "ar_lamport_rows 8 below 16"),
         ({"ar_lamport_rows": 0}, "ar_lamport_rows 0 below 16"),
-        # the day0 decode hands o_proj E4M3 rows from day0_decode_rows rows on
-        ({"day0_decode_rows": 16}, "day0_decode_rows 16 within 16"),
-        ({"day0_decode_rows": 1}, "day0_decode_rows 1 within 16"),
         # AR #1 from 1 row up on the one-launch kernel, not the Lamport sum + norm
         ({"ar_fused_rows": 128}, "ar_fused_rows 128 overlaps 1 .. 16"),
         ({"ar_fused_rows": 1}, "ar_fused_rows 1 overlaps 1 .. 16"),
@@ -227,7 +224,8 @@ def test_ar_fused_rows_above_the_row_limit_keep_mono(monkeypatch, over, why):
 
 
 @pytest.mark.parametrize("min_rows", [16, 32])
-def test_mono_to_32_rows_with_the_one_launch_ar_above_it_keeps_mono(min_rows):
+@pytest.mark.parametrize("day0", [24, 48])
+def test_mono_to_32_rows_with_the_one_launch_ar_above_it_keeps_mono(min_rows, day0):
     """mono to 32 rows (a wider build), the one-launch AR and the folds above it: no refusal
     from these variants (the width a build supports is the latch's, not checked here).
     """
@@ -236,15 +234,21 @@ def test_mono_to_32_rows_with_the_one_launch_ar_above_it_keeps_mono(min_rows):
         "ar_lamport_rows": 32,
         "ar_fused_rows": 128,
         "ar_fused_min_rows": min_rows,
-        "day0_decode_rows": 48,
+        "day0_decode_rows": day0,
     }
     assert variants_refusal(_variants(**over), True) is None
 
 
-@pytest.mark.parametrize("day0, rows", [(24, 16), (17, 16), (0, 16), (9, 8)])
-def test_a_day0_decode_above_the_row_limit_or_off_is_served(monkeypatch, day0, rows):
-    """The Agentic recipe's 24 against mono's 16, or the day0 decode off."""
+@pytest.mark.parametrize(
+    "day0, rows", [(24, 16), (17, 16), (0, 16), (9, 8), (16, 16), (1, 16), (24, 32)]
+)
+def test_a_day0_decode_at_any_row_limit_is_served(monkeypatch, day0, rows):
+    """The Agentic recipe's 24 against mono's 16 or 32, the day0 decode off,
+    or from within the row limit: the day0 decode hands a mono layer bf16 rows
+    (``ProSparseAttentionImpl._mxfp8_out``)."""
     over = {"day0_decode_rows": day0, "mono_ffn_rows": rows}
+    if rows > 16:
+        over["ar_lamport_rows"] = rows  # AR #1 on the Lamport path at every mono width
     assert variants_refusal(_variants(**over), True) is None
     h = Harness(monkeypatch, **over)
     assert h.take(rows) is h.runner and h.route.rows == rows

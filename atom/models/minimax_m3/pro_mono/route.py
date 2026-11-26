@@ -51,10 +51,11 @@ def variants_refusal(v, mx_norm: bool) -> str | None:
     in-kernel AR #1 sums in the Lamport all-reduce's order, so production's
     AR #1 must be the Lamport one at every width mono serves
     (``ar_lamport_rows``), or h_mid would differ from production's. It reads
-    the attention's output as bf16: below the day0 decode the layers it takes
-    get bf16 (``MiniMaxM3ProAttention.forward_core``), but the day0 decode
-    hands o_proj E4M3 rows from ``day0_decode_rows`` rows, so it must start
-    above the row limit. ``ar_fused_rows`` sends production's AR #1 of 1 ..
+    the attention's output as bf16, which every decode attention writes for
+    the layers it takes (``MiniMaxM3ProAttention.forward_core``), the day0
+    decode included (its epilogue's E4M3 rows are the o stage's quantization
+    of them), so ``day0_decode_rows`` may start within the row limit.
+    ``ar_fused_rows`` sends production's AR #1 of 1 ..
     ``ar_fused_rows`` rows to the one-launch two-shot Lamport kernel (the
     fused 1-stage kernel's bytes, not the Lamport all-reduce's sum and norm),
     so a positive value refuses, as a short ``ar_lamport_rows`` does, unless
@@ -79,11 +80,6 @@ def variants_refusal(v, mx_norm: bool) -> str | None:
             rows_refusal(v.mono_ffn_rows, v.mono_routed_act) is not None
             or v.ar_lamport_rows >= v.mono_ffn_rows,
             f"ar_lamport_rows {v.ar_lamport_rows} below {v.mono_ffn_rows}",
-        ),
-        (
-            rows_refusal(v.mono_ffn_rows, v.mono_routed_act) is not None
-            or not 0 < v.day0_decode_rows <= v.mono_ffn_rows,
-            f"day0_decode_rows {v.day0_decode_rows} within {v.mono_ffn_rows}",
         ),
         (
             rows_refusal(v.mono_ffn_rows, v.mono_routed_act) is not None

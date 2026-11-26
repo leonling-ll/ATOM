@@ -332,16 +332,32 @@ def test_a_dense_layer_never_takes_the_glue(rec, glue):
     assert "glue" not in rec.calls and ("ffn", False, True) in rec.calls
 
 
-def test_the_default_day0_decode_starts_above_the_row_limit():
+def test_the_day0_decode_leaves_mono_on_at_any_row_limit():
     """``ProVariants``' own defaults: the day0 decode from 24 rows leaves
-    mono's 16 on; a day0 decode from 16 rows turns mono off."""
+    mono's 16 on, and so does a day0 decode from within the limit (16 rows of
+    16, 24 of 32): it hands the layers mono takes bf16 rows."""
     from atom.models.minimax_m3.pro_mono.route import variants_refusal
 
     v = ProVariants(ar_lamport_rows=16, moe_route_glue=True, mono_ffn_rows=16)
     assert v.day0_decode_rows == 24 and v.day0_decode_mxfp8
     assert variants_refusal(v, True) is None
     v = ProVariants(ar_lamport_rows=16, mono_ffn_rows=16, day0_decode_rows=16)
-    assert variants_refusal(v, True) == "day0_decode_rows 16 within 16"
+    assert variants_refusal(v, True) is None
+    v = ProVariants(ar_lamport_rows=32, mono_ffn_rows=32)
+    assert variants_refusal(v, True) is None
+
+
+def test_the_day0_decode_hands_a_mono_layer_bf16_rows():
+    """``_mxfp8_out`` on a day0 decode batch: E4M3 for o_proj (``mx_out``,
+    ``day0_decode_mxfp8``), bf16 for ``forward_core``'s call (``bf16_out``)."""
+    m = object.__new__(pro_attn.ProSparseAttentionImpl)
+    m.dcp_world, m.mx_out, m.bf16_out = 1, True, False
+    v = ProVariants(mono_ffn_rows=32, day0_decode_rows=24)
+    assert m._mxfp8_out(v, 32, day0_dec=True)
+    m.bf16_out = True
+    assert not m._mxfp8_out(v, 32, day0_dec=True)
+    m.bf16_out = False
+    assert not m._mxfp8_out(ProVariants(day0_decode_mxfp8=False), 32, day0_dec=True)
 
 
 def test_the_rows_mono_reads_stay_bf16_where_o_proj_takes_mxfp8(monkeypatch):

@@ -288,8 +288,8 @@ class ProVariants:
     # mono takes get the decode attention's output as bf16. On where the deployment and
     # the variants allow it (``pro_mono.config.config_refusal``,
     # ``pro_mono.route.variants_refusal``: TP8 with FlyDSL, the Lamport AR #1 up to
-    # these rows, the MXFP8 norms and the resid_in lookahead, a ``day0_decode_rows``
-    # above the limit); elsewhere it logs why and production serves. Latched once, at
+    # these rows, the MXFP8 norms and the resid_in lookahead; the day0 decode hands
+    # its layers bf16 rows); elsewhere it logs why and production serves. Latched once, at
     # the first forward (``pro_mono.route``, agreed over the TP group): a later edit of
     # the file does not change it. The accuracy it was turned on with (A16W4, the
     # Agentic recipe's variants) is in recipes/MiniMax-M3.1-Pro-Accuracy-Switches.md.
@@ -916,7 +916,9 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
         if not self.mx_out:
             return False
         if day0_dec:
-            return v.day0_decode_mxfp8
+            # a mono layer's call (``bf16_out``) takes the day0 decode's rows as
+            # bf16 too: its o stage quantizes them as the epilogue would
+            return v.day0_decode_mxfp8 and not self.bf16_out
         return (
             not self.bf16_out
             and v.fuse_mxfp8_quant
