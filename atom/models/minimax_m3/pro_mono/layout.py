@@ -114,6 +114,8 @@ O_SCALES_PW = O_K // MX_GROUP // 4  # 24
 O_ROW = O_K // 4 + 4
 OSC_ROW = O_K // MX_GROUP // 4
 UPTO = ("norm", "ffn")
+# the o stage's input formats (``P1Build.o_in``)
+O_INS = ("bf16", "mx8")
 # tokens a 16x16 MFMA's B operand holds: a build of more rows runs each stage
 # whose B operand is the token rows once a tile (the o stage: ``stage_o``)
 TOKEN_TILE = 16
@@ -447,7 +449,7 @@ def max_u(s: int) -> int:
 
 
 ABI_NAMES = (
-    "core", "w_o", "s_o", "res", "g_post", "g_ahead", "moe_w",
+    "core", "core_s", "w_o", "s_o", "res", "g_post", "g_ahead", "moe_w",
     "h_mid", "x", "x8", "x8s", "la8", "la8s", "ffn_out",
     "scratch", "plain", "nvalid", "peers", "rank", "layer", "tl",
 )  # fmt: skip
@@ -486,12 +488,19 @@ class P1Build:
     # the routed planes' loaded intermediate (``RoutedPlanes``, read off the
     # bound weights): an FFN build's, 0 for a norm build
     inter_r: int = field(default=0, metadata={"sym": "ir"})
+    # the o stage's input (``O_INS``): "bf16" core rows (quantized to MXFP8 1x32
+    # in LDS, quantize_fp8's bytes) or "mx8", the attention's own MXFP8 rows
+    # (E4M3 ``core`` [S, 3072] + E8M0 ``core_s`` [S, 96], the same bytes),
+    # copied to LDS as they are
+    o_in: str = field(default="bf16", metadata={"sym": "oi"})
 
     def __post_init__(self):
         if self.upto not in UPTO:
             raise ValueError(f"upto {self.upto!r} not in {UPTO}")
         if self.routed_act not in ROUTED_ACTS:
             raise ValueError(f"routed_act {self.routed_act!r} not in {ROUTED_ACTS}")
+        if self.o_in not in O_INS:
+            raise ValueError(f"o_in {self.o_in!r} not in {O_INS}")
         top = max_tokens(self.upto, self.routed_act)
         if not 1 <= self.tokens <= top:
             raise ValueError(

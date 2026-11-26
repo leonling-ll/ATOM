@@ -300,6 +300,12 @@ class ProVariants:
     # "fp4" (W4A4, aiter a4w4 numerics); the last two quantize the activations, a
     # numerics change. Latched with ``mono_ffn_rows`` and agreed over the TP group.
     mono_routed_act: str = "bf16"
+    # The layers mono takes get the decode attention's output as it writes o_proj's
+    # input (E4M3 rows + E8M0 scales where it can, ``_mxfp8_out``) instead of bf16:
+    # the mono o stage then copies those bytes rather than quantizing bf16 rows in
+    # each of its 224 o CTAs (the same bytes, quantize_fp8's). Read per forward; the
+    # o stage is rank-local, so ranks need not agree on it.
+    mono_o_mx8: bool = False
     # Developer profile, not an attention switch (the attention path never reads it): count
     # the distinct routed experts each MoE layer reads in every forward (TP rank 0) into
     # ``<diag_tag>_experts.jsonl`` (``eplb.ExpertCountProfile``). A counting run, not a

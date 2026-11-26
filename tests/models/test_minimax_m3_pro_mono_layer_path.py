@@ -98,13 +98,13 @@ def _layer(rec, moe=True, route=None):
         def __call__(self, **kw):
             rec.calls.append("attn")
             rec.attn_in = weakref.ref(kw["hidden_states"])
-            return self.o_proj(self.forward_core(**kw))
+            return self.o_proj(self.forward_core(**kw)[0])
 
-        def forward_core(self, **kw):
+        def forward_core(self, mx=False, **kw):
             rec.calls.append("core")
-            return kw["hidden_states"][:, :OK] * 5
+            return kw["hidden_states"][:, :OK] * 5, None
 
-        def o_proj(self, core):
+        def o_proj(self, core, x_scale=None):
             rec.calls.append("o_proj")
             out = torch.cat([core, core[:, : H - OK]], 1) * 7
             rec.o_proj_out = weakref.ref(out)
@@ -420,11 +420,16 @@ def test_the_rows_mono_reads_stay_bf16_where_o_proj_takes_mxfp8(monkeypatch):
     front = (torch.zeros(2 * n_tok, 64), torch.zeros(2 * n_tok, 2))
     args = (torch.zeros(n_tok, dtype=torch.long), hidden, None, None, None, front)
 
-    core = a.forward_core(*args)
+    core, sc = a.forward_core(*args)
     assert core.dtype == torch.bfloat16 and core.shape == (n_tok, heads * dv)
     assert (core[:n] == 1.0).all() and (core[n:] == 0).all()
-    assert scales == [None] and m.take_mx_scale() is None
+    assert sc is None and scales == [None] and m.take_mx_scale() is None
     assert not m.bf16_out  # this call only
+
+    # mono_o_mx8: forward_core hands the E4M3 rows and their scales, as forward's
+    core8, sc8 = a.forward_core(*args, mx=True)
+    assert core8.dtype == torch.float8_e4m3fn and sc8.shape == (n_tok, heads * dv // 32)
+    assert m.take_mx_scale() is None and not m.bf16_out
 
     a.forward(*args)  # production: o_proj reads the E4M3 rows and their scales
     assert got[0][0] == torch.float8_e4m3fn and got[0][1] is not None

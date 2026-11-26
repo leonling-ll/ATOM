@@ -64,6 +64,7 @@ from atom.models.minimax_m3.pro_mono.kernels.layer import ABI, build
 from atom.models.minimax_m3.pro_mono.layout import (
     DIMS,
     MOE_WEIGHTS,
+    O_INS,
     REGIONS,
     P1Build,
     peer_bytes,
@@ -237,15 +238,18 @@ class ProMonoRunner:
     # -------------------------------------------------------------- builds
 
     def _build_width(self, rows: int) -> dict:
+        # both o-stage inputs: the attention hands MXFP8 rows where it writes
+        # them (``ProVariants.mono_o_mx8``) and bf16 rows elsewhere, by shape
         return {
-            kind: build(
+            (kind, o_in): build(
                 P1Build(
                     tokens=rows, upto=UPTO, lookahead=kind[0], eps=kind[1],
                     eps_ahead=kind[2], debug=self.debug,
-                    routed_act=self.routed_act, inter_r=self.inter_r,
+                    routed_act=self.routed_act, inter_r=self.inter_r, o_in=o_in,
                 )
             )
             for kind in self.kinds
+            for o_in in O_INS
         }  # fmt: skip
 
     def prepare(self, rows: int) -> bool:
@@ -257,20 +261,36 @@ class ProMonoRunner:
 
     # ------------------------------------------------------------- a layer
 
-    def launch(self, layer_id: int, core: torch.Tensor, residual: torch.Tensor):
+    def launch(
+        self,
+        layer_id: int,
+        core: torch.Tensor,
+        residual: torch.Tensor,
+        core_scale: torch.Tensor | None = None,
+    ):
         """The layer kernel on ``core`` [S, 3072] and ``residual`` [S, 7168]:
-        its outputs by ABI name (``OUTPUTS``). The lookahead (``la8`` /
-        ``la8s``) is its reader's ring rows where they exist
+        its outputs by ABI name (``OUTPUTS``). ``core`` is bf16, or with
+        ``core_scale`` the attention's MXFP8 rows (E4M3, and E8M0 [S, 96]),
+        which the "mx8" build copies instead of quantizing. The lookahead
+        (``la8`` / ``la8s``) is its reader's ring rows where they exist
         (``ProLookaheadState.lookahead_rows``), as ``put`` writes it."""
         n = residual.shape[0]
         lw = self.layers[layer_id]
         o_k = DIMS.o_k
-        if core.dtype != BF16 or core.numel() != n * o_k:
+        mx8 = core_scale is not None
+        want = torch.float8_e4m3fn if mx8 else BF16
+        if core.dtype != want or core.numel() != n * o_k:
             raise RuntimeError(
                 f"layer {layer_id}: core {core.dtype} {tuple(core.shape)},"
-                f" expected bf16 [{n}, {o_k}]"
+                f" expected {want} [{n}, {o_k}]"
+            )
+        if mx8 and core_scale.numel() != n * (o_k // 32):
+            raise RuntimeError(
+                f"layer {layer_id}: core scale {tuple(core_scale.shape)},"
+                f" expected [{n}, {o_k // 32}]"
             )
         core = core.reshape(n, o_k).contiguous()
+        core_s = core_scale.reshape(n, o_k // 32).contiguous() if mx8 else None
         residual = residual.contiguous()
         ring = (
             None
@@ -289,7 +309,8 @@ class ProMonoRunner:
         ptrs.update({name: t.data_ptr() for name, t in out.items()})
         w = lw.w
         args = {
-            "core": core.data_ptr(), "w_o": w.w_o.data_ptr(), "s_o": w.s_o.data_ptr(),
+            "core": core.data_ptr(), "core_s": 0 if core_s is None else core_s.data_ptr(),
+            "w_o": w.w_o.data_ptr(), "s_o": w.s_o.data_ptr(),
             "res": residual.data_ptr(), "g_post": w.g_post.data_ptr(),
             "g_ahead": 0 if w.g_ahead is None else w.g_ahead.data_ptr(),
             "moe_w": lw.moe_w.data_ptr(), **ptrs,
@@ -301,12 +322,16 @@ class ProMonoRunner:
         if layer_id == self.first:
             self.mailboxes.begin_step()
         stream = torch.cuda.current_stream()
-        _run_compiled(self.builds[n][lw.kind], *ABI.pack(args), stream)
+        _run_compiled(
+            self.builds[n][(lw.kind, "mx8" if mx8 else "bf16")], *ABI.pack(args), stream
+        )
         if layer_id == self.last and self.debug and not capturing():
             self._raise_on_given_up_waits(n)
         return out
 
-    def segment(self, layer, core: torch.Tensor, residual: torch.Tensor, reference):
+    def segment(
+        self, layer, core: torch.Tensor, residual: torch.Tensor, reference, core_scale=None
+    ):
         """Decoder layer ``layer``'s post-attention segment on the kernel:
         ``(FFN partial, residual_mid)``. ``reference(residual)``: production's
         segment of this layer's o_proj of ``core`` at this width (the
@@ -317,7 +342,7 @@ class ProMonoRunner:
         ref = None
         if self.check and not capturing():
             ref = self._production(layer, residual, reference)
-        out = self.launch(lid, core, residual)
+        out = self.launch(lid, core, residual, core_scale)
         reader = self.layers[lid].reader
         if reader is not None:
             self.state.resid_in[reader] = (

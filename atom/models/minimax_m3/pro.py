@@ -565,16 +565,21 @@ class MiniMaxM3ProAttention(nn.Module):
         index_src: torch.Tensor | tuple[torch.Tensor, torch.Tensor] | None = None,
         diag_srcs: dict[str, torch.Tensor | None] | None = None,
         front: tuple[torch.Tensor, torch.Tensor] | None = None,
-    ) -> torch.Tensor:
-        """The attention up to o_proj as bf16 [M, heads x 192], what the mono layer
-        kernel reads (``front`` as in ``forward``). The Triton / aiter decode
-        attention writes this call's rows as bf16 where ``forward``'s would be
-        o_proj's MXFP8 input (``ProSparseAttentionImpl.bf16_out``), the day0 decode
-        included (its epilogue's E4M3 rows are what the mono o stage makes of these)."""
+        mx: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """The attention up to o_proj, what the mono layer kernel reads (``front``
+        as in ``forward``): ``(core, scale)``. Without ``mx`` the core is bf16 [M,
+        heads x 192] and the scale None: the Triton / aiter decode attention writes
+        this call's rows as bf16 where ``forward``'s would be o_proj's MXFP8 input
+        (``ProSparseAttentionImpl.bf16_out``), the day0 decode included (its
+        epilogue's E4M3 rows are what the mono o stage makes of these). With ``mx``
+        (``ProVariants.mono_o_mx8``) the attention writes what ``forward`` would:
+        E4M3 rows and their E8M0 scales where it can (then the mono "mx8" build
+        copies them, the same bytes), bf16 and None elsewhere."""
         impl = self.attn.impl
-        impl.bf16_out = True
+        impl.bf16_out = not mx
         try:
-            return self._attend(
+            core = self._attend(
                 positions,
                 hidden_states,
                 hidden_states_scale,
@@ -582,6 +587,8 @@ class MiniMaxM3ProAttention(nn.Module):
                 diag_srcs,
                 front,
             )
+            scale = impl.take_mx_scale() if core.dtype != torch.bfloat16 else None
+            return core, scale
         finally:
             impl.bf16_out = False
 
@@ -772,12 +779,21 @@ class MiniMaxM3ProDecoderLayer(MiniMaxM3DecoderLayer):
         }
         if mono is not None:
             # production's segment of this o_proj is check mode's reference
-            core = attn.forward_core(**attn_in)
+            core, core_scale = attn.forward_core(**attn_in, mx=v.mono_o_mx8)
             hidden_states, residual = mono.segment(
                 self,
                 core,
                 residual,
-                lambda res: self._segment(attn.o_proj(core), res, v, mx_norm, fuse),
+                lambda res: self._segment(
+                    attn.o_proj(core)
+                    if core_scale is None
+                    else attn.o_proj(core, x_scale=core_scale),
+                    res,
+                    v,
+                    mx_norm,
+                    fuse,
+                ),
+                core_scale,
             )
         else:
             # Neither the attention's inputs nor o_proj's output is held across the

@@ -303,7 +303,7 @@ def _worker(rank, port, queue, done, inputs, ties):
         def run(launch, out, core, res, moe_w, nvalid=0):
             args = ABI.pack(
                 {
-                    "core": core.data_ptr(), "w_o": w_o.data_ptr(),
+                    "core": core.data_ptr(), "core_s": 0, "w_o": w_o.data_ptr(),
                     "s_o": s_o.data_ptr(), "res": res.data_ptr(),
                     "g_post": w_post.data_ptr(), "g_ahead": w_ahead.data_ptr(),
                     "moe_w": moe_w.data_ptr(),

@@ -48,7 +48,7 @@ from aiter.ops.flydsl.kernels import buffer_ops as bo
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import Int32, Int64, T
 
-from atom.models.minimax_m3.pro_mono.config import COLS, EXPERTS, HIDDEN, TOPK
+from atom.models.minimax_m3.pro_mono.config import COLS, EXPERTS, HIDDEN, MX_GROUP, TOPK
 from atom.models.minimax_m3.pro_mono.kernels import ffn
 from atom.models.minimax_m3.pro_mono.layout import (
     ABI_NAMES,
@@ -263,6 +263,64 @@ def load_core(c, loads, issue):
     return got
 
 
+# the attention's MXFP8 core rows (``P1Build.o_in`` "mx8"): a dwordx4 holds 16
+# E4M3 values, or 16 E8M0 codes (a row's 96 codes are 6 of them)
+CORE8_ITEMS = O_K // 16
+CORE8_SC_ITEMS = O_K // MX_GROUP // 16
+
+
+def core8_loads(c):
+    """``core_loads`` for an "mx8" build: the E4M3 rows (``core`` [S, 3072])
+    and their E8M0 codes (``core_s`` [S, 96]) as the attention wrote them,
+    every round's loads issued before anything else of the o stage."""
+    s, tid = c["S"], c["tid"]
+    r_q, r_s = rsrc(c["core"]), rsrc(c["core_s"])
+    out = []
+    n = s * CORE8_ITEMS
+    for i in range_constexpr(-(-n // THREADS)):
+        e = fx.min(tid + THREADS * i, n - 1)
+        t, q = e // CORE8_ITEMS, e % CORE8_ITEMS
+        out.append(_ld4(r_q, (t * O_K + 16 * q) // 4))
+    m = s * CORE8_SC_ITEMS
+    for i in range_constexpr(-(-m // THREADS)):
+        e = fx.min(tid + THREADS * i, m - 1)
+        t, q = e // CORE8_SC_ITEMS, e % CORE8_SC_ITEMS
+        out.append(_ld4(r_s, (t * (O_K // MX_GROUP) + 16 * q) // 4))
+    rocdl.sched_barrier(0)
+    return out
+
+
+@traced
+def load_core8(c, loads, issue):
+    """``load_core`` for an "mx8" build: the attention's E4M3 words to ``xs``
+    (token t's at t O_ROW) and its codes to ``osc`` (t OSC_ROW), byte for byte
+    the layout ``load_core`` quantizes into (``quantize_fp8``'s bytes, the
+    same blocks); the o stage's weight loads issued a share a round."""
+    s, tid = c["S"], c["tid"]
+    n, m = s * CORE8_ITEMS, s * CORE8_SC_ITEMS
+    rounds_q = -(-n // THREADS)
+    per = -(-len(issue) // len(loads))
+    got = []
+    for i in range_constexpr(len(loads)):
+        got += [f() for f in issue[per * i : per * (i + 1)]]
+        rocdl.sched_barrier(0)
+        if const_expr(i < rounds_q):
+            j, tot, items = i, n, CORE8_ITEMS
+            e = fx.min(tid + THREADS * j, tot - 1)
+            dst = c["xs"] + ((e // items) * O_ROW + 4 * (e % items))
+        else:
+            j, tot, items = i - rounds_q, m, CORE8_SC_ITEMS
+            e = fx.min(tid + THREADS * j, tot - 1)
+            dst = c["osc"] + ((e // items) * OSC_ROW + 4 * (e % items))
+        if const_expr(THREADS * (j + 1) <= tot):
+            fx.ptr_store(loads[i], dst)
+        else:
+            if tid + THREADS * j < tot:
+                fx.ptr_store(loads[i], dst)
+        rocdl.sched_barrier(0)
+    return got
+
+
 def _core_store(c, t, q, w0, w1, codes):
     fx.ptr_store(w0, c["xs"] + (t * O_ROW + 2 * q))
     fx.ptr_store(w1, c["xs"] + (t * O_ROW + 2 * q + 1))
@@ -292,7 +350,8 @@ def stage_o(c):
     if bid < O_TASKS:
         t = bid
         rg = t * 2 + wave // 4
-        core = core_loads(c)
+        mx8 = c["o_in"] == "mx8"
+        core = core8_loads(c) if mx8 else core_loads(c)
         r_wo, r_so = rsrc(c["w_o"]), rsrc(c["s_o"])
         # lane (row l16, block g4): the E8M0 bytes of this wave's 24 blocks,
         # row-major [7168, 96]; MFMA p takes block g4 of dword p
@@ -305,7 +364,7 @@ def stage_o(c):
             functools.partial(_ld4, r_so, sw),
             functools.partial(_ld4, r_so, sw + 4, 0, 2),
         ]
-        got = load_core(c, core, issue)
+        got = load_core8(c, core, issue) if mx8 else load_core(c, core, issue)
         wts, s_lo, s_hi = got[:O_CPW], got[O_CPW], got[O_CPW + 1]
         ws = [s_lo[d] for d in range(4)] + [s_hi[d] for d in range(2)]
         gpu.barrier()
@@ -655,7 +714,7 @@ def build(key: P1Build):
 
     @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
     def p1_layer(
-        core: Int64, w_o: Int64, s_o: Int64, res: Int64, g_post: Int64,
+        core: Int64, core_s: Int64, w_o: Int64, s_o: Int64, res: Int64, g_post: Int64,
         g_ahead: Int64, moe_w: Int64, h_mid: Int64, x: Int64, x8: Int64,
         x8s: Int64, la8: Int64, la8s: Int64, ffn_out: Int64, scratch: Int64,
         plain: Int64, nvalid: Int64,
@@ -690,7 +749,8 @@ def build(key: P1Build):
             "obeg": owner * OWN, "is_owner": owner == rank,
             "not_owner": owner != rank,
             "off": {r: play[r][0] for r in NORM_REGIONS},
-            "core": core, "w_o": w_o, "s_o": s_o, "res": res,
+            "core": core, "core_s": core_s, "o_in": key.o_in,
+            "w_o": w_o, "s_o": s_o, "res": res,
             "g_post": g_post, "g_ahead": g_ahead, "h_mid": h_mid, "x": x,
             "x8": x8, "x8s": x8s, "la8": la8, "la8s": la8s,
             "xs": lds.xs.ptr, "osc": lds.osc.ptr, "red": lds.red.ptr,
@@ -779,7 +839,7 @@ def build(key: P1Build):
 
     @launcher(name)
     def launch(
-        core: Int64, w_o: Int64, s_o: Int64, res: Int64, g_post: Int64,
+        core: Int64, core_s: Int64, w_o: Int64, s_o: Int64, res: Int64, g_post: Int64,
         g_ahead: Int64, moe_w: Int64, h_mid: Int64, x: Int64, x8: Int64,
         x8s: Int64, la8: Int64, la8s: Int64, ffn_out: Int64, scratch: Int64,
         plain: Int64, nvalid: Int64,
@@ -788,7 +848,7 @@ def build(key: P1Build):
     ):  # fmt: skip
         _ = keyed
         p1_layer(
-            core, w_o, s_o, res, g_post, g_ahead, moe_w, h_mid, x, x8, x8s,
+            core, core_s, w_o, s_o, res, g_post, g_ahead, moe_w, h_mid, x, x8, x8s,
             la8, la8s, ffn_out, scratch, plain, nvalid, peers, rank, layer, tl,
         ).launch(grid=(BLOCKS,), block=(THREADS,), stream=stream)  # fmt: skip
 
