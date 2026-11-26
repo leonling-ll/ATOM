@@ -71,6 +71,9 @@ class Split:
         # K-only pages as the kernels address them: [block, 1, page, 256]
         self.kc = (torch.randn(total, 1, PG, D, generator=g) * 0.5).to(DT)
         self.ic = (torch.randn(total, PG, DI, generator=g) * 0.5).to(DT)
+        # index_compress's cache: a centroid row a group of 4 keys, [block, 4, 128]
+        gc = torch.Generator().manual_seed(seed + 1)
+        self.icc = (torch.randn(total, PG // 4, DI, generator=gc) * 0.5).to(DT)
         # rank r: every entry of every sequence, block j = e * world + r where it exists
         self.ranks = []
         for r in range(world):
@@ -79,16 +82,21 @@ class Split:
             bt = torch.zeros(len(lens), self.ne, dtype=torch.int32)
             kc = torch.zeros(len(ents), 1, PG, D, dtype=DT)
             ic = torch.zeros(len(ents), PG, DI, dtype=DT)
+            icc = torch.zeros(len(ents), PG // 4, DI, dtype=DT)
             for i, (s, e) in enumerate(ents):
                 phys = int(order[i])
                 bt[s, e] = phys
                 j = e * world + r
                 if j < nb[s]:
                     kc[phys], ic[phys] = self.kc[self.bt[s, j]], self.ic[self.bt[s, j]]
+                    icc[phys] = self.icc[self.bt[s, j]]
             self.ranks.append(
-                SimpleNamespace(bt=bt.to(DEV), kc=kc.to(DEV), ic=ic.to(DEV))
+                SimpleNamespace(
+                    bt=bt.to(DEV), kc=kc.to(DEV), ic=ic.to(DEV), icc=icc.to(DEV)
+                )
             )
         self.bt, self.kc, self.ic = self.bt.to(DEV), self.kc.to(DEV), self.ic.to(DEV)
+        self.icc = self.icc.to(DEV)
 
     def rows(self, per_seq):
         """The last ``per_seq`` tokens of each sequence: ``(seq, positions)``."""
@@ -220,6 +228,49 @@ def test_the_folded_keys_over_spans_are_dcp_local_keys(K, fused):
     ids = K.select_logical(s, pos, k)
     got = K.select_logical(s, pos, k, dcp_keys=(r, world))
     assert torch.equal(got, K.dcp_local_keys(s, ids, pos, r, world))
+
+
+@pytest.mark.parametrize("tq", [0, 2])
+@pytest.mark.parametrize("per_seq", [2, 6])
+@pytest.mark.parametrize("fold", [False, True])
+def test_compressed_scores_select_as_single_rank(K, tq, per_seq, fold):
+    """``index_compress`` under DCP: each rank's centroid scores over the compressed rows
+    of the blocks it holds, pinned and merged by ``dcp_topk_merge``, select what the
+    single rank's centroid scores over the whole compressed cache select, cut to the
+    rank (order included)."""
+    world, topk, init, local = 4, 8, 1, 2
+    c = Split([300, 517, 70], world)
+    seq, pos = c.rows(per_seq)
+    g = torch.Generator().manual_seed(2)
+    iq = torch.randn(len(pos), NI, DI, generator=g).to(DT).to(DEV)
+    kw = {
+        "block_mode": K.BLOCK_CENTROID,
+        "head_mode": K.HEAD_MAX,
+        "causal": True,
+        "tq": tq,
+    }
+    ref = K.scores(iq, c.icc, c.bt, seq, pos, c.nb, None, init, local, 1.0, **kw)
+    want = K.select_logical(ref, pos, topk, split=True)
+    parts, qpos = [], []
+    for r, rk in enumerate(c.ranks):
+        qpos.append(K.dcp_local_positions(pos, r, world))
+        s = K.scores(iq, rk.icc, rk.bt, seq, qpos[r], c.ne, None, 0, 0, 1.0, **kw)
+        parts.append(K.dcp_pin(s, pos, r, world, init, local))
+    full = K.dcp_interleave(torch.cat(parts), world)
+    for t, p in enumerate(pos.tolist()):
+        causal = p // PG + 1
+        torch.testing.assert_close(full[t, :causal], ref[t, :causal], atol=ATOL, rtol=0)
+    picks = [
+        K.select_logical(parts[r], qpos[r], topk, split=True) for r in range(world)
+    ]
+    gathered = torch.cat(
+        [K.dcp_local_keys(parts[r], picks[r], qpos[r], r, world) for r in range(world)]
+    )
+    for r in range(world):
+        got = K.dcp_select(
+            parts[r], qpos[r], topk, r, world, lambda x: gathered, split=True, fold=fold
+        )
+        assert torch.equal(got, K.dcp_local_selection(want, r, world))
 
 
 @pytest.mark.parametrize("splits", [1, 4])
@@ -446,6 +497,43 @@ def test_config_admits_the_dspark_draft_only():
             admit_minimax_m3_pro_dcp(
                 _config(speculative_config=SimpleNamespace(method=method))
             )
+
+
+@pytest.mark.parametrize(
+    "dcp, interleave, ok", [(1, 1, True), (8, 16, True), (8, 32, True), (8, 1, False)]
+)
+def test_the_compressed_index_cache_under_dcp_takes_whole_blocks_a_rank(
+    dcp, interleave, ok
+):
+    """``index_compress``'s cache spec ([page, 4, 128] bf16 a block) under DCP where a
+    rank holds whole 16-token blocks (Pro's interleave), so every group's keys are one
+    rank's; refused where the interleave splits a block over ranks."""
+    from conftest import gpu_stack_import
+
+    aiter_attention = gpu_stack_import("atom.model_ops.attentions.aiter_attention")
+    cfg = SimpleNamespace(
+        hf_config=SimpleNamespace(sparse_attention_config={"sparse_index_dim": DI}),
+        index_cache_dtype="auto",
+        decode_context_parallel_size=dcp,
+        dcp_config=DCPConfig(interleave_size=interleave),
+    )
+    builder = SimpleNamespace(
+        _has_sparse_attention=False,
+        _has_pro_sparse_attention=True,
+        model_runner=SimpleNamespace(config=cfg),
+        block_size=PG,
+        row_counts=lambda: {aiter_attention.INDEX_ROWS: 3},
+        _pro_index_compress=lambda: True,
+    )
+    spec = aiter_attention.AiterAttentionMetadataBuilder._index_cache_spec
+    if not ok:
+        with pytest.raises(ValueError, match="whole blocks a rank"):
+            spec(builder, PG)
+        return
+    got = spec(builder, PG)
+    assert got.view_dtype == torch.bfloat16
+    assert tuple(got.view_shape) == (-1, PG // 4, DI)
+    assert got.field_shape == (PG // 4 * DI * 2,)
 
 
 def test_compressed_index_pooled_per_rank_gathers_to_the_single_ranks(K):
