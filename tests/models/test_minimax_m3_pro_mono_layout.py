@@ -97,16 +97,22 @@ def test_build_key():
     assert names == list(L.NORM_REGIONS)
 
 
-def test_a_norm_and_an_a16w4_build_take_24_rows_w4a4_and_w4a8_16():
+def test_a_norm_and_an_a16w4_build_take_32_rows_w4a4_and_w4a8_16():
     """Past 16 rows the norm build (two token tiles in the o stage, AR #1 in
-    three passes) and the A16W4 FFN build (two token tiles in every stage, ug
-    over K quarters) exist; W4A4 and W4A8 hold one tile, so no forward of 17
-    .. 24 rows reaches a stage of theirs."""
-    assert MAX_ROWS < MAX_ROWS_NORM == MAX_ROWS_A16W4 == 24 <= MAX_ROWS_LAYOUT
+    three or four passes) and the A16W4 FFN build (two token tiles in every
+    stage, ug over K quarters; past MIDS_LDS_ROWS the down's mids from L2)
+    exist; W4A4 and W4A8 hold one tile, so no forward of 17 .. 32 rows
+    reaches a stage of theirs."""
+    assert MAX_ROWS < MAX_ROWS_NORM == MAX_ROWS_A16W4 == 32 <= MAX_ROWS_LAYOUT
     assert L.max_tokens("norm") == MAX_ROWS_NORM
     assert L.max_tokens("ffn", "bf16") == MAX_ROWS_A16W4
     assert L.max_tokens("ffn", "fp4") == L.max_tokens("ffn", "fp8") == MAX_ROWS
-    assert L.P1Build(tokens=MAX_ROWS_NORM).tokens == 24
+    assert L.P1Build(tokens=MAX_ROWS_NORM).tokens == 32
+    # the staged mids up to 24 rows (124 KB), not at 32 (166 KB > 160)
+    assert L.mids_staged("bf16", L.MIDS_LDS_ROWS) and L.MIDS_LDS_ROWS == 24
+    assert not L.mids_staged("bf16", L.MIDS_LDS_ROWS + 1)
+    assert not L.mids_staged("fp8", 1) and not L.mids_staged("fp4", 1)
+    assert 24 * L.TOPK * L.MIDB_ROW * 4 < 163840 < 32 * L.TOPK * L.MIDB_ROW * 4
     with pytest.raises(ValueError, match="norm build"):
         L.P1Build(tokens=MAX_ROWS_NORM + 1)
     for act in ROUTED_ACTS:
@@ -115,11 +121,11 @@ def test_a_norm_and_an_a16w4_build_take_24_rows_w4a4_and_w4a8_16():
         with pytest.raises(ValueError, match="ffn build"):
             L.P1Build(tokens=top + 1, upto="ffn", routed_act=act, inter_r=640)
     # the o stage: a tile a 16 tokens, its K-quarter sum a pass a tile
-    assert [L.token_tiles(s) for s in (1, 16, 17, 24)] == [1, 1, 2, 2]
+    assert [L.token_tiles(s) for s in (1, 16, 17, 24, 32)] == [1, 1, 2, 2, 2]
     assert L.O_ROWS * L.TOKEN_TILE == 512
 
 
-@pytest.mark.parametrize("s", [1, 2, 16, 17, 20, 24])
+@pytest.mark.parametrize("s", [1, 2, 16, 17, 20, 24, 25, 32])
 def test_a16w4_task_lists_hold_every_entry_and_down_task_once(s):
     """A16W4 up to 16 rows: two lists (K halves), a task a CTA; past 16: four
     (K quarters), each entry two tasks a CTA runs at once. Every (list,
@@ -154,17 +160,18 @@ def test_a16w4_task_lists_hold_every_entry_and_down_task_once(s):
     # the launch's queue words cover the widest build's lists
     assert L.queue_lists(act) == L.UG_QUARTERS >= n
     assert L.queue_lists("fp4") == L.queue_lists("fp8") == L.ug_split("fp8", s) == 1
-    # a quarter's x rows: 24 rows fit where a K half's would not
+    # a quarter's x rows: 32 rows fit where a K half's would not
     assert L.XQ_WORDS * L.UG_QUARTERS * 2 == HIDDEN
     assert MAX_ROWS_A16W4 * L.XQ_ROW * 4 < 163840 < MAX_ROWS_A16W4 * L.XH_ROW * 4
 
 
 def test_the_route_ctas_follow_the_build_rows():
     """A token a route CTA, the last before the router's: 219 .. 234 up to 16
-    rows (as before), 211 .. 234 at 24; never on a shared or router CTA."""
+    rows (as before), 211 .. 234 at 24, 203 .. 234 at 32; never on a shared
+    or router CTA."""
     assert L.route_cta0(1) == L.route_cta0(MAX_ROWS) == L.RT0 == 219
-    assert L.route_cta0(MAX_ROWS_A16W4) == 211
-    for s in (MAX_ROWS, MAX_ROWS_A16W4):
+    assert L.route_cta0(24) == 211 and L.route_cta0(MAX_ROWS_A16W4) == 203
+    for s in (MAX_ROWS, 24, MAX_ROWS_A16W4):
         route = set(range(L.route_cta0(s), L.route_cta0(s) + s))
         assert max(route) == L.R0 - 1
         assert not route & set(range(L.SH0, L.SH0 + L.SH_TASKS))

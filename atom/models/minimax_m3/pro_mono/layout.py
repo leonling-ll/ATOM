@@ -255,6 +255,17 @@ SMSC_WORDS = INTER_S // 128
 # ``xs`` past the shared mid's rows), padded so that the 16 rows a lane group
 # reads (a pick column a lane, 16 B each) start 4 banks apart (324 = 4 mod 64)
 MIDB_ROW = INTERB_WORDS + 4
+# A16W4: the widest build whose down stages every pick's mid row in LDS
+# (s x TOPK x MIDB_ROW words: 124 KB at 24 rows, 166 KB at 32, past the CU's
+# 160). A wider build's down reads each slot's B operands from ``inter`` (the
+# step's mids, 164 KB at 32 rows: L2 / MALL), as W4A4 / W4A8 do.
+MIDS_LDS_ROWS = 24
+
+
+def mids_staged(act: str, tokens: int) -> bool:
+    """Whether an A16W4 build of ``tokens`` rows stages the routed mids in LDS
+    (``ffn.load_mids``) for its down; False for W4A4 / W4A8 (never staged)."""
+    return act == "bf16" and tokens <= MIDS_LDS_ROWS
 
 
 def midb_word(row, st, kb, j):
@@ -274,7 +285,7 @@ RT0 = R0 - MAX_ROWS  # 219
 
 def route_cta0(tokens: int) -> int:
     """The first route CTA of a ``tokens``-row build (a token a CTA, up to
-    R0): ``RT0`` up to 16 rows, 211 at 24."""
+    R0): ``RT0`` up to 16 rows, 211 at 24, 203 at 32."""
     return R0 - max(tokens, MAX_ROWS)
 
 

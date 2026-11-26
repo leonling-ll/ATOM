@@ -78,6 +78,7 @@ from atom.models.minimax_m3.pro_mono.layout import (
     ag_pair,
     agsq_pair,
     max_u,
+    mids_staged,
     peer_layout,
     plain_layout,
     rs_pair,
@@ -383,7 +384,7 @@ def stage_o(c):
 
 @traced
 def ar_reduce(c, ins):
-    """Stages reduce / gather, the wave's tokens (one to three passes) at once:
+    """Stages reduce / gather, the wave's tokens (one to four passes) at once:
     -> the f32 v = bf16(sum) + res of this lane's two columns, a token each.
     The owner of the columns polls every token's partials of the 8 ranks in
     one batch, sums each token's in rank order and sends its bf16 sum and the
@@ -392,15 +393,16 @@ def ar_reduce(c, ins):
     .. 16 rows, the owner's before its second sum went out.)"""
     lane, la = c["lane"], c["lookahead"]
     n = len(ins)
-    # the passes' values below (a, b, d) hold three tokens a wave: a wider
-    # build (25 .. 32 rows) needs a fourth set, not a silently dropped pass
-    assert 1 <= n <= 3, f"AR #1 takes 1 .. 3 tokens a wave, got {n}"
+    # the passes' values below (a, b, d, f) hold four tokens a wave: a wider
+    # build (33 .. rows) needs a fifth set, not a silently dropped pass
+    assert 1 <= n <= 4, f"AR #1 takes 1 .. 4 tokens a wave, got {n}"
     # bound before the traced ifs: names their branches bind are not seen
     # past them otherwise (a second pass's, unused at <= 8 rows; a third's,
-    # unused at <= 16)
+    # unused at <= 16; a fourth's, unused at <= 24)
     a0, a1 = fx.Float32(0.0), fx.Float32(0.0)
     b0, b1 = fx.Float32(0.0), fx.Float32(0.0)
     d0, d1 = fx.Float32(0.0), fx.Float32(0.0)
+    f0, f1 = fx.Float32(0.0), fx.Float32(0.0)
     enter_stage("reduce")
     if c["is_owner"]:
         own_rs = preg(c["own"], c["off"]["rs"], "rs")
@@ -448,8 +450,10 @@ def ar_reduce(c, ins):
         a0, a1 = held_o[0]
         if const_expr(n >= 2):
             b0, b1 = held_o[1]
-        if const_expr(n == 3):
+        if const_expr(n >= 3):
             d0, d1 = held_o[2]
+        if const_expr(n == 4):
+            f0, f1 = held_o[3]
     enter_stage("gather")
     if c["not_owner"]:
         w = c["poll"](
@@ -465,11 +469,15 @@ def ar_reduce(c, ins):
             h0, h1 = bf2_f32(w[1][0])
             b0 = h0 + ins[1][2][0]
             b1 = h1 + ins[1][2][1]
-        if const_expr(n == 3):
+        if const_expr(n >= 3):
             e0, e1 = bf2_f32(w[2][0])
             d0 = e0 + ins[2][2][0]
             d1 = e1 + ins[2][2][1]
-    return [[a0, a1], [b0, b1], [d0, d1]][:n]
+        if const_expr(n == 4):
+            k0, k1 = bf2_f32(w[3][0])
+            f0 = k0 + ins[3][2][0]
+            f1 = k1 + ins[3][2][1]
+    return [[a0, a1], [b0, b1], [d0, d1], [f0, f1]][:n]
 
 
 @traced
@@ -569,7 +577,7 @@ def build(key: P1Build):
     s = key.tokens
     ffn_on = key.upto == "ffn"
     passes = -(-s // WAVES)
-    assert passes <= 3, f"{s} rows: AR #1 runs at most 3 passes (ar_reduce)"
+    assert passes <= 4, f"{s} rows: AR #1 runs at most 4 passes (ar_reduce)"
     play = peer_layout()
     slay = scratch_layout(key)
     play_plain = plain_layout(key)
@@ -589,7 +597,9 @@ def build(key: P1Build):
     if fp8:
         xs_row = max(O_ROW, X8_ROW)
     if bf16:
-        xs_row = max(O_ROW, xk_row(key.routed_act, s), SM_ROW + TOPK * MIDB_ROW)
+        # the staged mids (``ffn.load_mids``) only up to MIDS_LDS_ROWS rows
+        mids = TOPK * MIDB_ROW if mids_staged(key.routed_act, s) else 0
+        xs_row = max(O_ROW, xk_row(key.routed_act, s), SM_ROW + mids)
     assert xs_row >= (ffn.R_KLEN + 8) // 2 and xs_row >= SM_ROW
     # An FFN build past one token tile (A16W4 only) keeps one tile of ``red``
     # and puts the o stage's ``osc`` and ``misc`` and every stage's second
@@ -602,6 +612,11 @@ def build(key: P1Build):
     if compact:
         o_end = s * (O_ROW + OSC_ROW + O_ROWS)
         x_end = s * max(xk_row(key.routed_act, s), (ffn.R_KLEN + 8) // 2)
+        if not mids_staged(key.routed_act, s):
+            # no staged mids to size ``xs``: room for ``red1`` past the
+            # o stage's and the x slices' rows (whole 16 B a token row)
+            need = -(-(max(o_end, x_end) + red_words) // s)
+            xs_row = max(xs_row, (need + 3) // 4 * 4)
         assert max(o_end, x_end) <= s * xs_row - red_words, (o_end, x_end)
 
     @fx.struct

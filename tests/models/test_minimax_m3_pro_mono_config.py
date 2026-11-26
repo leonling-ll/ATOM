@@ -232,17 +232,17 @@ def test_rows_in_range_latch(rows):
     assert got == rows and (why is None) == (rows > 0)
 
 
-@pytest.mark.parametrize("rows", [-1, MAX_ROWS_A16W4 + 1, 32, "8", 8.0, True])
+@pytest.mark.parametrize("rows", [-1, MAX_ROWS_A16W4 + 1, 64, "8", 8.0, True])
 def test_rows_out_of_range_turn_the_phase_off(rows):
     assert rows_refusal(rows) is not None
     assert latch_rows(rows, None)[0] == 0
 
 
-@pytest.mark.parametrize("rows", [MAX_ROWS + 1, 20, MAX_ROWS_A16W4])
-def test_a16w4_serves_up_to_24_rows_w4a4_and_w4a8_16(rows):
-    """A16W4's FFN build takes two token tiles (17 .. 24 rows); W4A4 and W4A8
+@pytest.mark.parametrize("rows", [MAX_ROWS + 1, 20, 24, 25, MAX_ROWS_A16W4])
+def test_a16w4_serves_up_to_32_rows_w4a4_and_w4a8_16(rows):
+    """A16W4's FFN build takes two token tiles (17 .. 32 rows); W4A4 and W4A8
     hold one, so a latch past 16 turns them off with the reason."""
-    assert (MAX_ROWS, MAX_ROWS_A16W4) == (16, 24)
+    assert (MAX_ROWS, MAX_ROWS_A16W4) == (16, 32)
     assert max_rows("bf16") == MAX_ROWS_A16W4
     assert rows_refusal(rows, "bf16") is None
     assert latch_rows(rows, None, act="bf16") == (rows, None)

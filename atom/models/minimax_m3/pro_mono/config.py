@@ -70,11 +70,12 @@ COLS = 128
 # operand holds them in one tile. W4A4 / W4A8 stop here.
 MAX_ROWS = 16
 # Rows a norm build (``upto = "norm"``: o_proj, AR #1 and the norms) takes at
-# most: two 16-token MFMA B tiles in the o stage, AR #1 in up to 3 passes.
-MAX_ROWS_NORM = 24
+# most: two 16-token MFMA B tiles in the o stage, AR #1 in up to 4 passes.
+MAX_ROWS_NORM = 32
 # Rows an A16W4 FFN build takes and serves at most (``max_rows``): its stages
 # run two token tiles past 16 rows and its routed gate / up four K quarters (a
-# quarter of the bf16 x a token is what fits LDS at 24 rows).
+# quarter of the bf16 x a token is what fits LDS at 32 rows); past
+# ``layout.MIDS_LDS_ROWS`` its down reads the routed mids from L2, not LDS.
 MAX_ROWS_A16W4 = MAX_ROWS_NORM
 # Rows the kernel ABI, the peer regions and the scratch are sized for from day
 # one, so a later 32-row build changes no layout (``begin_step`` zeroes the

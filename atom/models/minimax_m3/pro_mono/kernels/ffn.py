@@ -109,6 +109,7 @@ from atom.models.minimax_m3.pro_mono.layout import (
     list_down,
     max_u,
     midb_word,
+    mids_staged,
     mxfp8_tile_dword,
     queued,
     rlog_pair,
@@ -1053,32 +1054,37 @@ def ug_tile1(c, entry):
     slot = task // UG_GROUPS
     first = fx.ptr_load(rt["first"] + slot)
     count = fx.ptr_load(rt["first"] + slot + 1) - first
-    tt = TOKEN_TILE + (tid % (THREADS // 2)) // UG_COLS
     col = tid % UG_COLS
-    tc = fx.min(tt, count - 1)
     h4 = (wave >> 2) * 4
     r = col % 16
     lo = col < 16
     red1 = c["red1"]
-    tl = tc - TOKEN_TILE
-    gv = lo.select(
-        row_sum(red1, r, tl, waves=(h4,)), row_sum(red1, r, tl, waves=(h4 + 1,))
-    )
-    uv = lo.select(
-        row_sum(red1, r, tl, waves=(h4 + 2,)), row_sum(red1, r, tl, waves=(h4 + 3,))
-    )
-    row = first + tc
     g = task % UG_GROUPS
     sender, part = ug_sender(c)
-    if tt < count:
-        if sender:
-            c["put_words"](
-                c["ugp"],
-                ugp_pair(row, g, col, part),
-                [gv.bitcast(fx.Int32), uv.bitcast(fx.Int32)],
-            )
-        else:
-            ug_mid(c, row, g, col, gv, uv, None)
+    # tile 1 holds up to S - 16 picks: 8 a pass of the task's 256 threads
+    # (a second pass past 24 rows, for a slot of more than 24 picks)
+    per = THREADS // 2 // UG_COLS
+    for p in range_constexpr(-(-(c["S"] - TOKEN_TILE) // per)):
+        tt = TOKEN_TILE + per * p + (tid % (THREADS // 2)) // UG_COLS
+        tc = fx.min(tt, count - 1)
+        tl = tc - TOKEN_TILE
+        gv = lo.select(
+            row_sum(red1, r, tl, waves=(h4,)), row_sum(red1, r, tl, waves=(h4 + 1,))
+        )
+        uv = lo.select(
+            row_sum(red1, r, tl, waves=(h4 + 2,)),
+            row_sum(red1, r, tl, waves=(h4 + 3,)),
+        )
+        row = first + tc
+        if tt < count:
+            if sender:
+                c["put_words"](
+                    c["ugp"],
+                    ugp_pair(row, g, col, part),
+                    [gv.bitcast(fx.Int32), uv.bitcast(fx.Int32)],
+                )
+            else:
+                ug_mid(c, row, g, col, gv, uv, None)
 
 
 def ug_pick_token(c, first, count, k=0):
@@ -1420,31 +1426,38 @@ def stage_shared(c, j, ops):
 def load_smid(c):
     """Every token's shared mid (``smid``) -> MXFP8 1x32 (``quantize_fp8``'s
     recipe, as ``swiglu_oai_split_mxfp8`` writes it) in LDS: the shared
-    down's B operands. A thread a (token, 32-block)."""
+    down's B operands. A thread a (token, 32-block), a pass of THREADS cells
+    (20 blocks a token: two passes past 25 rows)."""
     s, tid = c["S"], c["tid"]
     nblk = INTER_S // 32
     n = s * nblk
-    b = fx.min(tid, n - 1)
-    t = b // nblk
-    k = b % nblk
-    got = c["poll"]([(c["smid"], smid_pair(t, 32 * k + 4 * h), 2) for h in range(8)])
-    vals = []
-    for h in range_constexpr(8):
-        for w in got[h]:
-            vals += list(bf2_f32(w))
-    code = mx8_code(absmax(vals))
-    inv = rcp_pow2(code)
-    q = [clamp_fp8(v * inv) for v in vals]
-    words = [
-        fp8_pack4(q[4 * i], q[4 * i + 1], q[4 * i + 2], q[4 * i + 3]) for i in range(8)
-    ]
-    # a 128-column chunk's 4 blocks are 4 adjacent lanes (20 blocks a token)
-    codes = butterfly(code << (8 * (k % 4)), (1, 2), _or)
-    if tid < n:
-        for i in range_constexpr(8):
-            fx.ptr_store(words[i], c["sm8"] + (t * SM_ROW + 8 * k + i))
-        if k % 4 == 0:
-            fx.ptr_store(codes, c["smsc"] + (t * SMSC_WORDS + k // 4))
+    # a 128-column chunk's 4 blocks stay on 4 adjacent lanes in every pass
+    # (THREADS and nblk are multiples of 4)
+    assert THREADS % 4 == 0 and nblk % 4 == 0
+    for p in range_constexpr(passes(n)):
+        b = fx.min(tid + THREADS * p, n - 1)
+        t = b // nblk
+        k = b % nblk
+        got = c["poll"](
+            [(c["smid"], smid_pair(t, 32 * k + 4 * h), 2) for h in range(8)]
+        )
+        vals = []
+        for h in range_constexpr(8):
+            for w in got[h]:
+                vals += list(bf2_f32(w))
+        code = mx8_code(absmax(vals))
+        inv = rcp_pow2(code)
+        q = [clamp_fp8(v * inv) for v in vals]
+        words = [
+            fp8_pack4(q[4 * i], q[4 * i + 1], q[4 * i + 2], q[4 * i + 3])
+            for i in range(8)
+        ]
+        codes = butterfly(code << (8 * (k % 4)), (1, 2), _or)
+        if tid + THREADS * p < n:
+            for i in range_constexpr(8):
+                fx.ptr_store(words[i], c["sm8"] + (t * SM_ROW + 8 * k + i))
+            if k % 4 == 0:
+                fx.ptr_store(codes, c["smsc"] + (t * SMSC_WORDS + k // 4))
     gpu.barrier()
 
 
@@ -1509,6 +1522,10 @@ def down_batch(c) -> int:
     an A16W4 build whose union is at most a slot a wave (``max_u`` <=
     ``WAVES``: 1 and 2 rows), where a second slot is always past U and would
     only add its zero tile's dequant and MFMAs to every wave's down."""
+    if const_expr(bf16_routed(c) and not mids_in_lds(c)):
+        # past MIDS_LDS_ROWS a slot's B operands (80 VGPRs a lane) are held
+        # from their loads to its MFMAs: two slots' spilled at 32 rows
+        return 1
     return 1 if bf16_routed(c) and max_u(c["S"]) <= WAVES else DOWN_BATCH
 
 
@@ -1541,6 +1558,41 @@ def inter_operands(c, row):
         bw = fx.Vector.from_elements(words, fx.Int32)
         out.append((bw, code))
     return out
+
+
+def mids_in_lds(c) -> bool:
+    """Whether the down reads its A16W4 B operands from the staged mids in
+    LDS (``load_mids``; a build-time constant): up to
+    ``layout.MIDS_LDS_ROWS`` rows. Past it, ``interb_operands`` from
+    ``inter``."""
+    return mids_staged(c["routed_act"], c["S"])
+
+
+def interb_operands(c, row):
+    """A16W4 past ``layout.MIDS_LDS_ROWS``: a lane's B operands of pick row
+    ``row`` for every down step (``mid_operands``' words: step st, MFMA j, k
+    128 st + 32 kb + 8 j .. + 8), from ``inter`` at device scope (every ug
+    flag is in, ``wait_ug``), as loaded; ``_live_words`` at their use."""
+    kb = c["lane"] // 16
+    base = c["pw"]["inter"] + row * INTERB_WORDS
+    return [
+        [
+            fx.Vector(
+                ld_dev(c["plain"], base + (4 * st + kb) * (UG_COLS // 2) + 4 * j, 4)
+            )
+            for j in range(4)
+        ]
+        for st in range(W2_STEPS)
+    ]
+
+
+def bf16_b(c, row, st, live, bs):
+    """A16W4: the 4 B operands of down step ``st`` of pick row ``row``: the
+    staged mids' (``mid_operands``) or, past MIDS_LDS_ROWS, ``bs``
+    (``interb_operands``, loaded ahead), zero where the column is dead."""
+    if const_expr(mids_in_lds(c)):
+        return mid_operands(c, row, st, live)
+    return [_live_words(v, live) for v in bs[st]]
 
 
 @traced
@@ -1626,7 +1678,7 @@ def down_tile(c, rgd, ops, first, count, bs):
     for st in range_constexpr(W2_STEPS):
         if const_expr(bf16_routed(c)):
             # A16W4: the w2 tile dequantized to bf16, 4 bf16 MFMAs a step
-            bw = mid_operands(c, row, st, live)
+            bw = bf16_b(c, row, st, live, bs)
             wa = fp4_bf16_tile(ops[st], w2_code(words, rgd, st))
             for q in range_constexpr(4):
                 acc = mfma_bf16(wa[q], bw[q].bitcast(fx.BFloat16), acc)
@@ -1663,8 +1715,9 @@ def down_tile1(c, rgd, ops, first, count):
     row, live = tile_row(c, first, count, 1)
     words = ops[W2_STEPS:]
     acc = fx.Vector.filled(4, 0.0, fx.Float32)
+    bs = None if mids_in_lds(c) else interb_operands(c, row)
     for st in range_constexpr(W2_STEPS):
-        bw = mid_operands(c, row, st, live)
+        bw = bf16_b(c, row, st, live, bs)
         wa = fp4_bf16_tile(ops[st], w2_code(words, rgd, st))
         for q in range_constexpr(4):
             acc = mfma_bf16(wa[q], bw[q].bitcast(fx.BFloat16), acc)
@@ -1782,7 +1835,10 @@ def stage_down(c, rgd, nu, ops0, sops, nrgd):
         # for them)
         for j in range_constexpr(nbat):
             row, _ = tile_row(c, firsts[j], counts[j])
-            bss.append(None if bf16_routed(c) else inter_operands(c, row))
+            if const_expr(bf16_routed(c)):
+                bss.append(None if mids_in_lds(c) else interb_operands(c, row))
+            else:
+                bss.append(inter_operands(c, row))
         nrg = more.select(rgd, nr)
         nb0 = more.select(nb, wave)
         nlv = more | nlive
@@ -1852,7 +1908,7 @@ def run_down(c, nu, task, nxt):
     load_smid(c)
     if live:
         wait_ug(c, nu)
-        if const_expr(bf16_routed(c)):
+        if const_expr(mids_in_lds(c)):
             load_mids(c)
     while d < DOWN_TASKS:
         got = take_ahead(c) if q else fx.Int32(0)

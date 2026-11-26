@@ -96,9 +96,11 @@ INTER_V, INTER_R, INTER_S = 640, 640, 640
 # the lookahead); W4A8 (32/32 on GPU at 05a6fc80) and W4A4 (26/26 at
 # c467bcf9) at one row and the widest, so every format stays covered (and
 # runs padded)
-# A16W4 past 16 rows: a third token a wave's AR pass (17), 20, the widest
-# (24, with and without the lookahead), and the widest with the hot router
-# bias (a fourth field, ``HOT``)
+# A16W4 past 16 rows: a third token a wave's AR pass (17), 20, 24 (with and
+# without the lookahead, and with the hot router bias: a fourth field,
+# ``HOT``); past MIDS_LDS_ROWS (the down's B operands from L2): a fourth AR
+# pass (25), the widest (32, with and without the lookahead, and hot: a slot
+# of 32 picks, tile 1's second ug pass)
 CASES = (
     (1, True, "bf16"), (2, True, "bf16"), (3, True, "bf16"), (4, True, "bf16"),
     (8, True, "bf16"), (9, True, "bf16"), (16, True, "bf16"),
@@ -106,6 +108,8 @@ CASES = (
     (1, True, "fp8"), (16, True, "fp8"), (1, True, "fp4"), (16, True, "fp4"),
     (17, True, "bf16"), (20, True, "bf16"), (24, True, "bf16"),
     (24, False, "bf16"), (24, True, "bf16", "hot"),
+    (25, True, "bf16"), (32, True, "bf16"), (32, False, "bf16"),
+    (32, True, "bf16", "hot"),
 )  # fmt: skip
 
 
@@ -116,6 +120,7 @@ PADDED = {
     (16, True, "fp8"): 9, (16, True, "fp4"): 9,
     (24, True, "bf16"): 17, (24, False, "bf16"): 20,
     (24, True, "bf16", "hot"): 20,
+    (32, True, "bf16"): 25, (32, True, "bf16", "hot"): 28,
 }  # fmt: skip
 
 # the hot cases' router bias: these experts' + 2.0 (a sigmoid is below 1, the

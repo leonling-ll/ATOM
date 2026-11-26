@@ -66,7 +66,8 @@ EPS = 1e-6
 # the waves' (20), the widest norm build (24)
 CASES = (
     (1, True), (3, True), (8, True), (9, True), (16, True), (16, False),
-    (17, True), (20, True), (24, True), (24, False),
+    (17, True), (20, True), (24, True), (24, False), (25, True), (32, True),
+    (32, False),
 )  # fmt: skip
 TIMEOUT_S = 900
 
