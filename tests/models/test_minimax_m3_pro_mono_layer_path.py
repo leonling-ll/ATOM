@@ -59,7 +59,7 @@ def rec(monkeypatch):
     monkeypatch.setattr(pro_attn, "_variants", ProVariants(ar_lamport_rows=16))
     monkeypatch.setattr(pro, "_aiter_mx_norm", lambda: True)
 
-    def ar_norm(hidden, residual, norm, addend=None):
+    def ar_norm(hidden, residual, norm, addend=None, reduced=False):
         assert addend is None  # moe_tail_ar is off here
         r.calls.append("ar_in")
         return hidden + residual, residual + 1

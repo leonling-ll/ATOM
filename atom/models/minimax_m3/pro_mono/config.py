@@ -28,7 +28,6 @@ a forward whose ranks disagree on mono waits in-kernel for ever.
 from dataclasses import dataclass
 
 from atom.config import CompilationLevel
-from atom.model_ops.fused_moe.sp_mega_moe import tp_mega_moe_selected
 from atom.mono.plan.shard import Shard, ShardError, padded
 from atom.mono.runtime.deployment import (
     common_refusals,
@@ -264,7 +263,8 @@ def config_refusal(atom_config) -> str | None:
     checks = [(envs.ATOM_MONO_ENABLE, "switched off")]
     # A mono layer hands on its FFN's TP partial, which the next input norm no
     # longer reduces once TP MegaMoE owns the MoE layers.
-    checks += [(not tp_mega_moe_selected(atom_config), "TP MegaMoE")]
+    backend = getattr(atom_config, "moe_backend", None)
+    checks += [(backend != "mega", "--moe-backend mega")]
     # Decode CP is harmless: the attention, the only reader of the KV split,
     # stays on the production path (``common_refusals``' docstring).
     checks += common_refusals(
