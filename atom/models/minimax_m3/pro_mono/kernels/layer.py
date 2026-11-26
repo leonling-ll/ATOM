@@ -80,6 +80,7 @@ from atom.models.minimax_m3.pro_mono.layout import (
     max_u,
     mids_staged,
     peer_layout,
+    WAVE_STAGE_WORDS,
     plain_layout,
     rs_pair,
     scratch_layout,
@@ -673,8 +674,9 @@ def build(key: P1Build):
         x_end = s * max(xk_row(key.routed_act, s), (ffn.R_KLEN + 8) // 2)
         if not mids_staged(key.routed_act, s):
             # no staged mids to size ``xs``: room for ``red1`` past the
-            # o stage's and the x slices' rows (whole 16 B a token row)
-            need = -(-(max(o_end, x_end) + red_words) // s)
+            # o stage's and the x slices' rows, and for the down waves' own
+            # mid rows past the shared mid's (whole 16 B a token row)
+            need = -(-(max(o_end, x_end, s * SM_ROW + WAVE_STAGE_WORDS) + red_words) // s)
             xs_row = max(xs_row, (need + 3) // 4 * 4)
         assert max(o_end, x_end) <= s * xs_row - red_words, (o_end, x_end)
 
@@ -812,7 +814,7 @@ def build(key: P1Build):
                 ],
                 "rlog_own": preg(c["own"], play["rlog"][0], "rlog"),
                 "xl": lds.xs.ptr, "sm8": lds.xs.ptr,
-                "midl": lds.xs.ptr + s * SM_ROW,
+                "midl": lds.xs.ptr + s * SM_ROW, "midw": lds.xs.ptr + s * SM_ROW,
                 "xbl": lds.xs.ptr if fp8 or bf16 else fl.x4l.ptr,
                 "xsl": fl.xsl.ptr,
                 "smsc": fl.smsc.ptr,

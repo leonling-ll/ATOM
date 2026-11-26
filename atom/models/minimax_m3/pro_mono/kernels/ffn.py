@@ -110,6 +110,7 @@ from atom.models.minimax_m3.pro_mono.layout import (
     max_u,
     midb_word,
     mids_staged,
+    WAVE_PICKS,
     mxfp8_tile_dword,
     queued,
     rlog_pair,
@@ -1522,10 +1523,6 @@ def down_batch(c) -> int:
     an A16W4 build whose union is at most a slot a wave (``max_u`` <=
     ``WAVES``: 1 and 2 rows), where a second slot is always past U and would
     only add its zero tile's dequant and MFMAs to every wave's down."""
-    if const_expr(bf16_routed(c) and not mids_in_lds(c)):
-        # past MIDS_LDS_ROWS a slot's B operands (80 VGPRs a lane) are held
-        # from their loads to its MFMAs: two slots' spilled at 32 rows
-        return 1
     return 1 if bf16_routed(c) and max_u(c["S"]) <= WAVES else DOWN_BATCH
 
 
@@ -1586,6 +1583,39 @@ def interb_operands(c, row):
     ]
 
 
+def interb_step(c, row, st, live):
+    """A16W4 past MIDS_LDS_ROWS: step ``st``'s 4 B operands of pick row ``row``
+    from ``inter`` (device scope), zero where the column is dead."""
+    kb = c["lane"] // 16
+    base = c["pw"]["inter"] + row * INTERB_WORDS + (4 * st + kb) * (UG_COLS // 2)
+    return [
+        _live_words(fx.Vector(ld_dev(c["plain"], base + 4 * j, 4)), live)
+        for j in range(4)
+    ]
+
+
+@traced
+def down_tile_staged(c, rgd, ops, row, first, count, live, area, acc):
+    """A16W4 past MIDS_LDS_ROWS: ``down_tile``'s MFMAs of a slot the wave staged
+    at ``area`` (``stage_slots``), or, a slot of more than WAVE_PICKS picks,
+    its B operands from ``inter`` at each step."""
+    words = ops[W2_STEPS:]
+    local = row - first
+    if count <= WAVE_PICKS:
+        for st in range_constexpr(W2_STEPS):
+            bw = area_operands(c, area, local, st, live)
+            wa = fp4_bf16_tile(ops[st], w2_code(words, rgd, st))
+            for q in range_constexpr(4):
+                acc = mfma_bf16(wa[q], bw[q].bitcast(fx.BFloat16), acc)
+    else:
+        for st in range_constexpr(W2_STEPS):
+            bw = interb_step(c, row, st, live)
+            wa = fp4_bf16_tile(ops[st], w2_code(words, rgd, st))
+            for q in range_constexpr(4):
+                acc = mfma_bf16(wa[q], bw[q].bitcast(fx.BFloat16), acc)
+    return acc
+
+
 def bf16_b(c, row, st, live, bs):
     """A16W4: the 4 B operands of down step ``st`` of pick row ``row``: the
     staged mids' (``mid_operands``) or, past MIDS_LDS_ROWS, ``bs``
@@ -1624,6 +1654,47 @@ def load_mids(c):
         batch=passes(n),
     )  # fmt: skip
     gpu.barrier()
+
+
+def area_operands(c, area, local, st, live):
+    """A16W4 past MIDS_LDS_ROWS: ``mid_operands`` of local pick row ``local``
+    (0 .. WAVE_PICKS - 1) of a slot the wave staged at LDS ``area``."""
+    kb = c["lane"] // 16
+    return [
+        _live_words(
+            fx.Vector(
+                fx.ptr_load(area + midb_word(local, st, kb, j), result_type=_v4i())
+            ),
+            live,
+        )
+        for j in range(4)
+    ]
+
+
+@traced
+def stage_slots(c, areas, firsts, counts):
+    """A16W4 past MIDS_LDS_ROWS: the wave copies each batch slot's first
+    min(count, WAVE_PICKS) pick mid rows (``inter``, device scope; every ug
+    flag is in) to its LDS ``areas`` (rows of MIDB_ROW words), every load issued
+    before the first store. A slot of more picks reads ``inter`` at each step
+    (``down_tile``)."""
+    lane = c["lane"]
+    per = WAVE_PICKS * (INTERB_WORDS // 4)  # dwordx4 items a slot
+    loads = []
+    for j in range_constexpr(len(areas)):
+        n = fx.min(counts[j], WAVE_PICKS) * (INTERB_WORDS // 4)
+        for p in range_constexpr(-(-per // 64)):
+            it = fx.min(lane + 64 * p, fx.max(n - 1, 0))
+            r, w = it // (INTERB_WORDS // 4), it % (INTERB_WORDS // 4) * 4
+            v = fx.Vector(
+                ld_dev(c["plain"], c["pw"]["inter"] + (firsts[j] + r) * INTERB_WORDS + w, 4)
+            )
+            loads.append((j, lane + 64 * p < n, r, w, v))
+    rocdl.sched_barrier(0)
+    for j, ok, r, w, v in loads:
+        if ok:
+            fx.ptr_store(v, areas[j] + (r * MIDB_ROW + w))
+    rocdl.sched_barrier(0)
 
 
 def mid_operands(c, row, st, live):
@@ -1675,7 +1746,12 @@ def down_tile(c, rgd, ops, first, count, bs):
     words = ops[W2_STEPS:]
     acc = fx.Vector.filled(4, 0.0, fx.Float32)
     b_fmt = FP8 if fp8_routed(c) else FP4
-    for st in range_constexpr(W2_STEPS):
+    wave_staged = bf16_routed(c) and not mids_in_lds(c)
+    if const_expr(wave_staged):
+        # the slot's rows in the wave's area, or (more than WAVE_PICKS picks)
+        # ``inter`` at each step: a wave-uniform branch
+        acc = down_tile_staged(c, rgd, ops, row, first, count, live, bs, acc)
+    for st in range_constexpr(0 if wave_staged else W2_STEPS):
         if const_expr(bf16_routed(c)):
             # A16W4: the w2 tile dequantized to bf16, 4 bf16 MFMAs a step
             bw = bf16_b(c, row, st, live, bs)
@@ -1715,9 +1791,11 @@ def down_tile1(c, rgd, ops, first, count):
     row, live = tile_row(c, first, count, 1)
     words = ops[W2_STEPS:]
     acc = fx.Vector.filled(4, 0.0, fx.Float32)
-    bs = None if mids_in_lds(c) else interb_operands(c, row)
     for st in range_constexpr(W2_STEPS):
-        bw = bf16_b(c, row, st, live, bs)
+        if const_expr(mids_in_lds(c)):
+            bw = mid_operands(c, row, st, live)
+        else:
+            bw = interb_step(c, row, st, live)
         wa = fp4_bf16_tile(ops[st], w2_code(words, rgd, st))
         for q in range_constexpr(4):
             acc = mfma_bf16(wa[q], bw[q].bitcast(fx.BFloat16), acc)
@@ -1833,10 +1911,19 @@ def stage_down(c, rgd, nu, ops0, sops, nrgd):
         # registers they freed: in flight under the next slot's MFMAs and B
         # wait, and carried round the loop without a copy (a copy would wait
         # for them)
+        if const_expr(bf16_routed(c) and not mids_in_lds(c)):
+            # past MIDS_LDS_ROWS: the wave stages its batch's slots in its areas
+            areas = [
+                c["midw"] + (c["wave"] * nbat + j) * (WAVE_PICKS * MIDB_ROW)
+                for j in range(nbat)
+            ]
+            stage_slots(c, areas, firsts, counts)
+            bss = areas
         for j in range_constexpr(nbat):
             row, _ = tile_row(c, firsts[j], counts[j])
             if const_expr(bf16_routed(c)):
-                bss.append(None if mids_in_lds(c) else interb_operands(c, row))
+                if const_expr(mids_in_lds(c)):
+                    bss.append(None)
             else:
                 bss.append(inter_operands(c, row))
         nrg = more.select(rgd, nr)

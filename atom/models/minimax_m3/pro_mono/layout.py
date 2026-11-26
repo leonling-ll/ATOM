@@ -93,7 +93,7 @@ from atom.models.minimax_m3.pro_mono.config import (
     max_rows,
 )
 from atom.mono.plan.check import RegionDecl
-from atom.mono.plan.execution import BLOCKS, THREADS
+from atom.mono.plan.execution import BLOCKS, THREADS, WAVES as WAVES_PER_CTA
 from atom.mono.plan.layout import byte_layout, pair_layout
 from atom.mono.plan.trace import Space
 
@@ -262,6 +262,14 @@ MIDB_ROW = INTERB_WORDS + 4
 # 160). A wider build's down reads each slot's B operands from ``inter`` (the
 # step's mids, 164 KB at 32 rows: L2 / MALL), as W4A4 / W4A8 do.
 MIDS_LDS_ROWS = 24
+
+
+# A16W4 past MIDS_LDS_ROWS: each down wave stages its batch's slots' mid rows
+# itself (up to WAVE_PICKS picks a slot, a slot of more reads ``inter`` at each
+# step), in ``xs`` past the shared mid's rows: DOWN_BATCH x WAVE_PICKS rows of
+# MIDB_ROW words a wave (81 KB for the CTA)
+WAVE_PICKS = 4
+WAVE_STAGE_WORDS = WAVES_PER_CTA * 2 * WAVE_PICKS * MIDB_ROW
 
 
 def mids_staged(act: str, tokens: int) -> bool:
