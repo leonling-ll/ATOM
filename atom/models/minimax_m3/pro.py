@@ -90,6 +90,12 @@ def _ar_fused_rows(v, rows: int) -> int:
     return v.ar_fused_rows if rows > getattr(v, "ar_fused_min_rows", 0) else 0
 
 
+def _folds(v, rows: int) -> bool:
+    """Whether a step of ``rows`` rows takes ``moe_glue_fold`` / ``moe_tail_ar``: above
+    ``ar_fused_min_rows`` only, so the widths below it keep today's launches and bytes."""
+    return rows > getattr(v, "ar_fused_min_rows", 0)
+
+
 def _quantized_once(x: torch.Tensor, x_scale: torch.Tensor | None, linears) -> tuple:
     """``x`` (and its scale) for ``linears`` that share it: quantised here, once, when
     every one runs the native group32 FP8 GEMM, which would quantise it the same way
@@ -823,7 +829,11 @@ class MiniMaxM3ProDecoderLayer(MiniMaxM3DecoderLayer):
             # moves into the next layer's input all-reduce
             state = self._pro_state
             mx = None
-            if v.moe_glue_fold and moe_route_glue.takes_lookahead():
+            if (
+                v.moe_glue_fold
+                and _folds(v, hidden_states.shape[0])
+                and moe_route_glue.takes_lookahead()
+            ):
                 mx = state.mx_target(self.layer_num, hidden_states)
             r = moe_route_glue.route(
                 hidden_states, residual, self.post_attention_layernorm, ffn, mx
@@ -886,7 +896,10 @@ class MiniMaxM3ProDecoderLayer(MiniMaxM3DecoderLayer):
             state = self._pro_state
             # moe_glue_fold: the shared add moves into the next layer's input all-reduce
             defer = (
-                hand_tail and v.moe_glue_fold and self.layer_num + 1 < state.end_layer
+                hand_tail
+                and v.moe_glue_fold
+                and _folds(v, hidden_states.shape[0])
+                and self.layer_num + 1 < state.end_layer
             )
             out = ffn.forward_glue(routes, quant_down=True, defer_shared=defer)
             if defer:
@@ -900,6 +913,7 @@ class MiniMaxM3ProDecoderLayer(MiniMaxM3DecoderLayer):
             defer = (
                 hand_tail
                 and v.moe_tail_ar
+                and _folds(v, hidden_states.shape[0])
                 and ffn.shared_experts is not None
                 and self.layer_num + 1 < state.end_layer
             )

@@ -209,6 +209,21 @@ def test_the_route_op_writes_the_lookahead_rows_and_the_next_ar_adds_the_shared(
     }
 
 
+@pytest.mark.parametrize("rows, folds", [(6, False), (16, False), (20, True)])
+def test_ar_fused_min_rows_keeps_todays_launches_at_or_below_it(
+    load, monkeypatch, rows, folds
+):
+    """ar_fused_min_rows 16 (mono's widths): steps of at most 16 rows keep the lookahead
+    norm and the shared add; wider ones fold both, the same bytes either way."""
+    run, log, _ = _layers(load, monkeypatch)
+    want_h, want_res = run(rows)
+    got_h, got_res = run(rows, moe_glue_fold=True, ar_fused_min_rows=16)
+    assert torch.equal(got_h, want_h) and torch.equal(got_res, want_res)
+    norm_ran = {(2, "in"), (3, "in")} <= set(log.norm)
+    added = sum(add is not None for _, add in log.ar)
+    assert (norm_ran, added) == ((False, 3) if folds else (True, 0))
+
+
 def test_an_aiter_without_the_lookahead_keeps_the_norm_and_still_defers(
     load, monkeypatch
 ):
