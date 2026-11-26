@@ -36,6 +36,7 @@ Shapes are fixed by the model: head_dim 256, rotary 64, value 192, index 16 x 12
 
 import functools
 import inspect
+import logging
 
 import numpy as np
 import torch
@@ -43,6 +44,8 @@ import triton
 import triton.language as tl
 
 from atom.model_ops.blockscale_kernels.quantization import fp8_groups
+
+logger = logging.getLogger("atom")
 
 PAGE = 16
 HEAD_DIM = 256
@@ -2265,6 +2268,7 @@ def _merge_keys(base, count, K: tl.constexpr, VOLATILE: tl.constexpr):
         "stride_ctx",
         "NB",
         "SPAN",
+        "LONG_FROM",
     ]
 )
 def _select_split_kernel(
@@ -2289,6 +2293,9 @@ def _select_split_kernel(
     IS_HIP: tl.constexpr,
     LOGICAL: tl.constexpr = False,
     WIDE: tl.constexpr = True,
+    GUARD: tl.constexpr = False,
+    rowlen_ptr=None,  # GUARD: [T] int32, each row's causal block count, for the long rows'
+    LONG_FROM=0,  # GUARD: rows of at least this many blocks are left to another selector
 ):
     if not WIDE:  # a chunk a span: a constant, so no chunk loop is compiled
         SPAN = CHUNK
@@ -2296,6 +2303,11 @@ def _select_split_kernel(
     part = tl.program_id(1)
     qpos = tl.load(pos_ptr + t)
     hi = tl.minimum(qpos // PG + 1, NB)
+    if GUARD:
+        if part == 0:
+            tl.store(rowlen_ptr + t, hi)
+        if hi >= LONG_FROM:  # the long-row selector's (launched after this one)
+            return
     lo = part * SPAN
     if lo >= hi:  # past the token's causal blocks: the cost follows the context
         return
@@ -2437,13 +2449,17 @@ def select_rows_split(
     logical=False,
     rows=None,
     ctx=None,
+    long_from=0,
+    row_lens=None,
 ):
     """``select_rows``' tables (bit for bit), each row's causal blocks split into ``parts``
     spans that separate programs reduce to their ``k`` best, merged per row by the last
     span program to finish (``fused``, the default) or a second launch. Spans
     past a row's blocks exit at once, so the cost follows the context, not ``score``'s
     width; the grid depends only on the shapes, so a graph can hold it. Any width (block
-    ids below 2**31)."""
+    ids below 2**31). ``long_from`` > 0 (fused merge only): rows of at least that many
+    causal blocks are skipped (their ``rows`` left as they are, for another selector), and
+    every row's causal block count is written to ``row_lens`` ([T] int32)."""
     assert k & (k - 1) == 0 and chunk >= 4 * k and chunk & (chunk - 1) == 0, (k, chunk)
     t, nb = score.shape
     dev = score.device
@@ -2491,7 +2507,12 @@ def select_rows_split(
         "LOGICAL": logical,
         "num_warps": num_warps,
     }
-    _select_split_kernel[(t, parts)](*args, WIDE=span > chunk, **meta)
+    guard = {}
+    if long_from:
+        assert fused, "the guard is the fused launch's"
+        assert row_lens is not None and row_lens.shape == (t,), row_lens
+        guard = {"GUARD": True, "rowlen_ptr": row_lens, "LONG_FROM": long_from}
+    _select_split_kernel[(t, parts)](*args, WIDE=span > chunk, **meta, **guard)
     warm = (dev, k, chunk, fused, logical, num_warps)
     if span <= chunk and warm not in _wide_warmed:
         # the first one-chunk launch of these constants (the startup warmup's forwards
@@ -2521,12 +2542,38 @@ def select_rows_split(
     return rows, ctx
 
 
-def select_logical(score, positions, k, num_warps=8, split=False):
+def select_logical(score, positions, k, num_warps=8, split=False, long_from=0):
     """``select_rows``' selection as block ids, for the Triton attention: ``[T, k]`` int32,
     best first, the token's valid (causal) blocks leading and -1 after. ``split``: by
-    ``select_rows_split`` (same ids; its cost follows the context, not the width)."""
+    ``select_rows_split`` (same ids; its cost follows the context, not the width).
+    ``long_from`` > 0 (with ``split``): rows of at least that many causal blocks select on
+    aiter's FlyDSL top-k (``tie="low"``: the same keys, so the same ids; its cost follows
+    the row's length, not the width), the shorter ones on ``select_rows_split``; both
+    launch in every forward, so a graph holds the pair. Off on an aiter without it."""
     assert k & (k - 1) == 0, k
     if split:
+        served = bool(long_from) and long_rows_selector_serves(score, k)
+        if long_from:
+            _log_long_rows_once(long_from, served, score, k)
+        if served:
+            t = score.shape[0]
+            sel = torch.empty(t, k, dtype=torch.int32, device=score.device)
+            row_lens = torch.empty(t, dtype=torch.int32, device=score.device)
+            select_rows_split(
+                score,
+                score,
+                positions,
+                positions,
+                k,
+                logical=True,
+                rows=sel,
+                long_from=long_from,
+                row_lens=row_lens,
+            )
+            _long_rows_selector()[0](
+                score, row_lens, sel, k, tie="low", min_row_len=long_from
+            )
+            return sel
         # no page table in this mode: the positions stand in for the unread seq ids
         return select_rows_split(score, score, positions, positions, k, logical=True)[0]
     t, nb = score.shape
@@ -2549,6 +2596,79 @@ def select_logical(score, positions, k, num_warps=8, split=False):
         num_warps=num_warps,
     )
     return sel
+
+
+@functools.cache
+def _long_rows_selector():
+    """aiter's FlyDSL ``topk_per_row_small_k`` and its support predicate, where it takes
+    ``min_row_len`` (aiter-M3 #29: a ``tie="low"`` row costs what its length needs), else
+    None."""
+    try:
+        from aiter.ops.flydsl.topk.topk_per_row_small_k import (
+            topk_per_row_small_k,
+            topk_per_row_small_k_supported,
+        )
+    except ImportError:
+        return None
+    if "min_row_len" not in inspect.signature(topk_per_row_small_k).parameters:
+        return None
+    return topk_per_row_small_k, topk_per_row_small_k_supported
+
+
+_LONG_ROWS_SERVES: dict[tuple, bool] = {}
+_LONG_ROWS_LOGGED: set[tuple] = set()
+
+
+def _log_long_rows_once(long_from: int, served: bool, score, k: int) -> None:
+    """One line a process (each TP rank logs its own) per bound and outcome: what a
+    start check greps for (served) or must not find (declined)."""
+    key = (long_from, served)
+    if key in _LONG_ROWS_LOGGED:
+        return
+    _LONG_ROWS_LOGGED.add(key)
+    if served:
+        logger.info(
+            "M3-Pro select_long_rows %d: decode rows of %d+ causal blocks select on "
+            "aiter's FlyDSL top-k (aiter-M3 #29), shorter rows on select_rows_split",
+            long_from,
+            long_from,
+        )
+        return
+    if _long_rows_selector() is None:
+        why = "this aiter has no topk_per_row_small_k(min_row_len) (aiter-M3 #29)"
+    elif not score.is_cuda:
+        why = "the scores are not on a GPU"
+    else:
+        why = f"aiter's top-k does not serve k={k} over {score.shape[1]} blocks"
+    logger.warning(
+        "M3-Pro select_long_rows %d declined: %s; every row selects on "
+        "select_rows_split",
+        long_from,
+        why,
+    )
+
+
+def long_rows_selector_serves(score, k: int) -> bool:
+    """Whether ``select_logical(split=True, long_from=...)`` can put rows of this
+    ``score`` ([T, width] fp32) on aiter's selector; else every row stays on the split.
+    """
+    sel = _long_rows_selector()
+    if sel is None or not score.is_cuda:
+        return False
+    t, width = score.shape
+    key = (t, width, k, score.device)
+    served = _LONG_ROWS_SERVES.get(key)
+    if served is None:
+        served = _LONG_ROWS_SERVES[key] = bool(
+            sel[1](
+                score,
+                torch.empty(t, dtype=torch.int32, device=score.device),
+                torch.empty(t, k, dtype=torch.int32, device=score.device),
+                k,
+                tie="low",
+            )
+        )
+    return served
 
 
 _fused_scorer = None  # aiter's FlyDSL decode scorer (tests swap it)

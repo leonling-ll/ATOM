@@ -211,6 +211,11 @@ class ProVariants:
     # two; 0: one): the rows of a sequence read each tile of block keys once, one dot for
     # all their query heads. A plain decode (one row a sequence) keeps one.
     score_tq: int = 0
+    # Decode / verify graphs, block-id selection with "topk": "split": rows of at least
+    # this many causal blocks select on aiter's FlyDSL top-k (aiter-M3 #29: tie "low",
+    # its cost follows the row's length), shorter ones on select_rows_split; the same ids
+    # bit for bit. 0: off; also off on an aiter without #29.
+    select_long_rows: int = 0
     # The decode / verify block scorer of the kernel path: "triton" (``scores``) or
     # "fused" (``scores_fused``: aiter's FlyDSL scorer, each tile of keys read once
     # for up to 8 rows of a sequence). "fused" takes the static (graph) decode with
@@ -1417,7 +1422,11 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
                 # shares are contiguous and in rank order, so gathered they are in place
                 valid_first = True
                 mine = pro_kernels.select_logical(
-                    score, rpos, k, split=v.topk == "split"
+                    score,
+                    rpos,
+                    k,
+                    split=v.topk == "split",
+                    long_from=v.select_long_rows if static else 0,
                 )
                 if share > r1 - r0:
                     mine = torch.cat([mine, mine.new_empty(share - r1 + r0, k)])
@@ -1461,7 +1470,11 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
                 valid_first = True
                 return attend(
                     pro_kernels.select_logical(
-                        score, positions, k, split=v.topk == "split"
+                        score,
+                        positions,
+                        k,
+                        split=v.topk == "split",
+                        long_from=v.select_long_rows if static else 0,
                     )
                 )
             return attend(None, select(score, block_tables, seq_id, positions, k))

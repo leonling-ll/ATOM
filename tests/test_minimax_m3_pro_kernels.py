@@ -907,6 +907,140 @@ class TestSelectRowsSplit:
         if parts is None:
             assert torch.equal(K.select_logical(score, pos, k, split=True), want)
 
+    @staticmethod
+    def _rows_case(width, his, seed, ties):
+        """``_case``'s scores for rows of the given causal block counts ``his``."""
+        g = torch.Generator(device=DEV).manual_seed(seed)
+        t = len(his)
+        bt = torch.randint(1, 1 << 20, (3, width), generator=g, device=DEV).to(
+            torch.int32
+        )
+        seq = torch.randint(0, 3, (t,), generator=g, device=DEV)
+        pos = (torch.tensor(his, device=DEV) - 1) * PG + 1
+        j = torch.arange(width, device=DEV)
+        qb = pos // PG
+        if ties:
+            score = torch.randint(-2, 3, (t, width), generator=g, device=DEV).float()
+            score[:, 1::7] = float("-inf")
+        else:
+            score = torch.randn(t, width, generator=g, device=DEV)
+        score[:, :1] = 1e30
+        score = torch.where(j[None, :] >= qb[:, None] - 2, 1e29, score)
+        score = torch.where(j[None, :] <= qb[:, None], score, float("nan"))
+        return score, bt, seq, pos
+
+    @pytest.mark.parametrize("fused", [None, True])
+    def test_long_from_guard_leaves_long_rows(self, fused):
+        # long_from: rows of at least that many causal blocks are left as they were and
+        # every row's causal block count is written; the short rows are select_rows'
+        k, chunk, width, long_from = 8, 32, 400, 97
+        his = [400, 4, 96, 97, 200, 33, 1, 98]
+        score, _bt, _seq, pos = self._rows_case(width, his, seed=5, ties=True)
+        want = K.select_logical(score.masked_fill(score.isnan(), float("-inf")), pos, k)
+        rows = torch.full((len(his), k), 12345, dtype=torch.int32, device=DEV)
+        row_lens = torch.zeros(len(his), dtype=torch.int32, device=DEV)
+        for _ in range(2):  # the arrival counters are rearmed
+            K.select_rows_split(
+                score,
+                score,
+                pos,
+                pos,
+                k,
+                chunk=chunk,
+                fused=fused,
+                logical=True,
+                rows=rows,
+                long_from=long_from,
+                row_lens=row_lens,
+            )
+            assert row_lens.tolist() == his
+            short = torch.tensor([h < long_from for h in his], device=DEV)
+            assert torch.equal(rows[short], want[short])
+            assert bool((rows[~short] == 12345).all())
+
+    def test_long_rows_probe_declines_an_aiter_without_min_row_len(self, monkeypatch):
+        # the capability probe: an aiter whose topk_per_row_small_k has no min_row_len
+        # (no #29), or none at all, gives no long-row selector
+        import types
+
+        mod = "aiter.ops.flydsl.topk.topk_per_row_small_k"
+
+        def old_topk(scores, row_lens, indices, k, init_blocks=0, local_blocks=0):
+            raise AssertionError("never launched")
+
+        for fake in (
+            types.SimpleNamespace(
+                topk_per_row_small_k=old_topk,
+                topk_per_row_small_k_supported=lambda *a, **kw: True,
+            ),
+            None,  # the module is missing
+        ):
+            monkeypatch.setitem(sys.modules, mod, fake)
+            K._long_rows_selector.cache_clear()
+            assert K._long_rows_selector() is None
+        monkeypatch.undo()
+        K._long_rows_selector.cache_clear()
+
+    @pytest.mark.parametrize("width", [400, 8256])
+    def test_long_rows_fall_back_to_the_split(self, monkeypatch, width):
+        # no long-row selector (an aiter without #29): long_from changes nothing, every
+        # row selects on the split, the same ids as without it
+        monkeypatch.setattr(K, "_long_rows_selector", lambda: None)
+        k = 8 if width == 400 else 128
+        his = [1, 3, width // 3, width // 2, width - 1, width]
+        score, _bt, _seq, pos = self._rows_case(width, his, seed=width, ties=True)
+        want = K.select_logical(score, pos, k, split=True)
+        got = K.select_logical(score, pos, k, split=True, long_from=2)
+        assert torch.equal(got, want)
+
+    @pytest.mark.skipif(
+        not (GPU and K._long_rows_selector() is not None),
+        reason="aiter's FlyDSL top-k with min_row_len (aiter-M3 #29) on a GPU",
+    )
+    @pytest.mark.parametrize("ties", [False, True])
+    @pytest.mark.parametrize("width", [8256, 65536])
+    def test_long_rows_on_aiter_equal_the_split(self, width, ties):
+        # the guarded pair (short rows on the split, long ones on aiter) picks what the
+        # split alone picks, block ids in order and -1 after: rows below / at / past the
+        # bound, under k blocks, at and around the selector's 16384-column load rounds
+        his = [1, 100, 2047, 2048, 2049, 8256, 16383, 16384, 16385, 21760, 32769, 65536]
+        his = [h for h in his if h <= width]
+        score, _bt, _seq, pos = self._rows_case(width, his, seed=width, ties=ties)
+        want = K.select_logical(score, pos, 128, split=True)
+        assert K.long_rows_selector_serves(score, 128)
+        for long_from in (2048, 1, width + 1):
+            got = K.select_logical(score, pos, 128, split=True, long_from=long_from)
+            assert torch.equal(got, want), long_from
+
+    @pytest.mark.skipif(
+        not (GPU and K._long_rows_selector() is not None),
+        reason="aiter's FlyDSL top-k with min_row_len (aiter-M3 #29) on a GPU",
+    )
+    def test_long_rows_graph_replays_other_rows(self):
+        # captured once over a 1M-token table, replayed for other lengths and scores: each
+        # replay's rows move between the two selectors by their own lengths
+        width, t = 65536, 8
+        score, _bt, _seq, pos = self._rows_case(width, [300] * t, seed=1, ties=False)
+        s_buf, p_buf = score.clone(), pos.clone()
+        side = torch.cuda.Stream()
+        side.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(side):
+            K.select_logical(s_buf, p_buf, 128, split=True, long_from=2048)
+        torch.cuda.current_stream().wait_stream(side)
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g):
+            out = K.select_logical(s_buf, p_buf, 128, split=True, long_from=2048)
+        for seed, his in (
+            (2, [65536, 3, 2048, 2047, 40000, 16385, 5000, 21760]),
+            (3, [100, 200, 300, 400, 500, 600, 700, 65535]),
+        ):
+            sc, _, _, po = self._rows_case(width, his, seed=seed, ties=seed == 3)
+            s_buf.copy_(sc)
+            p_buf.copy_(po)
+            g.replay()
+            torch.cuda.synchronize()
+            assert torch.equal(out, K.select_logical(sc, po, 128, split=True)), seed
+
     def test_rearms_its_counters(self):
         # the fused merge zeroes its arrival counters: a second call (a graph replay)
         # selects alike
