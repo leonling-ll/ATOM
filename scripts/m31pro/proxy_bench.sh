@@ -46,8 +46,9 @@
 #                    "1. Start the ATOM server", every env and flag of it
 #                    (tests/test_m31pro_proxy_bench.py diffs the two);
 #                    agentic_sc: the same recipe's "Small concurrency (CONC
-#                    1-16)" launch, section 1 without LMCache, cache-aware
-#                    admission and index_compress [pro]
+#                    1-16)" launch, section 1 without LMCache and cache-aware
+#                    admission; below CONC 8 without index_compress, from
+#                    CONC 8 with mono off [pro]
 #   CHAT_TEMPLATE    agentic*: --chat-template file; unset, a checkpoint
 #                    chat_template.jinja without the thinking_mode switch (the
 #                    1 KB stub) is refused []
@@ -162,13 +163,25 @@ pro)
 agentic | agentic_sc)
     # ar_lamport_rows needs the Lamport path.
     unset AITER_CUSTOM_AR_DISABLE_LAMPORT
-    recipe_variants='{"kernels": true, "attn": "aiter", "topk": "split", "prep": "aiter", "index_split": true, "score_tq": 8, "ar_lamport_rows": 16, "k_only": true, "k_plain_fp8": true, "prefill_attn": "day0", "index_split_decode": 64, "moe_route_glue": true'
-    # Up to 16 rows the centroid writes cost more than the faster scoring saves;
-    # there the decode scores of a 1M-wide block table take aiter's fp8 scorer.
-    if [ "$RECIPE" = agentic_sc ]; then
-        recipe_variants+=', "index": "fused"'
-    else
+    # The decode indexer splits over the TP ranks from this many graph rows.
+    # Small concurrency: from 3 sequences of k7 verify rows, where every rank
+    # scoring and selecting every row costs more than one sequence a rank and
+    # the all-gather.
+    split_decode=64
+    [ "$RECIPE" = agentic_sc ] && split_decode=24
+    recipe_variants='{"kernels": true, "attn": "aiter", "topk": "split", "prep": "aiter", "index_split": true, "score_tq": 8, "ar_lamport_rows": 16, "k_only": true, "k_plain_fp8": true, "prefill_attn": "day0", "index_split_decode": '"$split_decode"', "moe_route_glue": true'
+    if [ "$RECIPE" = agentic ]; then
         recipe_variants+=', "index_compress": true'
+    elif [ "$CONC" -ge 8 ]; then
+        # CONC 8 and 16: the tail decodes at 5-7 sequences (40-56 rows), where
+        # the compressed index scores faster and mono (up to 16 rows) does not
+        # serve. GSM8K 64-shot on this set: mean 0.9419 over 3 runs (#313).
+        recipe_variants+=', "index_compress": true, "index_compress_fused": true, "index": "triton", "mono_ffn_rows": 0'
+    else
+        # Up to 16 rows the centroid writes cost more than the faster scoring
+        # saves; there the decode scores of a 1M-wide block table take aiter's
+        # fp8 scorer.
+        recipe_variants+=', "index": "fused"'
     fi
     recipe_variants+='}'
     default_variants=$(python3 -c 'import json, sys
