@@ -136,7 +136,7 @@ def test_the_spec_binds_the_pools_own_scale_planes(monkeypatch):
     k_scale, _ = pool.scale_views(0)
     assert layer.k_scale.data_ptr() == k_scale.data_ptr()
     assert tuple(layer.k_scale.shape) == (3 * 8, 1, 16)
-    assert tuple(layer.k_cache.shape)[0] == 3 * 8
+    assert layer.k_cache.shape[0] == 3 * 8
 
 
 def _fill(pool, seed):
@@ -258,23 +258,31 @@ def test_the_dcp8_block_writes_and_reads_what_the_dcp1_block_does(
     # the target's table under DCP 8: as wide as at DCP 1, its tail never allocated
     wide = torch.randint(0, 4000, (max_bs, 8 * w8), dtype=torch.int32, generator=g)
     wide[:, :w8] = t128
-    t16 = t128.repeat_interleave(8, dim=1) * 8 + torch.arange(8, dtype=torch.int32).repeat(w8)
+    t16 = t128.repeat_interleave(8, dim=1) * 8 + torch.arange(
+        8, dtype=torch.int32
+    ).repeat(w8)
     anchors = torch.zeros(running_bs, dtype=torch.int64)
     alloc8 = []
     for i in range(scheduled_bs):
-        anchors[i] = rng.choice([rng.randrange(0, 3), rng.randrange(0, max_model_len - T - 1)])
+        anchors[i] = rng.choice(
+            [rng.randrange(0, 3), rng.randrange(0, max_model_len - T - 1)]
+        )
         need = (int(anchors[i]) + 1) // 128 + 1
         alloc8.append(min(w8, max(1, need + rng.choice([-1, 0, 1]))))
     wide, t16, anchors = (x.to(DEV) for x in (wide, t16, anchors))
     dcp8, d8 = _block(wide, alloc8, anchors, scheduled_bs, T, 128, max_model_len)
-    dcp1, d1 = _block(t16, [8 * a for a in alloc8], anchors, scheduled_bs, T, 16, max_model_len)
+    dcp1, d1 = _block(
+        t16, [8 * a for a in alloc8], anchors, scheduled_bs, T, 16, max_model_len
+    )
     assert d8._block_rows_p == d1._block_rows_p == 8 * w8
     for name in ("slot_mapping", "context_lens", "blk_positions", "dspark_ctx_rows"):
         assert torch.equal(getattr(dcp8, name), getattr(dcp1, name)), name
     reads = (dcp1.dspark_ctx_rows.long() + 15) // 16
     for r in range(running_bs * T):
         n = int(reads[r])
-        assert torch.equal(dcp8.dspark_bt16_rows[r, :n], dcp1.dspark_bt16_rows[r, :n]), r
+        assert torch.equal(
+            dcp8.dspark_bt16_rows[r, :n], dcp1.dspark_bt16_rows[r, :n]
+        ), r
 
 
 # -- the target's builder stages the draft's context slots ---------------------------
@@ -379,7 +387,9 @@ def test_a_mixed_steps_decode_half_stages_after_its_prefill_rows():
     var["positions"].np[:3] = [0, 1, 2]
     var["mixed_positions"].np[:4] = [200, 201, 40, 41]
     group = _Group()
-    DraftCtxSlotsMixin._stage_draft_ctx_slots(stub, _batch([3]), np.array([3]), 3, group)
+    DraftCtxSlotsMixin._stage_draft_ctx_slots(
+        stub, _batch([3]), np.array([3]), 3, group
+    )
     DraftCtxSlotsMixin._stage_draft_ctx_slots(
         stub, _batch([2, 2]), np.array([2, 2]), 9, group, "mixed_", first=3
     )

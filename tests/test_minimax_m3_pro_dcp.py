@@ -332,7 +332,8 @@ def test_compressed_index_pooled_per_rank_gathers_to_the_single_ranks(K):
         done = [b for _, b in runs]
         plans = [K.dcp_prefill_plan(rk.bt, done, world) for rk in c.ranks]
         for (rows, tables), own in zip(plans, ranks):
-            def gather(x, rows=rows):
+
+            def gather(x, rows=rows, plans=plans):
                 return torch.cat([o.ic[p[0]] for o, p in zip(ranks, plans)])
 
             ic = K.dcp_gather_blocks(own.ic, rows, gather, world)
