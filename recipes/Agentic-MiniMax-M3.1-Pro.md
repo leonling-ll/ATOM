@@ -317,7 +317,7 @@ The server's `/metrics` has what explains a run: `atom:prefix_cache_hit_ratio`,
 
 The current best CONC 64 launch on the uncapped AgentX corpus, whose sessions grow to 1M tokens. It
 was measured with the official InferenceX client (`benchmarks/srt_agentic.sh` at InferenceX
-`e1999621`, agentx-harness 1.0.14). It changes four things in section 1's launch:
+`e1999621`, agentx-harness 1.0.14). It changes five things in section 1's launch:
 
 - **One LMCache server stores the KV once.** Pro has one KV head, so the eight TP ranks hold the
   same KV and section 1's in-process LMCache pins eight identical copies. In LMCache's multiprocess
@@ -328,8 +328,10 @@ was measured with the official InferenceX client (`benchmarks/srt_agentic.sh` at
 - **DSpark 5 draft tokens at AL 2.89**, the golden AL for 5 tokens with thinking on, as in vLLM's
   launch (#225).
 - **The decode fusions and the LMCache MP transfer settings** in the block below (#279, #280).
+- **vLLM's prefill indexer** for the split prefills (`index_day0`, #286), on aiter-M3's port of
+  amd-kernels-day0's kernel.
 
-The aiter is section 0's (aiter-M3 `yuhua/m3.1-pro` with aiter-M3#19, `6b9b5e32a`). `amd_kernels` is not
+The aiter is aiter-M3 `yuhua/m3.1-pro` at `882741bd5`: section 0's aiter-M3#19 plus aiter-M3#24. `amd_kernels` is not
 needed.
 
 ```bash
@@ -349,7 +351,7 @@ until (exec 3<>"/dev/tcp/127.0.0.1/${LMCACHE_PORT}") 2>/dev/null; do sleep 2; do
 
 export AITER_LOG_LEVEL=WARNING
 unset AITER_CUSTOM_AR_DISABLE_LAMPORT          # ar_lamport_rows needs the Lamport path
-export ATOM_M3PRO_VARIANTS='{"kernels": true, "attn": "aiter", "topk": "split", "prep": "aiter", "index_split": true, "score_tq": 8, "ar_lamport_rows": 16, "k_only": true, "k_plain_fp8": true, "prefill_attn": "day0", "index_split_decode": 64, "moe_route_glue": true, "index_compress": true, "score_tq_causal": true, "ar_fused_rows": 128, "moe_tail_ar": true, "moe_glue_fold": true, "index_compress_fused": true, "day0_decode_rows": 48}'
+export ATOM_M3PRO_VARIANTS='{"kernels": true, "attn": "aiter", "topk": "split", "prep": "aiter", "index_split": true, "score_tq": 8, "ar_lamport_rows": 16, "k_only": true, "k_plain_fp8": true, "prefill_attn": "day0", "index_split_decode": 64, "moe_route_glue": true, "index_compress": true, "score_tq_causal": true, "ar_fused_rows": 128, "moe_tail_ar": true, "moe_glue_fold": true, "index_compress_fused": true, "day0_decode_rows": 48, "index_day0": true}'
 export ATOM_WARMUP_TOKENS=auto
 export ATOM_ONLINE_QUANT_STREAMING=1
 export ATOM_CACHE_AWARE_ADMISSION=1
@@ -403,6 +405,7 @@ What the settings beyond section 1 do:
 | `ar_fused_rows` 128, `moe_tail_ar` | One-launch Lamport all-reduce + RMSNorm + MXFP8 up to 128 rows, and the shared-expert add in the next all-reduce (#127). |
 | `day0_decode_rows` 48, `index_compress_fused`, `moe_glue_fold` | Decode attention on aiter-M3's FlyDSL fp8 sparse decode from 48 rows (#208); the compressed index insert in one launch (#216); the MoE glue's shared add in the next Lamport all-reduce and the lookahead norm from the route op (#220). |
 | `ATOM_TOKEN_GRAPH_SIZES` up to 4096 | Token graphs for prefills up to 4096 tokens (#217). |
+| `index_day0` | A split prefill's index scores and top-128 come from aiter-M3's FlyDSL `minimax_m3_index_top128`, amd-kernels-day0's `index_top128` (vLLM's prefill indexer) ported in aiter-M3#24, instead of the Triton kernels (#286). Its scores are fp16, as in vLLM, so a near-tie can pick another block ([`MiniMax-M3.1-Pro-Accuracy-Switches.md`](MiniMax-M3.1-Pro-Accuracy-Switches.md)). `false` turns it off. An aiter without the op logs `M3-Pro index_day0: Triton indexer (this aiter has no minimax_m3_index_top128)` and runs the Triton kernels. |
 | `OFFLOAD_MAX_PENDING_SAVES=32` | Lets 32 saves run or wait at once; unset, the bound is twice the copy workers. |
 | `OFFLOAD_MP_SAVE_SAME_STEP=1` | Submits a prefill chunk's save once the step that computed it has finished its forward, instead of at the next step. |
 | `OFFLOAD_MIN_LOAD_TOKENS=2048` | Loads CPU-tier hits from 2048 tokens; shorter ones are recomputed. `lmcache_mp`'s default is 8192. |
@@ -410,7 +413,8 @@ What the settings beyond section 1 do:
 | `lmcache.mp.transfer_deadline_s` 120 | ATOM stops the engine when an LMCache MP load or save stays open past this deadline, 30 s by default. At CONC 64 a 65k-118k-token retrieve occasionally takes 13-23 s instead of tens of ms, and loads queued behind it passed 30 s in three runs. |
 
 Check the startup log: `num_kvcache_blocks` near 217,600 (`available_for_kv` near 80 GB) on every
-rank, and the `ATOM_KV_OFFLOAD` line with `"lmcache.mp.tp_rank_collapse": "auto"`. The client needs
+rank, and the `ATOM_KV_OFFLOAD` line with `"lmcache.mp.tp_rank_collapse": "auto"`. Once the first
+split prefill has run, the log has no `M3-Pro index_day0: Triton indexer` line. The client needs
 the served name `minimax-m3-pro`; with InferenceX's `srt_agentic.sh` set `SERVED_MODEL_NAME`
 to it and `KV_OFFLOADING=dram`, `KV_OFFLOAD_BACKEND=lmcache_mp`, `TOTAL_CPU_DRAM_GB=2405`.
 The host needs 2,240 GiB free for the pool once it fills, on top of the server and the page cache.
@@ -425,7 +429,8 @@ the uncapped corpus at 1M context and DSpark k=5 at AL 2.89, and no request fail
 | Section 1's launch (in-process LMCache, 184 GiB a rank) | 3600 s | 3,698 | 7.53 | 322 / 405 s |
 | One LMCache server, 2,240 GiB, section 1's variants + `score_tq_causal` (*) | 3600 s | 15,241 | 40.90 | 3.0 / 99.6 s |
 | vLLM, #225's launch (2.4 TB CPU offload) | 3600 s | 12,360 | 35.88 | 64 / 100 s |
-| This launch | 3600 s | **16,360** | **43.30** | 2.6 / 91.7 s |
+| This launch without `index_day0` (#282) | 3600 s | 16,360 | 43.30 | 2.6 / 91.7 s |
+| This launch | 3600 s | **16,798** | **44.65** | 2.7 / 84.1 s |
 
 Single steps, 600 s each on one node. 600 s runs of one launch differ by up to about 10% run to run.
 
@@ -435,10 +440,13 @@ Single steps, 600 s each on one node. 600 s runs of one launch differ by up to a
 | + the decode fusions (*) | 15,631 | 45.19 | 0.5 / 76.2 s |
 | + the decode fusions, without `index_day0` | 14,584 | 42.22 | 0.3 / 79.1 s |
 | + the LMCache MP transfer settings, no fusions (*, transfer profiling on) | 14,610 | 46.66 | 0.5 / 72.8 s |
-| This launch | 14,664 | 44.24 | 0.5 / 69.9 s |
+| This launch without `index_day0` (#282) | 14,664 | 44.24 | 0.5 / 69.9 s |
+| This launch | 15,047 | 45.96 | 0.5 / 85.0 s |
+| This launch with `"index_day0": false`, right after the row above | 15,478 | 51.62 | 0.4 / 78.2 s |
 
-(*) These runs also had `index_day0`, a prefill indexer variant that needs a package outside
-aiter-M3 and is not in ATOM; the third row is the second without it.
+(*) These runs had `index_day0` on amd-kernels-day0's own kernel, before its aiter-M3 port; the
+third row is the second without it. The last two rows ran back to back on one node: 600 s does not
+resolve the hour's 2.7%.
 
 Over the hour, the one-server launch recomputed 4.6% of its prompt tokens and vLLM 9.4%: ATOM
 served about 30% from HBM and 66% from the CPU tier, vLLM 7% and 84%. The in-process run
@@ -446,7 +454,8 @@ recomputed most of its prompts and queued: its median TTFT was 322 s.
 
 GSM8K for the second row's launch (DSpark k=5 at real acceptance, 3 runs): 0.9439 64-shot,
 0.9353 on vLLM's 5-shot protocol, where vLLM scores 0.9174 with DSpark. For this launch, one run:
-0.9416 ± 0.0065 64-shot and 0.9249 ± 0.0073 5-shot, acceptance length 3.84.
+0.9431 ± 0.0064 64-shot and 0.9356 ± 0.0068 5-shot, acceptance length 3.85 (without `index_day0`:
+0.9416 and 0.9249, 3.84). AIME 2026 for this launch: avg@16 0.9625 ± 0.0029, pass@16 0.9667.
 
 ## CONC 32
 
