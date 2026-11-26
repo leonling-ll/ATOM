@@ -2337,7 +2337,7 @@ def _select_split_kernel(
             return
     lo = part * SPAN
     if lo >= hi:  # past the token's causal blocks: the cost follows the context
-        if KEY_W:
+        if KEY_W:  # noqa: SIM102 (a constexpr, then the program id)
             if part == 0:  # no causal block on this rank: keys below every block's
                 tl.store(
                     rows_ptr + t.to(tl.int64) * stride_rows + tl.arange(0, K),
@@ -3096,9 +3096,7 @@ def _dcp_local_keys_kernel(
     j = tl.load(sel_ptr + t.to(tl.int64) * stride_sel + e)
     # a row with no causal block on this rank selected nothing (and wrote nothing)
     ok = (j >= 0) & (e < tl.where(tl.load(pos_ptr + t) >= 0, K, 0))
-    s = tl.load(
-        score_ptr + t.to(tl.int64) * stride_s + j, mask=ok, other=float("-inf")
-    )
+    s = tl.load(score_ptr + t.to(tl.int64) * stride_s + j, mask=ok, other=float("-inf"))
     b = s.to(tl.int32, bitcast=True)
     key = (b ^ ((b >> 31) & 0x7FFFFFFF)).to(tl.int64) << 32
     key = key | (0x7FFFFFFF - (j * W + R)).to(tl.int64)

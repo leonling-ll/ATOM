@@ -170,7 +170,7 @@ def test_topk_merge_selects_as_the_gathered_scores(K, split, per_seq, fold):
     ``dcp_local_keys``' (the all-gather is handed exactly those)."""
     world, k, init, local = 4, 8, 1, 2
     c = Split([300, 517, 70, 20], world)
-    seq, pos = c.rows(per_seq)
+    _, pos = c.rows(per_seq)
     g = torch.Generator().manual_seed(5)
     parts, qpos = [], []
     for r in range(world):
@@ -212,7 +212,7 @@ def test_the_folded_keys_over_spans_are_dcp_local_keys(K, fused):
     s = torch.randint(0, 6, (len(pos), nb), generator=g).float()
     s[torch.rand(s.shape, generator=g) < 0.1] = float("-inf")
     s = s.to(DEV)
-    split = dict(parts=3, chunk=32, fused=fused, logical=True)
+    split = {"parts": 3, "chunk": 32, "fused": fused, "logical": True}
     ids = K.select_rows_split(s, s, pos, pos, k, **split)[0]
     got = K.select_rows_split(s, s, pos, pos, k, dcp_keys=(r, world), **split)[0]
     assert got.dtype == torch.int64

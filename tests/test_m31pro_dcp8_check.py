@@ -58,7 +58,7 @@ def _variant_fields():
 def test_serve_is_the_conc64_launch_at_dcp8_with_dspark_and_lmcache_mp(tmp_path):
     done = _dry("serve", tmp_path)
     assert done.returncode == 0, done.stdout + done.stderr
-    (env, argv), = _launches(done.stdout)
+    ((env, argv),) = _launches(done.stdout)
     assert "unset AITER_CUSTOM_AR_DISABLE_LAMPORT" in done.stdout
     assert env["ATOM_KV_OFFLOAD"] == "lmcache_mp"
     assert env["LMCACHE_CHUNK_SIZE"] == "256"
@@ -80,7 +80,7 @@ def test_serve_is_the_conc64_launch_at_dcp8_with_dspark_and_lmcache_mp(tmp_path)
 
 def test_in_process_lmcache_takes_the_c64_cpu_tier(tmp_path):
     done = _dry("serve", tmp_path, OFFLOAD="lmcache")
-    (env, _), = _launches(done.stdout)
+    ((env, _),) = _launches(done.stdout)
     assert env["ATOM_KV_OFFLOAD"] == "lmcache"
     assert env["LMCACHE_LOCAL_CPU"] == "True"
     assert env["LMCACHE_MAX_LOCAL_CPU_SIZE"] == "280"
@@ -88,7 +88,7 @@ def test_in_process_lmcache_takes_the_c64_cpu_tier(tmp_path):
 
 def test_restore_without_mp_turns_hbm_prefix_caching_off(tmp_path):
     done = _dry("restore", tmp_path, OFFLOAD="lmcache")
-    (_, argv), = _launches(done.stdout)
+    ((_, argv),) = _launches(done.stdout)
     assert "--no-enable_prefix_caching" in argv
     assert "--spec-decode-acceptance-length" not in argv  # real acceptance
     assert not (tmp_path / "out").exists()
@@ -106,7 +106,7 @@ def test_ab_launches_differ_only_in_dcp_topk_merge(tmp_path):
 
 
 def test_ab_runs_dcp_variants_against_ab_variants(tmp_path):
-    (env, _), = _launches(_dry("serve", tmp_path).stdout)
+    ((env, _),) = _launches(_dry("serve", tmp_path).stdout)
     c64 = json.loads(env["ATOM_M3PRO_VARIANTS"])
     fold = json.dumps(dict(c64, dcp_fold=True))
     done = _dry("ab", tmp_path, DCP_VARIANTS=fold, AB_VARIANTS=json.dumps(c64))
