@@ -613,6 +613,54 @@ def test_compressed_index_pooled_per_rank_gathers_to_the_single_ranks(K):
                     )
 
 
+def test_day0_index_plan_of_the_gathered_caches_is_the_single_ranks(K):
+    """``dcp_index_day0``: for every rank's two ``row_split_index`` segments of a
+    prefill, the day0 plan through a gathered cache's tables (``_dcp_prefill_caches``)
+    hands ``index_top128`` the single rank's inputs: the same rows, lengths and page
+    table, and page for page the same centroids."""
+    world, tp = 4, 4
+    lens, new = [300, 517, 70], [150, 517, 6]
+    c = Split(lens, world, seed=7)
+    cu = [0] + np.cumsum(new).tolist()
+    n = cu[-1]
+    seg = -(-n // (2 * tp))
+    plans = [K.dcp_prefill_plan(rk.bt, lens, world) for rk in c.ranks]
+    for rank, ((rows, tables), rk) in enumerate(zip(plans, c.ranks)):
+
+        def gather(x):
+            return torch.cat([o.icc[p[0]] for o, p in zip(c.ranks, plans)])
+
+        ic = K.dcp_gather_blocks(rk.icc, rows, gather, world)
+        mirror = 2 * tp - 1 - rank
+        ranges = (
+            (rank * seg, (rank + 1) * seg),
+            (mirror * seg, min(n, (mirror + 1) * seg)),
+        )
+        got = K.day0_index_plan(tables, cu, lens, ranges)
+        want = K.day0_index_plan(c.bt, cu, lens, ranges)
+        assert torch.equal(ic[got[0]], c.icc[want[0]])
+        for a, b in zip(got[1:4], want[1:4]):
+            assert torch.equal(a, b)
+        assert got[4:] == want[4:]
+
+
+@pytest.mark.parametrize(
+    "dcp, on, ok", [(1, False, True), (8, False, False), (8, True, True)]
+)
+def test_dcp_index_day0_lets_a_dcp_prefill_take_index_day0(monkeypatch, dcp, on, ok):
+    """A split prefill's indexer under DCP runs ``index_day0`` only with
+    ``dcp_index_day0``; without DCP the switch changes nothing."""
+    from conftest import gpu_stack_import
+
+    pro_attn = gpu_stack_import("atom.model_ops.minimax_m3.pro_attn")
+    monkeypatch.setattr(pro_attn.pro_kernels, "day0_index_blocker", lambda *a: None)
+    impl = object.__new__(pro_attn.ProSparseAttentionImpl)
+    impl.dcp_world, impl.max_model_len = dcp, 1 << 20
+    v = pro_attn.ProVariants(index_day0=True, index_compress=True, dcp_index_day0=on)
+    ic = torch.zeros(2, PG // 4, DI, dtype=torch.bfloat16)
+    assert impl._day0_index_ok(v, ic, 1, 9) is ok
+
+
 # -- the decode merge: aiter's mailbox combine, else all-to-all ----------------------
 
 
