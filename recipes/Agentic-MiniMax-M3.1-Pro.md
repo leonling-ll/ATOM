@@ -634,12 +634,13 @@ the window: 203 s eager, 163 s here.
 
 The CONC 1, 4, 8 and 16 launch, as `scripts/m31pro/proxy_bench.sh` starts it with
 `RECIPE=agentic_sc` (`tests/test_m31pro_proxy_bench.py` diffs the two). It is the section 1 launch
-and aiter (section 0) with three settings off and a smaller `--max-num-seqs` below CONC 8:
+and aiter (section 0) with three settings off, the fused decode scorer on, and a smaller `--max-num-seqs` below CONC 8:
 
 | Setting | Here | Why |
 |---|---|---|
 | LMCache offload, cache-aware admission | off | Up to CONC 16 the HBM pool holds every live session's prefix: at CONC 16 the prefix working set peaks at about 1.2M tokens, and util 0.95 with streaming quant gives 155,940 blocks (2.5M tokens). On that HBM-only launch, adding LMCache (184 GiB a rank) and admission left the prefix hit at 0.94 and cost 10.6% P90 E2E-normalized interactivity (77.38 -> 69.21) and 1.4% tok/s/GPU (3270.4 -> 3224.7). This was one 900 s run per arm at CONC 16, k=7, AL 2.94, measured in #133. |
 | `index_compress` | off | Up to 16 rows the centroid writes (two launches a layer, 576 us a step) cost more than the faster scoring saves: a decode step is 2.9% slower at CONC 1 (13,018 -> 13,398 us) and 2.0% slower at CONC 4 (#145, 8-row buckets). Its 17.6% more KV blocks are not needed here. |
+| `index` | `"fused"` | INDEX_ROW |
 | `ar_fused_rows` | 0 (unset) | Up to 16 rows the all-reduce already runs on the Lamport path (`ar_lamport_rows` 16), and the mono decode path (#55) refuses an `ar_fused_rows` above 0. |
 | `--max-num-seqs` | 16 below CONC 8, else 2 × CONC | `proxy_bench.sh`'s rule for every small-concurrency point. |
 
@@ -655,7 +656,7 @@ export CONC="${CONC:-16}"                     # 1 to 16
 
 export AITER_LOG_LEVEL=WARNING
 unset AITER_CUSTOM_AR_DISABLE_LAMPORT          # ar_lamport_rows needs the Lamport path
-export ATOM_M3PRO_VARIANTS='{"kernels": true, "attn": "aiter", "topk": "split", "prep": "aiter", "index_split": true, "score_tq": 8, "ar_lamport_rows": 16, "k_only": true, "k_plain_fp8": true, "prefill_attn": "day0", "index_split_decode": 64, "moe_route_glue": true}'
+export ATOM_M3PRO_VARIANTS='{"kernels": true, "attn": "aiter", "topk": "split", "prep": "aiter", "index_split": true, "score_tq": 8, "ar_lamport_rows": 16, "k_only": true, "k_plain_fp8": true, "prefill_attn": "day0", "index_split_decode": 64, "moe_route_glue": true, "index": "fused"}'
 export ATOM_WARMUP_TOKENS=auto
 export ATOM_ONLINE_QUANT_STREAMING=1
 export AITER_REUSE_IDENTICAL_COMM_GROUPS=1

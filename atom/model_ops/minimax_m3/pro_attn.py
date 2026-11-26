@@ -304,10 +304,16 @@ class ProVariants:
     qk_pair: bool = False
 
 
-# Below it, on an fp8 index cache, Triton's query-blocked scores are as fast or faster
-# than aiter's fused scorer (MI355X, 16 rows: 19.6 vs 27.3 us at 32k context, 32.9 vs
-# 28.2 at 128k; 64 rows: 33.3 vs 26.2 at 32k), so "index": "fused" keeps Triton there.
+# On an fp8 index cache, "index": "fused" takes aiter's scorer for a decode / verify
+# graph of at least _FUSED_MIN_ROWS_FP8 rows, where Triton's scores fill the block
+# table's whole width (past QTILE_ROWS rows). Below it Triton's causal scores are
+# faster at short contexts and slower at long ones, and a graph cannot see the
+# context, so the block table's width (the server's max-model-len) decides: from
+# _FUSED_MIN_BLOCKS_FP8 blocks wide, aiter's. MI355X, 68 layers, us a layer, fp8
+# Triton vs aiter: 8 rows 8.55 vs 13.52 at 64k, 31.90 vs 21.95 at 340k; 16 rows
+# 12.09 vs 15.60 at 64k, 51.40 vs 33.93 at 340k.
 _FUSED_MIN_ROWS_FP8 = 32
+_FUSED_MIN_BLOCKS_FP8 = 12288
 
 # Below it the all-gather costs more than the scoring it saves (moo's threshold).
 _SPLIT_MIN_TOKENS = 1024
@@ -929,17 +935,23 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
         )
 
     def _fused_index(
-        self, v: ProVariants, static: bool, split, ic, n: int, dsplit=None
+        self, v: ProVariants, static: bool, split, ic, n: int, dsplit=None, nb=0
     ) -> bool:
         """Whether the decode scores take aiter's FlyDSL scorer (``"index":
         "fused"``): graph-shaped decode rows of one rank, neither an index split
         (``split``) nor a decode split (``dsplit``), pool4 / max scores, a
         selection that reads only each row's causal blocks, and an index cache ``ic``
-        it reads: fp8 (from _FUSED_MIN_ROWS_FP8 of the ``n`` rows) or NVFP4, or with
+        it reads: fp8 (from _FUSED_MIN_ROWS_FP8 of the ``n`` rows, or a block table
+        ``nb`` of at least _FUSED_MIN_BLOCKS_FP8 blocks) or NVFP4, or with
         ``index_compress`` the bf16 centroids (a bf16 token cache it does not read)."""
         if v.index != "fused":
             return False
         centroid = v.index_compress
+        small_fp8 = (
+            ic.dtype == torch.float8_e4m3fn
+            and n < _FUSED_MIN_ROWS_FP8
+            and nb < _FUSED_MIN_BLOCKS_FP8
+        )
         ok = (
             static
             and split is None
@@ -950,9 +962,7 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
                     not centroid
                     and (
                         ic.dtype == torch.uint8
-                        or (
-                            ic.dtype == torch.float8_e4m3fn and n >= _FUSED_MIN_ROWS_FP8
-                        )
+                        or (ic.dtype == torch.float8_e4m3fn and not small_fp8)
                     )
                 )
             )
@@ -962,7 +972,6 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
             and v.topk != "torch"
             and pro_kernels.fused_scores_available(centroid)
         )
-        small_fp8 = ic.dtype == torch.float8_e4m3fn and n < _FUSED_MIN_ROWS_FP8
         if (
             static
             and not ok
@@ -1272,7 +1281,7 @@ class ProSparseAttentionImpl(PagedAttentionImpl):
             # every row scores alone, so this rank's rows come out as they would in full
             idx, seg, n_rows, tp = split
             rq, rseq, rpos = iq[idx], seq_id[idx], positions[idx]
-        if self._fused_index(v, static, split, ic, n, dsplit):
+        if self._fused_index(v, static, split, ic, n, dsplit, nb):
             # each group of `rows` rows is one sequence's: k + 1 a verify, so the
             # largest power of two (at most 8) dividing them
             rows = min(8, rps & -rps) if rps > 1 else 1
