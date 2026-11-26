@@ -21,8 +21,13 @@ import torch
 logger = logging.getLogger("atom")
 
 MAX_ROWS = 512  # the op's limit; larger steps keep the separate launches
+# Steps of at most this many rows take a second set of buffers sized for them: fewer reduce
+# CTAs reserved, so all of the router's tasks get a CTA each (TP8, 384 experts: 240 router CTAs
+# instead of 192 with two tasks each). The same kernel and the same bits.
+SMALL_ROWS = 128
 BLOCK_M = 16  # the sort block the generic MXFP4 pipeline's tuned rows use
 _COMMS: dict[tuple[int, int, int], object] = {}
+_SMALL: dict[tuple[int, int, int], object] = {}
 
 
 def build(hidden: int, experts: int, topk: int) -> bool:
@@ -50,6 +55,9 @@ def build(hidden: int, experts: int, topk: int) -> bool:
         return False
     _COMMS[key] = AllReduceRmsnormMoeRoute(
         tp.cpu_group, MAX_ROWS, hidden, experts, topk, router_fp32=False
+    )
+    _SMALL[key] = AllReduceRmsnormMoeRoute(
+        tp.cpu_group, SMALL_ROWS, hidden, experts, topk, router_fp32=False
     )
     logger.info(
         "M3-Pro moe_route_glue: fused all-reduce + norm + router + top-k + sort, "
@@ -99,7 +107,9 @@ def route(x: torch.Tensor, residual: torch.Tensor, norm, moe, lookahead=None) ->
     )
 
     ex = moe.experts
-    comm = _COMMS[(x.shape[-1], ex.global_num_experts, ex.top_k)]
+    key = (x.shape[-1], ex.global_num_experts, ex.top_k)
+    comm = _SMALL.get(key) if x.shape[0] <= SMALL_ROWS else None
+    comm = _COMMS[key] if comm is None else comm
     la = {}
     if lookahead is not None:
         n, q, s = lookahead

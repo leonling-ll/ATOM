@@ -336,3 +336,40 @@ def test_route_hands_the_op_the_lookahead_norm_and_its_rows(load, monkeypatch):
     assert out["la_scale"].dtype == torch.uint8
     glue.route(x, x, norm, moe, (la_norm, None, None))
     assert seen["out"] is None
+
+
+@pytest.mark.parametrize(
+    "rows, small", [(1, True), (128, True), (129, False), (512, False)]
+)
+def test_route_takes_the_small_buffers_up_to_small_rows(load, monkeypatch, rows, small):
+    """Up to SMALL_ROWS rows the op runs on the second, smaller set of buffers (one router task
+    a CTA); wider steps keep the MAX_ROWS set. Without the small set, every step takes the big.
+    """
+    glue = load("atom.models.minimax_m3.moe_route_glue")
+    seen = []
+    op = SimpleNamespace(
+        fused_all_reduce_rmsnorm_moe_route=lambda x, r, w, eps, rw, comm, **kw: seen.append(
+            comm
+        )
+    )
+    monkeypatch.setitem(
+        sys.modules, "aiter.ops.triton.comms.fused.all_reduce_rmsnorm_moe_route", op
+    )
+    ex = SimpleNamespace(
+        global_num_experts=8,
+        top_k=2,
+        renormalize=True,
+        routed_scaling_factor=1.0,
+        fold_routed_scaling_factor=True,
+    )
+    moe = SimpleNamespace(
+        experts=ex, gate=SimpleNamespace(weight=None), e_score_correction_bias=None
+    )
+    big, little = object(), object()
+    monkeypatch.setitem(glue._COMMS, (H, 8, 2), big)
+    norm = SimpleNamespace(weight=torch.zeros(H), variance_epsilon=1e-6)
+    x = torch.zeros(rows, H)
+    glue.route(x, x, norm, moe)
+    monkeypatch.setitem(glue._SMALL, (H, 8, 2), little)
+    glue.route(x, x, norm, moe)
+    assert seen == [big, little if small else big]
