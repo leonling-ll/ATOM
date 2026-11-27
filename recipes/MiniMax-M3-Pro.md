@@ -443,8 +443,19 @@ FlyDSL `minimax_m3_fp8_sparse_decode_dcp` (the `dcp_day0_decode` variant: day0's
 over one rank's blocks, all 128 heads, with the LSE for the merge; the query goes to e4m3 before the
 all-gather) on the K-only plain fp8 cache, 4-6× faster than the Triton attention it replaces
 (23-45 against 90-238 µs a layer at 256-768 rows). With the variant off, or on an aiter without the
-op, the Triton attention runs; the `M3-Pro attention:` log line says which. The CONC 64 AgentX
-launch at DCP 8 and its numbers are in
+op, the Triton attention runs; the `M3-Pro attention:` log line says which.
+
+With `"index_compress": true` the index cache under DCP is the bf16 centroid cache, each rank
+pooling the blocks it holds (+10% KV blocks a GPU at the CONC 64 launch). `dcp_index_day0` runs a
+prefill's split indexer on aiter-M3's FlyDSL `minimax_m3_index_top128` over the centroids the
+prefill gathers, the same kernel on the same pages as DCP 1's `index_day0`, so the same picks; on
+an aiter without it the server warns `M3-Pro index_day0: Triton indexer` and the Triton indexer
+runs. `dcp_push_merge` 512 merges a decode step of up to 512 rows by storing each rank's partials
+and LSEs into its peers' buffers (bit for bit the all-to-all merge; the server logs
+`DCP push collectives ready`). The CONC 64 AgentX launch at DCP 8 runs all three on ATOM
+`ca5d168c` and aiter-M3 `d76a4587f`: 26,259 tok/s/GPU over the hour, P90 / P50 interactivity
+25.18 / 37.87, TTFT p90 1.45 s, against 19,681 before them (a different node). The launch and its
+numbers are in
 [`Agentic-MiniMax-M3.1-Pro.md`](Agentic-MiniMax-M3.1-Pro.md#conc-64-with-dcp8).
 
 Add to the server's arguments `--decode-context-parallel-size 8`. The DCP group shares the TP

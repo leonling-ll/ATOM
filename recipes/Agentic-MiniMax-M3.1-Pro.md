@@ -470,10 +470,13 @@ DCP=1. It changes these things in the DCP=1 launch above:
   3 tokens with thinking on, as vLLM's TP8 + DCP8 launch runs it.
 - **The DCP variants**: `dcp_topk_merge`, `dcp_mailbox` 768, `dcp_fold`, `dcp_q_fp8` and
   `dcp_day0_decode`, which attends decode and verify steps with aiter-M3's FlyDSL
-  `minimax_m3_fp8_sparse_decode_dcp` instead of the Triton attention. `index_compress` is off: the
-  measured runs used the fp8 index cache. `index_day0` is in the JSON as it ran, but it needs
-  `index_compress` and DCP=1, so the split prefills run the Triton indexer. `index_compress_fused`
-  and `day0_decode_rows` are not set.
+  `minimax_m3_fp8_sparse_decode_dcp` instead of the Triton attention.
+- **The compressed index under DCP**: `index_compress` stores the index cache as bf16 centroids
+  (a rank holds whole blocks of them), and `dcp_index_day0` runs a prefill's split indexer on
+  aiter-M3's `minimax_m3_index_top128` over the caches the prefill gathers, as `index_day0` does
+  at DCP=1. `dcp_push_merge` 512 merges decode partials of up to 512 rows by pushing them to their
+  owners, bit for bit the all-to-all merge. `index_compress_fused` and `day0_decode_rows` are not
+  set.
 - **Decode protection**: `ATOM_PREFILL_DECODE_INTERVAL=4` runs at least 4 scheduler passes for decode
   after each prefill forward. Without it a DP=1 server is prefill first, and at DCP=8 the pool has room
   for every waiting prefill, so prefill steps stop all decodes (one run without it had two minutes with
@@ -485,9 +488,11 @@ DCP=1. It changes these things in the DCP=1 launch above:
   `OFFLOAD_MP_TRANSFER_THREAD` are not set, as in the measured runs.
 
 The aiter is aiter-M3 `yuhua/m3.1-pro` at `d76a4587f` (aiter-M3#36), which adds
-`minimax_m3_fp8_sparse_decode_dcp`, built as in section 0. On an aiter without it the server's
-`M3-Pro attention:` line says `triton` where it should say `DCP decode day0 attention`, and decode
-runs the Triton attention. `amd_kernels` is not needed.
+`minimax_m3_fp8_sparse_decode_dcp` and has `minimax_m3_index_top128`, built as in section 0. On an
+aiter without the first the server's `M3-Pro attention:` line says `triton` where it should say
+`DCP decode day0 attention`, and decode runs the Triton attention; without the second the server
+warns `M3-Pro index_day0: Triton indexer (this aiter has no minimax_m3_index_top128)` at the first
+split prefill, and prefills run the Triton indexer. `amd_kernels` is not needed.
 
 ```bash
 export MODEL_PATH="${MODEL_PATH:-/data/models/m3-pro}"
@@ -506,7 +511,7 @@ until (exec 3<>"/dev/tcp/127.0.0.1/${LMCACHE_PORT}") 2>/dev/null; do sleep 2; do
 
 export AITER_LOG_LEVEL=WARNING
 unset AITER_CUSTOM_AR_DISABLE_LAMPORT          # ar_lamport_rows needs the Lamport path
-export ATOM_M3PRO_VARIANTS='{"kernels":true,"attn":"aiter","topk":"split","prep":"aiter","index_split":true,"score_tq":8,"ar_lamport_rows":16,"k_only":true,"k_plain_fp8":true,"prefill_attn":"day0","index_split_decode":64,"moe_route_glue":true,"index_compress":false,"score_tq_causal":true,"index_day0":true,"dcp_topk_merge":true,"ar_fused_rows":128,"moe_tail_ar":true,"moe_glue_fold":true,"dcp_mailbox":768,"dcp_fold":true,"dcp_q_fp8":true,"dcp_day0_decode":true}'
+export ATOM_M3PRO_VARIANTS='{"kernels":true,"attn":"aiter","topk":"split","prep":"aiter","index_split":true,"score_tq":8,"ar_lamport_rows":16,"k_only":true,"k_plain_fp8":true,"prefill_attn":"day0","index_split_decode":64,"moe_route_glue":true,"index_compress":true,"score_tq_causal":true,"index_day0":true,"dcp_topk_merge":true,"ar_fused_rows":128,"moe_tail_ar":true,"moe_glue_fold":true,"dcp_mailbox":768,"dcp_fold":true,"dcp_q_fp8":true,"dcp_day0_decode":true,"dcp_index_day0":true,"dcp_push_merge":512}'
 export ATOM_WARMUP_TOKENS=auto
 export ATOM_ONLINE_QUANT_STREAMING=1
 export ATOM_CACHE_AWARE_ADMISSION=1
@@ -557,7 +562,9 @@ python3 -m atom.entrypoints.openai_server \
 
 Check the startup log: the `ATOM_KV_OFFLOAD` line with `"lmcache.mp.tp_rank_collapse": false`,
 `Forced speculative acceptance ON: mean acceptance length 2.5300 over 3 draft positions`, and an
-`M3-Pro attention:` line a rank with `DCP decode day0 attention`. The client is the one of
+`M3-Pro attention:` line a rank with `DCP decode day0 attention`,
+`DCP push collectives ready: up to 512 decode rows`, and no `M3-Pro index_day0: Triton indexer`
+warning once prefills run. The client is the one of
 [CONC 64 on the full workload](#conc-64-on-the-full-workload), with the served name
 `minimax-m3-pro`. The measured runs also set `OFFLOAD_PROFILE=1` and
 `ATOM_ENABLE_METRICS_DEVICE_TIMER=1`, which only add logging.
@@ -565,28 +572,38 @@ Check the startup log: the `ATOM_KV_OFFLOAD` line with `"lmcache.mp.tp_rank_coll
 ### Measured (full workload, CONC 64, DCP=8)
 
 The official client (InferenceX `e1999621`, agentx-harness 1.0.14), uncapped corpus at 1M context,
-one run per row, no request failed. The rows of this launch ran on ATOM `yuhzhu/attn9-dcp` `782d18cd`
-(the DCP code of this recipe's commit before its merge) with aiter-M3's sync tree plus the DCP decode
-op (`84822644e`, the op merged in aiter-M3#36); the last row ran on `7c636337` with the sync tree
-alone, and the DCP=1 row is the full-workload launch above.
+one run per row, no request failed. The first two rows ran this launch on ATOM `yuhua/m3.1-pro`
+`ca5d168c` with aiter-M3 `d76a4587f`. The rows marked "before the compressed index" ran it with
+`index_compress` off and without `dcp_index_day0` and `dcp_push_merge`, on ATOM `yuhzhu/attn9-dcp`
+`782d18cd` (the DCP code before its merge) with aiter-M3's sync tree plus the DCP decode op
+(`84822644e`, merged in aiter-M3#36); the last row ran on `7c636337` with the sync tree alone, and
+the DCP=1 row is the full-workload launch above.
 
 | Launch | Duration | tok/s/GPU | P90 / P50 interactivity | TTFT p50 / p90 | Requests | GPU prefix hit |
 |---|---|---:|---:|---:|---:|---:|
-| This launch (node B) | 3600 s | **19,681** | 17.74 / 23.75 | 0.6 / 2.5 s | 4,876 | 0.903 |
+| This launch (node A) | 3600 s | **26,259** | 25.18 / 37.87 | 0.38 / 1.45 s | 6,294 | 0.931 |
+| This launch (node A) | 600 s | 22,024 | 26.96 / 37.66 | 0.35 / 1.86 s | 1,083 | 0.917 |
+| Before the compressed index (node B) | 3600 s | 19,681 | 17.74 / 23.75 | 0.6 / 2.5 s | 4,876 | 0.903 |
 | DCP=1: the full-workload CONC 64 launch above (node A) | 3600 s | 16,798 | 44.65 / 64.6 | 2.7 / 84.1 s | 4,210 | 0.242 (+ 0.716 CPU) |
-| This launch (node A) | 600 s | 18,469 | 19.9 / 29.2 | 0.48 / 2.38 s | 923 | 0.892 |
-| This launch without decode protection, `dcp_mailbox`, `dcp_fold`, `dcp_q_fp8` and `dcp_day0_decode` (ATOM `7c636337`, node B) | 600 s | 17,344 | 18.2 / 28.4 | 0.34 / 2.00 s | 872 | 0.893 |
+| Before the compressed index (node A) | 600 s | 18,469 | 19.9 / 29.2 | 0.48 / 2.38 s | 923 | 0.892 |
+| Before the compressed index, without decode protection, `dcp_mailbox`, `dcp_fold`, `dcp_q_fp8` and `dcp_day0_decode` (ATOM `7c636337`, node B) | 600 s | 17,344 | 18.2 / 28.4 | 0.34 / 2.00 s | 872 | 0.893 |
 
-Over the hour DCP=8 gives 17% more tok/s/GPU than DCP=1 and trades per-user speed for no queueing:
-P90 and P50 interactivity are 2.5× and 2.7× lower, but TTFT p90 is 2.5 s instead of 84 s and the
-GPU serves 0.90 of the prompt tokens from HBM instead of 0.24. The two 3600 s rows ran on different
-nodes. The 600 s rows are not 3600 s rows: 600 s runs of one launch differ by up to about 10%.
-Against the last row, this launch's decode step costs 1.39 ms a sequence instead of 1.51 (−8%) and
-prefill 51.5 µs a token instead of 55.0 (600 s each, different nodes).
+Over the hour this launch gives 33% more tok/s/GPU than before the compressed index (out tokens
+212.7 against 160.8 a second a GPU), with P90 and P50 interactivity 1.4× and 1.6× higher and TTFT
+p90 1.45 s instead of 2.5 s. Its decode step costs 0.93 ms a sequence instead of 1.18 (43.2
+sequences a step against 48.3) and prefill 41.1 µs a token instead of 55.9; the compressed index
+holds 120,859 KV blocks a GPU against 109,806. The two hours ran on different nodes (A and B), on the
+same workload and client (mean ISL 120k against 116k); each full 10-minute window of the new hour
+is 23-65% above the same window of the old one. Against DCP=1 (same node) it gives 56% more tok/s/GPU,
+trading per-user speed for no queueing: P90 and P50 interactivity are 1.8× and 1.7× lower, but
+TTFT p90 is 1.45 s instead of 84 s and the GPU serves 0.93 of the prompt tokens from HBM instead of
+0.24. The 600 s rows are not 3600 s rows: 600 s runs of one launch differ by up to about 10%, and
+this launch's hour gains more over its first 10 minutes (1.19×) than the old one did (1.07×).
 
 GSM8K (64-shot, DSpark k=5 at real acceptance, 3 runs, DCP=8 with `dcp_topk_merge`, fp8 index
 cache): 0.9414 without the DCP cuts, 0.9391 with `dcp_mailbox` 768, `dcp_fold` and `dcp_q_fp8`,
-0.9409 with `dcp_day0_decode`, none apart beyond the repeats
+0.9409 with `dcp_day0_decode`, 0.9386 with `index_compress` and `dcp_index_day0` on top, none
+apart beyond the repeats; `dcp_push_merge` is bit for bit the all-to-all merge
 ([`MiniMax-M3.1-Pro-Accuracy-Switches.md`](MiniMax-M3.1-Pro-Accuracy-Switches.md)).
 
 ## CONC 32
@@ -915,6 +932,5 @@ verify steps are 129-256 rows, where tuned a16w4 is within 3-5% of a4w4 per MoE 
 - CONC 32 with the full 237eada chat template (#182), and at aiter-M3 `5bc8d81ec`.
 - A 3600 s run with `GPTOSS_SWIGLU_MXFP4_BF16_BOUND=1040`; the 3600 s row above is without it.
 - The intermittent LMCache start hang (see Host memory for LMCache) is not fixed in the launcher.
-- DCP=8 has its CONC 64 launch ([CONC 64 with DCP=8](#conc-64-with-dcp8)), measured on the
-  pre-merge tree; a run on the merged commits, other concurrencies and `index_compress` at DCP=8
-  are not measured yet.
+- DCP=8 has its CONC 64 launch ([CONC 64 with DCP=8](#conc-64-with-dcp8)), measured on
+  `ca5d168c`; other concurrencies at DCP=8 are not measured yet, nor this launch's hour on node B.
