@@ -17,7 +17,11 @@ Keys are decoded in registers into the fp16 MFMA B operand (``v_cvt_scalef32_pk_
 then an exact ``v_pk_mul_f16`` by the scale). Query rows are head-major, so a block
 maximum takes three cross-lane steps. Programs with several tiles keep two 64-row key
 tiles in flight in registers; loads are issued in an explicit order because ``vmcnt``
-retires them in order.
+retires them in order. With several query rows, a tile's MFMAs run at wave priority 0
+and its vector work at 1, so the two programs sharing a SIMD alternate between the
+matrix and vector pipes. Packed f32 ops are disabled: they cannot co-issue with the other
+wave's MFMAs. Buffer operations address up to ``_BUFFER_BYTES``; larger tensors use
+64-bit pointers.
 """
 
 import os
@@ -33,6 +37,7 @@ CENTROIDS = 4
 IDX_HEADS = 16
 IDX_DIM = 128
 NUM_WARPS = 4
+_BUFFER_BYTES = 2**31
 
 
 def page_bytes(rows):
@@ -86,6 +91,17 @@ def _cvt_byte(word, sc2, SEL: gl.constexpr):
         return gl.inline_asm_elementwise(
             "v_cvt_scalef32_pk_f16_fp4 $0, $1, 1.0 op_sel:[1,1,0]\nv_pk_mul_f16 $0, $0, $2",
             "=&v,v,v", [word, sc2], dtype=gl.int32, is_pure=True, pack=1)  # fmt: skip
+
+
+@gluon.jit
+def _setprio(dummy, P: gl.constexpr):
+    """``s_setprio P`` (0 or 1) for the issuing wave; ``dummy`` is any scalar."""
+    if P == 0:
+        return gl.inline_asm_elementwise("s_setprio 0", "=s,s", [dummy], dtype=gl.int32,
+                                         is_pure=False, pack=1)  # fmt: skip
+    else:
+        return gl.inline_asm_elementwise("s_setprio 1", "=s,s", [dummy], dtype=gl.int32,
+                                         is_pure=False, pack=1)  # fmt: skip
 
 
 @gluon.jit
@@ -152,23 +168,23 @@ def _k_permute(x, ROWS: gl.constexpr):
 
 
 @gluon.jit
-def _phys_rows(bt_ptr, s_bt, seq, j0, qbmax, NB, ROWS: gl.constexpr, R: gl.constexpr,
+def _phys_rows(bt_row, j0, qbmax, NB, ROWS: gl.constexpr, R: gl.constexpr,
                RL: gl.constexpr):  # fmt: skip
     """Physical page and live mask of each of a tile's ``R`` cache rows."""
     rr = gl.arange(0, R, layout=RL)
     jr = j0 + rr // ROWS
     live = (jr <= qbmax) & (jr < NB)
-    phys = gl.amd.cdna4.buffer_load(bt_ptr, seq * s_bt + jr, mask=live)
+    phys = gl.amd.cdna4.buffer_load(bt_row, jr, mask=live)
     return phys, live
 
 
 @gluon.jit
-def _phys_any(bt_ptr, s_bt, seq, j0, NB, ROWS: gl.constexpr, R: gl.constexpr,
+def _phys_any(bt_row, j0, NB, ROWS: gl.constexpr, R: gl.constexpr,
               RL: gl.constexpr):  # fmt: skip
     """Physical pages of a tile's rows bounded by the table width only (no positions)."""
     rr = gl.arange(0, R, layout=RL)
     jr = j0 + rr // ROWS
-    return gl.amd.cdna4.buffer_load(bt_ptr, seq * s_bt + jr, mask=jr < NB)
+    return gl.amd.cdna4.buffer_load(bt_row, jr, mask=jr < NB)
 
 
 @gluon.jit
@@ -177,6 +193,28 @@ def _live_rows(j0, qbmax, NB, ROWS: gl.constexpr, R: gl.constexpr, RL: gl.conste
     rr = gl.arange(0, R, layout=RL)
     jr = j0 + rr // ROWS
     return (jr <= qbmax) & (jr < NB)
+
+
+@gluon.jit
+def _load_meta(pos_ptr, seq_ptr, q_rows, tval, SINGLE_SEQ: gl.constexpr):
+    """Positions and sequence ids of the program's query rows (-1 past ``T``)."""
+    pos_t = gl.amd.cdna4.buffer_load(pos_ptr, q_rows, mask=tval)
+    if SINGLE_SEQ:
+        seq_t = gl.full(q_rows.shape, 0, gl.int32, layout=q_rows.type.layout)
+    else:
+        seq_t = gl.where(tval, gl.amd.cdna4.buffer_load(seq_ptr, q_rows, mask=tval), -1)
+    return pos_t, seq_t
+
+
+@gluon.jit
+def _load_q(iq_ptr, tm, rm, dd, T, TQ: gl.constexpr, BIG_Q: gl.constexpr):
+    """The program's head-major query rows ``[M, 128]`` bf16 (zeros past ``T``)."""
+    qmask = gl.expand_dims(tm < T, 1) & gl.expand_dims(dd >= 0, 0)
+    if BIG_Q:
+        qoff = gl.expand_dims(tm.to(gl.int64) * 2048 + (rm // TQ) * 128, 1)
+        return gl.load(iq_ptr + qoff + gl.expand_dims(dd, 0), mask=qmask, other=0.0)
+    qoff = gl.expand_dims(tm * 2048 + (rm // TQ) * 128, 1) + gl.expand_dims(dd, 0)
+    return gl.amd.cdna4.buffer_load(iq_ptr, qoff, mask=qmask)
 
 
 @gluon.jit
@@ -245,17 +283,25 @@ def _split_pool4(x):
 
 
 @gluon.jit
-def _score_tile(qa, ca, kb, ti, jt, qb_t, orow, mine, sc, pool_temp, NB: gl.constexpr,
+def _score_tile(qa, ca, kb, ti, jt, qb_t, out_ptr, orow, mine, sc, pool_temp, NB: gl.constexpr,
                 INIT: gl.constexpr, LOCAL: gl.constexpr, TQ: gl.constexpr,
                 BB: gl.constexpr, ROWS: gl.constexpr, POOL: gl.constexpr,
-                MFMA: gl.constexpr, SL: gl.constexpr):  # fmt: skip
+                MFMA: gl.constexpr, SL: gl.constexpr,
+                BIG_OUT: gl.constexpr):  # fmt: skip
     """Score tile ``ti`` from its decoded keys and store its pinned ``[TQ, BB]`` scores."""
     NI: gl.constexpr = 16
     M: gl.constexpr = TQ * NI
     R: gl.constexpr = BB * ROWS
+    if TQ > 1:
+        _setprio(ti, 0)
+        gl.amd.hint.sched_barrier()
     dots = gl.amd.cdna4.mfma(qa, kb, gl.zeros([M, R], gl.float32, layout=MFMA))
     if POOL:
         lg = gl.amd.cdna4.mfma(ca, kb, gl.zeros([16, R], gl.float32, layout=MFMA))
+    if TQ > 1:
+        gl.amd.hint.sched_barrier()
+        _setprio(ti, 1)
+    if POOL:
         lg = gl.reshape(lg * (pool_temp * 1.4426950408889634), [16, R // 4, 4])
         e = gl.exp2(lg - gl.expand_dims(gl.max(lg, axis=2), 2))
         den = gl.sum(e, axis=2)
@@ -289,7 +335,11 @@ def _score_tile(qa, ca, kb, ti, jt, qb_t, orow, mine, sc, pool_temp, NB: gl.cons
     score = gl.where(jb2 < INIT, 1e30, score)
     score = gl.where(jb2 >= qb2 + 1 - LOCAL, 1e29, score)
     score = gl.where(jb2 <= qb2, score, float("-inf"))
-    gl.store(orow + jb2, score, mask=gl.expand_dims(mine, 1) & (jb2 < NB))
+    smask = gl.expand_dims(mine, 1) & (jb2 < NB)
+    if BIG_OUT:
+        gl.store(out_ptr + orow + jb2, score, mask=smask)
+    else:
+        gl.amd.cdna4.buffer_store(score, out_ptr, orow + jb2, mask=smask)
 
 
 @gluon.jit
@@ -322,6 +372,8 @@ def _score_kernel(
     NSPLIT: gl.constexpr,
     BIG_IC: gl.constexpr,
     FIRST_TILE: gl.constexpr,
+    BIG_Q: gl.constexpr,
+    BIG_OUT: gl.constexpr,
 ):
     """Block scores for ``TQ`` query tokens over every ``NSPLIT``-th tile of ``BB`` blocks."""
     NI: gl.constexpr = 16
@@ -352,35 +404,26 @@ def _score_kernel(
     if FT:
         q_rows = t0 + gl.arange(0, TQ, layout=gl.SliceLayout(1, SL))
         tval = q_rows < T
-        pos_t = gl.load(pos_ptr + q_rows, mask=tval, other=0)
-        if SINGLE_SEQ:
-            seq_t = gl.full([TQ], 0, gl.int32, layout=gl.SliceLayout(1, SL))
-        else:
-            seq_t = gl.load(seq_ptr + q_rows, mask=tval, other=-1)
+        pos_t, seq_t = _load_meta(pos_ptr, seq_ptr, q_rows, tval, SINGLE_SEQ)
         qb_t = pos_t // 16
 
     rm = gl.arange(0, M, layout=gl.SliceLayout(1, QL))
     dd = gl.arange(0, DI, layout=gl.SliceLayout(0, QL))
     tm = t0 + rm % TQ
-    qmask = gl.expand_dims(tm < T, 1) & gl.expand_dims(dd >= 0, 0)
-    qoff = gl.expand_dims(
-        tm.to(gl.int64) * (NI * DI) + (rm // TQ) * DI, 1
-    ) + gl.expand_dims(dd, 0)
     ka = gl.arange(0, DI, layout=gl.SliceLayout(0, AL))
     dperm = gl.max_contiguous(
         gl.multiple_of(32 * ((ka // 8) % 4) + 8 * (ka // 32) + ka % 8, 8), 8
     )
     if EARLY:
-        ph_0 = _phys_any(bt_ptr, s_bt, 0, pid_s * BB, NB, ROWS, R, RL)
-        ph_1 = _phys_any(bt_ptr, s_bt, 0, (pid_s + ns) * BB, NB, ROWS, R, RL)
-        ph_a0 = _phys_any(bt_ptr, s_bt, 0, (pid_s + 2 * ns) * BB, NB, ROWS, R, RL)
-        ph_b0 = _phys_any(bt_ptr, s_bt, 0, (pid_s + 3 * ns) * BB, NB, ROWS, R, RL)
+        ph_0 = _phys_any(bt_ptr, pid_s * BB, NB, ROWS, R, RL)
+        ph_1 = _phys_any(bt_ptr, (pid_s + ns) * BB, NB, ROWS, R, RL)
+        ph_a0 = _phys_any(bt_ptr, (pid_s + 2 * ns) * BB, NB, ROWS, R, RL)
+        ph_b0 = _phys_any(bt_ptr, (pid_s + 3 * ns) * BB, NB, ROWS, R, RL)
         q_rows = t0 + gl.arange(0, TQ, layout=gl.SliceLayout(1, SL))
         tval = q_rows < T
-        pos_t = gl.load(pos_ptr + q_rows, mask=tval, other=0)
-        seq_t = gl.full([TQ], 0, gl.int32, layout=gl.SliceLayout(1, SL))
+        pos_t, seq_t = _load_meta(pos_ptr, seq_ptr, q_rows, tval, True)
         qb_t = pos_t // 16
-        q_raw = gl.load(iq_ptr + qoff, mask=qmask, other=0.0)
+        q_raw = _load_q(iq_ptr, tm, rm, dd, T, TQ, BIG_Q)
         if POOL:
             r16e = gl.arange(0, 16, layout=gl.SliceLayout(1, AL))
             ca_raw = gl.load(
@@ -398,18 +441,16 @@ def _score_kernel(
         gl.amd.hint.sched_barrier()
         q = q_raw.to(gl.float32)
     elif FT:
-        q_raw = gl.load(iq_ptr + qoff, mask=qmask, other=0.0)
+        q_raw = _load_q(iq_ptr, tm, rm, dd, T, TQ, BIG_Q)
         qb_first = gl.max(gl.where(tval, qb_t, -1), axis=0)
-        ph_first, lv_first = _phys_rows(
-            bt_ptr, s_bt, 0, pid_s * BB, qb_first, NB, ROWS, R, RL
-        )
+        ph_first, lv_first = _phys_rows(bt_ptr, pid_s * BB, qb_first, NB, ROWS, R, RL)
         w_first, s_first = _load_tile(
             ic_ptr, icw_ptr, ph_first, lv_first, ROWS, R, WL3, BIG_IC
         )
         gl.amd.hint.sched_barrier()
         q = q_raw.to(gl.float32)
     else:
-        q = gl.load(iq_ptr + qoff, mask=qmask, other=0.0).to(gl.float32)
+        q = _load_q(iq_ptr, tm, rm, dd, T, TQ, BIG_Q).to(gl.float32)
     if Q4:
         q = _fake_nvfp4(q, M, DI)
     if TQ > 1:
@@ -441,14 +482,13 @@ def _score_kernel(
     if not (FT or EARLY):
         q_rows = t0 + gl.arange(0, TQ, layout=gl.SliceLayout(1, SL))
         tval = q_rows < T
-        pos_t = gl.load(pos_ptr + q_rows, mask=tval, other=0)
-        if SINGLE_SEQ:
-            seq_t = gl.full([TQ], 0, gl.int32, layout=gl.SliceLayout(1, SL))
-        else:
-            seq_t = gl.load(seq_ptr + q_rows, mask=tval, other=-1)
+        pos_t, seq_t = _load_meta(pos_ptr, seq_ptr, q_rows, tval, SINGLE_SEQ)
         qb_t = pos_t // 16
     jt = gl.arange(0, BB, layout=gl.SliceLayout(0, SL))
-    orow = out_ptr + gl.expand_dims(q_rows.to(gl.int64) * NB, 1)
+    if BIG_OUT:
+        orow = gl.expand_dims(q_rows.to(gl.int64) * NB, 1)
+    else:
+        orow = gl.expand_dims(q_rows * NB, 1)
 
     big = 2147483647
     s_lo = gl.min(gl.where(tval, seq_t, big), axis=0)
@@ -456,6 +496,10 @@ def _score_kernel(
     s_sub = s_lo
     while s_sub <= s_hi:
         mine = tval & (seq_t == s_sub)
+        if SINGLE_SEQ:
+            bt_row = bt_ptr
+        else:
+            bt_row = bt_ptr + s_sub.to(gl.int64) * s_bt
         qbmax = gl.max(gl.where(mine, qb_t, -1), axis=0)
         ntile = qbmax // BB + 1
         if EARLY:
@@ -463,17 +507,13 @@ def _score_kernel(
             ph_a, lv_a, ph_b, lv_b = ph_a0, lv_a0, ph_b0, lv_b0
         elif PIPE:
             if not FT:
-                ph, lv = _phys_rows(
-                    bt_ptr, s_bt, s_sub, pid_s * BB, qbmax, NB, ROWS, R, RL
-                )
-            ph_1, lv_1 = _phys_rows(
-                bt_ptr, s_bt, s_sub, (pid_s + ns) * BB, qbmax, NB, ROWS, R, RL
-            )
+                ph, lv = _phys_rows(bt_row, pid_s * BB, qbmax, NB, ROWS, R, RL)
+            ph_1, lv_1 = _phys_rows(bt_row, (pid_s + ns) * BB, qbmax, NB, ROWS, R, RL)
             ph_a, lv_a = _phys_rows(
-                bt_ptr, s_bt, s_sub, (pid_s + 2 * ns) * BB, qbmax, NB, ROWS, R, RL
+                bt_row, (pid_s + 2 * ns) * BB, qbmax, NB, ROWS, R, RL
             )
             ph_b, lv_b = _phys_rows(
-                bt_ptr, s_bt, s_sub, (pid_s + 3 * ns) * BB, qbmax, NB, ROWS, R, RL
+                bt_row, (pid_s + 3 * ns) * BB, qbmax, NB, ROWS, R, RL
             )
             gl.amd.hint.sched_barrier()
             if FT:
@@ -489,45 +529,50 @@ def _score_kernel(
                 gl.amd.hint.sched_barrier()
                 w_a, s_a = _load_tile(ic_ptr, icw_ptr, ph_a, lv_a, ROWS, R, WL3, BIG_IC)
                 ph_a, lv_a = _phys_rows(
-                    bt_ptr, s_bt, s_sub, (ti + 4 * ns) * BB, qbmax, NB, ROWS, R, RL
+                    bt_row, (ti + 4 * ns) * BB, qbmax, NB, ROWS, R, RL
                 )
-                _score_tile(qa, ca, kb, ti, jt, qb_t, orow, mine, sc, pool_temp, NB,
+                _score_tile(qa, ca, kb, ti, jt, qb_t, out_ptr, orow, mine, sc, pool_temp, NB,
                             INIT, LOCAL, TQ, BB, ROWS, POOL, MFMA,
-                            SL)  # fmt: skip
+                            SL, BIG_OUT)  # fmt: skip
                 kb = _keys_b(w_b, s_b, R, BL)
                 gl.amd.hint.sched_barrier()
                 w_b, s_b = _load_tile(ic_ptr, icw_ptr, ph_b, lv_b, ROWS, R, WL3, BIG_IC)
                 ph_b, lv_b = _phys_rows(
-                    bt_ptr, s_bt, s_sub, (ti + 5 * ns) * BB, qbmax, NB, ROWS, R, RL
+                    bt_row, (ti + 5 * ns) * BB, qbmax, NB, ROWS, R, RL
                 )
                 if ti + ns < ntile:
-                    _score_tile(qa, ca, kb, ti + ns, jt, qb_t, orow, mine, sc,
+                    _score_tile(qa, ca, kb, ti + ns, jt, qb_t, out_ptr, orow, mine, sc,
                                 pool_temp, NB, INIT, LOCAL, TQ, BB, ROWS, POOL, MFMA,
-                                SL)  # fmt: skip
+                                SL, BIG_OUT)  # fmt: skip
         else:
             for ti in range(pid_s, ntile, ns):
                 if FT:
                     w_c, s_c = w_first, s_first
                 else:
-                    ph, lv = _phys_rows(
-                        bt_ptr, s_bt, s_sub, ti * BB, qbmax, NB, ROWS, R, RL
-                    )
+                    ph, lv = _phys_rows(bt_row, ti * BB, qbmax, NB, ROWS, R, RL)
                     w_c, s_c = _load_tile(ic_ptr, icw_ptr, ph, lv, ROWS, R, WL3, BIG_IC)
                 kb = _keys_b(w_c, s_c, R, BL)
-                _score_tile(qa, ca, kb, ti, jt, qb_t, orow, mine, sc, pool_temp, NB,
+                _score_tile(qa, ca, kb, ti, jt, qb_t, out_ptr, orow, mine, sc, pool_temp, NB,
                             INIT, LOCAL, TQ, BB, ROWS, POOL, MFMA,
-                            SL)  # fmt: skip
+                            SL, BIG_OUT)  # fmt: skip
         if not CAUSAL:
             f1 = gl.minimum(NB, (pid_s + 1) * FILL)
             neg = gl.full([TQ, FW], float("-inf"), gl.float32, layout=FL)
             q_fill_rows = t0 + gl.arange(0, TQ, layout=gl.SliceLayout(1, FL))
             minef = gl.convert_layout(mine, gl.SliceLayout(1, FL))
-            orowf = out_ptr + gl.expand_dims(q_fill_rows.to(gl.int64) * NB, 1)
+            if BIG_OUT:
+                orowf = gl.expand_dims(q_fill_rows.to(gl.int64) * NB, 1)
+            else:
+                orowf = gl.expand_dims(q_fill_rows * NB, 1)
             for c0 in range(gl.maximum(ntile * BB, pid_s * FILL), f1, FW):
                 cols = gl.expand_dims(
                     c0 + gl.arange(0, FW, layout=gl.SliceLayout(0, FL)), 0
                 )
-                gl.store(orowf + cols, neg, mask=gl.expand_dims(minef, 1) & (cols < f1))
+                fmask = gl.expand_dims(minef, 1) & (cols < f1)
+                if BIG_OUT:
+                    gl.store(out_ptr + orowf + cols, neg, mask=fmask)
+                else:
+                    gl.amd.cdna4.buffer_store(neg, out_ptr, orowf + cols, mask=fmask)
         if SINGLE_SEQ:
             s_sub = big
         else:
@@ -638,7 +683,9 @@ def _score(iq, ic, block_tables, seq_id, positions, nb, cq, init, local, pool_te
         PIPE=pipe,
         SINGLE_SEQ=block_tables.shape[0] == 1,
         NSPLIT=nsplit,
-        BIG_IC=ic.numel() > 2**32,
+        BIG_IC=ic.numel() >= _BUFFER_BYTES,
+        BIG_Q=iq.numel() * 2 >= _BUFFER_BYTES,
+        BIG_OUT=t * nb * 4 >= _BUFFER_BYTES,
         FIRST_TILE=(
             rows == PAGE
             and block_tables.shape[0] == 1
@@ -649,7 +696,10 @@ def _score(iq, ic, block_tables, seq_id, positions, nb, cq, init, local, pool_te
         ),
         num_warps=NUM_WARPS,
         enable_fp_fusion=True,
-        llvm_fn_attrs="amdgpu-ieee=false",
+        llvm_fn_attrs=(
+            ("amdgpu-ieee", "false"),
+            ("target-features", "-packed-fp32-ops"),
+        ),
     )
     return out
 
