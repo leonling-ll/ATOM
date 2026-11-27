@@ -117,3 +117,43 @@ def test_64_bit_addressing_paths(score, monkeypatch):
         live = torch.arange(width, device="cuda")[None, :] <= pos[:, None] // nvfp4.PAGE
         mask = live if causal else torch.ones_like(live)
         assert torch.equal(got[mask], want[mask])
+
+
+@needs_gfx950
+def test_cache_pages_past_2_gib():
+    # Buffer descriptors cover 0x7ffffffe bytes: a cache just over 2 GiB must take the
+    # 64-bit path, or its pages past 2 GiB read as zeros.
+    page = nvfp4.page_bytes(nvfp4.PAGE)
+    live_pages = 64
+    total = 2**31 // page + live_pages + 1
+    if torch.cuda.mem_get_info()[0] < total * page + (1 << 30):
+        pytest.skip("needs 3 GiB of free device memory")
+    rng = torch.Generator(device="cuda").manual_seed(5)
+    cache = torch.empty((total, page), dtype=torch.uint8, device="cuda")
+    low = torch.arange(1, live_pages + 1, device="cuda")
+    high = torch.arange(total - live_pages, total, device="cuda")
+    assert cache.numel() >= 2**31 and int(high[0]) * page >= 2**31
+    keys, iq, cq = _inputs(rng, live_pages, 8)
+    cache[low] = keys
+    cache[high] = keys
+    context = live_pages * nvfp4.PAGE - 5
+    seq_id = torch.zeros(8, device="cuda", dtype=torch.int32)
+    pos = torch.arange(context - 8, context, device="cuda", dtype=torch.int32)
+
+    # A 64-block table gives one tile a program; 4096 blocks run the pipelined loop.
+    for width in (live_pages, 4096):
+        tables = []
+        for pages in (low, high):
+            table = torch.zeros((1, width), dtype=torch.int32, device="cuda")
+            table[0, :live_pages] = pages.to(torch.int32)
+            tables.append(table)
+        live = torch.arange(width, device="cuda")[None, :] <= pos[:, None] // nvfp4.PAGE
+        for score in SCORERS:
+            for causal in (True, False):
+                lo, hi = (
+                    score(iq, cache, table, seq_id, pos, width, cq, 0, 0,
+                          nvfp4.IDX_DIM**-0.5, tq=8, causal=causal)
+                    for table in tables
+                )  # fmt: skip
+                mask = live if causal else torch.ones_like(live)
+                assert torch.equal(hi[mask], lo[mask]), (score.__name__, width, causal)
