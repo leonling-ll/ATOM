@@ -21,7 +21,7 @@ retires them in order. With several query rows, a tile's MFMAs run at wave prior
 and its vector work at 1, so the two programs sharing a SIMD alternate between the
 matrix and vector pipes. Packed f32 ops are disabled: they cannot co-issue with the other
 wave's MFMAs. Buffer operations address up to ``_BUFFER_BYTES``; larger tensors use
-64-bit pointers.
+64-bit pointers, and single-row tiles read dead cache rows from one aligned query line.
 """
 
 import os
@@ -219,8 +219,10 @@ def _load_q(iq_ptr, tm, rm, dd, T, TQ: gl.constexpr, BIG_Q: gl.constexpr):
 
 @gluon.jit
 def _load_tile(ic_ptr, icw_ptr, phys, live, ROWS: gl.constexpr, R: gl.constexpr,
-               WL3: gl.constexpr, BIG_IC: gl.constexpr):  # fmt: skip
-    """Load a tile's E2M1 words ``[R, 4, 4]`` and their E4M3 scale bytes."""
+               WL3: gl.constexpr, BIG_IC: gl.constexpr, QLINE: gl.constexpr, q_line):  # fmt: skip
+    """Load a tile's E2M1 words ``[R, 4, 4]`` and their E4M3 scale bytes. With ``QLINE``, rows
+    past the sequence read the 16-byte line ``q_line`` of this launch's queries instead of
+    masked branches."""
     rr = gl.arange(0, R, layout=gl.SliceLayout(1, gl.SliceLayout(2, WL3)))
     cc = gl.arange(0, 4, layout=gl.SliceLayout(0, gl.SliceLayout(2, WL3)))
     ss = gl.arange(0, 4, layout=gl.SliceLayout(0, gl.SliceLayout(1, WL3)))
@@ -241,7 +243,15 @@ def _load_tile(ic_ptr, icw_ptr, phys, live, ROWS: gl.constexpr, R: gl.constexpr,
     )
     m3 = l3 & (c3 >= 0) & (s3 >= 0)
     S_IC: gl.constexpr = ROWS * 72
-    if BIG_IC:
+    if BIG_IC and QLINE:
+        p64 = p3.to(gl.int64)
+        qw = q_line.to(gl.pointer_type(gl.int32))
+        qb = q_line.to(gl.pointer_type(gl.uint8))
+        wbase = gl.where(l3, icw_ptr + (p64 * (S_IC // 4) + r3 * 16 + c3 * 4), qw)
+        words = gl.load(wbase + s3)
+        sbase = gl.where(l3, ic_ptr + (p64 * S_IC + ROWS * 64 + r3 * 8 + c3 * 2), qb)
+        scales = gl.load(sbase + s3 // 2)
+    elif BIG_IC:
         p64 = p3.to(gl.int64)
         woff = p64 * (S_IC // 4) + r3 * 16 + c3 * 4 + s3
         words = gl.load(icw_ptr + woff, mask=m3, other=0)
@@ -399,6 +409,8 @@ def _score_kernel(
     ns = NSPLIT
     icw_ptr = ic_ptr.to(gl.pointer_type(gl.int32), bitcast=True)
     EARLY: gl.constexpr = PIPE and SINGLE_SEQ
+    QLINE: gl.constexpr = TQ == 1
+    q_line = (iq_ptr.to(gl.int64) + 15) & -16
     FT: gl.constexpr = FIRST_TILE and not EARLY
 
     if FT:
@@ -435,9 +447,13 @@ def _score_kernel(
         lv_a0 = _live_rows((pid_s + 2 * ns) * BB, qb0, NB, ROWS, R, RL)
         lv_b0 = _live_rows((pid_s + 3 * ns) * BB, qb0, NB, ROWS, R, RL)
         gl.amd.hint.sched_barrier()
-        w_a0, s_a0 = _load_tile(ic_ptr, icw_ptr, ph_0, lv_0, ROWS, R, WL3, BIG_IC)
+        w_a0, s_a0 = _load_tile(
+            ic_ptr, icw_ptr, ph_0, lv_0, ROWS, R, WL3, BIG_IC, QLINE, q_line
+        )
         gl.amd.hint.sched_barrier()
-        w_b0, s_b0 = _load_tile(ic_ptr, icw_ptr, ph_1, lv_1, ROWS, R, WL3, BIG_IC)
+        w_b0, s_b0 = _load_tile(
+            ic_ptr, icw_ptr, ph_1, lv_1, ROWS, R, WL3, BIG_IC, QLINE, q_line
+        )
         gl.amd.hint.sched_barrier()
         q = q_raw.to(gl.float32)
     elif FT:
@@ -445,7 +461,7 @@ def _score_kernel(
         qb_first = gl.max(gl.where(tval, qb_t, -1), axis=0)
         ph_first, lv_first = _phys_rows(bt_ptr, pid_s * BB, qb_first, NB, ROWS, R, RL)
         w_first, s_first = _load_tile(
-            ic_ptr, icw_ptr, ph_first, lv_first, ROWS, R, WL3, BIG_IC
+            ic_ptr, icw_ptr, ph_first, lv_first, ROWS, R, WL3, BIG_IC, QLINE, q_line
         )
         gl.amd.hint.sched_barrier()
         q = q_raw.to(gl.float32)
@@ -519,15 +535,21 @@ def _score_kernel(
             if FT:
                 w_a, s_a = w_first, s_first
             else:
-                w_a, s_a = _load_tile(ic_ptr, icw_ptr, ph, lv, ROWS, R, WL3, BIG_IC)
+                w_a, s_a = _load_tile(
+                    ic_ptr, icw_ptr, ph, lv, ROWS, R, WL3, BIG_IC, QLINE, q_line
+                )
             gl.amd.hint.sched_barrier()
-            w_b, s_b = _load_tile(ic_ptr, icw_ptr, ph_1, lv_1, ROWS, R, WL3, BIG_IC)
+            w_b, s_b = _load_tile(
+                ic_ptr, icw_ptr, ph_1, lv_1, ROWS, R, WL3, BIG_IC, QLINE, q_line
+            )
             gl.amd.hint.sched_barrier()
         if PIPE:
             for ti in range(pid_s, ntile, 2 * ns):
                 kb = _keys_b(w_a, s_a, R, BL)
                 gl.amd.hint.sched_barrier()
-                w_a, s_a = _load_tile(ic_ptr, icw_ptr, ph_a, lv_a, ROWS, R, WL3, BIG_IC)
+                w_a, s_a = _load_tile(
+                    ic_ptr, icw_ptr, ph_a, lv_a, ROWS, R, WL3, BIG_IC, QLINE, q_line
+                )
                 ph_a, lv_a = _phys_rows(
                     bt_row, (ti + 4 * ns) * BB, qbmax, NB, ROWS, R, RL
                 )
@@ -536,7 +558,9 @@ def _score_kernel(
                             SL, BIG_OUT)  # fmt: skip
                 kb = _keys_b(w_b, s_b, R, BL)
                 gl.amd.hint.sched_barrier()
-                w_b, s_b = _load_tile(ic_ptr, icw_ptr, ph_b, lv_b, ROWS, R, WL3, BIG_IC)
+                w_b, s_b = _load_tile(
+                    ic_ptr, icw_ptr, ph_b, lv_b, ROWS, R, WL3, BIG_IC, QLINE, q_line
+                )
                 ph_b, lv_b = _phys_rows(
                     bt_row, (ti + 5 * ns) * BB, qbmax, NB, ROWS, R, RL
                 )
@@ -550,7 +574,9 @@ def _score_kernel(
                     w_c, s_c = w_first, s_first
                 else:
                     ph, lv = _phys_rows(bt_row, ti * BB, qbmax, NB, ROWS, R, RL)
-                    w_c, s_c = _load_tile(ic_ptr, icw_ptr, ph, lv, ROWS, R, WL3, BIG_IC)
+                    w_c, s_c = _load_tile(
+                        ic_ptr, icw_ptr, ph, lv, ROWS, R, WL3, BIG_IC, QLINE, q_line
+                    )
                 kb = _keys_b(w_c, s_c, R, BL)
                 _score_tile(qa, ca, kb, ti, jt, qb_t, out_ptr, orow, mine, sc, pool_temp, NB,
                             INIT, LOCAL, TQ, BB, ROWS, POOL, MFMA,
