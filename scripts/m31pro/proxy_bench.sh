@@ -109,6 +109,18 @@ if [ -z "${MAX_NUM_SEQS:-}" ]; then
 fi
 
 AGENTIC_CAPTURE_SIZES=1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,18,20,22,24,26,28,30,32,48,64,128,256,512
+# Above 32 sequences that ladder has only 48, 64 and 128, and a decode step
+# replays the smallest graph that holds its sequences: at CONC 96 every full
+# step replays the 128-sequence graph, 512 verify rows for 384. From CONC 33 to
+# 128 add every fourth size from 36 up to CONC, and CONC itself.
+if [ "$CONC" -gt 32 ] && [ "$CONC" -le 128 ]; then
+    between=$CONC
+    for ((n = 36; n <= CONC; n += 4)); do
+        between="$between $n"
+    done
+    AGENTIC_CAPTURE_SIZES=$(printf '%s\n' ${AGENTIC_CAPTURE_SIZES//,/ } $between |
+        sort -nu | paste -sd, -)
+fi
 if [ -z "${PREWARM_BATCHES:-}" ]; then
     PREWARM_BATCHES=
     for n in ${AGENTIC_CAPTURE_SIZES//,/ }; do
@@ -213,8 +225,9 @@ print(json.dumps({**json.loads(sys.argv[1]), **json.loads(sys.argv[2]), **json.l
     fi
     # Set but empty records no bucket: every prefill runs eagerly.
     export ATOM_TOKEN_GRAPH_SIZES="${ATOM_TOKEN_GRAPH_SIZES-256,512,1024,2048}"
-    # Graphs between 8, 16 and 32 sequences: a step replays the smallest graph
-    # that holds its sequences, and padded rows cost index score time.
+    # Graphs between 8, 16 and 32 sequences, and above CONC 32 every fourth
+    # size up to CONC: a step replays the smallest graph that holds its
+    # sequences, and padded rows cost what real rows do.
     recipe_args=(--cudagraph-capture-sizes
         "[$AGENTIC_CAPTURE_SIZES]"
         --text-only --timeout-keep-alive 600)

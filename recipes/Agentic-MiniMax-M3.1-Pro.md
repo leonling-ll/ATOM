@@ -260,6 +260,32 @@ At CONC 32 the cut leaves 26 graphs against the default's 12: capture takes 280 
 for either ladder, so the KV pool does not shrink; the extra pool comes out of the HBM left unused
 under the 0.95 target. Step times and the c32 proxy before and after are in #99.
 
+Above 32 sequences that ladder has only 48, 64 and 128, so from CONC 33 a step again replays a
+graph wider than itself, and there the padded rows cost every kernel that scales with rows (the
+GEMMs, the attention, the all-reduces, the DCP gathers and merge), not only the index. A full
+CONC 96 verify step (96 sequences of 4 rows with 3 draft tokens) replays the 128-sequence graph:
+512 rows for 384. With every fourth size from 36 to 96 added it replays its own:
+
+| decode step | ladder above | + 36, 40, ... 96 | |
+|---|---:|---:|---:|
+| DCP 8, 96 sequences | 106.4 ms | 92.0 ms | -13.5% |
+| DCP 8, 69 sequences running | 106.4 ms | 77.6 ms | -27% |
+| no DCP (`index_compress`, `index: "fused"`), 96 sequences | 47.8 ms | 41.2 to 42.7 ms | -11% to -14% |
+| no DCP, 69 to 71 sequences running | 47.7 ms | 37.1 to 39.8 ms | -17% to -22% |
+
+Measured on ATOM `309ce81` and aiter-M3 `882741bd5`, before `dcp_topk_merge` and the other DCP
+decode variants (to be repeated with them), on MI355X x 8 at TP 8 with DSpark k=3 at acceptance
+length 2.53: 96 concurrent requests with 24k-token prompts decoding 64 tokens, the mean wall time
+of the decode forwards in a torch profiler trace (read with `scripts/m31pro/kernel_roofline.py`'s
+`read_forwards`). The forward that first uses a graph is left out: it stalls once, for 0.12 to
+0.17 s. The no-DCP row is three runs over two server starts, the others one run each. The 14
+extra sizes take the graph pool from 1.47 GB (33 graphs) to 1.54 GB (47 graphs).
+
+`scripts/m31pro/proxy_bench.sh` adds these sizes itself from CONC 33 to 128 (every fourth size
+from 36 up to CONC, and CONC), and its prewarm batches replay each one before the client starts.
+The hand launches in this recipe keep the ladder they were measured with; a launch above CONC 32
+should pass the sizes up to its CONC too.
+
 ## 2. Run the AgentX profile
 
 Same client as [`Agentic-Kimi-K3.md`](Agentic-Kimi-K3.md); only the model and the concurrency

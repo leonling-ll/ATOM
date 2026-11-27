@@ -185,6 +185,43 @@ def test_agentic_launch_captures_graphs_between_8_16_and_32(tmp_path, recipe):
     assert _ladders(args) == [AGENTIC_LADDER]
 
 
+def _ladder_above_32(conc):
+    """AGENTIC_LADDER with every fourth size from 36 up to ``conc`` and ``conc``."""
+    sizes = set(json.loads(AGENTIC_LADDER)) | set(range(36, conc + 1, 4)) | {conc}
+    return "[" + ",".join(map(str, sorted(sizes))) + "]"
+
+
+@pytest.mark.parametrize("conc", [33, 64, 70, 96, 128])
+def test_agentic_launch_captures_every_fourth_size_from_36_to_conc(tmp_path, conc):
+    # the recipe ladder has only 48, 64 and 128 above 32: a full CONC 96 step
+    # (96 sequences) replayed the 128-sequence graph
+    done, values, args = _dry_run(tmp_path, conc=conc, RECIPE="agentic")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert _ladders(args) == [_ladder_above_32(conc)]
+    ladder = json.loads(_ladders(args)[0])
+    assert conc in ladder
+    steps = [n for n in ladder if 32 <= n <= conc]
+    assert all(b - a <= 4 for a, b in itertools.pairwise(steps))
+    # ... and the prewarm replays each of them before the client starts
+    batches = [int(n) for n in values["prewarm_batches"].split(",")]
+    assert batches == [n for n in ladder if n <= 2 * conc]
+
+
+def test_ladder_at_conc_96_is_the_measured_one(tmp_path):
+    _, _, args = _dry_run(tmp_path, conc=96, RECIPE="agentic")
+    assert _ladders(args) == [
+        "[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,18,20,22,24,26,28,30,32,"
+        "36,40,44,48,52,56,60,64,68,72,76,80,84,88,92,96,128,256,512]"
+    ]
+
+
+@pytest.mark.parametrize("conc", [16, 32, 129, 256])
+def test_agentic_ladder_is_unchanged_outside_conc_33_to_128(tmp_path, conc):
+    done, _, args = _dry_run(tmp_path, conc=conc, RECIPE="agentic")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert _ladders(args) == [AGENTIC_LADDER]
+
+
 def test_pro_launch_keeps_the_default_ladder(tmp_path):
     done, _, args = _dry_run(tmp_path)
     assert done.returncode == 0, done.stdout + done.stderr
